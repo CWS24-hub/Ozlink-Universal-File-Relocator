@@ -2967,11 +2967,43 @@ class MainWindow(QMainWindow):
         if button is not None:
             button.setText("Collapse All" if expanded else "Expand All")
 
+    def _panel_loaded_branch_state(self, panel_key):
+        tree = self.source_tree_widget if panel_key == "source" else self.destination_tree_widget
+        if tree is None:
+            return False, False
+
+        has_loaded_branches = False
+        all_loaded_branches_expanded = True
+        queue = [tree.topLevelItem(index) for index in range(tree.topLevelItemCount())]
+        while queue:
+            item = queue.pop(0)
+            if item is None:
+                continue
+            node_data = item.data(0, Qt.UserRole) or {}
+            if node_data.get("placeholder"):
+                continue
+            real_children = []
+            for index in range(item.childCount()):
+                child = item.child(index)
+                child_data = child.data(0, Qt.UserRole) or {}
+                if child_data.get("placeholder"):
+                    continue
+                real_children.append(child)
+            if bool(node_data.get("is_folder")) and real_children:
+                has_loaded_branches = True
+                if not item.isExpanded():
+                    all_loaded_branches_expanded = False
+            queue.extend(real_children)
+        return has_loaded_branches, all_loaded_branches_expanded
+
     def _panel_is_expanded_all(self, panel_key):
-        button = self._expand_all_button_for_panel(panel_key)
-        if button is not None and button.text() == "Collapse All":
+        if self._expand_all_pending.get(panel_key):
             return True
-        return bool(self._expand_all_pending.get(panel_key))
+        has_loaded_branches, all_loaded_branches_expanded = self._panel_loaded_branch_state(panel_key)
+        if has_loaded_branches:
+            return all_loaded_branches_expanded
+        button = self._expand_all_button_for_panel(panel_key)
+        return bool(button is not None and button.text() == "Collapse All")
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -13773,6 +13805,7 @@ class MainWindow(QMainWindow):
             return
 
         button = self._expand_all_button_for_panel(panel_key)
+        self._set_expand_all_button_label(panel_key, self._panel_is_expanded_all(panel_key))
         if self._panel_is_expanded_all(panel_key):
             self._cancel_expand_all(panel_key)
             if panel_key == "destination":

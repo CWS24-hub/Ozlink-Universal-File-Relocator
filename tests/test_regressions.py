@@ -505,6 +505,29 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         self.assertEqual(labels, [("source", True)])
         self.assertEqual(statuses[-1], ("source", "Expanded from local snapshot. Refreshing live content...", True))
 
+    def test_panel_is_expanded_all_uses_tree_state_over_stale_button_label(self):
+        window = MainWindow.__new__(MainWindow)
+        tree = QTreeWidget()
+        root = QTreeWidgetItem(["Folder: Root"])
+        root.setData(0, Qt.UserRole, {"item_path": "Root", "is_folder": True})
+        root.setExpanded(True)
+        child = QTreeWidgetItem(["Folder: Child"])
+        child.setData(0, Qt.UserRole, {"item_path": "Root\\Child", "is_folder": True})
+        child.setExpanded(False)
+        grandchild = QTreeWidgetItem(["File: Example"])
+        grandchild.setData(0, Qt.UserRole, {"item_path": "Root\\Child\\Example.txt", "is_folder": False})
+        child.addChild(grandchild)
+        root.addChild(child)
+        tree.addTopLevelItem(root)
+
+        window.source_tree_widget = tree
+        window.destination_tree_widget = QTreeWidget()
+        window.source_expand_all_button = _ButtonStub("Collapse All")
+        window.destination_expand_all_button = _ButtonStub("Expand All")
+        window._expand_all_pending = {"source": False, "destination": False}
+
+        self.assertFalse(window._panel_is_expanded_all("source"))
+
     def test_find_visible_destination_item_by_path_skips_verbose_logs_by_default(self):
         window = MainWindow.__new__(MainWindow)
         tree = QTreeWidget()
