@@ -1,0 +1,82 @@
+from __future__ import annotations
+
+import os
+import re
+from pathlib import Path
+
+APP_VENDOR = "OzlinkIT"
+PYTHON_APP_NAME = "OzlinkITSharePointRelocationConsole"
+LEGACY_APP_NAME = "SharePointRelocationConsole"
+
+def vendor_root() -> Path:
+    return Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))) / APP_VENDOR
+
+def python_primary_storage_root() -> Path:
+    return vendor_root() / PYTHON_APP_NAME
+
+def _safe_storage_segment(value: str, fallback: str) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return fallback
+    text = re.sub(r"[^a-z0-9._@-]+", "_", text)
+    text = text.strip("._-")
+    return text or fallback
+
+def user_scoped_storage_root(tenant_domain: str = "", operator_upn: str = "") -> Path:
+    tenant_segment = _safe_storage_segment(tenant_domain, "unknown_tenant")
+    user_segment = _safe_storage_segment(operator_upn, "anonymous")
+    return python_primary_storage_root() / "Users" / tenant_segment / user_segment
+
+def legacy_compatibility_root() -> Path:
+    return vendor_root() / LEGACY_APP_NAME
+
+def appdata_root() -> Path:
+    return python_primary_storage_root()
+
+def logs_root() -> Path:
+    path = appdata_root() / "Logs"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+def memory_root() -> Path:
+    path = appdata_root() / "Memory"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+def legacy_memory_root() -> Path:
+    return legacy_compatibility_root() / "Memory"
+
+def backups_root() -> Path:
+    path = memory_root() / "Backups"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+def quarantine_root() -> Path:
+    path = memory_root() / "Quarantine"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+def exports_root() -> Path:
+    path = appdata_root() / "Exports"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+def requests_root() -> Path:
+    path = appdata_root() / "Requests"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+def test_requests_root() -> Path:
+    path = requests_root() / "Test"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+def cache_root() -> Path:
+    path = appdata_root() / "Cache"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+def graph_cache_root() -> Path:
+    path = cache_root() / "Graph"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
