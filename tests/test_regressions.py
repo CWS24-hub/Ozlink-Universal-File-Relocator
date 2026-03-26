@@ -648,6 +648,64 @@ class DestinationReplayRegressionTests(unittest.TestCase):
 
         self.assertEqual(applied, [])
 
+    def test_source_shallow_root_payload_does_not_overwrite_richer_visible_tree(self):
+        window = MainWindow.__new__(MainWindow)
+        window.root_load_workers = {"source": {"id": "root-1", "request_signature": {"panel_key": "source"}}}
+        window.pending_root_drive_ids = {"source": "drive-1"}
+        window._memory_restore_in_progress = False
+        window._log_restore_phase = lambda *args, **kwargs: None
+        window._log_worker_lifecycle = lambda *args, **kwargs: None
+        window._count_root_payload_nodes = MainWindow._count_root_payload_nodes.__get__(window, MainWindow)
+        window._count_expandable_tree_nodes = lambda panel_key: 12
+        window._reset_source_background_preload_state = lambda: None
+        applied = []
+        window._apply_root_payload_to_tree = lambda panel_key, items: applied.append((panel_key, items))
+
+        payload = {
+            "panel_key": "source",
+            "drive_id": "drive-1",
+            "items": [{
+                "name": "FTBMRoot",
+                "children": [],
+            }],
+        }
+
+        window.on_root_load_success(payload, "root-1")
+
+        self.assertEqual(applied, [])
+
+    def test_destination_shallow_folder_payload_does_not_overwrite_richer_visible_branch(self):
+        app = QApplication.instance() or QApplication([])
+        window = MainWindow.__new__(MainWindow)
+        item = QTreeWidgetItem(["Folder: Finance"])
+        item.setData(0, Qt.UserRole, {"item_path": "Root\\Finance", "is_folder": True, "children_loaded": True})
+        child = QTreeWidgetItem(["Folder: Payroll"])
+        child.setData(0, Qt.UserRole, {"item_path": "Root\\Finance\\Payroll", "is_folder": True, "children_loaded": True})
+        item.addChild(child)
+
+        window.pending_folder_loads = {"destination": set()}
+        window.folder_load_workers = {"destination:item-1": {"id": "folder-1", "item": item}}
+        window._memory_restore_in_progress = False
+        window._snapshot_branch_refresh_baseline_by_worker = {}
+        window._destination_preserved_children_by_worker = {"destination:item-1": []}
+        window._log_worker_lifecycle = lambda *args, **kwargs: None
+        window._log_restore_phase = lambda *args, **kwargs: None
+        window.normalize_memory_path = MainWindow.normalize_memory_path.__get__(window, MainWindow)
+        window._count_visible_subtree_nodes = MainWindow._count_visible_subtree_nodes.__get__(window, MainWindow)
+        window._count_folder_payload_nodes = MainWindow._count_folder_payload_nodes.__get__(window, MainWindow)
+
+        payload = {
+            "panel_key": "destination",
+            "drive_id": "drive-1",
+            "item_id": "item-1",
+            "items": [],
+        }
+
+        window.on_folder_load_success(payload, "folder-1")
+
+        self.assertEqual(item.childCount(), 1)
+        self.assertEqual((item.child(0).data(0, Qt.UserRole) or {}).get("item_path"), "Root\\Finance\\Payroll")
+
     def test_refresh_tree_ui_after_root_bind_skips_source_materialization_when_snapshot_restored(self):
         window = MainWindow.__new__(MainWindow)
         window._pending_snapshot_branch_refresh = {"source": {"FTBMRoot\\Public"}, "destination": set()}
@@ -666,6 +724,25 @@ class DestinationReplayRegressionTests(unittest.TestCase):
 
         self.assertEqual(synced, [("source", False)])
         self.assertEqual(statuses[-1], ("source", "Expanded from local snapshot. Refreshing live content...", True))
+
+    def test_fast_expand_all_persists_workspace_ui_state(self):
+        window = MainWindow.__new__(MainWindow)
+        window.source_tree_widget = _ExpandTreeStub()
+        window.destination_tree_widget = _ExpandTreeStub()
+        window._expand_all_pending = {"source": False, "destination": False}
+        window._expand_all_deferred_refresh = {"source": False, "destination": False}
+        window._reset_expand_all_progress = lambda panel_key: None
+        window._set_expand_all_button_label = lambda panel_key, expanded: None
+        window.source_tree_status = _LabelStub()
+        window.destination_tree_status = _LabelStub()
+        window._set_tree_status_message = lambda panel_key, message, loading=False: None
+        persisted = []
+        window._persist_workspace_ui_state_safely = lambda: persisted.append(True)
+
+        result = window._fast_expand_all_loaded_tree("source")
+
+        self.assertTrue(result)
+        self.assertEqual(persisted, [True])
 
     def test_snapshot_refresh_targets_from_source_snapshot_limits_depth(self):
         window = MainWindow.__new__(MainWindow)

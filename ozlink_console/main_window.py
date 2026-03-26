@@ -3011,6 +3011,12 @@ class MainWindow(QMainWindow):
         self._set_expand_all_button_label(panel_key, expanded)
         return expanded
 
+    def _persist_workspace_ui_state_safely(self):
+        try:
+            self._save_draft_shell(force=True, include_workspace_ui=True)
+        except Exception as exc:
+            self._log_restore_exception("persist_workspace_ui_state", exc)
+
     def showEvent(self, event):
         super().showEvent(event)
         print(
@@ -7205,6 +7211,20 @@ class MainWindow(QMainWindow):
 
             items = payload.get("items", [])
             self._log_restore_phase("root_worker_success payload_received", panel_key=panel_key, item_count=len(items))
+            if (
+                panel_key == "source"
+                and not getattr(self, "_memory_restore_in_progress", False)
+            ):
+                incoming_node_count = self._count_root_payload_nodes(items)
+                visible_node_count = self._count_expandable_tree_nodes("source")
+                if incoming_node_count > 0 and visible_node_count > incoming_node_count:
+                    self._log_restore_phase(
+                        "source_shallow_root_payload_skipped",
+                        worker_id=worker_id,
+                        incoming_node_count=incoming_node_count,
+                        visible_node_count=visible_node_count,
+                    )
+                    return
             if (
                 panel_key == "destination"
                 and not getattr(self, "_memory_restore_in_progress", False)
@@ -11817,10 +11837,25 @@ class MainWindow(QMainWindow):
             previous_child_paths = self._snapshot_branch_refresh_baseline_by_worker.pop(worker_key, set())
 
             preserved_destination_children = []
-            if panel_key == "destination":
-                preserved_destination_children = self._destination_preserved_children_by_worker.pop(worker_key, [])
-            item.takeChildren()
+            existing_destination_subtree_nodes = 0
             items = payload.get("items", [])
+            if panel_key == "destination":
+                existing_destination_subtree_nodes = self._count_visible_subtree_nodes(item)
+                preserved_destination_children = self._destination_preserved_children_by_worker.pop(worker_key, [])
+                if not getattr(self, "_memory_restore_in_progress", False):
+                    incoming_destination_subtree_nodes = 1 + self._count_folder_payload_nodes(items)
+                    if existing_destination_subtree_nodes > incoming_destination_subtree_nodes:
+                        self._log_restore_phase(
+                            "destination_shallow_folder_payload_skipped",
+                            worker_id=worker_id,
+                            incoming_node_count=incoming_destination_subtree_nodes,
+                            visible_node_count=existing_destination_subtree_nodes,
+                            trigger_path=self.normalize_memory_path(
+                                ((item.data(0, Qt.UserRole) or {}).get("item_path", ""))
+                            ),
+                        )
+                        return
+            item.takeChildren()
             if items:
                 for child in sorted(items, key=lambda value: (not value.get("is_folder", False), value.get("name", "").lower())):
                     item.addChild(self.build_tree_item(child))
@@ -13684,6 +13719,41 @@ class MainWindow(QMainWindow):
                 queue.append(item.child(index))
         return count
 
+    def _count_visible_subtree_nodes(self, item):
+        if item is None:
+            return 0
+        count = 0
+        queue = [item]
+        while queue:
+            current = queue.pop(0)
+            if current is None:
+                continue
+            node_data = current.data(0, Qt.UserRole) or {}
+            if node_data.get("placeholder"):
+                continue
+            count += 1
+            for index in range(current.childCount()):
+                queue.append(current.child(index))
+        return count
+
+    def _count_folder_payload_nodes(self, items):
+        if not isinstance(items, list):
+            return 0
+
+        count = 0
+
+        def _walk(node):
+            nonlocal count
+            if not isinstance(node, dict):
+                return
+            count += 1
+            for child in list(node.get("children", []) or []):
+                _walk(child)
+
+        for item in items:
+            _walk(item)
+        return count
+
     def _fast_expand_all_loaded_tree(self, panel_key):
         tree = self.source_tree_widget if panel_key == "source" else self.destination_tree_widget
         if tree is None:
@@ -13705,6 +13775,7 @@ class MainWindow(QMainWindow):
         status = self.source_tree_status if panel_key == "source" else self.destination_tree_status
         if status is not None:
             self._set_tree_status_message(panel_key, "All branches expanded.", loading=False)
+        self._persist_workspace_ui_state_safely()
         return True
 
     def _process_expand_all_queue(self, panel_key):
@@ -13785,6 +13856,7 @@ class MainWindow(QMainWindow):
                     self.destination_tree_widget.viewport().update()
         self._set_expand_all_button_label(panel_key, True)
         self._update_expand_all_status(panel_key, "All loaded branches expanded.", loading=False)
+        self._persist_workspace_ui_state_safely()
 
     def _continue_expand_all(self, panel_key, item=None):
         if not self._expand_all_pending.get(panel_key):
@@ -13842,6 +13914,7 @@ class MainWindow(QMainWindow):
             status = self.source_tree_status if panel_key == "source" else self.destination_tree_status
             if status is not None:
                 self._set_tree_status_message(panel_key, "Loaded branches collapsed.", loading=False)
+            self._persist_workspace_ui_state_safely()
             return
 
         status = self.source_tree_status if panel_key == "source" else self.destination_tree_status
