@@ -513,6 +513,10 @@ class MainWindow(QMainWindow):
         self._pending_snapshot_branch_refresh = {"source": set(), "destination": set()}
         self._snapshot_branch_refresh_scheduled = {"source": False, "destination": False}
         self._snapshot_branch_refresh_baseline_by_worker = {}
+        self._runtime_session_tree_snapshots = {"source": [], "destination": []}
+        self._workspace_ui_persist_timer = QTimer(self)
+        self._workspace_ui_persist_timer.setSingleShot(True)
+        self._workspace_ui_persist_timer.timeout.connect(self._persist_workspace_ui_state_safely)
         self._pending_session_workspace_restore_panels = set()
         self._pending_workspace_post_expand_selection = {"source": "", "destination": ""}
         self._worker_sequence = 0
@@ -3017,6 +3021,29 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._log_restore_exception("persist_workspace_ui_state", exc)
 
+    def _refresh_runtime_tree_snapshot(self, panel_key):
+        if panel_key not in {"source", "destination"}:
+            return []
+        snapshots = self._capture_tree_items_snapshot(panel_key)
+        runtime_snapshots = getattr(self, "_runtime_session_tree_snapshots", None)
+        if not isinstance(runtime_snapshots, dict):
+            runtime_snapshots = {"source": [], "destination": []}
+            self._runtime_session_tree_snapshots = runtime_snapshots
+        runtime_snapshots[panel_key] = list(snapshots or [])
+        return runtime_snapshots[panel_key]
+
+    def _schedule_workspace_ui_persist(self, delay_ms=1200, *, panel_key=None):
+        try:
+            if panel_key in {"source", "destination"}:
+                self._refresh_runtime_tree_snapshot(panel_key)
+            else:
+                self._refresh_runtime_tree_snapshot("source")
+                self._refresh_runtime_tree_snapshot("destination")
+            if hasattr(self, "_workspace_ui_persist_timer") and self._workspace_ui_persist_timer is not None:
+                self._workspace_ui_persist_timer.start(max(0, int(delay_ms)))
+        except Exception as exc:
+            self._log_restore_exception("schedule_workspace_ui_persist", exc)
+
     def showEvent(self, event):
         super().showEvent(event)
         print(
@@ -3478,6 +3505,16 @@ class MainWindow(QMainWindow):
         if worker is not None:
             worker.deleteLater()
         self._log_worker_lifecycle("cleaned_up", "folder", worker_id, worker_key)
+
+    def _tree_item_is_alive(self, item):
+        if item is None:
+            return False
+        try:
+            item.childCount()
+            item.data(0, Qt.UserRole)
+            return True
+        except RuntimeError:
+            return False
 
     def _build_restored_planned_move_record(self, row: AllocationRow):
         source_path = str(row.SourcePath or "")
@@ -7066,6 +7103,11 @@ class MainWindow(QMainWindow):
         tree.setEnabled(True)
         self._set_tree_status_message(panel_key, status_message, loading=False)
         tree.viewport().update()
+        runtime_snapshots = getattr(self, "_runtime_session_tree_snapshots", None)
+        if not isinstance(runtime_snapshots, dict):
+            runtime_snapshots = {"source": [], "destination": []}
+            self._runtime_session_tree_snapshots = runtime_snapshots
+        runtime_snapshots[panel_key] = list(snapshots or [])
         return True
 
     def _maybe_restore_runtime_snapshot_after_root_bind(self, panel_key):
@@ -7370,6 +7412,7 @@ class MainWindow(QMainWindow):
                     future_state_count=future_state_count,
                     survived=future_state_count > 0,
                 )
+            self._schedule_workspace_ui_persist(panel_key=panel_key)
             self._log_restore_phase("root_worker_success completed", panel_key=panel_key, item_count=len(items))
         except Exception as exc:
             self._log_restore_exception("on_root_load_success", exc)
@@ -8251,6 +8294,7 @@ class MainWindow(QMainWindow):
         item.setToolTip(0, "")
 
         color = None
+        background_color = None
         role = node_data.get("tree_role", "")
         if role == "source":
             relationship = self._evaluate_source_relationship(node_data)
@@ -8265,12 +8309,16 @@ class MainWindow(QMainWindow):
                 color = QColor("#8FC9FF")
         elif role == "destination":
             origin = str(node_data.get("node_origin", "")).lower()
+            branch_color, branch_depth = self._destination_branch_visual_color(node_data)
+            background_color = self._destination_branch_background_color(branch_color, branch_depth)
             if self.node_is_proposed(node_data):
                 color = QColor("#FFC14D")
             elif self.node_is_planned_allocation(node_data):
                 color = QColor("#51E3F6")
             elif origin == "projectedallocationdescendant":
                 color = QColor("#89C9D8")
+            elif branch_color is not None:
+                color = branch_color
 
         submitted_state = self._submitted_visual_state_for_node(node_data)
         node_data["submitted_visual"] = bool(submitted_state["submitted"])
@@ -8282,6 +8330,8 @@ class MainWindow(QMainWindow):
 
         if color is not None:
             item.setForeground(0, QBrush(color))
+        if background_color is not None and not submitted_state["submitted"]:
+            item.setBackground(0, QBrush(background_color))
         if submitted_state["submitted"]:
             item.setBackground(0, QBrush(QColor("#1B2942")))
             item.setToolTip(
@@ -8292,6 +8342,63 @@ class MainWindow(QMainWindow):
                     else "Submitted and locked."
                 ),
             )
+
+    def _destination_branch_color_map(self):
+        return {
+            "finance": "#7FD36B",
+            "hr": "#F3B45A",
+            "it": "#5DD0FF",
+            "management": "#E78AB2",
+            "marketing": "#C38BFF",
+            "operations": "#3FD0B0",
+            "projects": "#E9C15F",
+            "sales": "#FF8A66",
+        }
+
+    def _blend_colors(self, start_color, end_color, ratio):
+        ratio = max(0.0, min(1.0, float(ratio)))
+        inverse_ratio = 1.0 - ratio
+        return QColor(
+            int((start_color.red() * inverse_ratio) + (end_color.red() * ratio)),
+            int((start_color.green() * inverse_ratio) + (end_color.green() * ratio)),
+            int((start_color.blue() * inverse_ratio) + (end_color.blue() * ratio)),
+        )
+
+    def _destination_branch_visual_context(self, node_data):
+        destination_path = self._canonical_destination_projection_path(self._tree_item_path(node_data))
+        segments = self._path_segments(destination_path)
+        if len(segments) < 2 or str(segments[0]).lower() != "root":
+            return "", 0
+        return segments[1], len(segments) - 1
+
+    def _destination_branch_visual_color(self, node_data):
+        branch_name, branch_depth = self._destination_branch_visual_context(node_data)
+        branch_hex = self._destination_branch_color_map().get(str(branch_name).lower())
+        if not branch_hex:
+            return None, branch_depth
+
+        branch_color = QColor(branch_hex)
+        neutral_color = QColor("#D6E8FF")
+        if branch_depth <= 1:
+            return branch_color, branch_depth
+        if branch_depth == 2:
+            return self._blend_colors(branch_color, neutral_color, 0.18), branch_depth
+        if branch_depth == 3:
+            return self._blend_colors(branch_color, neutral_color, 0.34), branch_depth
+        return self._blend_colors(branch_color, neutral_color, 0.52), branch_depth
+
+    def _destination_branch_background_color(self, branch_color, branch_depth):
+        if branch_color is None or branch_depth <= 0:
+            return None
+
+        base_background = QColor("#09101A")
+        if branch_depth == 1:
+            return self._blend_colors(base_background, branch_color, 0.20)
+        if branch_depth == 2:
+            return self._blend_colors(base_background, branch_color, 0.12)
+        if branch_depth == 3:
+            return self._blend_colors(base_background, branch_color, 0.07)
+        return self._blend_colors(base_background, branch_color, 0.04)
 
     def normalize_memory_path(self, path):
         text = str(path or "").strip().replace("/", "\\")
@@ -9889,6 +9996,7 @@ class MainWindow(QMainWindow):
                 top_level_count=tree.topLevelItemCount(),
                 visible_future_branch_count=visible_future_branch_count,
             )
+            self._schedule_workspace_ui_persist(panel_key="destination")
             return visible_future_branch_count
         finally:
             tree.setUpdatesEnabled(True)
@@ -11851,7 +11959,10 @@ class MainWindow(QMainWindow):
                 return
 
             item = worker_state.get("item")
-            if item is None:
+            if not self._tree_item_is_alive(item):
+                self._snapshot_branch_refresh_baseline_by_worker.pop(worker_key, None)
+                self._destination_preserved_children_by_worker.pop(worker_key, None)
+                self._log_worker_lifecycle("stale_deleted_item_success_skipped", "folder", worker_id, worker_key, drive_id=drive_id)
                 return
             previous_child_paths = self._snapshot_branch_refresh_baseline_by_worker.pop(worker_key, set())
 
@@ -12059,6 +12170,7 @@ class MainWindow(QMainWindow):
                 self._continue_expand_all("source", item)
                 self._refresh_tree_column_width("source")
 
+            self._schedule_workspace_ui_persist(panel_key=panel_key)
             if self._pending_snapshot_branch_refresh.get(panel_key):
                 self._schedule_snapshot_branch_refresh(panel_key, delay_ms=0)
             self._schedule_progress_summary_refresh()
@@ -12082,7 +12194,10 @@ class MainWindow(QMainWindow):
                 return
 
             item = worker_state.get("item")
-            if item is None:
+            if not self._tree_item_is_alive(item):
+                self._snapshot_branch_refresh_baseline_by_worker.pop(worker_key, None)
+                self._destination_preserved_children_by_worker.pop(worker_key, None)
+                self._log_worker_lifecycle("stale_deleted_item_error_skipped", "folder", worker_id, worker_key, drive_id=drive_id)
                 return
             self._snapshot_branch_refresh_baseline_by_worker.pop(worker_key, None)
 

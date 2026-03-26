@@ -63,6 +63,14 @@ class _ButtonStub:
         self.enabled = bool(value)
 
 
+class _TimerStub:
+    def __init__(self):
+        self.started_with = []
+
+    def start(self, value):
+        self.started_with.append(int(value))
+
+
 class _ExpandTreeStub:
     def __init__(self):
         self.collapsed = False
@@ -112,19 +120,30 @@ class _ExpandTreeStub:
         return _ViewportStub()
 
 
+class _DeletedTreeItemStub:
+    def childCount(self):
+        raise RuntimeError("Internal C++ object (PySide6.QtWidgets.QTreeWidgetItem) already deleted.")
+
+    def data(self, *_args, **_kwargs):
+        raise RuntimeError("Internal C++ object (PySide6.QtWidgets.QTreeWidgetItem) already deleted.")
+
+
 class _TimerStub:
     def __init__(self):
         self.active = False
         self.started = 0
+        self.started_with = []
         self.stopped = 0
         self._interval = 900000
 
     def isActive(self):
         return self.active
 
-    def start(self):
+    def start(self, value=None):
         self.active = True
         self.started += 1
+        if value is not None:
+            self.started_with.append(int(value))
 
     def stop(self):
         self.active = False
@@ -362,6 +381,62 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         self.assertEqual(panel_states, [("header", True), ("workspace", True)])
         self.assertIn("FTBMRoot\\Public", window._pending_snapshot_branch_refresh["source"])
         self.assertIn("Root\\Finance", window._pending_snapshot_branch_refresh["destination"])
+
+    def test_restore_tree_items_snapshot_updates_runtime_cache(self):
+        window = MainWindow.__new__(MainWindow)
+        window.source_tree_widget = QTreeWidget()
+        window.destination_tree_widget = QTreeWidget()
+        window.source_tree_status = _LabelStub()
+        window.destination_tree_status = _LabelStub()
+        window._destination_root_prime_pending = True
+        window._runtime_session_tree_snapshots = {"source": [], "destination": []}
+        snapshots = [{
+            "text": "Folder: Public",
+            "expanded": True,
+            "data": {"item_path": "FTBMRoot\\Public", "is_folder": True},
+            "children": [],
+        }]
+
+        restored = window._restore_tree_items_snapshot(
+            "source",
+            snapshots,
+            "Loaded source tree from local snapshot. Refreshing live content...",
+        )
+
+        self.assertTrue(restored)
+        self.assertEqual(window._runtime_session_tree_snapshots["source"], snapshots)
+
+    def test_schedule_workspace_ui_persist_refreshes_runtime_snapshots_and_starts_timer(self):
+        window = MainWindow.__new__(MainWindow)
+        source_tree = QTreeWidget()
+        source_root = QTreeWidgetItem(["Folder: Public"])
+        source_root.setData(0, Qt.UserRole, {"item_path": "FTBMRoot\\Public", "is_folder": True})
+        source_tree.addTopLevelItem(source_root)
+        destination_tree = QTreeWidget()
+        destination_root = QTreeWidgetItem(["Folder: Root"])
+        destination_root.setData(0, Qt.UserRole, {"item_path": "Root", "is_folder": True})
+        destination_tree.addTopLevelItem(destination_root)
+        window.source_tree_widget = source_tree
+        window.destination_tree_widget = destination_tree
+        window.source_tree_status = _LabelStub()
+        window.destination_tree_status = _LabelStub()
+        window._runtime_session_tree_snapshots = {"source": [], "destination": []}
+        window._workspace_ui_persist_timer = _TimerStub()
+        exceptions = []
+        window._log_restore_exception = lambda phase, exc: exceptions.append((phase, str(exc)))
+
+        window._schedule_workspace_ui_persist(delay_ms=1500)
+
+        self.assertEqual(window._workspace_ui_persist_timer.started_with, [1500])
+        self.assertEqual(
+            window._runtime_session_tree_snapshots["source"][0]["data"]["item_path"],
+            "FTBMRoot\\Public",
+        )
+        self.assertEqual(
+            window._runtime_session_tree_snapshots["destination"][0]["data"]["item_path"],
+            "Root",
+        )
+        self.assertEqual(exceptions, [])
 
     def test_process_snapshot_branch_refresh_starts_visible_expanded_branch_loads(self):
         window = MainWindow.__new__(MainWindow)
@@ -705,6 +780,80 @@ class DestinationReplayRegressionTests(unittest.TestCase):
 
         self.assertEqual(item.childCount(), 1)
         self.assertEqual((item.child(0).data(0, Qt.UserRole) or {}).get("item_path"), "Root\\Finance\\Payroll")
+
+    def test_folder_worker_success_skips_deleted_tree_item(self):
+        window = MainWindow.__new__(MainWindow)
+        worker_key = "destination:item-1"
+        window.pending_folder_loads = {"destination": {"drive-1:item-1"}}
+        window.folder_load_workers = {worker_key: {"id": "folder-1", "item": _DeletedTreeItemStub()}}
+        window._snapshot_branch_refresh_baseline_by_worker = {worker_key: {"Root\\Finance\\Payroll"}}
+        window._destination_preserved_children_by_worker = {worker_key: ["kept"]}
+        lifecycle = []
+        window._log_worker_lifecycle = lambda *args, **kwargs: lifecycle.append((args, kwargs))
+        window._tree_item_is_alive = MainWindow._tree_item_is_alive.__get__(window, MainWindow)
+
+        payload = {
+            "panel_key": "destination",
+            "drive_id": "drive-1",
+            "item_id": "item-1",
+            "items": [],
+        }
+
+        window.on_folder_load_success(payload, "folder-1")
+
+        self.assertEqual(window.pending_folder_loads["destination"], set())
+        self.assertNotIn(worker_key, window._snapshot_branch_refresh_baseline_by_worker)
+        self.assertNotIn(worker_key, window._destination_preserved_children_by_worker)
+        self.assertTrue(any(args[:3] == ("stale_deleted_item_success_skipped", "folder", "folder-1") for args, _kwargs in lifecycle))
+
+    def test_destination_branch_visual_color_uses_family_for_top_level_and_children(self):
+        window = MainWindow.__new__(MainWindow)
+        window.normalize_memory_path = MainWindow.normalize_memory_path.__get__(window, MainWindow)
+        window._path_segments = MainWindow._path_segments.__get__(window, MainWindow)
+        window._tree_item_path = MainWindow._tree_item_path.__get__(window, MainWindow)
+        window._canonical_destination_projection_path = lambda path: MainWindow.normalize_memory_path(window, path)
+        window._destination_branch_visual_context = MainWindow._destination_branch_visual_context.__get__(window, MainWindow)
+        window._destination_branch_color_map = MainWindow._destination_branch_color_map.__get__(window, MainWindow)
+        window._blend_colors = MainWindow._blend_colors.__get__(window, MainWindow)
+        window._destination_branch_visual_color = MainWindow._destination_branch_visual_color.__get__(window, MainWindow)
+
+        top_level_color, top_level_depth = window._destination_branch_visual_color({"destination_path": "Root\\Finance"})
+        child_color, child_depth = window._destination_branch_visual_color({"destination_path": "Root\\Finance\\Payroll"})
+
+        self.assertEqual(top_level_depth, 1)
+        self.assertEqual(child_depth, 2)
+        self.assertEqual(top_level_color.name().lower(), "#7fd36b")
+        self.assertNotEqual(child_color.name().lower(), top_level_color.name().lower())
+
+    def test_destination_visual_state_keeps_semantic_foreground_and_branch_background(self):
+        app = QApplication.instance() or QApplication([])
+        window = MainWindow.__new__(MainWindow)
+        window.normalize_memory_path = MainWindow.normalize_memory_path.__get__(window, MainWindow)
+        window._path_segments = MainWindow._path_segments.__get__(window, MainWindow)
+        window._tree_item_path = MainWindow._tree_item_path.__get__(window, MainWindow)
+        window._canonical_destination_projection_path = lambda path: MainWindow.normalize_memory_path(window, path)
+        window._destination_branch_visual_context = MainWindow._destination_branch_visual_context.__get__(window, MainWindow)
+        window._destination_branch_color_map = MainWindow._destination_branch_color_map.__get__(window, MainWindow)
+        window._blend_colors = MainWindow._blend_colors.__get__(window, MainWindow)
+        window._destination_branch_visual_color = MainWindow._destination_branch_visual_color.__get__(window, MainWindow)
+        window._destination_branch_background_color = MainWindow._destination_branch_background_color.__get__(window, MainWindow)
+        window._submitted_visual_state_for_node = lambda node_data: {"submitted": False, "batch_id": ""}
+        window.node_is_proposed = lambda node_data: bool(node_data.get("is_proposed"))
+        window.node_is_planned_allocation = lambda node_data: bool(node_data.get("is_planned_allocation"))
+
+        item = QTreeWidgetItem(["Folder: Contractor Resumes"])
+        node_data = {
+            "tree_role": "destination",
+            "destination_path": "Root\\HR\\Employee Resumes\\Contractor Resumes",
+            "is_planned_allocation": True,
+            "base_display_label": "Folder: Contractor Resumes",
+        }
+
+        window._apply_tree_item_visual_state = MainWindow._apply_tree_item_visual_state.__get__(window, MainWindow)
+        window._apply_tree_item_visual_state(item, node_data)
+
+        self.assertEqual(item.foreground(0).color().name().lower(), "#51e3f6")
+        self.assertNotEqual(item.background(0).color().name().lower(), "#000000")
 
     def test_refresh_tree_ui_after_root_bind_skips_source_materialization_when_snapshot_restored(self):
         window = MainWindow.__new__(MainWindow)
