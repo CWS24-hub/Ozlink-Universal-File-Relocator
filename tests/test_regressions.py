@@ -744,6 +744,21 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         self.assertTrue(result)
         self.assertEqual(persisted, [True])
 
+    def test_destination_live_refresh_waits_until_overlay_work_is_finished(self):
+        window = MainWindow.__new__(MainWindow)
+        window._memory_restore_in_progress = False
+        window._restore_destination_overlay_pending = True
+        window._destination_restore_materialization_queue = []
+        window._destination_idle_materialize_pending_reason = ""
+        window._destination_idle_materialize_timer = _TimerStub()
+        window._unresolved_proposed_queue_size = lambda: 0
+        window._unresolved_allocation_queue_size = lambda: 0
+
+        self.assertTrue(window._destination_live_refresh_still_blocked())
+
+        window._restore_destination_overlay_pending = False
+        self.assertFalse(window._destination_live_refresh_still_blocked())
+
     def test_snapshot_refresh_targets_from_source_snapshot_limits_depth(self):
         window = MainWindow.__new__(MainWindow)
         window._draft_shell_state = SessionState()

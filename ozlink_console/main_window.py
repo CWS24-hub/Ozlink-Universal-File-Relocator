@@ -6554,6 +6554,9 @@ class MainWindow(QMainWindow):
             if getattr(self, "_memory_restore_in_progress", False):
                 self._schedule_live_root_refresh(panel_key, delay_ms=delay_ms, site=selected_site, library=selected_library)
                 return
+            if panel_key == "destination" and self._destination_live_refresh_still_blocked():
+                self._schedule_live_root_refresh(panel_key, delay_ms=max(500, int(delay_ms)), site=selected_site, library=selected_library)
+                return
             current_site = site_selector.currentData() if site_selector is not None else None
             current_library = library_selector.currentData() if library_selector is not None else None
             current_signature = self._build_root_request_signature(panel_key, current_site or {}, current_library or {})
@@ -6564,6 +6567,22 @@ class MainWindow(QMainWindow):
             self.load_library_root(panel_key, current_site, current_library, force_refresh=True)
 
         QTimer.singleShot(max(0, int(delay_ms)), _run)
+
+    def _destination_live_refresh_still_blocked(self):
+        if getattr(self, "_memory_restore_in_progress", False):
+            return True
+        if getattr(self, "_restore_destination_overlay_pending", False):
+            return True
+        if self._unresolved_proposed_queue_size() > 0 or self._unresolved_allocation_queue_size() > 0:
+            return True
+        if bool(getattr(self, "_destination_restore_materialization_queue", []) or []):
+            return True
+        if bool(getattr(self, "_destination_idle_materialize_pending_reason", "")):
+            return True
+        timer = getattr(self, "_destination_idle_materialize_timer", None)
+        if timer is not None and timer.isActive():
+            return True
+        return False
 
     def _schedule_post_login_restore(self):
         self._log_restore_phase(
