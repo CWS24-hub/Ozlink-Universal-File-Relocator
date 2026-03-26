@@ -3005,6 +3005,12 @@ class MainWindow(QMainWindow):
         button = self._expand_all_button_for_panel(panel_key)
         return bool(button is not None and button.text() == "Collapse All")
 
+    def _sync_expand_all_button_from_tree(self, panel_key, fallback_expanded=False):
+        has_loaded_branches, all_loaded_branches_expanded = self._panel_loaded_branch_state(panel_key)
+        expanded = all_loaded_branches_expanded if has_loaded_branches else bool(fallback_expanded)
+        self._set_expand_all_button_label(panel_key, expanded)
+        return expanded
+
     def showEvent(self, event):
         super().showEvent(event)
         print(
@@ -6300,6 +6306,7 @@ class MainWindow(QMainWindow):
         return True
 
     def _restore_selector_matches(self):
+        self._log_restore_phase("phase2_restore_selector_matches_start")
         state = self._draft_shell_state if isinstance(self._draft_shell_state, SessionState) else SessionState()
         source_site_selector = self.planning_inputs.get("Source Site")
         destination_site_selector = self.planning_inputs.get("Destination Site")
@@ -6354,7 +6361,9 @@ class MainWindow(QMainWindow):
         )
 
         if source_library_matched:
+            self._log_restore_phase("phase2_restore_source_library_start")
             self.on_library_selector_changed("source", force=True)
+            self._log_restore_phase("phase2_restore_source_library_end")
         if destination_library_matched:
             if getattr(self, "_sharepoint_lazy_mode", False):
                 self._schedule_safe_timer(
@@ -6363,7 +6372,10 @@ class MainWindow(QMainWindow):
                     self._trigger_delayed_destination_library_restore,
                 )
             else:
+                self._log_restore_phase("phase2_restore_destination_library_start")
                 self.on_library_selector_changed("destination", force=True)
+                self._log_restore_phase("phase2_restore_destination_library_end")
+        self._log_restore_phase("phase2_restore_selector_matches_end")
 
     def _trigger_delayed_destination_library_restore(self):
         self.on_library_selector_changed("destination", force=True)
@@ -6373,15 +6385,18 @@ class MainWindow(QMainWindow):
             self._log_restore_phase("phase2_restore_selectors skipped", reason="session not connected")
             return
 
+        self._log_restore_phase("phase2_post_login_restore_enter")
         self._memory_ui_rebind_in_progress = True
         self._memory_restore_in_progress = True
         self._suppress_selector_change_handlers = True
         try:
             self._run_restore_phase("phase2_restore_selectors", self._restore_selector_matches)
+            self._log_restore_phase("phase2_post_login_restore_after_selectors")
             self._run_restore_phase(
                 "phase3_refresh_planned_moves",
                 lambda: self.refresh_planned_moves_table(),
             )
+            self._log_restore_phase("phase2_post_login_restore_after_planned_moves")
             self._log_restore_state_snapshot("restore_ui_bound", destination_replay_invoked=False)
         finally:
             self._suppress_selector_change_handlers = False
@@ -6393,6 +6408,7 @@ class MainWindow(QMainWindow):
                 autosave_suppressed=self._suppress_autosave,
             )
             self._schedule_safe_timer(0, "phase4_destination_overlay_timer", self._post_login_restore_phase4)
+            self._log_restore_phase("phase2_post_login_restore_exit")
 
     def _post_login_restore_phase4(self):
         if not self._restore_destination_overlay_pending:
@@ -6826,7 +6842,7 @@ class MainWindow(QMainWindow):
                     "Expanded from local snapshot. Refreshing live content..."
                 )
                 self._restore_tree_items_snapshot(panel_key, cached_snapshots, status_message)
-            self._set_expand_all_button_label(panel_key, True)
+            self._sync_expand_all_button_from_tree(panel_key, fallback_expanded=False)
             self._set_tree_status_message(
                 panel_key,
                 "Expanded from local snapshot. Refreshing live content...",
@@ -7044,7 +7060,7 @@ class MainWindow(QMainWindow):
             "Expanded from local snapshot. Refreshing live content...",
         )
         if restored:
-            self._set_expand_all_button_label(panel_key, True)
+            self._sync_expand_all_button_from_tree(panel_key, fallback_expanded=False)
             self._restore_selected_tree_path(
                 panel_key,
                 str(ui_state.get(f"{panel_key}_selected_path", "") or ""),
@@ -7288,7 +7304,7 @@ class MainWindow(QMainWindow):
                         ),
                     )
                     if restored_from_snapshot:
-                        self._set_expand_all_button_label(panel_key, True)
+                        self._sync_expand_all_button_from_tree(panel_key, fallback_expanded=False)
                         self._restore_selected_tree_path(
                             panel_key,
                             str(panel_ui_state.get(f"{panel_key}_selected_path", "") or ""),
@@ -8053,7 +8069,7 @@ class MainWindow(QMainWindow):
         self._log_root_success_step("step_11_ui_refresh_enter", panel_key=panel_key)
         if panel_key == "source":
             if restored_runtime_snapshot:
-                self._set_expand_all_button_label("source", True)
+                self._sync_expand_all_button_from_tree("source", fallback_expanded=False)
                 self._set_tree_status_message(
                     "source",
                     "Expanded from local snapshot. Refreshing live content...",

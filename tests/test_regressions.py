@@ -455,10 +455,10 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._pending_session_tree_snapshots = {"source": [{"text": "Folder: Public"}], "destination": []}
         window._runtime_session_tree_snapshots = {"source": [], "destination": []}
         window._pending_snapshot_branch_refresh = {"source": {"FTBMRoot\\Public"}, "destination": set()}
-        labels = []
+        synced = []
         statuses = []
         window._panel_is_expanded_all = lambda panel_key: False
-        window._set_expand_all_button_label = lambda panel_key, expanded: labels.append((panel_key, expanded))
+        window._sync_expand_all_button_from_tree = lambda panel_key, fallback_expanded=False: synced.append((panel_key, fallback_expanded))
         window._set_tree_status_message = lambda panel_key, message, loading=False: statuses.append((panel_key, message, loading))
         window._can_fast_bulk_expand = lambda panel_key: False
         window._count_expandable_tree_nodes = lambda panel_key: 0
@@ -473,7 +473,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._restore_panel_expanded_all_state("source")
 
         self.assertEqual(restored, [("source", [{"text": "Folder: Public"}], "Expanded from local snapshot. Refreshing live content...")])
-        self.assertEqual(labels, [("source", True)])
+        self.assertEqual(synced, [("source", False)])
         self.assertEqual(
             statuses,
             [("source", "Expanded from local snapshot. Refreshing live content...", True)],
@@ -486,14 +486,14 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._pending_snapshot_branch_refresh = {"source": {"FTBMRoot\\Public"}, "destination": set()}
         restored = []
         statuses = []
-        labels = []
+        synced = []
         window._panel_is_expanded_all = lambda panel_key: False
         window._count_expandable_tree_nodes = lambda panel_key: 1
         window._count_tree_snapshot_nodes = lambda snapshots: 6
         window._restore_tree_items_snapshot = lambda panel_key, snapshots, status_message: restored.append(
             (panel_key, snapshots, status_message)
         ) or True
-        window._set_expand_all_button_label = lambda panel_key, expanded: labels.append((panel_key, expanded))
+        window._sync_expand_all_button_from_tree = lambda panel_key, fallback_expanded=False: synced.append((panel_key, fallback_expanded))
         window._set_tree_status_message = lambda panel_key, message, loading=False: statuses.append((panel_key, message, loading))
         window._can_fast_bulk_expand = lambda panel_key: False
         window._fast_expand_all_loaded_tree = lambda panel_key: (_ for _ in ()).throw(AssertionError("should not bulk expand"))
@@ -502,7 +502,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._restore_panel_expanded_all_state("source")
 
         self.assertEqual(restored, [("source", [{"text": "Folder: Public"}], "Expanded from local snapshot. Refreshing live content...")])
-        self.assertEqual(labels, [("source", True)])
+        self.assertEqual(synced, [("source", False)])
         self.assertEqual(statuses[-1], ("source", "Expanded from local snapshot. Refreshing live content...", True))
 
     def test_panel_is_expanded_all_uses_tree_state_over_stale_button_label(self):
@@ -604,12 +604,12 @@ class DestinationReplayRegressionTests(unittest.TestCase):
             }],
         }
         restored = []
-        labels = []
+        synced = []
         selections = []
         window._restore_tree_items_snapshot = lambda panel_key, snapshots, status_message: restored.append(
             (panel_key, snapshots, status_message)
         ) or True
-        window._set_expand_all_button_label = lambda panel_key, expanded: labels.append((panel_key, expanded))
+        window._sync_expand_all_button_from_tree = lambda panel_key, fallback_expanded=False: synced.append((panel_key, fallback_expanded))
         window._restore_selected_tree_path = lambda panel_key, path: selections.append((panel_key, path))
         window._count_expandable_tree_nodes = lambda panel_key: 1
         window._count_tree_snapshot_nodes = lambda snapshots: 5
@@ -618,7 +618,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
 
         self.assertTrue(reused)
         self.assertEqual(restored[0][0], "destination")
-        self.assertEqual(labels, [("destination", True)])
+        self.assertEqual(synced, [("destination", False)])
         self.assertEqual(selections, [("destination", "Root\\Finance")])
 
     def test_destination_shallow_root_payload_does_not_overwrite_richer_visible_tree(self):
@@ -653,9 +653,9 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._pending_snapshot_branch_refresh = {"source": {"FTBMRoot\\Public"}, "destination": set()}
         window.planned_moves = []
         window.proposed_folders = []
-        labels = []
+        synced = []
         statuses = []
-        window._set_expand_all_button_label = lambda panel_key, expanded: labels.append((panel_key, expanded))
+        window._sync_expand_all_button_from_tree = lambda panel_key, fallback_expanded=False: synced.append((panel_key, fallback_expanded))
         window._set_tree_status_message = lambda panel_key, message, loading=False: statuses.append((panel_key, message, loading))
         window._refresh_source_projection = lambda reason: (_ for _ in ()).throw(AssertionError("should not refresh shallow source projection"))
         window._start_source_restore_materialization = lambda: (_ for _ in ()).throw(AssertionError("should not start source restore materialization"))
@@ -664,7 +664,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
 
         window._refresh_tree_ui_after_root_bind("source", restored_runtime_snapshot=True)
 
-        self.assertEqual(labels, [("source", True)])
+        self.assertEqual(synced, [("source", False)])
         self.assertEqual(statuses[-1], ("source", "Expanded from local snapshot. Refreshing live content...", True))
 
     def test_snapshot_refresh_targets_from_source_snapshot_limits_depth(self):
