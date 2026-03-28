@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 import hashlib
 import subprocess
 import time
@@ -47,6 +48,11 @@ from ozlink_console.memory import MemoryManager
 from ozlink_console.models import AllocationRow, ProposedFolder, SessionState, SubmissionBatch
 from ozlink_console.requests_store import RequestStore
 from ozlink_console.transfer_manifest import build_simulation_manifest, write_manifest_json
+from ozlink_console.transfer_job_runner import (
+    load_manifest_json,
+    validate_manifest,
+    manifest_execution_summary,
+)
 
 
 class LoginWorker(QThread):
@@ -597,6 +603,32 @@ class SourceTreeRelationshipDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+class ManifestRunWorker(QThread):
+    """Runs transfer_job_runner on a manifest in a background thread."""
+
+    finished_ok = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, manifest: dict, *, dry_run: bool, log_file: str):
+        super().__init__()
+        self._manifest = manifest
+        self._dry_run = dry_run
+        self._log_file = log_file
+
+    def run(self):
+        try:
+            from ozlink_console.transfer_job_runner import run_manifest_local_filesystem
+
+            result = run_manifest_local_filesystem(
+                self._manifest,
+                dry_run=self._dry_run,
+                log_file=self._log_file,
+            )
+            self.finished_ok.emit(result)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class MainWindow(QMainWindow):
     @staticmethod
     def _source_tree_model_view_effective() -> bool:
@@ -790,6 +822,7 @@ class MainWindow(QMainWindow):
         self.current_profile = None
         self.discovered_sites = []
         self.planned_moves = []
+        self._manifest_run_worker = None
         self._current_details_node_data = None
         self._current_details_panel_key = ""
         self._current_details_context = None
@@ -5053,7 +5086,14 @@ class MainWindow(QMainWindow):
             "Nothing is copied or moved; this is for review and future execution."
         )
         self.simulate_run_manifest_button.clicked.connect(self._on_simulate_run_save_manifest)
+        self.run_manifest_button = QPushButton("Run manifest (local paths)…")
+        self.run_manifest_button.setToolTip(
+            "Open a saved manifest and run local copies/mkdir for absolute Windows paths "
+            "(C:\\… or UNC). SharePoint-only paths are skipped; Graph execution is not implemented yet."
+        )
+        self.run_manifest_button.clicked.connect(self._on_run_transfer_manifest)
         simulate_row.addWidget(self.simulate_run_manifest_button)
+        simulate_row.addWidget(self.run_manifest_button)
         simulate_row.addStretch(1)
 
         layout.addWidget(loading_banner)
@@ -18562,7 +18602,7 @@ class MainWindow(QMainWindow):
             proposed_folders=list(self.proposed_folders or []),
             draft_id=str(self.active_draft_session_id or draft_key or ""),
             tenant_hint=tenant_hint,
-            notes="Simulation export from Ozlink Console; executor not enabled.",
+            notes="Simulation export from Ozlink Console. Local absolute paths can be run from Planned Moves (Run manifest).",
         )
         try:
             write_manifest_json(path, manifest)
@@ -18582,6 +18622,118 @@ class MainWindow(QMainWindow):
             "Simulate run",
             f"Manifest saved ({len(manifest.get('transfer_steps', []))} file step(s), "
             f"{len(manifest.get('proposed_folder_steps', []))} proposed folder step(s)).\n\n{path}",
+        )
+
+    def _on_manifest_run_worker_finished_cleanup(self):
+        if getattr(self, "run_manifest_button", None) is not None:
+            self.run_manifest_button.setEnabled(True)
+        if getattr(self, "simulate_run_manifest_button", None) is not None:
+            self.simulate_run_manifest_button.setEnabled(True)
+        self._manifest_run_worker = None
+
+    def _on_manifest_run_finished(self, result):
+        msg = f"{result.summary_line()}\n\nDetail log:\n{result.log_path or '(none)'}"
+        QMessageBox.information(self, "Run manifest", msg)
+
+    def _on_manifest_run_failed(self, err):
+        QMessageBox.warning(self, "Run manifest", err)
+
+    def _on_run_transfer_manifest(self):
+        import tempfile
+
+        path, _selected = QFileDialog.getOpenFileName(
+            self,
+            "Open transfer manifest",
+            str(Path.home()),
+            "JSON (*.json);;All files (*.*)",
+        )
+        if not path:
+            return
+        try:
+            manifest = load_manifest_json(path)
+        except OSError as exc:
+            QMessageBox.warning(self, "Run manifest", f"Could not read file:\n{exc}")
+            return
+        except json.JSONDecodeError as exc:
+            QMessageBox.warning(self, "Run manifest", f"Invalid JSON:\n{exc}")
+            return
+
+        errs = validate_manifest(manifest)
+        if errs:
+            QMessageBox.warning(self, "Run manifest", "\n".join(errs))
+            return
+
+        summary = manifest_execution_summary(manifest)
+        msg = (
+            f"Manifest:\n{path}\n\n"
+            f"Transfer steps: {summary['transfer_steps_total']}\n"
+            f"  • Eligible for local copy: {summary['local_filesystem_transfer']}\n"
+            f"  • Needs Microsoft Graph (not in this build): {summary['graph_transfer_pending']}\n"
+            f"  • Skipped (non-local paths): {summary['transfer_skipped_non_local']}\n\n"
+            f"Proposed folders: {summary['proposed_folder_steps_total']}\n"
+            f"  • Local mkdir: {summary['local_mkdir']}\n"
+            f"  • Skipped (non-local): {summary['proposed_skipped_non_local']}\n\n"
+            "Only absolute Windows paths (C:\\ or UNC) run on this PC.\n"
+            "Typical SharePoint library paths are skipped until a Graph executor exists.\n\n"
+            "Continue to run options?"
+        )
+        if (
+            QMessageBox.question(
+                self,
+                "Run manifest",
+                msg,
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            != QMessageBox.Yes
+        ):
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Run manifest — options")
+        v = QVBoxLayout(dlg)
+        dry_cb = QCheckBox("Dry run only (log steps; no copies or mkdir)")
+        dry_cb.setChecked(True)
+        v.addWidget(dry_cb)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        v.addWidget(bb)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        dry = dry_cb.isChecked()
+
+        if not dry:
+            confirm = QMessageBox.warning(
+                self,
+                "Confirm execution",
+                "This will copy files and create folders on this PC for every eligible path in the manifest.\n\n"
+                "Verify paths before continuing.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if confirm != QMessageBox.Yes:
+                return
+
+        log_file = Path(tempfile.gettempdir()) / (
+            f"Ozlink_transfer_job_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.log"
+        )
+
+        worker = ManifestRunWorker(manifest, dry_run=dry, log_file=str(log_file))
+        self._manifest_run_worker = worker
+        worker.finished_ok.connect(self._on_manifest_run_finished)
+        worker.failed.connect(self._on_manifest_run_failed)
+        worker.finished.connect(self._on_manifest_run_worker_finished_cleanup)
+        if getattr(self, "run_manifest_button", None) is not None:
+            self.run_manifest_button.setEnabled(False)
+        if getattr(self, "simulate_run_manifest_button", None) is not None:
+            self.simulate_run_manifest_button.setEnabled(False)
+        worker.start()
+        log_info(
+            "transfer_manifest_run_started",
+            manifest_path=str(path),
+            dry_run=dry,
+            log_file=str(log_file),
         )
 
     def refresh_planned_moves_table(self):

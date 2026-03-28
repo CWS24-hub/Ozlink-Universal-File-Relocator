@@ -1,4 +1,4 @@
-"""Build JSON manifests for future execution (simulation only — no I/O to cloud or disk paths)."""
+"""Build JSON manifests for handoff and execution. Local paths can be run via transfer_job_runner."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from ozlink_console.models import ProposedFolder
 
 @dataclass
 class TransferStep:
-    """One planned file or folder relocation as understood by the console (execution not implemented)."""
+    """One planned file or folder relocation as understood by the console."""
 
     index: int
     operation: str
@@ -25,6 +25,10 @@ class TransferStep:
     request_id: str
     status: str
     allocation_method: str = ""
+    source_drive_id: str = ""
+    source_item_id: str = ""
+    destination_drive_id: str = ""
+    destination_item_id: str = ""
 
     def to_json_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -89,6 +93,10 @@ def _planned_move_to_step(index: int, move: dict[str, Any]) -> TransferStep:
         request_id=str(move.get("request_id", "") or ""),
         status=str(move.get("status", "") or "Draft"),
         allocation_method=str(move.get("allocation_method", "") or ""),
+        source_drive_id=str(src.get("drive_id", "") or move.get("source_drive_id", "") or ""),
+        source_item_id=str(src.get("id", "") or move.get("source_id", "") or ""),
+        destination_drive_id=str(dest.get("drive_id", "") or move.get("destination_drive_id", "") or ""),
+        destination_item_id=str(dest.get("id", "") or move.get("destination_id", "") or ""),
     )
 
 
