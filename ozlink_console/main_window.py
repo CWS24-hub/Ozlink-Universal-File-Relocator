@@ -10,7 +10,7 @@ import re
 import io
 import math
 import zipfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
@@ -46,6 +46,7 @@ from ozlink_console.logger import log_error, log_info, log_trace, log_warn
 from ozlink_console.memory import MemoryManager
 from ozlink_console.models import AllocationRow, ProposedFolder, SessionState, SubmissionBatch
 from ozlink_console.requests_store import RequestStore
+from ozlink_console.transfer_manifest import build_simulation_manifest, write_manifest_json
 
 
 class LoginWorker(QThread):
@@ -5045,8 +5046,19 @@ class MainWindow(QMainWindow):
         self.planned_moves_loading_title = loading_title
         self.planned_moves_loading_detail = loading_detail
 
+        simulate_row = QHBoxLayout()
+        self.simulate_run_manifest_button = QPushButton("Simulate run (save manifest)…")
+        self.simulate_run_manifest_button.setToolTip(
+            "Save a JSON file listing planned file steps and proposed folders. "
+            "Nothing is copied or moved; this is for review and future execution."
+        )
+        self.simulate_run_manifest_button.clicked.connect(self._on_simulate_run_save_manifest)
+        simulate_row.addWidget(self.simulate_run_manifest_button)
+        simulate_row.addStretch(1)
+
         layout.addWidget(loading_banner)
         layout.addWidget(table, 1)
+        layout.addLayout(simulate_row)
         layout.addWidget(status)
 
         return box, table, status
@@ -18513,6 +18525,64 @@ class MainWindow(QMainWindow):
             "destination": dict(destination_node),
             "status": "Draft",
         }
+
+    def _on_simulate_run_save_manifest(self):
+        if not self.planned_moves and not self.proposed_folders:
+            QMessageBox.information(
+                self,
+                "Simulate run",
+                "There are no planned moves or proposed folders to include in a manifest.",
+            )
+            return
+
+        draft_key = str(self.active_draft_session_id or "").strip()
+        if not draft_key and isinstance(self._draft_shell_state, SessionState):
+            draft_key = str(self._draft_shell_state.DraftId or "").strip()
+        if not draft_key:
+            draft_key = "draft"
+        safe_draft = re.sub(r"[^\w\-.]+", "_", draft_key)[:80]
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        default_name = f"Ozlink_transfer_manifest_{safe_draft}_{stamp}.json"
+        path, _selected = QFileDialog.getSaveFileName(
+            self,
+            "Save transfer manifest (simulation)",
+            str(Path.home() / default_name),
+            "JSON manifest (*.json);;All files (*.*)",
+        )
+        if not path:
+            return
+        if not str(path).lower().endswith(".json"):
+            path = str(path) + ".json"
+
+        ctx = getattr(self, "current_session_context", None) or {}
+        tenant_hint = str(ctx.get("tenant_domain") or "")
+
+        manifest = build_simulation_manifest(
+            planned_moves=list(self.planned_moves or []),
+            proposed_folders=list(self.proposed_folders or []),
+            draft_id=str(self.active_draft_session_id or draft_key or ""),
+            tenant_hint=tenant_hint,
+            notes="Simulation export from Ozlink Console; executor not enabled.",
+        )
+        try:
+            write_manifest_json(path, manifest)
+        except OSError as exc:
+            log_error("simulate_manifest_write_failed", path=str(path), error=str(exc))
+            QMessageBox.warning(self, "Simulate run", f"Could not write the file:\n{exc}")
+            return
+
+        log_info(
+            "simulate_manifest_written",
+            path=str(path),
+            transfer_steps=len(manifest.get("transfer_steps", [])),
+            proposed_folder_steps=len(manifest.get("proposed_folder_steps", [])),
+        )
+        QMessageBox.information(
+            self,
+            "Simulate run",
+            f"Manifest saved ({len(manifest.get('transfer_steps', []))} file step(s), "
+            f"{len(manifest.get('proposed_folder_steps', []))} proposed folder step(s)).\n\n{path}",
+        )
 
     def refresh_planned_moves_table(self):
         self._rebuild_submission_visual_cache()
