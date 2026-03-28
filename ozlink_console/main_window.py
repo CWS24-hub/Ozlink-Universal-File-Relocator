@@ -597,6 +597,20 @@ class SourceTreeRelationshipDelegate(QStyledItemDelegate):
 
 
 class MainWindow(QMainWindow):
+    @staticmethod
+    def _source_tree_model_view_effective() -> bool:
+        """True when the source panel should use QTreeView + model (v2 path).
+
+        Precedence: ``OZLINK_SOURCE_QTREEVIEW`` forces on/off when set to a known value;
+        otherwise the saved Settings checkbox (``ui/source_use_qtreeview``) applies.
+        """
+        env = os.environ.get("OZLINK_SOURCE_QTREEVIEW", "").strip().lower()
+        if env in ("0", "false", "no"):
+            return False
+        if env in ("1", "true", "yes"):
+            return True
+        return QSettings().value("ui/source_use_qtreeview", False, type=bool)
+
     def __init__(self):
         super().__init__()
 
@@ -702,11 +716,7 @@ class MainWindow(QMainWindow):
         self._destination_full_tree_requested_drive_id = ""
         self._destination_full_tree_materialization_pending = False
         self._sharepoint_lazy_mode = True
-        self._source_tree_model_view = str(os.environ.get("OZLINK_SOURCE_QTREEVIEW", "")).strip().lower() in (
-            "1",
-            "true",
-            "yes",
-        )
+        self._source_tree_model_view = MainWindow._source_tree_model_view_effective()
         self.source_sharepoint_model = None
         self._submitted_visual_cache = {
             "source_keys": {},
@@ -6300,8 +6310,59 @@ class MainWindow(QMainWindow):
         card_layout.addStretch()
 
         outer.addWidget(card)
+
+        ui_card = QFrame()
+        ui_card.setObjectName("SectionBox")
+        ui_card_layout = QVBoxLayout(ui_card)
+        ui_card_layout.setContentsMargins(20, 20, 20, 20)
+        ui_card_layout.setSpacing(14)
+
+        ui_title = QLabel("Planning workspace (experimental)")
+        ui_title.setObjectName("CardTitle")
+
+        ui_intro = QLabel(
+            "The source library tree can use Qt’s model/view tree (QTreeView) for better scalability. "
+            "Some features (for example Expand All on source) are not finished in that mode yet."
+        )
+        ui_intro.setObjectName("CardBody")
+        ui_intro.setWordWrap(True)
+
+        env_qtv = os.environ.get("OZLINK_SOURCE_QTREEVIEW", "").strip()
+        env_qtv_norm = env_qtv.lower()
+        env_qtv_forces = env_qtv_norm in ("0", "false", "no", "1", "true", "yes")
+
+        self._settings_source_qtreeview_checkbox = QCheckBox(
+            "Use experimental QTreeView for the source tree (restart required)"
+        )
+        self._settings_source_qtreeview_checkbox.setChecked(
+            QSettings().value("ui/source_use_qtreeview", False, type=bool)
+        )
+        self._settings_source_qtreeview_checkbox.setEnabled(not env_qtv_forces)
+        if env_qtv_forces:
+            self._settings_source_qtreeview_checkbox.setToolTip(
+                f"This session uses OZLINK_SOURCE_QTREEVIEW={env_qtv!r}. Remove or clear that variable to use the checkbox."
+            )
+        self._settings_source_qtreeview_checkbox.toggled.connect(self._persist_settings_source_qtreeview)
+
+        ui_hint = QLabel(
+            "When the environment variable is unset, the checkbox is saved automatically. "
+            "Administrators can still force on or off for one launch with OZLINK_SOURCE_QTREEVIEW=1 or =0."
+        )
+        ui_hint.setObjectName("MutedText")
+        ui_hint.setWordWrap(True)
+
+        ui_card_layout.addWidget(ui_title)
+        ui_card_layout.addWidget(ui_intro)
+        ui_card_layout.addWidget(self._settings_source_qtreeview_checkbox)
+        ui_card_layout.addWidget(ui_hint)
+        ui_card_layout.addStretch()
+
+        outer.addWidget(ui_card)
         outer.addStretch()
         return page
+
+    def _persist_settings_source_qtreeview(self, checked: bool):
+        QSettings().setValue("ui/source_use_qtreeview", bool(checked))
 
     def _graph_settings_delta_sync_enabled(self) -> bool:
         env = os.environ.get("OZLINK_GRAPH_DELTA_SYNC", "").strip().lower()
