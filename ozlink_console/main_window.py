@@ -19262,7 +19262,8 @@ class MainWindow(QMainWindow):
                 # Do not block expand-all while the full-tree snapshot is fetched.
                 # Expand currently loaded branches immediately and hydrate additional
                 # branches when full-tree materialization completes.
-                self._destination_expand_all_after_full_tree = False
+                # When the full-tree snapshot finishes, on_destination_full_tree_success resumes expand-all.
+                self._destination_expand_all_after_full_tree = True
                 self._update_expand_all_status(panel_key, "Loading full destination tree in background; expanding loaded branches...", loading=True)
                 self.start_destination_full_tree_worker(drive_id)
 

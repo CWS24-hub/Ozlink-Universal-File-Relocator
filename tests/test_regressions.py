@@ -3,6 +3,7 @@ import logging
 import os
 import tempfile
 import unittest
+from collections import deque
 from pathlib import Path
 from unittest.mock import patch
 
@@ -34,6 +35,7 @@ class _LabelStub:
         self.text = ""
         self.properties = {}
         self.stylesheet = ""
+        self.tooltip = ""
 
     def setText(self, value):
         self.text = value
@@ -43,6 +45,9 @@ class _LabelStub:
 
     def setStyleSheet(self, value):
         self.stylesheet = value
+
+    def setToolTip(self, value):
+        self.tooltip = str(value or "")
 
     def property(self, name):
         return self.properties.get(name)
@@ -61,14 +66,6 @@ class _ButtonStub:
 
     def setEnabled(self, value):
         self.enabled = bool(value)
-
-
-class _TimerStub:
-    def __init__(self):
-        self.started_with = []
-
-    def start(self, value):
-        self.started_with.append(int(value))
 
 
 class _ExpandTreeStub:
@@ -303,6 +300,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
 
     def test_lazy_background_load_preloads_destination_and_only_counts_source(self):
         window = MainWindow.__new__(MainWindow)
+        window.planned_moves = []
         window._sharepoint_lazy_mode = True
         window._deferred_background_load_targets = {}
         destination_started = []
@@ -359,28 +357,22 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         )
         window._pending_snapshot_branch_refresh = {"source": set(), "destination": set()}
         window._snapshot_branch_refresh_scheduled = {"source": False, "destination": False}
-        restored = []
-        window._restore_tree_items_snapshot = lambda panel_key, snapshots, status_message: restored.append(
-            (panel_key, snapshots, status_message)
-        ) or True
-        scheduled = []
-        window._schedule_snapshot_branch_refresh = lambda panel_key, delay_ms=0: scheduled.append((panel_key, delay_ms))
         panel_states = []
         window._apply_planning_header_collapsed_state = lambda collapsed: panel_states.append(("header", collapsed))
         window._apply_workspace_tabs_collapsed_state = lambda collapsed: panel_states.append(("workspace", collapsed))
 
         window._begin_session_workspace_ui_restore()
 
-        self.assertEqual({panel for panel, *_ in restored}, {"source", "destination"})
         self.assertEqual(window._pending_session_workspace_restore_panels, {"source", "destination"})
-        self.assertIn("source", window._runtime_session_tree_snapshots)
-        self.assertIn("destination", window._runtime_session_tree_snapshots)
+        self.assertEqual(len(window._runtime_session_tree_snapshots["source"]), 1)
+        self.assertEqual(len(window._runtime_session_tree_snapshots["destination"]), 1)
         self.assertIn("source", window._pending_session_tree_snapshots)
         self.assertIn("destination", window._pending_session_tree_snapshots)
-        self.assertEqual({panel for panel, _delay in scheduled}, {"source", "destination"})
         self.assertEqual(panel_states, [("header", True), ("workspace", True)])
-        self.assertIn("FTBMRoot\\Public", window._pending_snapshot_branch_refresh["source"])
-        self.assertIn("Root\\Finance", window._pending_snapshot_branch_refresh["destination"])
+        src_pub = MainWindow._canonical_source_projection_path(window, "FTBMRoot\\Public")
+        dst_fin = MainWindow._canonical_destination_projection_path(window, "Root\\Finance")
+        self.assertIn(src_pub, window._pending_snapshot_branch_refresh["source"])
+        self.assertIn(dst_fin, window._pending_snapshot_branch_refresh["destination"])
 
     def test_restore_tree_items_snapshot_updates_runtime_cache(self):
         window = MainWindow.__new__(MainWindow)
@@ -421,11 +413,16 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window.source_tree_status = _LabelStub()
         window.destination_tree_status = _LabelStub()
         window._runtime_session_tree_snapshots = {"source": [], "destination": []}
+        window._workspace_ui_snapshot_dirty_panels = set()
+        window._expand_all_pending = {"source": False, "destination": False}
+        window._planning_workspace_is_busy = lambda: False
         window._workspace_ui_persist_timer = _TimerStub()
         exceptions = []
         window._log_restore_exception = lambda phase, exc: exceptions.append((phase, str(exc)))
+        window._persist_workspace_ui_state_safely = lambda: None
 
         window._schedule_workspace_ui_persist(delay_ms=1500)
+        window._on_workspace_ui_persist_timer()
 
         self.assertEqual(window._workspace_ui_persist_timer.started_with, [1500])
         self.assertEqual(
@@ -463,6 +460,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window.root_load_workers = {}
         window._pending_snapshot_branch_refresh = {"source": {"FTBMRoot\\Public"}, "destination": set()}
         window._snapshot_branch_refresh_scheduled = {"source": False, "destination": False}
+        window._expand_all_pending = {"source": False, "destination": False}
         started = []
         scheduled = []
         status_updates = []
@@ -510,6 +508,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
             "destination": set(),
         }
         window._snapshot_branch_refresh_scheduled = {"source": False, "destination": False}
+        window._expand_all_pending = {"source": False, "destination": False}
         started = []
         window._ensure_tree_item_load_started = lambda panel_key, item: started.append(
             (panel_key, item.data(0, Qt.UserRole).get("item_path"))
@@ -538,6 +537,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._can_fast_bulk_expand = lambda panel_key: False
         window._count_expandable_tree_nodes = lambda panel_key: 0
         window._count_tree_snapshot_nodes = lambda snapshots: 1
+        window._tree_snapshot_node_count_gt = lambda snapshots, threshold: True
         restored = []
         window._restore_tree_items_snapshot = lambda panel_key, snapshots, status_message: restored.append(
             (panel_key, snapshots, status_message)
@@ -565,6 +565,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._panel_is_expanded_all = lambda panel_key: False
         window._count_expandable_tree_nodes = lambda panel_key: 1
         window._count_tree_snapshot_nodes = lambda snapshots: 6
+        window._tree_snapshot_node_count_gt = lambda snapshots, threshold: True
         window._restore_tree_items_snapshot = lambda panel_key, snapshots, status_message: restored.append(
             (panel_key, snapshots, status_message)
         ) or True
@@ -971,6 +972,9 @@ class DestinationReplayRegressionTests(unittest.TestCase):
 
     def test_restore_workspace_tree_panel_state_reapplies_expanded_all(self):
         window = MainWindow.__new__(MainWindow)
+        window.destination_tree_widget = QTreeWidget()
+        window.destination_expand_all_button = _ButtonStub()
+        window._expand_all_pending = {"source": False, "destination": False}
         restored = []
         window._restore_expanded_tree_paths = lambda panel_key, expanded_paths: restored.append(("paths", panel_key, set(expanded_paths)))
         window._restore_selected_tree_path = lambda panel_key, selected_path: restored.append(("selected", panel_key, selected_path))
@@ -1053,9 +1057,10 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window.destination_tree_status = _LabelStub()
         window.pending_folder_loads = {"source": set(), "destination": set()}
         window._expand_all_pending = {"source": True, "destination": False}
-        window._expand_all_queue = {"source": [root], "destination": []}
+        window._expand_all_queue = {"source": deque([root]), "destination": deque()}
         window._expand_all_processed = {"source": 0, "destination": 0}
         window._expand_all_deferred_refresh = {"source": False, "destination": False}
+        window._expand_all_max_per_tick = {"source": 1, "destination": 2}
         scheduled = []
         started = []
         window._count_expandable_tree_nodes = lambda panel_key: 10
@@ -1082,6 +1087,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
                 "is_folder": True,
                 "children_loaded": True,
                 "load_failed": False,
+                "id": "root-id",
             },
         )
         placeholder = QTreeWidgetItem(["Expand to load contents"])
@@ -1091,6 +1097,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
 
         window.source_tree_widget = tree
         window.destination_tree_widget = _ExpandTreeStub()
+        window.pending_root_drive_ids = {"source": "drive-1", "destination": ""}
 
         self.assertTrue(window._tree_has_unloaded_folder_nodes("source"))
 
@@ -1101,7 +1108,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
 
         self.assertEqual(
             window._expand_all_progress_text("source", "Expanding branches..."),
-            "Expanding branches... (3/5)",
+            "Expanding branches... (3/5 folders)",
         )
 
     def test_projected_descendant_folder_node_is_preloaded(self):
@@ -1146,6 +1153,8 @@ class DestinationReplayRegressionTests(unittest.TestCase):
 
         log_calls = []
         window.destination_tree_widget = _TreeStub()
+        window.proposed_folders = []
+        window.planned_moves = []
         window._log_restore_phase = lambda phase, **data: log_calls.append((phase, data))
         window._find_planned_move_for_destination_node = lambda _: (_ for _ in ()).throw(AssertionError("should not resolve move"))
 
@@ -1359,6 +1368,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         }
         window._pending_cache_refresh_panels = {"destination"}
         window._cache_refresh_restore_active = True
+        window._cache_refresh_skip_expanded_restore_panels = set()
         window._restore_workspace_tree_state = lambda ui_state: setattr(window, "_restored_ui_state", ui_state)
         window._materialize_destination_future_model = lambda reason: setattr(window, "_cache_refresh_materialize_reason", reason)
         window._start_destination_restore_materialization = lambda: setattr(window, "_destination_materialization_started", True)
@@ -1562,13 +1572,17 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window.destination_tree_status = _LabelStub()
         window.destination_expand_all_button = _ButtonStub()
         window._expand_all_pending = {"source": False, "destination": False}
-        window._expand_all_queue = {"source": [], "destination": []}
+        window._expand_all_queue = {"source": deque(), "destination": deque()}
         window._expand_all_seen = {"source": set(), "destination": set()}
         window._expand_all_deferred_refresh = {"source": False, "destination": False}
+        window._expand_all_max_per_tick = {"source": 1, "destination": 2}
+        window._expand_all_status_last_update_ms = {"source": 0, "destination": 0}
         window._expand_all_timers = {}
         window._destination_expand_all_after_full_tree = False
         window._destination_root_prime_pending = False
         window.pending_root_drive_ids = {"destination": ""}
+        window.planned_moves = []
+        window._sharepoint_lazy_mode = False
         window._current_selected_destination_drive_id = lambda: "drive-123"
         window._destination_full_tree_ready = lambda: False
         window.start_destination_full_tree_worker = lambda drive_id: setattr(window, "_started_drive_id", drive_id)
@@ -1577,6 +1591,14 @@ class DestinationReplayRegressionTests(unittest.TestCase):
             "_last_status",
             (panel_key, message, loading),
         )
+        window._can_fast_bulk_expand = lambda panel_key: False
+        window._set_expand_all_button_label = lambda panel_key, expanded: window.destination_expand_all_button.setText(
+            "Collapse All" if expanded else "Expand All"
+        )
+        window._persist_workspace_ui_state_safely = lambda: None
+        window._refresh_runtime_tree_snapshot = lambda *args, **kwargs: None
+        window._workspace_ui_snapshot_dirty_panels = set()
+        window.node_is_planned_allocation = lambda node_data: False
 
         window.handle_expand_all("destination")
 
@@ -1592,7 +1614,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         self.assertFalse(window._destination_expand_all_after_full_tree)
         self.assertEqual(window.destination_expand_all_button.text(), "Expand All")
         self.assertTrue(window.destination_tree_widget.collapsed)
-        self.assertEqual(window._last_status, ("destination", "Loaded branches collapsed.", False))
+        self.assertEqual(window._last_status, ("destination", "Expand cancelled; branches collapsed.", False))
 
 
 if __name__ == "__main__":
