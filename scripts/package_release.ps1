@@ -12,7 +12,7 @@ if (-not (Test-Path $spec)) {
 }
 
 Write-Host "Running PyInstaller..."
-pyinstaller --noconfirm $spec
+python -m PyInstaller --noconfirm $spec
 
 $distDir = Join-Path $RepoRoot "dist\OzlinkConsole"
 if (-not (Test-Path (Join-Path $distDir "OzlinkConsole.exe"))) {
