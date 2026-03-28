@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 from .paths import logs_root
@@ -79,3 +80,18 @@ def log_warn(message: str, **data) -> None:
 
 def log_error(message: str, **data) -> None:
     get_logger().error(message, extra={"data": data or None})
+
+
+def trace_enabled() -> bool:
+    """True when full trace is enabled (OZLINK_FULL_TRACE is 1/true/yes). App defaults this on at startup."""
+    return os.environ.get("OZLINK_FULL_TRACE", "").strip().lower() in ("1", "true", "yes")
+
+
+def log_trace(category: str, action: str, **data) -> None:
+    """Structured UI/worker trace when trace_enabled(); disable with OZLINK_FULL_TRACE=0 if logs are too large."""
+    if not trace_enabled():
+        return
+    payload = {"trace_category": category, "trace_action": action}
+    if data:
+        payload.update(data)
+    get_logger().info(f"UI trace [{category}] {action}.", extra={"data": payload})

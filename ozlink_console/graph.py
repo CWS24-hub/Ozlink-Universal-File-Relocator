@@ -1,15 +1,27 @@
 import hashlib
 import json
+import os
 import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 import msal
 import pyperclip
 import requests
 
+from .logger import log_info, log_trace, log_warn
 from .paths import graph_cache_root
+
+
+def _graph_url_excerpt(url: str, max_len: int = 200) -> str:
+    s = str(url or "")
+    if "graph.microsoft.com" in s:
+        s = s.split("graph.microsoft.com", 1)[-1]
+    if "?" in s:
+        s = s.split("?", 1)[0]
+    return s[:max_len]
 
 
 AUTH_CONFIG = {
@@ -43,6 +55,17 @@ ADMIN_DIRECTORY_ROLE_NAMES = {
 
 class GraphClient:
     GRAPH_CACHE_TTL_HOURS = 24
+
+    def _persistent_cache_ttl(self) -> timedelta:
+        raw = os.environ.get("OZLINK_GRAPH_CACHE_TTL_HOURS", "").strip()
+        if raw:
+            try:
+                hours = float(raw)
+                if hours > 0:
+                    return timedelta(hours=hours)
+            except ValueError:
+                pass
+        return timedelta(hours=float(self.GRAPH_CACHE_TTL_HOURS))
 
     def __init__(self):
         self.token: Optional[str] = None
@@ -85,6 +108,12 @@ class GraphClient:
 
         pyperclip.copy(code)
 
+        log_trace(
+            "graph_auth",
+            "device_flow_ready",
+            verification_host_excerpt=str(url or "")[:120],
+            has_user_code=bool(code),
+        )
         return {
             "code": code,
             "url": url,
@@ -107,6 +136,7 @@ class GraphClient:
 
         self.token = result["access_token"]
         self.session_context["connected"] = True
+        log_trace("graph_auth", "token_acquired_device_flow", connected=True)
         return result
 
     def _get_cached_account(self) -> Optional[Dict[str, Any]]:
@@ -147,6 +177,7 @@ class GraphClient:
         return self._try_acquire_token_silent(force_refresh=force_refresh)
 
     def disconnect(self) -> None:
+        log_trace("graph_auth", "disconnect")
         self.token = None
         self.device_flow = None
         self.profile = None
@@ -180,6 +211,7 @@ class GraphClient:
         timeout: int = 60,
         stream: bool = False,
     ) -> requests.Response:
+        retried_401 = False
         response = requests.request(
             method,
             url,
@@ -190,6 +222,7 @@ class GraphClient:
             stream=stream,
         )
         if response.status_code == 401 and self._try_acquire_token_silent(force_refresh=True):
+            retried_401 = True
             response = requests.request(
                 method,
                 url,
@@ -200,6 +233,15 @@ class GraphClient:
                 stream=stream,
             )
         response.raise_for_status()
+        log_trace(
+            "graph_http",
+            "response_ok",
+            method=method,
+            path_excerpt=_graph_url_excerpt(url),
+            status_code=response.status_code,
+            retried_after_401=retried_401,
+            stream=stream,
+        )
         return response
 
     def get(self, url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -266,7 +308,7 @@ class GraphClient:
         except Exception:
             return None
 
-        if datetime.now(timezone.utc) - saved_at > timedelta(hours=self.GRAPH_CACHE_TTL_HOURS):
+        if datetime.now(timezone.utc) - saved_at > self._persistent_cache_ttl():
             return None
 
         items = payload.get("items", [])
@@ -296,8 +338,11 @@ class GraphClient:
         for cache_key in stale_keys:
             self._drive_children_cache.pop(cache_key, None)
 
+        disk_removed = 0
         for cache_path in self._graph_cache_root.glob("*.json"):
             try:
+                if cache_path.name.startswith("drive_delta_"):
+                    continue
                 payload = json.loads(cache_path.read_text(encoding="utf-8"))
             except Exception:
                 continue
@@ -305,16 +350,241 @@ class GraphClient:
                 continue
             try:
                 cache_path.unlink()
+                disk_removed += 1
             except Exception:
                 continue
+        log_trace(
+            "graph_cache",
+            "clear_drive_children_cache",
+            drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+            in_memory_keys_cleared=len(stale_keys),
+            disk_cache_files_removed=disk_removed,
+        )
 
     def clear_all_children_cache(self) -> None:
+        mem_count = len(self._drive_children_cache)
         self._drive_children_cache.clear()
+        disk_removed = 0
         for cache_path in self._graph_cache_root.glob("*.json"):
             try:
+                if cache_path.name.startswith("drive_delta_"):
+                    continue
                 cache_path.unlink()
+                disk_removed += 1
             except Exception:
                 continue
+        log_trace(
+            "graph_cache",
+            "clear_all_children_cache",
+            prior_in_memory_keys=mem_count,
+            disk_cache_files_removed=disk_removed,
+        )
+
+    def _drive_delta_state_path(self, drive_id: str) -> Path:
+        digest = hashlib.sha1(f"{drive_id}".encode("utf-8")).hexdigest()
+        return self._graph_cache_root / f"drive_delta_{digest}.json"
+
+    def invalidate_drive_folder_children_cache(self, drive_id: str, item_id: str) -> None:
+        drive_id = str(drive_id or "").strip()
+        item_id = str(item_id or "").strip()
+        if not drive_id or not item_id:
+            return
+        self._drive_children_cache.pop((drive_id, item_id), None)
+        path = self._graph_children_cache_path(drive_id, item_id)
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError:
+            pass
+
+    def sync_drive_children_delta(
+        self,
+        drive_id: str,
+        *,
+        allow_initial_bootstrap: bool = True,
+    ) -> Dict[str, Any]:
+        """Synchronize local per-folder child caches with Microsoft Graph drive delta.
+
+        First successful run pages ``/drives/{{id}}/root/delta`` until Graph returns ``@odata.deltaLink``
+        (bootstrap). That pass can be long on huge libraries; it does not invalidate caches.
+
+        Later runs follow ``deltaLink`` and **invalidate** only folder cache entries that changed.
+
+        ``allow_initial_bootstrap``: when False and no saved token, the call returns ``skipped`` (no network).
+
+        Environment overrides:
+        - ``OZLINK_GRAPH_DELTA_DISABLE_BOOTSTRAP=1`` — treated as ``allow_initial_bootstrap=False`` at call site.
+        - ``OZLINK_GRAPH_DELTA_MAX_PAGES`` — optional safety cap on HTTP pages (0 or unset = unlimited).
+        """
+        drive_id = str(drive_id or "").strip()
+        if not drive_id:
+            return {"ok": False, "reason": "no_drive_id"}
+        if not self.token:
+            return {"ok": False, "reason": "not_connected"}
+
+        state_path = self._drive_delta_state_path(drive_id)
+        delta_link = ""
+        if state_path.exists():
+            try:
+                st = json.loads(state_path.read_text(encoding="utf-8"))
+                delta_link = str(st.get("delta_link") or "").strip()
+            except Exception:
+                delta_link = ""
+
+        if not delta_link and not allow_initial_bootstrap:
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": "no_delta_token_bootstrap_disabled",
+            }
+
+        initial_run = not bool(delta_link)
+        url = delta_link or f"{AUTH_CONFIG['graph_base']}/drives/{drive_id}/root/delta"
+        params = None
+        invalidated: set[tuple[str, str]] = set()
+        total_items = 0
+        pages = 0
+        new_delta = None
+
+        max_pages = 0
+        raw_max = os.environ.get("OZLINK_GRAPH_DELTA_MAX_PAGES", "").strip()
+        if raw_max.isdigit():
+            max_pages = max(0, int(raw_max))
+
+        try:
+            while url:
+                pages += 1
+                if max_pages and pages > max_pages:
+                    log_warn(
+                        "graph_delta",
+                        "sync_drive_children_delta_aborted_max_pages",
+                        drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+                        max_pages=max_pages,
+                    )
+                    return {
+                        "ok": False,
+                        "reason": "max_pages_exceeded",
+                        "pages": pages,
+                        "items_seen": total_items,
+                        "invalidated_folders": len(invalidated),
+                        "invalidated_entries": [
+                            {"drive_id": d, "item_id": i} for d, i in sorted(invalidated)
+                        ],
+                    }
+
+                response = self._request("GET", url, params=params, timeout=120)
+                payload = response.json()
+                chunk = payload.get("value") or []
+                if not isinstance(chunk, list):
+                    chunk = []
+                total_items += len(chunk)
+
+                if not initial_run:
+                    for item in chunk:
+                        if not isinstance(item, dict):
+                            continue
+                        iid = str(item.get("id") or "").strip()
+                        parent = item.get("parentReference") or {}
+                        pid = str(parent.get("id") or "").strip()
+                        if item.get("@removed"):
+                            if iid:
+                                self.invalidate_drive_folder_children_cache(drive_id, iid)
+                                invalidated.add((drive_id, iid))
+                            if pid:
+                                self.invalidate_drive_folder_children_cache(drive_id, pid)
+                                invalidated.add((drive_id, pid))
+                        else:
+                            if pid:
+                                self.invalidate_drive_folder_children_cache(drive_id, pid)
+                                invalidated.add((drive_id, pid))
+                            if item.get("folder") and iid:
+                                self.invalidate_drive_folder_children_cache(drive_id, iid)
+                                invalidated.add((drive_id, iid))
+
+                new_delta = payload.get("@odata.deltaLink") or new_delta
+                url = payload.get("@odata.nextLink")
+                params = None
+        except requests.RequestException as exc:
+            log_warn(
+                "graph_delta",
+                "sync_drive_children_delta_http_failed",
+                drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+                error=str(exc)[:500],
+            )
+            return {
+                "ok": False,
+                "reason": "request_failed",
+                "error": str(exc),
+                "pages": pages,
+                "items_seen": total_items,
+                "invalidated_folders": len(invalidated),
+            }
+        except Exception as exc:
+            log_warn(
+                "graph_delta",
+                "sync_drive_children_delta_failed",
+                drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+                error=str(exc)[:500],
+            )
+            return {
+                "ok": False,
+                "reason": "unexpected_error",
+                "error": str(exc),
+                "pages": pages,
+                "items_seen": total_items,
+                "invalidated_folders": len(invalidated),
+            }
+
+        if new_delta:
+            try:
+                state_path.write_text(
+                    json.dumps(
+                        {
+                            "drive_id": drive_id,
+                            "delta_link": new_delta,
+                            "saved_utc": datetime.now(timezone.utc).isoformat(),
+                        },
+                        ensure_ascii=True,
+                    ),
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+        elif not initial_run:
+            log_warn(
+                "graph_delta",
+                "sync_drive_children_delta_missing_delta_link",
+                drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+                pages=pages,
+            )
+
+        log_trace(
+            "graph_delta",
+            "sync_drive_children_delta_done",
+            drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+            pages=pages,
+            items_seen=total_items,
+            invalidated=len(invalidated),
+            initial_token_run=initial_run,
+        )
+        if initial_run and new_delta:
+            log_info(
+                "graph_delta_bootstrap_complete",
+                drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+                pages=pages,
+                items_seen=total_items,
+            )
+
+        invalidated_entries = [{"drive_id": d, "item_id": i} for d, i in sorted(invalidated)]
+        return {
+            "ok": True,
+            "skipped": False,
+            "initial_token_run": initial_run,
+            "pages": pages,
+            "items_seen": total_items,
+            "invalidated_folders": len(invalidated),
+            "invalidated_entries": invalidated_entries,
+        }
 
     def has_cached_drive_root_children(self, drive_id: str) -> bool:
         cache_key = (drive_id, "__root__")
@@ -388,7 +658,7 @@ class GraphClient:
         profile = self.get_profile()
         role = self.determine_user_role()
 
-        return {
+        ctx = {
             "connected": True,
             "profile": profile,
             "operator_display_name": self.session_context.get("operator_display_name", ""),
@@ -396,6 +666,11 @@ class GraphClient:
             "tenant_domain": self.session_context.get("tenant_domain", ""),
             "user_role": role,
         }
+        upn = ""
+        if isinstance(profile, dict):
+            upn = str(profile.get("userPrincipalName") or profile.get("mail") or "")[:120]
+        log_trace("graph", "build_session_context", user_role=role, profile_upn_excerpt=upn)
+        return ctx
 
     # -------------------------------------------------------------------------
     # SharePoint discovery - foundation methods for upcoming Planning Workspace parity
@@ -454,8 +729,47 @@ class GraphClient:
     def get_drive_item(self, drive_id: str, item_id: str) -> Dict[str, Any]:
         return self.get(f"{AUTH_CONFIG['graph_base']}/drives/{drive_id}/items/{item_id}")
 
-    def count_drive_items_recursive(self, drive_id: str) -> int:
-        total = 0
+    def get_drive_item_by_path(self, drive_id: str, relative_path: str) -> Optional[Dict[str, Any]]:
+        """
+        Resolve a path relative to the document library root (e.g. FTBMRoot/Admin/Folder) to a driveItem.
+        Returns None on 404. Used when allocation payloads store SourcePath but omit Graph ids.
+        """
+        drive_id = str(drive_id or "").strip()
+        if not drive_id:
+            return None
+        normalized = str(relative_path or "").replace("\\", "/").strip("/")
+        if not normalized:
+            return None
+        encoded = "/".join(quote(segment, safe="") for segment in normalized.split("/") if segment)
+        url = f"{AUTH_CONFIG['graph_base']}/drives/{drive_id}/root:/{encoded}"
+        try:
+            payload = self.get(url)
+            log_trace(
+                "graph",
+                "get_drive_item_by_path_ok",
+                drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+                path_excerpt=encoded[:180],
+            )
+            return payload
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                log_trace(
+                    "graph",
+                    "get_drive_item_by_path_404",
+                    drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+                    path_excerpt=encoded[:180],
+                )
+                return None
+            raise
+
+    def count_drive_items_recursive_split(self, drive_id: str) -> tuple[int, int]:
+        """Return ``(file_count, folder_count)`` under the library root (recursive, paged).
+
+        Each file row counts toward files; each folder row counts toward folders. The library root
+        item itself is not included. ``file_count + folder_count`` matches ``count_drive_items_recursive``.
+        """
+        files = 0
+        folders = 0
         stack: List[Optional[str]] = [None]
 
         while stack:
@@ -467,13 +781,20 @@ class GraphClient:
             )
 
             for child in children:
-                total += 1
                 if "folder" in child:
+                    folders += 1
                     child_id = child.get("id")
                     if child_id:
                         stack.append(child_id)
+                else:
+                    files += 1
 
-        return total
+        return files, folders
+
+    def count_drive_items_recursive(self, drive_id: str) -> int:
+        """Total items (files + folders) under the library root; see ``count_drive_items_recursive_split``."""
+        files, folders = self.count_drive_items_recursive_split(drive_id)
+        return files + folders
 
     # -------------------------------------------------------------------------
     # Normalizers for UI parity
@@ -595,6 +916,7 @@ class GraphClient:
     # Composite helpers - these are what the UI should use next
     # -------------------------------------------------------------------------
     def discover_sites_with_libraries(self) -> List[Dict[str, Any]]:
+        log_trace("graph", "discover_sites_with_libraries_start")
         sites = self.list_sites()
         results: List[Dict[str, Any]] = []
 
@@ -620,6 +942,12 @@ class GraphClient:
             normalized_site["libraries"] = normalized_drives
             results.append(normalized_site)
 
+        log_trace(
+            "graph",
+            "discover_sites_with_libraries_done",
+            raw_site_count=len(sites),
+            sites_with_libraries=len(results),
+        )
         return results
 
     def list_drive_root_items_normalized(
@@ -741,6 +1069,14 @@ class GraphClient:
         if not drive_id or not item_id:
             return []
 
+        log_trace(
+            "graph",
+            "list_drive_subtree_start",
+            drive_id_suffix=str(drive_id)[-16:],
+            item_id_suffix=str(item_id)[-16:],
+            tree_role=tree_role,
+            parent_item_path_excerpt=str(parent_item_path or "")[:120],
+        )
         normalized_items: List[Dict[str, Any]] = []
         stack: List[Dict[str, str]] = [{
             "item_id": item_id,
@@ -774,10 +1110,20 @@ class GraphClient:
                         "parent_item_path": normalized.get("item_path", "/"),
                     })
 
+        log_trace("graph", "list_drive_subtree_done", normalized_descendant_count=len(normalized_items))
         return normalized_items
 
     def download_drive_item_content(self, drive_id: str, item_id: str, *, max_bytes: int = 262144) -> bytes:
         if not drive_id or not item_id:
             return b""
         url = f"{AUTH_CONFIG['graph_base']}/drives/{drive_id}/items/{item_id}/content"
-        return self.get_bytes(url, max_bytes=max_bytes)
+        data = self.get_bytes(url, max_bytes=max_bytes)
+        log_trace(
+            "graph",
+            "download_drive_item_content",
+            drive_id_suffix=str(drive_id)[-16:],
+            item_id_suffix=str(item_id)[-16:],
+            bytes_returned=len(data),
+            max_bytes=max_bytes,
+        )
+        return data

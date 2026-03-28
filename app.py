@@ -1,3 +1,4 @@
+import os
 import sys
 import threading
 import faulthandler
@@ -6,7 +7,7 @@ from datetime import datetime
 from PySide6.QtCore import QtMsgType, qInstallMessageHandler
 from PySide6.QtWidgets import QApplication
 
-from ozlink_console.logger import log_error, log_info
+from ozlink_console.logger import log_error, log_info, log_trace
 from ozlink_console.paths import logs_root
 from ozlink_console.main_window import MainWindow
 
@@ -81,15 +82,26 @@ def _install_global_exception_hooks():
 
 
 def run_app():
+    # Full UI/graph trace off by default (large logs and JSON serialization can stall the UI thread).
+    # Set OZLINK_FULL_TRACE=1 before launch when diagnosing projection/restore issues.
+    os.environ.setdefault("OZLINK_FULL_TRACE", "0")
     _install_global_exception_hooks()
     _install_native_crash_capture()
     app = QApplication(sys.argv)
     app.setApplicationName("Ozlink IT – SharePoint File Relocation Console")
     app.setOrganizationName("Ozlink IT")
-    app.aboutToQuit.connect(lambda: log_info("QApplication aboutToQuit emitted."))
+    log_trace("app", "run_app_start", argv_excerpt=" ".join(sys.argv[:8])[:400])
+
+    def _on_about_to_quit():
+        log_info("QApplication aboutToQuit emitted.")
+        log_trace("app", "about_to_quit")
+
+    app.aboutToQuit.connect(_on_about_to_quit)
 
     window = MainWindow()
+    log_trace("app", "main_window_constructed")
     window.show()
+    log_trace("app", "main_window_shown")
 
     return app.exec()
 

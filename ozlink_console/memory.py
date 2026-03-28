@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .logger import log_info, log_warn
+from .logger import log_info, log_trace, log_warn
 from .models import AllocationRow, ProposedFolder, SessionState, MemoryManifest
 from .paths import (
     memory_root,
@@ -331,11 +331,18 @@ class MemoryManager:
                 backup_proposed,
             ))
 
+        log_trace(
+            "memory",
+            "discover_restore_candidates",
+            candidate_count=len(candidates),
+            candidate_names=[str(c.get("name", "")) for c in candidates],
+        )
         return candidates
 
     def select_restore_candidate(self, candidates: list[dict[str, Any]] | None = None) -> tuple[dict[str, Any] | None, str]:
         inspected = candidates or self.discover_restore_candidates()
         if not inspected:
+            log_trace("memory", "select_restore_candidate", selected_name=None, reason="no candidates")
             return None, "no candidates"
 
         if self.expected_fingerprint:
@@ -352,6 +359,13 @@ class MemoryManager:
                     if str(candidate.get("storage_root", "")).lower().startswith(current_scope_root)
                 ]
                 if not inspected:
+                    log_trace(
+                        "memory",
+                        "select_restore_candidate",
+                        selected_name=None,
+                        reason="no_user_scoped_candidates",
+                        expected_fingerprint_excerpt=str(self.expected_fingerprint)[:80],
+                    )
                     return None, f"no user-scoped memory candidates for {self.expected_fingerprint}"
 
         ranked = sorted(
@@ -375,6 +389,12 @@ class MemoryManager:
             f"timestamp={selected.get('timestamp')} "
             f"timestamp_kind={selected.get('timestamp_kind', 'unknown')} "
             f"timestamp_sort_value={selected.get('timestamp_sort_value', float('-inf'))}"
+        )
+        log_trace(
+            "memory",
+            "select_restore_candidate",
+            selected_name=str(selected.get("name", "")),
+            reason_excerpt=reason[:400],
         )
         return selected, reason
 
@@ -426,6 +446,12 @@ class MemoryManager:
             selected_candidate=selected_name,
             selected_storage_root=candidate.get("storage_root", ""),
             write_root=str(self.root),
+        )
+        log_trace(
+            "memory",
+            "prepare_selected_candidate_for_runtime",
+            selected_name=selected_name,
+            restore_source=self.current_restore_source,
         )
 
         inspected = candidates or []
@@ -574,7 +600,9 @@ class MemoryManager:
 
     def load_allocations(self) -> list[AllocationRow]:
         data = self._read_json(self.paths["allocations"], [])
-        return [AllocationRow.from_dict(x) for x in data]
+        rows = [AllocationRow.from_dict(x) for x in data]
+        log_trace("memory", "load_allocations", row_count=len(rows), path_excerpt=str(self.paths["allocations"])[-80:])
+        return rows
 
     def save_allocations(self, rows: list[AllocationRow], *, allow_empty: bool = False) -> None:
         payload = [r.to_dict() for r in rows]
@@ -586,10 +614,13 @@ class MemoryManager:
             allow_dangerous_empty_overwrite=allow_empty,
             label="AllocationQueue",
         )
+        log_trace("memory", "save_allocations", row_count=len(payload), allow_empty=allow_empty)
 
     def load_proposed(self) -> list[ProposedFolder]:
         data = self._read_json(self.paths["proposed"], [])
-        return [ProposedFolder.from_dict(x) for x in data]
+        rows = [ProposedFolder.from_dict(x) for x in data]
+        log_trace("memory", "load_proposed", row_count=len(rows))
+        return rows
 
     def save_proposed(self, rows: list[ProposedFolder], *, allow_empty: bool = False) -> None:
         payload = [r.to_dict() for r in rows]
@@ -601,9 +632,16 @@ class MemoryManager:
             allow_dangerous_empty_overwrite=allow_empty,
             label="ProposedFolders",
         )
+        log_trace("memory", "save_proposed", row_count=len(payload), allow_empty=allow_empty)
 
     def load_session(self) -> SessionState:
-        return SessionState.from_dict(self._read_json(self.paths["session"], {}))
+        state = SessionState.from_dict(self._read_json(self.paths["session"], {}))
+        log_trace(
+            "memory",
+            "load_session",
+            draft_id_excerpt=str(getattr(state, "DraftId", "") or "")[:40],
+        )
+        return state
 
     def save_session(self, state: SessionState) -> None:
         existing_raw = self._read_json_path(self.paths["session"], {})
@@ -620,10 +658,17 @@ class MemoryManager:
             allow_dangerous_empty_overwrite=True,
             label="SessionState",
         )
+        log_trace("memory", "save_session", draft_id_excerpt=str(getattr(state, "DraftId", "") or "")[:40])
 
     def save_manifest(self, manifest: MemoryManifest) -> None:
         self._backup_file(self.paths["manifest"], self.paths["manifest"].stem)
         self._atomic_write_text(self.paths["manifest"], json.dumps(manifest.to_dict(), indent=2))
+        log_trace(
+            "memory",
+            "save_manifest",
+            draft_id_excerpt=str(getattr(manifest, "DraftId", "") or "")[:40],
+            save_status=str(getattr(manifest, "SaveStatus", "") or ""),
+        )
 
     def refresh_manifest(self, draft_id: str = "", fingerprint: str = "", status: str = "Healthy") -> None:
         manifest = MemoryManifest(
@@ -653,6 +698,7 @@ class MemoryManager:
         }
         (destination / "ExportMetadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
         log_info("Memory bundle exported.", destination=str(destination), reason=reason)
+        log_trace("memory", "export_bundle", reason=reason, destination_excerpt=str(destination)[-100:])
         return destination
 
     def export_bundle_zip(self, bundle_folder: Path, destination_zip: Path | None = None) -> Path:
@@ -716,6 +762,7 @@ class MemoryManager:
             status="Healthy",
         )
         log_info("Memory bundle imported.", source=str(source_folder))
+        log_trace("memory", "import_bundle", source_excerpt=str(source_folder)[-100:])
 
     def import_bundle_zip(self, source_zip: Path) -> None:
         source_zip = Path(source_zip)
@@ -729,6 +776,7 @@ class MemoryManager:
                 archive.extractall(extract_root)
             self.import_bundle(extract_root)
         log_info("Memory bundle zip imported.", source=str(source_zip))
+        log_trace("memory", "import_bundle_zip", source_excerpt=str(source_zip)[-100:])
 
     def submit_request_package(self, user_display: str, user_email: str, tenant_id: str, tenant_label: str,
                                source_context: dict[str, Any], destination_context: dict[str, Any]) -> Path:

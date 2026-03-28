@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .logger import log_info
+from .logger import log_info, log_trace
 from .models import SubmissionBatch
 from .paths import requests_root, test_requests_root
 
@@ -108,7 +108,7 @@ class RequestStore:
     def load_submission_batch(self, batch_id: str, *, test_mode: bool = False) -> dict[str, Any]:
         root = self.test_root if test_mode else self.root
         batch_dir = root / batch_id
-        return {
+        payload = {
             "request": self._read_json(batch_dir / "request.json", {}),
             "allocations": self._read_json(batch_dir / "allocations.json", []),
             "proposed_folders": self._read_json(batch_dir / "proposed_folders.json", []),
@@ -116,6 +116,15 @@ class RequestStore:
             "path": str(batch_dir),
             "is_test": test_mode,
         }
+        log_trace(
+            "requests",
+            "load_submission_batch",
+            batch_id=batch_id,
+            test_mode=test_mode,
+            allocations_count=len(payload.get("allocations") or []),
+            proposed_count=len(payload.get("proposed_folders") or []),
+        )
+        return payload
 
     def delete_submission_batch(self, batch_id: str, *, test_mode: bool = False) -> Path:
         root = self.test_root if test_mode else self.root
@@ -129,6 +138,7 @@ class RequestStore:
             path=str(batch_dir),
             test_mode=test_mode,
         )
+        log_trace("requests", "delete_submission_batch", batch_id=batch_id, test_mode=test_mode)
         return batch_dir
 
     def export_submission_batch_zip(
@@ -159,6 +169,13 @@ class RequestStore:
             batch_id=batch_id,
             source=str(batch_dir),
             destination=str(destination_zip),
+            test_mode=test_mode,
+        )
+        log_trace(
+            "requests",
+            "export_submission_batch_zip",
+            batch_id=batch_id,
+            destination_excerpt=str(destination_zip)[-100:],
             test_mode=test_mode,
         )
         return destination_zip
