@@ -38,7 +38,7 @@ python app.py
 
 The repo uses **`OzlinkConsole.spec`**: a **onedir** build (`OzlinkConsole.exe` plus an **`_internal`** folder). That is what your **Good Build.zip** sample contains under `dist_…/OzlinkConsole/` — **not** a single-file exe.
 
-**Client delivery:** zip **only** `dist/OzlinkConsole/` (exe + `_internal`). You do **not** need to ship the `build/` folder inside the zip (it is intermediate output and bloat).
+**Client delivery:** ship a zip that contains **only** the `OzlinkConsole` folder (`OzlinkConsole.exe` + `_internal`). Do **not** put the PyInstaller `build/` tree inside the zip.
 
 From repo root:
 
@@ -47,7 +47,9 @@ pip install pyinstaller
 .\scripts\package_release.ps1
 ```
 
-Or manually: `pyinstaller --noconfirm OzlinkConsole.spec` then zip the `dist\OzlinkConsole` folder. The client extracts the zip and runs **`OzlinkConsole.exe`** in place (folder must stay intact).
+`package_release.ps1` runs PyInstaller with **`dist`** and **`work`** under **`%TEMP%`** (avoids OneDrive locks on `dist\`) and writes **`OzlinkConsole_release_<timestamp>.zip`** next to the repo root. The client extracts that zip and runs **`OzlinkConsole.exe`** in place (folder must stay intact).
+
+Or manually from repo root: `python -m PyInstaller --noconfirm OzlinkConsole.spec`, then zip **`dist\OzlinkConsole`** yourself.
 
 ## Client handoff: optional faster source tree (mapping / large libraries)
 

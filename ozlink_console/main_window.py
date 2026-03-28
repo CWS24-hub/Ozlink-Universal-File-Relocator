@@ -9183,9 +9183,21 @@ class MainWindow(QMainWindow):
     def _iter_tree_items(self, parent_item):
         if parent_item is None:
             return
+        if not self._tree_item_is_alive(parent_item):
+            return
         yield parent_item
-        for index in range(parent_item.childCount()):
-            yield from self._iter_tree_items(parent_item.child(index))
+        try:
+            count = parent_item.childCount()
+        except RuntimeError:
+            return
+        for index in range(count):
+            try:
+                child = parent_item.child(index)
+            except RuntimeError:
+                continue
+            if not self._tree_item_is_alive(child):
+                continue
+            yield from self._iter_tree_items(child)
 
     def _iter_source_visible_payloads(self):
         tree = getattr(self, "source_tree_widget", None)
@@ -13887,10 +13899,22 @@ class MainWindow(QMainWindow):
         if tree is None:
             return
         pumped = 0
-        for index in range(tree.topLevelItemCount()):
-            top_item = tree.topLevelItem(index)
+        try:
+            top_n = tree.topLevelItemCount()
+        except RuntimeError:
+            return
+        for index in range(top_n):
+            try:
+                top_item = tree.topLevelItem(index)
+            except RuntimeError:
+                continue
+            if not self._tree_item_is_alive(top_item):
+                continue
             for item in self._iter_tree_items(top_item):
-                self._refresh_destination_item_visibility(item)
+                try:
+                    self._refresh_destination_item_visibility(item)
+                except RuntimeError:
+                    continue
                 pumped += 1
                 if pumped % 48 == 0:
                     QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
@@ -13924,8 +13948,18 @@ class MainWindow(QMainWindow):
         tree = getattr(self, "destination_tree_widget", None)
         if tree is None:
             return
-        for index in range(tree.topLevelItemCount()):
-            for item in self._iter_tree_items(tree.topLevelItem(index)):
+        try:
+            top_n = tree.topLevelItemCount()
+        except RuntimeError:
+            return
+        for index in range(top_n):
+            try:
+                top_item = tree.topLevelItem(index)
+            except RuntimeError:
+                continue
+            if not self._tree_item_is_alive(top_item):
+                continue
+            for item in self._iter_tree_items(top_item):
                 yield item
 
     def _find_destination_child_by_semantic_path(self, parent_item, semantic_path):

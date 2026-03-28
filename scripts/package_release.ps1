@@ -1,6 +1,8 @@
 # Build OzlinkConsole with PyInstaller (onedir) and zip ONLY the distributable folder.
 # Matches the usual Codex-style workflow: client extracts zip and runs OzlinkConsole.exe
 # with the _internal folder alongside (do not move the .exe away from _internal).
+#
+# Build/work dirs default under %TEMP% so OneDrive locks on repo dist\ do not break COLLECT.
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
@@ -11,15 +13,23 @@ if (-not (Test-Path $spec)) {
     throw "OzlinkConsole.spec not found at $spec"
 }
 
-Write-Host "Running PyInstaller..."
-python -m PyInstaller --noconfirm $spec
+$stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$piRoot = Join-Path $env:TEMP "OzlinkConsole_pyinstaller_$stamp"
+$distRoot = Join-Path $piRoot "dist"
+$workRoot = Join-Path $piRoot "build"
+New-Item -ItemType Directory -Force -Path $distRoot, $workRoot | Out-Null
 
-$distDir = Join-Path $RepoRoot "dist\OzlinkConsole"
-if (-not (Test-Path (Join-Path $distDir "OzlinkConsole.exe"))) {
-    throw "Build failed: dist\OzlinkConsole\OzlinkConsole.exe not found."
+Write-Host "Running PyInstaller (dist=$distRoot, work=$workRoot)..."
+python -m PyInstaller --noconfirm --distpath $distRoot --workpath $workRoot $spec
+if ($LASTEXITCODE -ne 0) {
+    throw "PyInstaller failed with exit code $LASTEXITCODE"
 }
 
-$stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$distDir = Join-Path $distRoot "OzlinkConsole"
+if (-not (Test-Path (Join-Path $distDir "OzlinkConsole.exe"))) {
+    throw "Build failed: OzlinkConsole.exe not found under $distDir"
+}
+
 $zipName = "OzlinkConsole_release_$stamp.zip"
 $zipPath = Join-Path $RepoRoot $zipName
 
@@ -31,3 +41,4 @@ Compress-Archive -Path $distDir -DestinationPath $zipPath -CompressionLevel Opti
 Write-Host ""
 Write-Host "Created: $zipPath"
 Write-Host "Ship this zip to the client. Do not include dist\build\ (intermediate); this archive is dist-only."
+Write-Host "PyInstaller scratch (safe to delete): $piRoot"
