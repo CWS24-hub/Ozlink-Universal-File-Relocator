@@ -15,3 +15,6 @@ env/
 
 .DS_Store
 Thumbs.db
+
+# Local PyInstaller client drops (repo root)
+OzlinkConsole_release_*.zip
