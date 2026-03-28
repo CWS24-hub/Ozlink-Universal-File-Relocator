@@ -6317,12 +6317,13 @@ class MainWindow(QMainWindow):
         ui_card_layout.setContentsMargins(20, 20, 20, 20)
         ui_card_layout.setSpacing(14)
 
-        ui_title = QLabel("Planning workspace (experimental)")
+        ui_title = QLabel("Planning workspace — faster source tree (optional)")
         ui_title.setObjectName("CardTitle")
 
         ui_intro = QLabel(
-            "The source library tree can use Qt’s model/view tree (QTreeView) for better scalability. "
-            "Some features (for example Expand All on source) are not finished in that mode yet."
+            "If the source library tree feels slow when scrolling or expanding folders, enable the option "
+            "below and restart the app. Mapping and normal planning behave the same. "
+            "Source Expand All is not available in this mode yet. If anything feels wrong, turn it off and restart."
         )
         ui_intro.setObjectName("CardBody")
         ui_intro.setWordWrap(True)
@@ -6332,7 +6333,7 @@ class MainWindow(QMainWindow):
         env_qtv_forces = env_qtv_norm in ("0", "false", "no", "1", "true", "yes")
 
         self._settings_source_qtreeview_checkbox = QCheckBox(
-            "Use experimental QTreeView for the source tree (restart required)"
+            "Use faster source tree (restart required)"
         )
         self._settings_source_qtreeview_checkbox.setChecked(
             QSettings().value("ui/source_use_qtreeview", False, type=bool)
@@ -6345,8 +6346,8 @@ class MainWindow(QMainWindow):
         self._settings_source_qtreeview_checkbox.toggled.connect(self._persist_settings_source_qtreeview)
 
         ui_hint = QLabel(
-            "When the environment variable is unset, the checkbox is saved automatically. "
-            "Administrators can still force on or off for one launch with OZLINK_SOURCE_QTREEVIEW=1 or =0."
+            "Off by default. Your choice is saved on this PC. "
+            "Administrators can force one launch with OZLINK_SOURCE_QTREEVIEW=1 (on) or =0 (off) when the variable is set."
         )
         ui_hint.setObjectName("MutedText")
         ui_hint.setWordWrap(True)
@@ -19191,8 +19192,8 @@ class MainWindow(QMainWindow):
         if panel_key == "source" and self._source_tree_uses_model_view():
             self._set_tree_status_message(
                 panel_key,
-                "Expand All is not available for the experimental QTreeView source. "
-                "Unset environment variable OZLINK_SOURCE_QTREEVIEW to use the classic source tree.",
+                "Expand All is not available while the faster source tree is on. "
+                "Turn it off under Settings, restart the app, or clear OZLINK_SOURCE_QTREEVIEW if your PC sets it.",
                 loading=False,
             )
             return

@@ -49,6 +49,20 @@ pip install pyinstaller
 
 Or manually: `pyinstaller --noconfirm OzlinkConsole.spec` then zip the `dist\OzlinkConsole` folder. The client extracts the zip and runs **`OzlinkConsole.exe`** in place (folder must stay intact).
 
+## Client handoff: optional faster source tree (mapping / large libraries)
+
+**Default:** the classic source tree (unchanged). **No action required** for normal deliveries.
+
+If the library is large and the **source** pane feels sluggish when scrolling or expanding:
+
+1. Open **Settings**.
+2. Under **Planning workspace — faster source tree (optional)**, turn on **Use faster source tree (restart required)**.
+3. **Fully quit** the app and start it again.
+
+To go back: turn the option **off** and restart. The setting is stored per Windows user profile (Qt `QSettings`).
+
+**Note:** In faster mode, **Source → Expand All** is not available yet; users expand folders as needed. IT can still force one launch with `OZLINK_SOURCE_QTREEVIEW=1` or `=0` if the environment variable is set.
+
 ## Important assumptions
 
 - Graph auth uses the same client/tenant configuration found in the PowerShell script.
