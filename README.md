@@ -34,12 +34,20 @@ pip install -r requirements.txt
 python app.py
 ```
 
-## Packaging as EXE later
+## Packaging (PyInstaller, same layout as historical Codex builds)
 
-```bash
+The repo uses **`OzlinkConsole.spec`**: a **onedir** build (`OzlinkConsole.exe` plus an **`_internal`** folder). That is what your **Good Build.zip** sample contains under `dist_…/OzlinkConsole/` — **not** a single-file exe.
+
+**Client delivery:** zip **only** `dist/OzlinkConsole/` (exe + `_internal`). You do **not** need to ship the `build/` folder inside the zip (it is intermediate output and bloat).
+
+From repo root:
+
+```powershell
 pip install pyinstaller
-pyinstaller --noconfirm --onefile --windowed app.py
+.\scripts\package_release.ps1
 ```
+
+Or manually: `pyinstaller --noconfirm OzlinkConsole.spec` then zip the `dist\OzlinkConsole` folder. The client extracts the zip and runs **`OzlinkConsole.exe`** in place (folder must stay intact).
 
 ## Important assumptions
 
