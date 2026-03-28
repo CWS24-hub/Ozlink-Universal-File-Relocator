@@ -22,12 +22,26 @@ from PySide6.QtWidgets import (
     QTabWidget, QMenu, QInputDialog, QTextEdit, QStyledItemDelegate,
     QStyle, QStyleOptionViewItem, QApplication, QFileDialog, QDialog,
     QCheckBox,
-    QDialogButtonBox, QFormLayout
+    QDialogButtonBox, QFormLayout, QTreeView,
 )
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QRect, QSettings, QUrl, QPoint, QEventLoop, QElapsedTimer
+from PySide6.QtCore import (
+    Qt,
+    QThread,
+    Signal,
+    QTimer,
+    QRect,
+    QSettings,
+    QUrl,
+    QPoint,
+    QEventLoop,
+    QElapsedTimer,
+    QModelIndex,
+    QPersistentModelIndex,
+)
 from PySide6.QtGui import QGuiApplication, QDesktopServices, QPainter, QColor, QPolygon, QCursor, QBrush
 
 from ozlink_console.graph import GraphClient
+from ozlink_console.tree_models.sharepoint_source_model import SharePointSourceTreeModel
 from ozlink_console.logger import log_error, log_info, log_trace, log_warn
 from ozlink_console.memory import MemoryManager
 from ozlink_console.models import AllocationRow, ProposedFolder, SessionState, SubmissionBatch
@@ -688,6 +702,12 @@ class MainWindow(QMainWindow):
         self._destination_full_tree_requested_drive_id = ""
         self._destination_full_tree_materialization_pending = False
         self._sharepoint_lazy_mode = True
+        self._source_tree_model_view = str(os.environ.get("OZLINK_SOURCE_QTREEVIEW", "")).strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        self.source_sharepoint_model = None
         self._submitted_visual_cache = {
             "source_keys": {},
             "source_paths": {},
@@ -1389,7 +1409,7 @@ class MainWindow(QMainWindow):
                 margin: 6px 10px;
             }
 
-            QTreeWidget {
+            QTreeWidget, QTreeView {
                 background-color: #040914;
                 border: 1px solid #20355E;
                 color: #EAF0FF;
@@ -1462,16 +1482,16 @@ class MainWindow(QMainWindow):
                 background: none;
             }
 
-            QTreeWidget::item {
+            QTreeWidget::item, QTreeView::item {
                 padding: 6px 4px;
             }
 
-            QTreeWidget::item:selected {
+            QTreeWidget::item:selected, QTreeView::item:selected {
                 background-color: #163C8F;
                 color: #FFFFFF;
             }
 
-            QTreeWidget::item:hover {
+            QTreeWidget::item:hover, QTreeView::item:hover {
                 background-color: #0C1831;
             }
 
@@ -2340,22 +2360,30 @@ class MainWindow(QMainWindow):
         ) = self.build_suggestions_panel()
         self.needs_review_box, self.needs_review_table, self.needs_review_status = self.build_needs_review_panel()
 
-        self.source_tree_widget.itemExpanded.connect(
-            lambda item: self.on_tree_item_expanded("source", item)
-        )
+        if getattr(self, "_source_tree_model_view", False):
+            self.source_tree_widget.expanded.connect(self._on_source_sharepoint_model_expanded)
+            self.source_tree_widget.collapsed.connect(self._on_source_sharepoint_model_collapsed)
+            self.source_tree_widget.selectionModel().selectionChanged.connect(
+                lambda *_args: self.on_tree_selection_changed("source")
+            )
+            self.source_tree_widget.setItemDelegate(SourceTreeRelationshipDelegate(self, self.source_tree_widget))
+        else:
+            self.source_tree_widget.itemExpanded.connect(
+                lambda item: self.on_tree_item_expanded("source", item)
+            )
+            self.source_tree_widget.itemCollapsed.connect(self._on_source_tree_item_collapsed)
+            self.source_tree_widget.itemSelectionChanged.connect(
+                lambda: self.on_tree_selection_changed("source")
+            )
+            self.source_tree_widget.setItemDelegate(SourceTreeRelationshipDelegate(self, self.source_tree_widget))
         self.destination_tree_widget.itemExpanded.connect(
             lambda item: self.on_tree_item_expanded("destination", item)
         )
         self.destination_tree_widget.itemCollapsed.connect(self._on_destination_tree_item_collapsed)
-        self.source_tree_widget.itemCollapsed.connect(self._on_source_tree_item_collapsed)
-        self.source_tree_widget.itemSelectionChanged.connect(
-            lambda: self.on_tree_selection_changed("source")
-        )
         self.destination_tree_widget.itemSelectionChanged.connect(
             lambda: self.on_tree_selection_changed("destination")
         )
         self.destination_tree_widget.itemChanged.connect(self.on_destination_tree_item_changed)
-        self.source_tree_widget.setItemDelegate(SourceTreeRelationshipDelegate(self, self.source_tree_widget))
         self.source_tree_widget.setContextMenuPolicy(Qt.CustomContextMenu)
         self.source_tree_widget.customContextMenuRequested.connect(self.show_source_context_menu)
         self.destination_tree_widget.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -2924,7 +2952,12 @@ class MainWindow(QMainWindow):
         surface_layout.setContentsMargins(8, 8, 8, 8)
         surface_layout.setSpacing(8)
 
-        tree = DestinationPlanningTreeWidget() if panel_key == "destination" else QTreeWidget()
+        if panel_key == "source" and getattr(self, "_source_tree_model_view", False):
+            tree = QTreeView()
+            self.source_sharepoint_model = SharePointSourceTreeModel(parent=tree)
+            tree.setModel(self.source_sharepoint_model)
+        else:
+            tree = DestinationPlanningTreeWidget() if panel_key == "destination" else QTreeWidget()
         tree.setHeaderHidden(True)
         tree.setRootIsDecorated(True)
         tree.setItemsExpandable(True)
@@ -3988,7 +4021,7 @@ class MainWindow(QMainWindow):
         self._log_worker_lifecycle("registered_active", "root", worker_id, panel_key)
         return entry
 
-    def _register_folder_worker(self, worker_key, worker, item):
+    def _register_folder_worker(self, worker_key, worker, item, *, source_folder_parent_persistent=None):
         worker_id = self._next_worker_id("folder")
         existing_entry = self.folder_load_workers.get(worker_key)
         if existing_entry:
@@ -4008,6 +4041,7 @@ class MainWindow(QMainWindow):
             "item": item,
             "worker_key": worker_key,
             "stale": False,
+            "source_folder_parent_persistent": source_folder_parent_persistent,
         }
         self.folder_load_workers[worker_key] = entry
         self._log_worker_lifecycle("created", "folder", worker_id, worker_key)
@@ -4027,7 +4061,16 @@ class MainWindow(QMainWindow):
 
     def _tree_has_bound_root_content(self, panel_key):
         tree, _status = self._get_tree_and_status(panel_key)
-        if tree is None or tree.topLevelItemCount() == 0:
+        if tree is None:
+            return False
+        if panel_key == "source" and self._source_tree_uses_model_view():
+            model = getattr(self, "source_sharepoint_model", None)
+            if model is None or model.rowCount(QModelIndex()) == 0:
+                return False
+            first_ix = model.index(0, 0, QModelIndex())
+            first_data = first_ix.data(Qt.UserRole) or {}
+            return not first_data.get("placeholder")
+        if tree.topLevelItemCount() == 0:
             return False
         first_item = tree.topLevelItem(0)
         first_data = first_item.data(0, Qt.UserRole) or {}
@@ -5065,6 +5108,15 @@ class MainWindow(QMainWindow):
             )
 
     def count_tree_items(self, tree):
+        if isinstance(tree, QTreeView) and tree.model() is getattr(self, "source_sharepoint_model", None):
+            model = tree.model()
+            total_count = 0
+            for ix in model.iter_depth_first():
+                data = ix.data(Qt.UserRole) or {}
+                if not data.get("placeholder"):
+                    total_count += 1
+            return total_count
+
         def count_item(item):
             data = item.data(0, Qt.UserRole) or {}
             total = 0 if data.get("placeholder") else 1
@@ -9053,11 +9105,17 @@ class MainWindow(QMainWindow):
         )
 
     def _root_tree_identity(self, tree):
+        top = -1
+        if tree is not None:
+            if isinstance(tree, QTreeView) and tree.model() is not None:
+                top = tree.model().rowCount(QModelIndex())
+            elif hasattr(tree, "topLevelItemCount"):
+                top = tree.topLevelItemCount()
         return {
             "is_none": tree is None,
             "class_name": tree.__class__.__name__ if tree is not None else "",
             "object_name": tree.objectName() if tree is not None else "",
-            "top_level_count": tree.topLevelItemCount() if tree is not None else -1,
+            "top_level_count": top,
         }
 
     def _iter_tree_items(self, parent_item):
@@ -9067,61 +9125,59 @@ class MainWindow(QMainWindow):
         for index in range(parent_item.childCount()):
             yield from self._iter_tree_items(parent_item.child(index))
 
-    def _count_visible_source_relationship_nodes(self):
+    def _iter_source_visible_payloads(self):
         tree = getattr(self, "source_tree_widget", None)
         if tree is None:
-            return 0
-        count = 0
+            return
+        if self._source_tree_uses_model_view():
+            model = getattr(self, "source_sharepoint_model", None)
+            if model is None:
+                return
+            for ix in model.iter_depth_first():
+                yield ix.data(Qt.UserRole) or {}
+            return
         for index in range(tree.topLevelItemCount()):
             for item in self._iter_tree_items(tree.topLevelItem(index)):
-                node_data = item.data(0, Qt.UserRole) or {}
-                if self.get_source_relationship_display(node_data).get("mode") != "none":
-                    count += 1
+                yield item.data(0, Qt.UserRole) or {}
+
+    def _count_visible_source_relationship_nodes(self):
+        count = 0
+        for node_data in self._iter_source_visible_payloads():
+            if self.get_source_relationship_display(node_data).get("mode") != "none":
+                count += 1
         return count
 
     def _collect_visible_source_relationship_paths(self):
-        tree = getattr(self, "source_tree_widget", None)
-        if tree is None:
-            return set()
-
         paths = set()
-        for index in range(tree.topLevelItemCount()):
-            for item in self._iter_tree_items(tree.topLevelItem(index)):
-                node_data = item.data(0, Qt.UserRole) or {}
-                if node_data.get("placeholder"):
-                    continue
-                if node_data.get("source_relationship_mode") in {"direct", "inherited"}:
-                    source_path = self._canonical_source_projection_path(self._tree_item_path(node_data))
-                    if source_path:
-                        paths.add(source_path)
+        for node_data in self._iter_source_visible_payloads():
+            if node_data.get("placeholder"):
+                continue
+            if node_data.get("source_relationship_mode") in {"direct", "inherited"}:
+                source_path = self._canonical_source_projection_path(self._tree_item_path(node_data))
+                if source_path:
+                    paths.add(source_path)
         return paths
 
     def _collect_source_projection_counts(self):
-        tree = getattr(self, "source_tree_widget", None)
         counts = {
             "visible_source_projection_count": 0,
             "direct_match_count": 0,
             "inherited_match_count": 0,
             "skipped_source_projection_count": 0,
         }
-        if tree is None:
-            return counts
-
-        for index in range(tree.topLevelItemCount()):
-            for item in self._iter_tree_items(tree.topLevelItem(index)):
-                node_data = item.data(0, Qt.UserRole) or {}
-                if node_data.get("placeholder"):
-                    continue
-                relationship = self._evaluate_source_relationship(node_data)
-                mode = relationship.get("mode", "none")
-                if mode == "direct":
-                    counts["direct_match_count"] += 1
-                    counts["visible_source_projection_count"] += 1
-                elif mode == "inherited":
-                    counts["inherited_match_count"] += 1
-                    counts["visible_source_projection_count"] += 1
-                else:
-                    counts["skipped_source_projection_count"] += 1
+        for node_data in self._iter_source_visible_payloads():
+            if node_data.get("placeholder"):
+                continue
+            relationship = self._evaluate_source_relationship(node_data)
+            mode = relationship.get("mode", "none")
+            if mode == "direct":
+                counts["direct_match_count"] += 1
+                counts["visible_source_projection_count"] += 1
+            elif mode == "inherited":
+                counts["inherited_match_count"] += 1
+                counts["visible_source_projection_count"] += 1
+            else:
+                counts["skipped_source_projection_count"] += 1
 
         return counts
 
@@ -9284,6 +9340,7 @@ class MainWindow(QMainWindow):
             )
             return
 
+        self._refresh_tree_visual_states("source")
         self.source_tree_widget.viewport().update()
         verbose_flag = os.environ.get("OZLINK_RESTORE_VERBOSE_LOG", "").strip().lower()
         if verbose_flag in ("1", "true", "yes"):
@@ -9486,6 +9543,8 @@ class MainWindow(QMainWindow):
         )
 
     def _prime_source_root_children_after_snapshot(self, force=False):
+        if self._source_tree_uses_model_view():
+            return False
         tree = getattr(self, "source_tree_widget", None)
         if tree is None or tree.topLevelItemCount() == 0:
             return False
@@ -9743,7 +9802,318 @@ class MainWindow(QMainWindow):
         tree.addTopLevelItem(node)
         self._log_root_success_step("step_08_add_node_exit", item_index=index, item_name=item_name, top_level_count=tree.topLevelItemCount())
 
+    def _source_tree_uses_model_view(self):
+        return bool(getattr(self, "_source_tree_model_view", False))
+
+    def _source_payload_from_graph_item(self, item):
+        prefix = "Folder" if item.get("is_folder") else "File"
+        base_label = f"{prefix}: {item.get('name', 'Unnamed Item')}"
+        node_data = dict(item)
+        node_data.setdefault("children_loaded", False)
+        node_data.setdefault("load_failed", False)
+        node_data.setdefault("tree_label", prefix)
+        node_data.setdefault("base_display_label", base_label)
+        node_data.setdefault("tree_role", "source")
+        return node_data
+
+    def _apply_root_payload_to_source_model_view(self, panel_key, items):
+        self._log_root_success_step("step_01_resolve_tree_enter", panel_key=panel_key)
+        tree, status = self._get_tree_and_status(panel_key)
+        model = getattr(self, "source_sharepoint_model", None)
+        self._log_root_success_step("step_01_resolve_tree_exit", panel_key=panel_key, tree_info=self._root_tree_identity(tree))
+        if tree is None or status is None or model is None:
+            self._log_root_success_step("step_02_validate_tree_exit", panel_key=panel_key, valid=False)
+            return
+        self._root_tree_bind_in_progress = True
+        tree.blockSignals(True)
+        tree.setUpdatesEnabled(False)
+        try:
+            tree.setEnabled(True)
+            model.clear()
+            if not items:
+                self._set_tree_status_message(panel_key, "This library is empty.", loading=False)
+                model.set_empty_library_message("This library is empty.")
+                tree.setEnabled(False)
+                return
+            sorted_items = sorted(items, key=lambda value: (not value.get("is_folder", False), value.get("name", "").lower()))
+            payloads = []
+            for it in sorted_items:
+                pl = self._source_payload_from_graph_item(it)
+                self._apply_tree_item_visual_state(None, pl)
+                payloads.append(pl)
+            model.reset_root_payloads(payloads)
+            self._set_tree_status_message(panel_key, f"{len(items)} root item(s) loaded.", loading=False)
+        finally:
+            tree.setUpdatesEnabled(True)
+            tree.blockSignals(False)
+            self._root_tree_bind_in_progress = False
+
+    def _capture_child_path_set_for_model_index(self, parent: QModelIndex):
+        paths = set()
+        model = getattr(self, "source_sharepoint_model", None)
+        if model is None or not parent.isValid():
+            return paths
+        rows = model.rowCount(parent)
+        for r in range(rows):
+            ix = model.index(r, 0, parent)
+            pl = ix.data(Qt.UserRole) or {}
+            if pl.get("placeholder"):
+                continue
+            p = self._tree_item_path(pl)
+            if p:
+                paths.add(str(p))
+        return paths
+
+    def _on_source_sharepoint_model_collapsed(self, index):
+        if not self._full_trace_enabled():
+            return
+        pl = index.data(Qt.UserRole) or {}
+        if pl.get("placeholder"):
+            self._ui_trace(
+                "tree",
+                "collapse_skipped_placeholder",
+                panel_key="source",
+                item=None,
+            )
+        else:
+            self._ui_trace("tree", "collapsed", panel_key="source", item=None)
+
+    def _on_source_sharepoint_model_expanded(self, index):
+        node_data = index.data(Qt.UserRole) or {}
+        panel_key = "source"
+        base_label = str(node_data.get("base_display_label", "") or "").strip().lower()
+        tree_label = str(node_data.get("tree_label", "") or "").strip().lower()
+        text_label = str(node_data.get("base_display_label", "") or "").strip().lower()
+        is_folder_like = bool(
+            node_data.get("is_folder")
+            or tree_label == "folder"
+            or base_label.startswith("folder:")
+            or text_label.startswith("folder:")
+        )
+        if self._full_trace_enabled():
+            self._ui_trace("tree", "expand_signal", panel_key=panel_key, item=None)
+        if node_data.get("placeholder") or not is_folder_like:
+            if self._full_trace_enabled():
+                self._ui_trace(
+                    "tree",
+                    "expand_route",
+                    panel_key=panel_key,
+                    item=None,
+                    route="skipped_not_folder_or_placeholder",
+                )
+            return
+        if node_data.get("children_loaded") or node_data.get("load_failed"):
+            if self._full_trace_enabled():
+                self._ui_trace(
+                    "tree",
+                    "expand_route",
+                    panel_key=panel_key,
+                    item=None,
+                    route="skipped_children_already_loaded_or_failed",
+                )
+            return
+
+        drive_id = self._resolve_tree_item_drive_id(panel_key, node_data)
+        item_id = node_data.get("id", "")
+        if not drive_id or not item_id:
+            if self._full_trace_enabled():
+                self._ui_trace(
+                    "tree",
+                    "expand_route",
+                    panel_key=panel_key,
+                    item=None,
+                    route="skipped_missing_drive_or_item_id",
+                    drive_id_resolved=bool(drive_id),
+                    item_id_resolved=bool(item_id),
+                )
+            return
+
+        pending_key = f"{drive_id}:{item_id}"
+        if pending_key in self.pending_folder_loads[panel_key]:
+            if self._full_trace_enabled():
+                self._ui_trace(
+                    "tree",
+                    "expand_route",
+                    panel_key=panel_key,
+                    item=None,
+                    route="skipped_folder_worker_already_pending",
+                    pending_key=pending_key,
+                )
+            return
+
+        pending_count = len(self.pending_folder_loads.get(panel_key, set()))
+        max_inflight_loads = 1
+        if pending_count >= max_inflight_loads:
+            if self._full_trace_enabled():
+                self._ui_trace(
+                    "tree",
+                    "expand_route",
+                    panel_key=panel_key,
+                    item=None,
+                    route="skipped_folder_worker_throttle",
+                    pending_count=pending_count,
+                    max_inflight_loads=max_inflight_loads,
+                )
+            return
+
+        self.pending_folder_loads[panel_key].add(pending_key)
+        worker_key = f"{panel_key}:{item_id}"
+        item_path = self._tree_item_path(node_data)
+        if item_path and item_path in self._pending_snapshot_branch_refresh.get(panel_key, set()):
+            self._snapshot_branch_refresh_baseline_by_worker[worker_key] = self._capture_child_path_set_for_model_index(
+                index
+            )
+        if self._full_trace_enabled():
+            self._ui_trace(
+                "tree",
+                "folder_load_take_children",
+                panel_key=panel_key,
+                item=None,
+                worker_key=worker_key,
+                prior_child_count_hint="cleared",
+            )
+        self.source_sharepoint_model.set_loading_children(index)
+
+        use_cache_only = bool(
+            (
+                getattr(self, "_memory_restore_in_progress", False)
+                or getattr(self, "_suppress_autosave", False)
+            )
+            and self.graph.has_cached_drive_item_children(drive_id, item_id)
+        )
+        worker_context = {
+            "site_id": node_data.get("site_id", ""),
+            "site_name": node_data.get("site_name", ""),
+            "library_id": node_data.get("library_id", drive_id),
+            "library_name": node_data.get("library_name", ""),
+            "tree_role": panel_key,
+            "parent_item_path": node_data.get("item_path", ""),
+            "cache_only": use_cache_only,
+        }
+        worker = FolderLoadWorker(self.graph, panel_key, drive_id, item_id, worker_context)
+        pmi = QPersistentModelIndex(index)
+        worker_entry = self._register_folder_worker(
+            worker_key, worker, None, source_folder_parent_persistent=pmi
+        )
+        worker.success.connect(
+            lambda payload, worker_id=worker_entry["id"]: self._safe_invoke(
+                "folder_worker.success", self.on_folder_load_success, payload, worker_id
+            )
+        )
+        worker.error.connect(
+            lambda payload, worker_id=worker_entry["id"]: self._safe_invoke(
+                "folder_worker.error", self.on_folder_load_error, payload, worker_id
+            )
+        )
+        worker.finished.connect(
+            lambda key=worker_key, worker_id=worker_entry["id"]: self._safe_invoke(
+                "folder_worker.finished", self.on_folder_worker_finished, key, worker_id
+            )
+        )
+        if self._full_trace_enabled():
+            self._ui_trace(
+                "tree",
+                "expand_route",
+                panel_key=panel_key,
+                item=None,
+                route="start_graph_folder_load_worker",
+                worker_key=worker_key,
+                cache_only=use_cache_only,
+            )
+        worker.start()
+
+    def _apply_source_folder_load_model_tail(self, parent_index, items, previous_child_paths, panel_key):
+        model = self.source_sharepoint_model
+        child_payloads = []
+        for child in sorted(items, key=lambda value: (not value.get("is_folder", False), value.get("name", "").lower())):
+            pl = self._source_payload_from_graph_item(child)
+            self._apply_tree_item_visual_state(None, pl)
+            child_payloads.append(pl)
+        model.replace_all_children(parent_index, child_payloads)
+
+        def _mut_parent(p):
+            p["children_loaded"] = True
+            p["load_failed"] = False
+
+        model.update_payload_for_index(parent_index, _mut_parent)
+        node_data = parent_index.data(Qt.UserRole) or {}
+        trigger_path = node_data.get("item_path") or node_data.get("display_path") or ""
+        current_child_paths = self._capture_child_path_set_for_model_index(parent_index)
+        if previous_child_paths:
+            added_count = len(current_child_paths - previous_child_paths)
+            removed_count = len(previous_child_paths - current_child_paths)
+            if added_count or removed_count:
+                self._set_tree_status_message(
+                    panel_key,
+                    f"Refreshing saved branches... {added_count} added, {removed_count} removed in {node_data.get('name', 'folder')}.",
+                    loading=bool(self._pending_snapshot_branch_refresh.get(panel_key)),
+                )
+
+        projection_refresh_invoked = False
+        if self._expand_all_pending.get("source"):
+            self._expand_all_deferred_refresh["source"] = True
+        elif self._memory_restore_in_progress or bool(self._source_restore_materialization_queue):
+            self._source_projection_refresh_pending = True
+        else:
+            self._schedule_source_projection_refresh_for_paths(
+                [trigger_path],
+                "source_projection_folder_load_applied",
+                trigger_path=trigger_path,
+            )
+            projection_refresh_invoked = True
+        destination_future_model_applied_count = 0
+        if (
+            not self._expand_all_pending.get("source")
+            and getattr(self, "destination_tree_widget", None) is not None
+            and self.planned_moves
+            and not getattr(self, "_sharepoint_lazy_mode", False)
+        ):
+            destination_future_model_applied_count = self._materialize_destination_future_model(
+                "source_folder_load_success"
+            )
+        should_log_source_branch_loaded = not self._expand_all_pending.get("source")
+        if self._expand_all_pending.get("source"):
+            self._source_expand_all_folder_load_log_counter = (
+                int(getattr(self, "_source_expand_all_folder_load_log_counter", 0) or 0) + 1
+            )
+            should_log_source_branch_loaded = self._source_expand_all_folder_load_log_counter % 24 == 0
+        if should_log_source_branch_loaded:
+            self._log_restore_phase(
+                "source_restore_branch_loaded",
+                source_path=trigger_path,
+                normalized_source_path=self._canonical_source_projection_path(trigger_path),
+                queue_size=len(self._source_restore_materialization_queue),
+                branch_depth=self._source_branch_depth(trigger_path),
+                already_loaded=False,
+                loaded_successfully=True,
+                projection_refresh_invoked=projection_refresh_invoked,
+                destination_future_model_applied_count=destination_future_model_applied_count,
+                trigger_path=self.normalize_memory_path(trigger_path),
+                verbose=True,
+            )
+        self._schedule_source_restore_materialization_queue("folder_load", trigger_path=trigger_path)
+        self._process_pending_source_navigation("folder_load", trigger_path=trigger_path)
+        if not self._expand_all_pending.get("source"):
+            self._continue_source_background_preload()
+        self._continue_expand_all("source", None)
+        if self._expand_all_pending.get("source"):
+            self._source_column_refresh_pending = True
+        else:
+            self._refresh_tree_column_width("source")
+        if self._source_branch_depth(trigger_path) <= 1:
+            self.source_tree_widget.expand(parent_index)
+            rc = model.rowCount(parent_index)
+            self._set_tree_status_message(
+                "source",
+                f"{rc} top-level source folder(s) loaded.",
+                loading=False,
+            )
+        self._try_flush_destination_future_model_after_source_restore("source_folder_load")
+
     def _apply_root_payload_to_tree(self, panel_key, items):
+        if panel_key == "source" and self._source_tree_uses_model_view():
+            self._apply_root_payload_to_source_model_view(panel_key, items)
+            return
         self._log_root_success_step("step_01_resolve_tree_enter", panel_key=panel_key)
         tree, status = self._get_tree_and_status(panel_key)
         self._log_root_success_step("step_01_resolve_tree_exit", panel_key=panel_key, tree_info=self._root_tree_identity(tree))
@@ -10045,12 +10415,17 @@ class MainWindow(QMainWindow):
         return False
 
     def _apply_tree_item_visual_state(self, item, node_data):
-        if item is None or not node_data or node_data.get("placeholder"):
+        if not node_data or node_data.get("placeholder"):
             return
 
-        item.setForeground(0, QBrush())
-        item.setBackground(0, QBrush())
-        item.setToolTip(0, "")
+        if item is not None:
+            item.setForeground(0, QBrush())
+            item.setBackground(0, QBrush())
+            item.setToolTip(0, "")
+        elif node_data.get("tree_role") == "source":
+            node_data.pop("_model_foreground", None)
+            node_data.pop("_model_background", None)
+            node_data.pop("_model_tooltip", None)
 
         color = None
         background_color = None
@@ -10082,25 +10457,40 @@ class MainWindow(QMainWindow):
         submitted_state = self._submitted_visual_state_for_node(node_data)
         node_data["submitted_visual"] = bool(submitted_state["submitted"])
         node_data["submitted_batch_visual"] = submitted_state["batch_id"]
-        item.setData(0, Qt.UserRole, node_data)
-        if role == "destination":
-            base_label = str(node_data.get("base_display_label", "")).strip() or item.text(0).replace(" [Submitted]", "")
-            item.setText(0, f"{base_label} [Submitted]" if submitted_state["submitted"] else base_label)
+        if item is not None:
+            item.setData(0, Qt.UserRole, node_data)
+            if role == "destination":
+                base_label = str(node_data.get("base_display_label", "")).strip() or item.text(0).replace(
+                    " [Submitted]", ""
+                )
+                item.setText(0, f"{base_label} [Submitted]" if submitted_state["submitted"] else base_label)
 
-        if color is not None:
-            item.setForeground(0, QBrush(color))
-        if background_color is not None and not submitted_state["submitted"]:
-            item.setBackground(0, QBrush(background_color))
-        if submitted_state["submitted"]:
-            item.setBackground(0, QBrush(QColor("#1B2942")))
-            item.setToolTip(
-                0,
-                (
+            if color is not None:
+                item.setForeground(0, QBrush(color))
+            if background_color is not None and not submitted_state["submitted"]:
+                item.setBackground(0, QBrush(background_color))
+            if submitted_state["submitted"]:
+                item.setBackground(0, QBrush(QColor("#1B2942")))
+                item.setToolTip(
+                    0,
+                    (
+                        f"Submitted and locked in batch {submitted_state['batch_id']}."
+                        if submitted_state["batch_id"]
+                        else "Submitted and locked."
+                    ),
+                )
+        elif role == "source":
+            if color is not None:
+                node_data["_model_foreground"] = color
+            if submitted_state["submitted"]:
+                node_data["_model_background"] = QColor("#1B2942")
+                node_data["_model_tooltip"] = (
                     f"Submitted and locked in batch {submitted_state['batch_id']}."
                     if submitted_state["batch_id"]
                     else "Submitted and locked."
-                ),
-            )
+                )
+            elif background_color is not None:
+                node_data["_model_background"] = background_color
         if self._full_trace_enabled():
             pk = str(role or "unknown")
             if pk in ("source", "destination"):
@@ -15452,6 +15842,21 @@ class MainWindow(QMainWindow):
             return
         self._rebuild_submission_visual_cache()
         refreshed = 0
+        if panel_key == "source" and self._source_tree_uses_model_view():
+            model = getattr(self, "source_sharepoint_model", None)
+            if model is not None:
+                for ix in model.iter_depth_first():
+                    node_data = ix.data(Qt.UserRole) or {}
+                    if node_data.get("placeholder"):
+                        continue
+                    self._apply_tree_item_visual_state(None, node_data)
+                    model.emit_payload_changed(ix)
+                    refreshed += 1
+            tree.viewport().update()
+            if self._full_trace_enabled():
+                log_trace("tree", "refresh_tree_visual_states_complete", panel_key=panel_key, nodes_refreshed=refreshed)
+            return
+
         for index in range(tree.topLevelItemCount()):
             for item in self._iter_tree_items(tree.topLevelItem(index)):
                 node_data = item.data(0, Qt.UserRole) or {}
@@ -16070,6 +16475,41 @@ class MainWindow(QMainWindow):
                 return
 
             item = worker_state.get("item")
+            if panel_key == "source" and self._source_tree_uses_model_view():
+                pmi = worker_state.get("source_folder_parent_persistent")
+                parent_index = QModelIndex(pmi) if pmi is not None and pmi.isValid() else QModelIndex()
+                if not parent_index.isValid():
+                    parent_index = self.source_sharepoint_model.find_index_by_drive_item(drive_id, item_id)
+                if not parent_index.isValid():
+                    self._snapshot_branch_refresh_baseline_by_worker.pop(worker_key, None)
+                    self._destination_preserved_children_by_worker.pop(worker_key, None)
+                    self._log_worker_lifecycle(
+                        "stale_deleted_item_success_skipped", "folder", worker_id, worker_key, drive_id=drive_id
+                    )
+                    return
+                previous_child_paths = self._snapshot_branch_refresh_baseline_by_worker.pop(worker_key, set())
+                items_list = payload.get("items", [])
+                if self._full_trace_enabled():
+                    nd = parent_index.data(Qt.UserRole) or {}
+                    log_trace(
+                        "worker",
+                        "folder_load_success_apply_payload",
+                        panel_key=panel_key,
+                        worker_id=worker_id,
+                        worker_key=worker_key,
+                        trigger_path_excerpt=str(nd.get("item_path", "") or "")[:200],
+                        payload_item_count=len(items_list or []),
+                        skip_destination_child_replace=False,
+                        preserved_destination_children=0,
+                    )
+                self._apply_source_folder_load_model_tail(parent_index, items_list, previous_child_paths, panel_key)
+                self._schedule_workspace_ui_persist(panel_key=panel_key)
+                if self._pending_snapshot_branch_refresh.get(panel_key) and not self._expand_all_pending.get(panel_key):
+                    self._schedule_snapshot_branch_refresh(panel_key, delay_ms=0)
+                if not (panel_key == "source" and self._expand_all_pending.get("source")):
+                    self._schedule_progress_summary_refresh()
+                return
+
             if not self._tree_item_is_alive(item):
                 recovered_item = self._find_visible_item_by_drive_item_id(panel_key, drive_id, item_id)
                 if recovered_item is None:
@@ -16358,6 +16798,36 @@ class MainWindow(QMainWindow):
                 return
 
             item = worker_state.get("item")
+            if panel_key == "source" and self._source_tree_uses_model_view():
+                pmi = worker_state.get("source_folder_parent_persistent")
+                parent_index = QModelIndex(pmi) if pmi is not None and pmi.isValid() else QModelIndex()
+                if not parent_index.isValid():
+                    parent_index = self.source_sharepoint_model.find_index_by_drive_item(drive_id, item_id)
+                if not parent_index.isValid():
+                    self._snapshot_branch_refresh_baseline_by_worker.pop(worker_key, None)
+                    self._destination_preserved_children_by_worker.pop(worker_key, None)
+                    self._log_worker_lifecycle(
+                        "stale_deleted_item_error_skipped", "folder", worker_id, worker_key, drive_id=drive_id
+                    )
+                    return
+                self._snapshot_branch_refresh_baseline_by_worker.pop(worker_key, None)
+                err_pl = {
+                    "placeholder": True,
+                    "placeholder_role": "error",
+                    "base_display_label": "Could not load folder contents.",
+                    "tree_role": "source",
+                }
+                self.source_sharepoint_model.replace_all_children(parent_index, [err_pl])
+
+                def _mut_err(p):
+                    p["children_loaded"] = False
+                    p["load_failed"] = True
+
+                self.source_sharepoint_model.update_payload_for_index(parent_index, _mut_err)
+                if self._pending_snapshot_branch_refresh.get(panel_key):
+                    self._schedule_snapshot_branch_refresh(panel_key, delay_ms=150)
+                return
+
             if not self._tree_item_is_alive(item):
                 recovered_item = self._find_visible_item_by_drive_item_id(panel_key, drive_id, item_id)
                 if recovered_item is None:
@@ -16424,10 +16894,17 @@ class MainWindow(QMainWindow):
                 return
 
             tree = self.source_tree_widget if panel_key == "source" else self.destination_tree_widget
-            selected_items = tree.selectedItems()
+            if panel_key == "source" and self._source_tree_uses_model_view():
+                ix = tree.currentIndex()
+                selected_items = [ix] if ix.isValid() else []
+            else:
+                selected_items = tree.selectedItems()
             if self._full_trace_enabled():
                 first = selected_items[0] if selected_items else None
-                nd = (first.data(0, Qt.UserRole) or {}) if first else {}
+                if isinstance(first, QModelIndex):
+                    nd = (first.data(Qt.UserRole) or {}) if first is not None and first.isValid() else {}
+                else:
+                    nd = (first.data(0, Qt.UserRole) or {}) if first else {}
                 log_trace(
                     "ui",
                     "tree_selection_changed",
@@ -16440,7 +16917,11 @@ class MainWindow(QMainWindow):
                 self.clear_selection_details()
                 return
 
-            node_data = selected_items[0].data(0, Qt.UserRole) or {}
+            first_sel = selected_items[0]
+            if isinstance(first_sel, QModelIndex):
+                node_data = first_sel.data(Qt.UserRole) or {}
+            else:
+                node_data = first_sel.data(0, Qt.UserRole) or {}
             if node_data.get("placeholder"):
                 self.clear_selection_details()
                 return
@@ -16804,7 +17285,10 @@ class MainWindow(QMainWindow):
         if item is None:
             return None
 
-        node_data = item.data(0, Qt.UserRole) or {}
+        if isinstance(item, QModelIndex):
+            node_data = item.data(Qt.UserRole) or {}
+        else:
+            node_data = item.data(0, Qt.UserRole) or {}
         if node_data.get("placeholder"):
             return None
 
@@ -16812,6 +17296,10 @@ class MainWindow(QMainWindow):
 
     def get_selected_tree_node_data(self, tree_role):
         tree = self.source_tree_widget if tree_role == "source" else self.destination_tree_widget
+        if tree_role == "source" and self._source_tree_uses_model_view():
+            ix = tree.currentIndex()
+            return self.get_tree_item_node_data(ix)
+
         selected_items = tree.selectedItems()
         if not selected_items:
             return None
@@ -16819,6 +17307,14 @@ class MainWindow(QMainWindow):
         return self.get_tree_item_node_data(selected_items[0])
 
     def select_tree_item_at_position(self, tree, position):
+        if isinstance(tree, QTreeView):
+            ix = tree.indexAt(position)
+            if not ix.isValid():
+                tree.clearSelection()
+                return None
+            tree.setCurrentIndex(ix)
+            return ix
+
         item = tree.itemAt(position)
         if item is None:
             tree.clearSelection()
@@ -18568,8 +19064,11 @@ class MainWindow(QMainWindow):
             for index in range(item.childCount()):
                 self._queue_expand_all_item(panel_key, item.child(index))
         elif not self._expand_all_queue[panel_key]:
-            for index in range(tree.topLevelItemCount()):
-                self._queue_expand_all_item(panel_key, tree.topLevelItem(index))
+            if panel_key == "source" and self._source_tree_uses_model_view():
+                pass
+            else:
+                for index in range(tree.topLevelItemCount()):
+                    self._queue_expand_all_item(panel_key, tree.topLevelItem(index))
 
         self._update_expand_all_status(panel_key, "Expanding branches...", loading=True)
         self._schedule_expand_all(panel_key, delay_ms=8 if panel_key == "source" else 10)
@@ -18600,10 +19099,17 @@ class MainWindow(QMainWindow):
         tree.blockSignals(True)
         try:
             tree.collapseAll()
-            for index in range(tree.topLevelItemCount()):
-                top_item = tree.topLevelItem(index)
-                if top_item is not None:
-                    tree.expandItem(top_item)
+            if panel_key == "source" and self._source_tree_uses_model_view():
+                model = getattr(self, "source_sharepoint_model", None)
+                if model is not None:
+                    for r in range(model.rowCount(QModelIndex())):
+                        ix = model.index(r, 0, QModelIndex())
+                        tree.expand(ix)
+            else:
+                for index in range(tree.topLevelItemCount()):
+                    top_item = tree.topLevelItem(index)
+                    if top_item is not None:
+                        tree.expandItem(top_item)
         finally:
             tree.blockSignals(False)
             tree.setUpdatesEnabled(True)
@@ -18620,6 +19126,14 @@ class MainWindow(QMainWindow):
     def handle_expand_all(self, panel_key):
         tree = self.source_tree_widget if panel_key == "source" else self.destination_tree_widget
         if tree is None:
+            return
+        if panel_key == "source" and self._source_tree_uses_model_view():
+            self._set_tree_status_message(
+                panel_key,
+                "Expand All is not available for the experimental QTreeView source. "
+                "Unset environment variable OZLINK_SOURCE_QTREEVIEW to use the classic source tree.",
+                loading=False,
+            )
             return
         if self._expand_all_pending.get(panel_key):
             self._collapse_loaded_branches_for_panel(
