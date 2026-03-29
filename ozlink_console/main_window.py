@@ -38,8 +38,9 @@ from PySide6.QtCore import (
     QElapsedTimer,
     QModelIndex,
     QPersistentModelIndex,
+    QItemSelectionModel,
 )
-from PySide6.QtGui import QGuiApplication, QDesktopServices, QPainter, QColor, QPolygon, QCursor, QBrush
+from PySide6.QtGui import QBrush, QColor, QCursor, QDesktopServices, QGuiApplication, QPainter, QPolygon
 
 from ozlink_console.graph import GraphClient
 from ozlink_console.tree_models.sharepoint_source_model import SharePointSourceTreeModel
@@ -3884,9 +3885,9 @@ class MainWindow(QMainWindow):
             "item_id_suffix": item_id[-16:] if len(item_id) > 16 else item_id,
         }
         if source_item is not None:
-            sid = source_item.data(0, Qt.UserRole) or {}
+            sid = self._source_tree_row_payload(source_item)
             payload["source_root_children_loaded"] = bool(sid.get("children_loaded"))
-            payload["source_root_child_count"] = source_item.childCount()
+            payload["source_root_child_count"] = self._source_tree_row_child_count(source_item)
             payload["source_subtree_fully_loaded"] = self._source_subtree_fully_loaded_in_tree(source_item)
         else:
             payload["source_root_children_loaded"] = None
@@ -8488,17 +8489,48 @@ class MainWindow(QMainWindow):
                 tree_kind="qtreewidget",
             )
 
+    def _serialize_source_model_subtree_snapshot(self, index, tree):
+        model = index.model()
+        if model is None:
+            return None
+        pl = index.data(Qt.UserRole) or {}
+        if pl.get("placeholder"):
+            return None
+        snap = {
+            "text": str(index.data(Qt.DisplayRole) or ""),
+            "data": dict(pl),
+            "expanded": bool(tree.isExpanded(index)),
+            "children": [],
+        }
+        for r in range(model.rowCount(index)):
+            ch = model.index(r, 0, index)
+            child_snap = self._serialize_source_model_subtree_snapshot(ch, tree)
+            if child_snap is not None:
+                snap["children"].append(child_snap)
+        return snap
+
     def _capture_tree_items_snapshot(self, panel_key):
         tree, _status = self._get_tree_and_status(panel_key)
         snapshots = []
         if tree is None:
             return snapshots
-        for index in range(tree.topLevelItemCount()):
-            item = tree.topLevelItem(index)
-            node_data = item.data(0, Qt.UserRole) or {}
-            if node_data.get("placeholder"):
-                continue
-            snapshots.append(self._serialize_tree_item_snapshot(item))
+        if panel_key == "source" and self._source_tree_uses_model_view():
+            model = getattr(self, "source_sharepoint_model", None)
+            if model is None:
+                return snapshots
+            root = QModelIndex()
+            for r in range(model.rowCount(root)):
+                ix = model.index(r, 0, root)
+                sub = self._serialize_source_model_subtree_snapshot(ix, tree)
+                if sub is not None:
+                    snapshots.append(sub)
+        else:
+            for index in range(tree.topLevelItemCount()):
+                item = tree.topLevelItem(index)
+                node_data = item.data(0, Qt.UserRole) or {}
+                if node_data.get("placeholder"):
+                    continue
+                snapshots.append(self._serialize_tree_item_snapshot(item))
         if panel_key == "destination":
             for snap in snapshots:
                 self._normalize_destination_snapshot_tree_for_persist(snap)
@@ -9137,8 +9169,14 @@ class MainWindow(QMainWindow):
                 return
             pre_bind_top_item_name = ""
             tree_for_top_item, _ = self._get_tree_and_status(panel_key)
-            if tree_for_top_item is not None and tree_for_top_item.topLevelItemCount() > 0:
-                pre_bind_top_item_name = str(tree_for_top_item.topLevelItem(0).text(0) or "")
+            if tree_for_top_item is not None:
+                if panel_key == "source" and self._source_tree_uses_model_view():
+                    model = getattr(self, "source_sharepoint_model", None)
+                    if model is not None and model.rowCount(QModelIndex()) > 0:
+                        ix0 = model.index(0, 0, QModelIndex())
+                        pre_bind_top_item_name = str(ix0.data(Qt.DisplayRole) or "")
+                elif hasattr(tree_for_top_item, "topLevelItemCount") and tree_for_top_item.topLevelItemCount() > 0:
+                    pre_bind_top_item_name = str(tree_for_top_item.topLevelItem(0).text(0) or "")
             self._apply_root_payload_to_tree(panel_key, items)
             self._refresh_tree_column_width(panel_key)
             self.loaded_root_request_signatures[panel_key] = active_entry.get("request_signature")
@@ -9151,11 +9189,19 @@ class MainWindow(QMainWindow):
             post_bind_top_item_name = ""
             post_bind_top_item_semantic_path = ""
             tree_for_top_item, _ = self._get_tree_and_status(panel_key)
-            if tree_for_top_item is not None and tree_for_top_item.topLevelItemCount() > 0:
-                top_item = tree_for_top_item.topLevelItem(0)
-                post_bind_top_item_name = str(top_item.text(0) or "")
-                node_data = top_item.data(0, Qt.UserRole) or {}
-                post_bind_top_item_semantic_path = str(node_data.get("semantic_path") or "")
+            if tree_for_top_item is not None:
+                if panel_key == "source" and self._source_tree_uses_model_view():
+                    model = getattr(self, "source_sharepoint_model", None)
+                    if model is not None and model.rowCount(QModelIndex()) > 0:
+                        ix0 = model.index(0, 0, QModelIndex())
+                        pl0 = ix0.data(Qt.UserRole) or {}
+                        post_bind_top_item_name = str(ix0.data(Qt.DisplayRole) or "")
+                        post_bind_top_item_semantic_path = str(pl0.get("semantic_path") or "")
+                elif hasattr(tree_for_top_item, "topLevelItemCount") and tree_for_top_item.topLevelItemCount() > 0:
+                    top_item = tree_for_top_item.topLevelItem(0)
+                    post_bind_top_item_name = str(top_item.text(0) or "")
+                    node_data = top_item.data(0, Qt.UserRole) or {}
+                    post_bind_top_item_semantic_path = str(node_data.get("semantic_path") or "")
             if panel_key == "destination":
                 self._log_restore_phase(
                     "destination_root_top_item_bound",
@@ -9396,6 +9442,56 @@ class MainWindow(QMainWindow):
                 continue
             yield from self._iter_tree_items(child)
 
+    def _source_tree_row_payload(self, row):
+        if row is None:
+            return {}
+        if isinstance(row, QModelIndex):
+            if not row.isValid():
+                return {}
+            return row.data(Qt.UserRole) or {}
+        return row.data(0, Qt.UserRole) or {}
+
+    def _source_tree_row_child_count(self, row):
+        if row is None:
+            return 0
+        if isinstance(row, QModelIndex):
+            if not row.isValid():
+                return 0
+            model = row.model()
+            return int(model.rowCount(row)) if model is not None else 0
+        return int(row.childCount())
+
+    def _iter_source_tree_subtree_rows(self, root_row):
+        """Depth-first: QTreeWidgetItem or QModelIndex root and all descendants."""
+        if root_row is None:
+            return
+        if isinstance(root_row, QModelIndex):
+            if not root_row.isValid():
+                return
+            yield root_row
+            model = root_row.model()
+            if model is None:
+                return
+            for r in range(model.rowCount(root_row)):
+                yield from self._iter_source_tree_subtree_rows(model.index(r, 0, root_row))
+            return
+        yield from self._iter_tree_items(root_row)
+
+    def _iter_source_visible_rows(self):
+        tree = getattr(self, "source_tree_widget", None)
+        if tree is None:
+            return
+        if self._source_tree_uses_model_view():
+            model = getattr(self, "source_sharepoint_model", None)
+            if model is None:
+                return
+            for ix in model.iter_depth_first():
+                yield ix
+            return
+        for i in range(tree.topLevelItemCount()):
+            for item in self._iter_tree_items(tree.topLevelItem(i)):
+                yield item
+
     def _iter_source_visible_payloads(self):
         tree = getattr(self, "source_tree_widget", None)
         if tree is None:
@@ -9635,6 +9731,18 @@ class MainWindow(QMainWindow):
         if tree is None:
             return None
         normalized_target = self._canonical_source_projection_path(source_path)
+        if self._source_tree_uses_model_view():
+            model = getattr(self, "source_sharepoint_model", None)
+            if model is None:
+                return None
+            for ix in model.iter_depth_first():
+                node_data = ix.data(Qt.UserRole) or {}
+                if node_data.get("placeholder"):
+                    continue
+                visible_path = self._canonical_source_projection_path(self._tree_item_path(node_data))
+                if visible_path and visible_path == normalized_target:
+                    return ix
+            return None
         for index in range(tree.topLevelItemCount()):
             for item in self._iter_tree_items(tree.topLevelItem(index)):
                 node_data = item.data(0, Qt.UserRole) or {}
@@ -9657,16 +9765,15 @@ class MainWindow(QMainWindow):
         if tree is None:
             return None
 
-        for index in range(tree.topLevelItemCount()):
-            for item in self._iter_tree_items(tree.topLevelItem(index)):
-                node_data = item.data(0, Qt.UserRole) or {}
-                if node_data.get("placeholder"):
-                    continue
-                if expected_key is not None and self.build_node_key(node_data, "source") == expected_key:
-                    return item
-                visible_path = self._canonical_source_projection_path(self._tree_item_path(node_data))
-                if visible_path and source_path and visible_path == source_path:
-                    return item
+        for row in self._iter_source_visible_rows():
+            node_data = self._source_tree_row_payload(row)
+            if node_data.get("placeholder"):
+                continue
+            if expected_key is not None and self.build_node_key(node_data, "source") == expected_key:
+                return row
+            visible_path = self._canonical_source_projection_path(self._tree_item_path(node_data))
+            if visible_path and source_path and visible_path == source_path:
+                return row
 
         # Some saved planned-move payloads store shortened source paths
         # (for example leaf-only or partial branch paths). Fall back to a
@@ -9675,26 +9782,25 @@ class MainWindow(QMainWindow):
         if source_path:
             normalized_suffix = source_path.lower()
             suffix_matches = []
-            for index in range(tree.topLevelItemCount()):
-                for item in self._iter_tree_items(tree.topLevelItem(index)):
-                    node_data = item.data(0, Qt.UserRole) or {}
-                    if node_data.get("placeholder"):
-                        continue
-                    visible_path = self._canonical_source_projection_path(self._tree_item_path(node_data))
-                    if not visible_path:
-                        continue
-                    visible_lower = visible_path.lower()
-                    if visible_lower == normalized_suffix or visible_lower.endswith(f"\\{normalized_suffix}"):
-                        suffix_matches.append(item)
+            for row in self._iter_source_visible_rows():
+                node_data = self._source_tree_row_payload(row)
+                if node_data.get("placeholder"):
+                    continue
+                visible_path = self._canonical_source_projection_path(self._tree_item_path(node_data))
+                if not visible_path:
+                    continue
+                visible_lower = visible_path.lower()
+                if visible_lower == normalized_suffix or visible_lower.endswith(f"\\{normalized_suffix}"):
+                    suffix_matches.append(row)
             if len(suffix_matches) == 1:
                 return suffix_matches[0]
             if len(suffix_matches) > 1:
                 # Prefer the shortest matching path to avoid over-scoping.
                 suffix_matches.sort(
-                    key=lambda item: len(
+                    key=lambda row: len(
                         self._path_segments(
                             self._canonical_source_projection_path(
-                                self._tree_item_path(item.data(0, Qt.UserRole) or {})
+                                self._tree_item_path(self._source_tree_row_payload(row))
                             )
                         )
                     )
@@ -11500,7 +11606,7 @@ class MainWindow(QMainWindow):
             return 0
 
         source_item = self._find_source_item_for_planned_move(move)
-        source_root_data = source_item.data(0, Qt.UserRole) or {} if source_item is not None else {}
+        source_root_data = self._source_tree_row_payload(source_item) if source_item is not None else {}
         if not source_root_data:
             source_root_data = dict(move.get("source", {}) or {})
             source_root_data.setdefault("item_path", move.get("source_path", ""))
@@ -12098,6 +12204,23 @@ class MainWindow(QMainWindow):
         """True when this node and all descendant folders have been expanded/loaded (no lazy placeholders)."""
         if item is None:
             return False
+        if isinstance(item, QModelIndex):
+            if not item.isValid():
+                return False
+            data = item.data(Qt.UserRole) or {}
+            if data.get("placeholder"):
+                return False
+            if not bool(data.get("is_folder", False)):
+                return True
+            if not bool(data.get("children_loaded")):
+                return False
+            model = item.model()
+            if model is None:
+                return False
+            for r in range(model.rowCount(item)):
+                if not self._source_subtree_fully_loaded_in_tree(model.index(r, 0, item)):
+                    return False
+            return True
         data = item.data(0, Qt.UserRole) or {}
         if data.get("placeholder"):
             return False
@@ -12176,10 +12299,10 @@ class MainWindow(QMainWindow):
 
         if source_item is not None and self._source_subtree_fully_loaded_in_tree(source_item):
             descendants = []
-            for descendant_item in self._iter_tree_items(source_item):
-                if descendant_item is source_item:
+            for descendant_item in self._iter_source_tree_subtree_rows(source_item):
+                if descendant_item == source_item:
                     continue
-                descendant_data = descendant_item.data(0, Qt.UserRole) or {}
+                descendant_data = self._source_tree_row_payload(descendant_item)
                 if descendant_data.get("placeholder"):
                     continue
                 descendants.append(dict(descendant_data))
@@ -12252,10 +12375,10 @@ class MainWindow(QMainWindow):
             return []
 
         descendants = []
-        for descendant_item in self._iter_tree_items(source_item):
-            if descendant_item is source_item:
+        for descendant_item in self._iter_source_tree_subtree_rows(source_item):
+            if descendant_item == source_item:
                 continue
-            descendant_data = descendant_item.data(0, Qt.UserRole) or {}
+            descendant_data = self._source_tree_row_payload(descendant_item)
             if descendant_data.get("placeholder"):
                 continue
             descendants.append(dict(descendant_data))
@@ -12367,7 +12490,7 @@ class MainWindow(QMainWindow):
             return 0
 
         source_item = self._find_source_item_for_planned_move(move)
-        source_root_data = source_item.data(0, Qt.UserRole) or {} if source_item is not None else {}
+        source_root_data = self._source_tree_row_payload(source_item) if source_item is not None else {}
         if not source_root_data:
             source_root_data = dict(move.get("source", {}) or {})
             source_root_data.setdefault("item_path", move.get("source_path", ""))
@@ -12444,7 +12567,7 @@ class MainWindow(QMainWindow):
             return None
 
         source_item = self._find_source_item_for_planned_move(move)
-        source_root_data = source_item.data(0, Qt.UserRole) or {} if source_item is not None else {}
+        source_root_data = self._source_tree_row_payload(source_item) if source_item is not None else {}
         if not source_root_data:
             source_root_data = dict(move.get("source", {}) or {})
             source_root_data.setdefault("item_path", move.get("source_path", ""))
@@ -12970,6 +13093,19 @@ class MainWindow(QMainWindow):
             return set()
 
         expanded_paths = set()
+        if self._source_tree_uses_model_view():
+            model = getattr(self, "source_sharepoint_model", None)
+            if model is None:
+                return expanded_paths
+            for ix in model.iter_depth_first():
+                pl = ix.data(Qt.UserRole) or {}
+                if pl.get("placeholder"):
+                    continue
+                if tree.isExpanded(ix):
+                    source_path = self._canonical_source_projection_path(self._tree_item_path(pl))
+                    if source_path:
+                        expanded_paths.add(source_path)
+            return expanded_paths
 
         def visit(item):
             if item is None:
@@ -13037,6 +13173,22 @@ class MainWindow(QMainWindow):
             return
 
         targets = {path for path in expanded_paths if path}
+        if self._source_tree_uses_model_view():
+            sorted_paths = sorted(targets, key=lambda p: len(self._path_segments(p)))
+            for path in sorted_paths:
+                ix = self._find_visible_source_item_by_path(path)
+                if ix is None or not isinstance(ix, QModelIndex):
+                    continue
+                chain = []
+                parent = ix.parent()
+                while parent.isValid():
+                    chain.append(parent)
+                    parent = parent.parent()
+                for p in reversed(chain):
+                    tree.expand(p)
+                tree.expand(ix)
+            return
+
         for index in range(tree.topLevelItemCount()):
             for item in self._iter_tree_items(tree.topLevelItem(index)):
                 node_data = item.data(0, Qt.UserRole) or {}
@@ -13064,6 +13216,17 @@ class MainWindow(QMainWindow):
             item = self._find_visible_source_item_by_path(selected_path)
 
         if tree is None or item is None:
+            return
+
+        if panel_key == "source" and self._source_tree_uses_model_view() and isinstance(item, QModelIndex):
+            tree.setCurrentIndex(item)
+            sm = tree.selectionModel()
+            if sm is not None:
+                sm.select(
+                    item,
+                    QItemSelectionModel.SelectionFlag.ClearAndSelect
+                    | QItemSelectionModel.SelectionFlag.Rows,
+                )
             return
 
         tree.setCurrentItem(item)
@@ -15362,7 +15525,7 @@ class MainWindow(QMainWindow):
             if source_path:
                 source_item = self._find_visible_source_item_by_path(source_path) or self._find_source_item_for_planned_move(move or {})
                 if source_item is not None:
-                    source_node = source_item.data(0, Qt.UserRole) or {}
+                    source_node = self._source_tree_row_payload(source_item)
 
         return {
             "traceable_to_source": bool(source_path),
@@ -18251,7 +18414,7 @@ class MainWindow(QMainWindow):
         destination_node = self._destination_target_snapshot(target_node, target_path)
         if move is None and inherited_move is not None:
             source_item = self._find_visible_source_item_by_path(source_node.get("source_path", ""))
-            source_item_node = source_item.data(0, Qt.UserRole) or {} if source_item is not None else {}
+            source_item_node = self._source_tree_row_payload(source_item) if source_item is not None else {}
             if not source_item_node:
                 source_item_node = {
                     "id": "",
@@ -18601,7 +18764,7 @@ class MainWindow(QMainWindow):
 
         if move is None and inherited_move is not None:
             source_item = self._find_visible_source_item_by_path(node_data.get("source_path", ""))
-            source_node = source_item.data(0, Qt.UserRole) or {} if source_item is not None else {}
+            source_node = self._source_tree_row_payload(source_item) if source_item is not None else {}
             if not source_node:
                 source_node = {
                     "id": "",
