@@ -824,6 +824,8 @@ class MainWindow(QMainWindow):
         self.discovered_sites = []
         self.planned_moves = []
         self._manifest_run_worker = None
+        self._execution_manifest_path = ""
+        self._execution_manifest = None
         self._current_details_node_data = None
         self._current_details_panel_key = ""
         self._current_details_context = None
@@ -1758,7 +1760,7 @@ class MainWindow(QMainWindow):
         self.planning_page = self.build_planning_page()
         self.settings_page = self.build_settings_page()
         self.audit_page = self.build_placeholder_page("Audit")
-        self.execution_page = self.build_placeholder_page("Execution")
+        self.execution_page = self.build_execution_page()
         self.requests_page = self.build_requests_page()
 
         page_defs = {
@@ -5084,7 +5086,7 @@ class MainWindow(QMainWindow):
         self.simulate_run_manifest_button = QPushButton("Simulate run (save manifest)…")
         self.simulate_run_manifest_button.setToolTip(
             "Save a JSON file listing planned file steps and proposed folders. "
-            "Nothing is copied or moved; this is for review and future execution."
+            "Nothing is copied or moved. Use the Execution page to dry-run or run eligible local paths."
         )
         self.simulate_run_manifest_button.clicked.connect(self._on_simulate_run_save_manifest)
         self.run_manifest_button = QPushButton("Run manifest (local paths)…")
@@ -6295,6 +6297,81 @@ class MainWindow(QMainWindow):
         card_layout.addStretch()
 
         layout.addWidget(card)
+        return page
+
+    def build_execution_page(self):
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(12)
+
+        card = QFrame()
+        card.setObjectName("SectionBox")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(20, 20, 20, 20)
+        card_layout.setSpacing(14)
+
+        title = QLabel("Execution")
+        title.setObjectName("CardTitle")
+
+        intro = QLabel(
+            "Run a saved transfer manifest on this PC when steps use absolute local paths "
+            "(for example C:\\… or UNC \\\\server\\share\\…). Typical SharePoint library paths are listed for review only "
+            "until a Microsoft Graph executor is implemented.\n\n"
+            "Heavy work runs in the background so the window stays responsive."
+        )
+        intro.setObjectName("CardBody")
+        intro.setWordWrap(True)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+        self.execution_open_manifest_button = QPushButton("Open manifest…")
+        self.execution_open_manifest_button.setToolTip("Load a JSON manifest saved from Planned Moves or elsewhere.")
+        self.execution_open_manifest_button.clicked.connect(self._on_execution_open_manifest)
+        self.execution_save_manifest_button = QPushButton("Save manifest from current plan…")
+        self.execution_save_manifest_button.setToolTip("Same as Planned Moves → Simulate run: export current planned moves and proposed folders to JSON.")
+        self.execution_save_manifest_button.clicked.connect(self._on_simulate_run_save_manifest)
+        btn_row.addWidget(self.execution_open_manifest_button)
+        btn_row.addWidget(self.execution_save_manifest_button)
+        btn_row.addStretch()
+
+        self.execution_manifest_path_label = QLabel("No manifest loaded.")
+        self.execution_manifest_path_label.setObjectName("CardBody")
+        self.execution_manifest_path_label.setWordWrap(True)
+        self.execution_manifest_path_label.setStyleSheet("color: palette(mid);")
+
+        self.execution_summary_text = QTextEdit()
+        self.execution_summary_text.setReadOnly(True)
+        self.execution_summary_text.setMinimumHeight(160)
+        self.execution_summary_text.setPlaceholderText("Open a manifest to see step counts and eligibility.")
+
+        run_row = QHBoxLayout()
+        run_row.setSpacing(10)
+        self.execution_dry_run_button = QPushButton("Dry run (log only)")
+        self.execution_dry_run_button.setEnabled(False)
+        self.execution_dry_run_button.setToolTip("Log what would be copied or created; no files changed.")
+        self.execution_dry_run_button.clicked.connect(self._on_execution_dry_run_manifest)
+        self.execution_run_button = QPushButton("Run local copies / mkdir…")
+        self.execution_run_button.setEnabled(False)
+        self.execution_run_button.setToolTip("Execute mkdir and file copies for eligible local paths (confirms before running).")
+        self.execution_run_button.clicked.connect(self._on_execution_run_manifest)
+        run_row.addWidget(self.execution_dry_run_button)
+        run_row.addWidget(self.execution_run_button)
+        run_row.addStretch()
+
+        self.execution_status_label = QLabel("")
+        self.execution_status_label.setObjectName("CardBody")
+        self.execution_status_label.setWordWrap(True)
+
+        card_layout.addWidget(title)
+        card_layout.addWidget(intro)
+        card_layout.addLayout(btn_row)
+        card_layout.addWidget(self.execution_manifest_path_label)
+        card_layout.addWidget(self.execution_summary_text, 1)
+        card_layout.addLayout(run_row)
+        card_layout.addWidget(self.execution_status_label)
+
+        outer.addWidget(card, 1)
         return page
 
     def build_settings_page(self):
@@ -18578,7 +18655,7 @@ class MainWindow(QMainWindow):
             proposed_folders=list(self.proposed_folders or []),
             draft_id=str(self.active_draft_session_id or draft_key or ""),
             tenant_hint=tenant_hint,
-            notes="Simulation export from Ozlink Console. Local absolute paths can be run from Planned Moves (Run manifest).",
+            notes="Simulation export from Ozlink Console. Local absolute paths can be run from the Execution page or Planned Moves (Run manifest).",
         )
         try:
             write_manifest_json(path, manifest)
@@ -18601,22 +18678,61 @@ class MainWindow(QMainWindow):
         )
 
     def _on_manifest_run_worker_finished_cleanup(self):
+        self._manifest_run_worker = None
+        if getattr(self, "execution_status_label", None) is not None:
+            self.execution_status_label.setText("")
+        self._update_manifest_run_buttons_state()
+
+    def _set_manifest_run_buttons_enabled(self, enabled: bool):
+        for name in (
+            "run_manifest_button",
+            "simulate_run_manifest_button",
+            "execution_open_manifest_button",
+            "execution_save_manifest_button",
+            "execution_dry_run_button",
+            "execution_run_button",
+        ):
+            w = getattr(self, name, None)
+            if w is not None:
+                w.setEnabled(enabled)
+
+    def _update_manifest_run_buttons_state(self):
+        if self._manifest_run_worker is not None:
+            self._set_manifest_run_buttons_enabled(False)
+            return
         if getattr(self, "run_manifest_button", None) is not None:
             self.run_manifest_button.setEnabled(True)
         if getattr(self, "simulate_run_manifest_button", None) is not None:
             self.simulate_run_manifest_button.setEnabled(True)
-        self._manifest_run_worker = None
+        if getattr(self, "execution_open_manifest_button", None) is not None:
+            self.execution_open_manifest_button.setEnabled(True)
+        if getattr(self, "execution_save_manifest_button", None) is not None:
+            self.execution_save_manifest_button.setEnabled(True)
+        has_manifest = self._execution_manifest is not None
+        if getattr(self, "execution_dry_run_button", None) is not None:
+            self.execution_dry_run_button.setEnabled(has_manifest)
+        if getattr(self, "execution_run_button", None) is not None:
+            self.execution_run_button.setEnabled(has_manifest)
 
-    def _on_manifest_run_finished(self, result):
-        msg = f"{result.summary_line()}\n\nDetail log:\n{result.log_path or '(none)'}"
-        QMessageBox.information(self, "Run manifest", msg)
+    def _refresh_execution_summary_panel(self):
+        if getattr(self, "execution_summary_text", None) is None:
+            return
+        if not self._execution_manifest:
+            self.execution_summary_text.clear()
+            return
+        s = manifest_execution_summary(self._execution_manifest)
+        text = (
+            f"Transfer steps (total): {s['transfer_steps_total']}\n"
+            f"  • Eligible for local copy on this PC: {s['local_filesystem_transfer']}\n"
+            f"  • Require Microsoft Graph (not implemented yet): {s['graph_transfer_pending']}\n"
+            f"  • Skipped (non-local paths or unsupported): {s['transfer_skipped_non_local']}\n\n"
+            f"Proposed folder steps (total): {s['proposed_folder_steps_total']}\n"
+            f"  • Local mkdir: {s['local_mkdir']}\n"
+            f"  • Skipped (non-local paths): {s['proposed_skipped_non_local']}\n"
+        )
+        self.execution_summary_text.setPlainText(text)
 
-    def _on_manifest_run_failed(self, err):
-        QMessageBox.warning(self, "Run manifest", err)
-
-    def _on_run_transfer_manifest(self):
-        import tempfile
-
+    def _on_execution_open_manifest(self):
         path, _selected = QFileDialog.getOpenFileName(
             self,
             "Open transfer manifest",
@@ -18625,6 +18741,87 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        try:
+            manifest = load_manifest_json(path)
+        except OSError as exc:
+            QMessageBox.warning(self, "Execution", f"Could not read file:\n{exc}")
+            return
+        except json.JSONDecodeError as exc:
+            QMessageBox.warning(self, "Execution", f"Invalid JSON:\n{exc}")
+            return
+
+        errs = validate_manifest(manifest)
+        if errs:
+            QMessageBox.warning(self, "Execution", "\n".join(errs))
+            return
+
+        self._execution_manifest_path = str(path)
+        self._execution_manifest = manifest
+        if getattr(self, "execution_manifest_path_label", None) is not None:
+            self.execution_manifest_path_label.setText(f"Manifest: {path}")
+            self.execution_manifest_path_label.setStyleSheet("")
+        self._refresh_execution_summary_panel()
+        self._update_manifest_run_buttons_state()
+        if getattr(self, "execution_status_label", None) is not None:
+            self.execution_status_label.setText("")
+
+    def _on_execution_dry_run_manifest(self):
+        if not self._execution_manifest or not self._execution_manifest_path:
+            QMessageBox.information(self, "Execution", "Open a manifest first.")
+            return
+        if (
+            QMessageBox.question(
+                self,
+                "Dry run",
+                "Run a dry run on the loaded manifest? Nothing will be copied or created on disk.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            != QMessageBox.Yes
+        ):
+            return
+        self._start_manifest_run_worker(self._execution_manifest, self._execution_manifest_path, dry_run=True)
+
+    def _on_execution_run_manifest(self):
+        if not self._execution_manifest or not self._execution_manifest_path:
+            QMessageBox.information(self, "Execution", "Open a manifest first.")
+            return
+        confirm = QMessageBox.warning(
+            self,
+            "Confirm execution",
+            "This will copy files and create folders on this PC for every eligible path in the manifest.\n\n"
+            "Verify paths before continuing.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        self._start_manifest_run_worker(self._execution_manifest, self._execution_manifest_path, dry_run=False)
+
+    def _start_manifest_run_worker(self, manifest: dict, path: str, *, dry_run: bool):
+        import tempfile
+
+        log_file = Path(tempfile.gettempdir()) / (
+            f"Ozlink_transfer_job_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.log"
+        )
+
+        worker = ManifestRunWorker(manifest, dry_run=dry_run, log_file=str(log_file))
+        self._manifest_run_worker = worker
+        worker.finished_ok.connect(self._on_manifest_run_finished)
+        worker.failed.connect(self._on_manifest_run_failed)
+        worker.finished.connect(self._on_manifest_run_worker_finished_cleanup)
+        self._set_manifest_run_buttons_enabled(False)
+        if getattr(self, "execution_status_label", None) is not None:
+            self.execution_status_label.setText("Running manifest job in the background…")
+        worker.start()
+        log_info(
+            "transfer_manifest_run_started",
+            manifest_path=str(path),
+            dry_run=dry_run,
+            log_file=str(log_file),
+        )
+
+    def _run_transfer_manifest_from_path_with_dialogs(self, path: str):
         try:
             manifest = load_manifest_json(path)
         except OSError as exc:
@@ -18691,26 +18888,25 @@ class MainWindow(QMainWindow):
             if confirm != QMessageBox.Yes:
                 return
 
-        log_file = Path(tempfile.gettempdir()) / (
-            f"Ozlink_transfer_job_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.log"
-        )
+        self._start_manifest_run_worker(manifest, path, dry_run=dry)
 
-        worker = ManifestRunWorker(manifest, dry_run=dry, log_file=str(log_file))
-        self._manifest_run_worker = worker
-        worker.finished_ok.connect(self._on_manifest_run_finished)
-        worker.failed.connect(self._on_manifest_run_failed)
-        worker.finished.connect(self._on_manifest_run_worker_finished_cleanup)
-        if getattr(self, "run_manifest_button", None) is not None:
-            self.run_manifest_button.setEnabled(False)
-        if getattr(self, "simulate_run_manifest_button", None) is not None:
-            self.simulate_run_manifest_button.setEnabled(False)
-        worker.start()
-        log_info(
-            "transfer_manifest_run_started",
-            manifest_path=str(path),
-            dry_run=dry,
-            log_file=str(log_file),
+    def _on_manifest_run_finished(self, result):
+        msg = f"{result.summary_line()}\n\nDetail log:\n{result.log_path or '(none)'}"
+        QMessageBox.information(self, "Run manifest", msg)
+
+    def _on_manifest_run_failed(self, err):
+        QMessageBox.warning(self, "Run manifest", err)
+
+    def _on_run_transfer_manifest(self):
+        path, _selected = QFileDialog.getOpenFileName(
+            self,
+            "Open transfer manifest",
+            str(Path.home()),
+            "JSON (*.json);;All files (*.*)",
         )
+        if not path:
+            return
+        self._run_transfer_manifest_from_path_with_dialogs(path)
 
     def refresh_planned_moves_table(self):
         self._rebuild_submission_visual_cache()
