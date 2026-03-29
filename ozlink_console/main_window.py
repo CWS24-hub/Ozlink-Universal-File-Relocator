@@ -8451,6 +8451,27 @@ class MainWindow(QMainWindow):
             tree = self.destination_tree_widget
             status = self.destination_tree_status
 
+        if panel_key == "source" and self._source_tree_uses_model_view():
+            model = getattr(self, "source_sharepoint_model", None)
+            if model is not None:
+                model.set_empty_library_message(message or "")
+                tree.setEnabled(False)
+                self._set_tree_status_message(
+                    panel_key,
+                    message,
+                    loading=str(message or "").lower().startswith("loading"),
+                )
+                if self._full_trace_enabled():
+                    log_trace(
+                        "tree",
+                        "set_tree_placeholder",
+                        panel_key=panel_key,
+                        message_excerpt=(message or "")[:200],
+                        tree_enabled=False,
+                        tree_kind="qtreeview_model",
+                    )
+                return
+
         tree.clear()
         placeholder = QTreeWidgetItem([message])
         placeholder.setData(0, Qt.UserRole, {"placeholder": True})
@@ -8464,6 +8485,7 @@ class MainWindow(QMainWindow):
                 panel_key=panel_key,
                 message_excerpt=(message or "")[:200],
                 tree_enabled=False,
+                tree_kind="qtreewidget",
             )
 
     def _capture_tree_items_snapshot(self, panel_key):
