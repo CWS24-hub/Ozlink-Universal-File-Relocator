@@ -89,7 +89,7 @@ class DiscoverSitesWorker(QThread):
     def run(self):
         log_trace("worker", "DiscoverSitesWorker_start")
         try:
-            discovered_sites = self.graph.discover_sites_with_libraries()
+            discovered_sites = self.graph.discover_sites_for_planning_workspace()
             log_trace("worker", "DiscoverSitesWorker_success", site_count=len(discovered_sites or []))
             self.success.emit({"discovered_sites": discovered_sites})
         except Exception as e:
@@ -7367,6 +7367,29 @@ class MainWindow(QMainWindow):
         self.update_selector_context_labels()
         self._refresh_planning_loading_banner()
 
+    def _reset_planning_trees_to_select_library_prompt(self):
+        """Clear post-login loading placeholders when sites are ready but no library is chosen yet."""
+        self.set_tree_placeholder(
+            "source",
+            "Review the current source folders here. Select a source library to load the current folder structure.",
+        )
+        self.set_tree_placeholder(
+            "destination",
+            "Review the destination folders here. Select a destination library to load the target folder structure.",
+        )
+        self._set_tree_status_message(
+            "source",
+            "Select a source site and library to load folders.",
+            loading=False,
+        )
+        self._set_tree_status_message(
+            "destination",
+            "Select a destination site and library to load folders.",
+            loading=False,
+        )
+        self.bottom_source.setText("Source: Not Set")
+        self.bottom_destination.setText("Destination: Not Set")
+
     def populate_planning_selectors(self, sites, *, auto_load_initial=True):
         self.discovered_sites = sites or []
         site_labels = ["Source Site", "Destination Site"]
@@ -7417,6 +7440,8 @@ class MainWindow(QMainWindow):
         else:
             if not self.discovered_sites:
                 self.reset_root_panels()
+            elif not auto_load_initial:
+                self._reset_planning_trees_to_select_library_prompt()
         self.update_selector_context_labels()
         self._refresh_planning_loading_banner()
 
@@ -7467,7 +7492,26 @@ class MainWindow(QMainWindow):
             return False
 
         selected_site = site_selector.currentData()
-        libraries = selected_site.get("libraries", []) if isinstance(selected_site, dict) else []
+        libraries = []
+        if isinstance(selected_site, dict):
+            libraries = list(selected_site.get("libraries") or [])
+            site_id = str(selected_site.get("id", "") or "").strip()
+            if not libraries and site_id and self.graph is not None:
+                try:
+                    drives = self.graph.list_site_drives(site_id)
+                    libraries = [
+                        self.graph.normalize_drive(drive)
+                        for drive in drives
+                        if self.graph.is_usable_document_library(drive)
+                    ]
+                    selected_site["libraries"] = libraries
+                except Exception as exc:
+                    log_warn(
+                        "planning_library_selector_site_drives_failed",
+                        error=str(exc)[:500],
+                        site_id_excerpt=site_id[:48],
+                    )
+                    libraries = []
 
         library_selector.blockSignals(True)
         try:

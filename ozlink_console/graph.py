@@ -915,6 +915,28 @@ class GraphClient:
     # -------------------------------------------------------------------------
     # Composite helpers - these are what the UI should use next
     # -------------------------------------------------------------------------
+    def discover_sites_for_planning_workspace(self) -> List[Dict[str, Any]]:
+        """Return sites the user can access. Libraries are loaded lazily per site (see MainWindow)."""
+        log_trace("graph", "discover_sites_for_planning_workspace_start")
+        sites = self.list_sites()
+        results: List[Dict[str, Any]] = []
+        for site in sites:
+            normalized_site = self.normalize_site(site)
+            site_id = normalized_site.get("id", "")
+            if not site_id:
+                continue
+            normalized_site["libraries"] = []
+            normalized_site["site_key"] = normalized_site.get("web_url") or site_id
+            results.append(normalized_site)
+
+        log_trace(
+            "graph",
+            "discover_sites_for_planning_workspace_done",
+            raw_site_count=len(sites),
+            site_row_count=len(results),
+        )
+        return results
+
     def discover_sites_with_libraries(self) -> List[Dict[str, Any]]:
         log_trace("graph", "discover_sites_with_libraries_start")
         sites = self.list_sites()
@@ -940,6 +962,7 @@ class GraphClient:
                 continue
 
             normalized_site["libraries"] = normalized_drives
+            normalized_site.setdefault("site_key", normalized_site.get("web_url") or site_id)
             results.append(normalized_site)
 
         log_trace(
