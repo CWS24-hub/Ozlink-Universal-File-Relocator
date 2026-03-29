@@ -63,7 +63,7 @@ If the library is large and the **source** pane feels sluggish when scrolling or
 
 To go back: turn the option **off** and restart. The setting is stored per Windows user profile (Qt `QSettings`).
 
-**Note:** In faster mode, **Source → Expand All** is not available yet; users expand folders as needed. IT can still force one launch with `OZLINK_SOURCE_QTREEVIEW=1` or `=0` if the environment variable is set.
+**Note:** In faster mode, **Source → Expand All** loads folder branches in the background (up to three concurrent Graph requests) and then expands all rows that are already materialized. Very large libraries may take a while; users can cancel with **Expand All** again (same as classic mode). IT can still force one launch with `OZLINK_SOURCE_QTREEVIEW=1` or `=0` if the environment variable is set.
 
 ## Important assumptions
 

@@ -783,6 +783,7 @@ class MainWindow(QMainWindow):
         self._destination_future_projection_timer.timeout.connect(self._run_destination_future_projection_chunk)
         self._expand_all_pending = {"source": False, "destination": False}
         self._expand_all_queue = {"source": deque(), "destination": deque()}
+        self._expand_all_source_model_queue = deque()
         self._expand_all_seen = {"source": set(), "destination": set()}
         self._expand_all_processed_seen = {"source": set(), "destination": set()}
         self._expand_all_requeue_attempts = {"source": {}, "destination": {}}
@@ -6375,7 +6376,7 @@ class MainWindow(QMainWindow):
         ui_intro = QLabel(
             "If the source library tree feels slow when scrolling or expanding folders, enable the option "
             "below and restart the app. Mapping and normal planning behave the same. "
-            "Source Expand All is not available in this mode yet. If anything feels wrong, turn it off and restart."
+            "Source Expand All loads folders in the background (up to 3 at a time). Very large libraries may take a while."
         )
         ui_intro.setObjectName("CardBody")
         ui_intro.setWordWrap(True)
@@ -8301,6 +8302,7 @@ class MainWindow(QMainWindow):
         self._workspace_restore_expanded_all_intent = {"source": False, "destination": False}
         self._expand_all_pending = {"source": False, "destination": False}
         self._expand_all_queue = {"source": deque(), "destination": deque()}
+        self._expand_all_source_model_queue = deque()
         self._expand_all_seen = {"source": set(), "destination": set()}
         self._expand_all_requeue_attempts = {"source": {}, "destination": {}}
         self._expand_all_deferred_refresh = {"source": False, "destination": False}
@@ -10004,9 +10006,13 @@ class MainWindow(QMainWindow):
         else:
             self._ui_trace("tree", "collapsed", panel_key="source", item=None)
 
-    def _on_source_sharepoint_model_expanded(self, index):
-        node_data = index.data(Qt.UserRole) or {}
+    def _source_model_request_folder_children_load(self, index, *, triggered_by_user_expand: bool) -> str:
+        """Start a Graph folder load for a source model row if needed.
+
+        Returns route name for tracing: ``noop``, ``throttled``, or ``started``.
+        """
         panel_key = "source"
+        node_data = index.data(Qt.UserRole) or {}
         base_label = str(node_data.get("base_display_label", "") or "").strip().lower()
         tree_label = str(node_data.get("tree_label", "") or "").strip().lower()
         text_label = str(node_data.get("base_display_label", "") or "").strip().lower()
@@ -10016,71 +10022,24 @@ class MainWindow(QMainWindow):
             or base_label.startswith("folder:")
             or text_label.startswith("folder:")
         )
-        if self._full_trace_enabled():
-            self._ui_trace("tree", "expand_signal", panel_key=panel_key, item=None)
         if node_data.get("placeholder") or not is_folder_like:
-            if self._full_trace_enabled():
-                self._ui_trace(
-                    "tree",
-                    "expand_route",
-                    panel_key=panel_key,
-                    item=None,
-                    route="skipped_not_folder_or_placeholder",
-                )
-            return
+            return "noop"
         if node_data.get("children_loaded") or node_data.get("load_failed"):
-            if self._full_trace_enabled():
-                self._ui_trace(
-                    "tree",
-                    "expand_route",
-                    panel_key=panel_key,
-                    item=None,
-                    route="skipped_children_already_loaded_or_failed",
-                )
-            return
+            return "noop"
 
         drive_id = self._resolve_tree_item_drive_id(panel_key, node_data)
         item_id = node_data.get("id", "")
         if not drive_id or not item_id:
-            if self._full_trace_enabled():
-                self._ui_trace(
-                    "tree",
-                    "expand_route",
-                    panel_key=panel_key,
-                    item=None,
-                    route="skipped_missing_drive_or_item_id",
-                    drive_id_resolved=bool(drive_id),
-                    item_id_resolved=bool(item_id),
-                )
-            return
+            return "noop"
 
         pending_key = f"{drive_id}:{item_id}"
         if pending_key in self.pending_folder_loads[panel_key]:
-            if self._full_trace_enabled():
-                self._ui_trace(
-                    "tree",
-                    "expand_route",
-                    panel_key=panel_key,
-                    item=None,
-                    route="skipped_folder_worker_already_pending",
-                    pending_key=pending_key,
-                )
-            return
+            return "noop"
 
         pending_count = len(self.pending_folder_loads.get(panel_key, set()))
-        max_inflight_loads = 1
+        max_inflight_loads = 1 if triggered_by_user_expand else 3
         if pending_count >= max_inflight_loads:
-            if self._full_trace_enabled():
-                self._ui_trace(
-                    "tree",
-                    "expand_route",
-                    panel_key=panel_key,
-                    item=None,
-                    route="skipped_folder_worker_throttle",
-                    pending_count=pending_count,
-                    max_inflight_loads=max_inflight_loads,
-                )
-            return
+            return "throttled"
 
         self.pending_folder_loads[panel_key].add(pending_key)
         worker_key = f"{panel_key}:{item_id}"
@@ -10147,6 +10106,15 @@ class MainWindow(QMainWindow):
                 cache_only=use_cache_only,
             )
         worker.start()
+        return "started"
+
+    def _on_source_sharepoint_model_expanded(self, index):
+        panel_key = "source"
+        if self._full_trace_enabled():
+            self._ui_trace("tree", "expand_signal", panel_key=panel_key, item=None)
+        route = self._source_model_request_folder_children_load(index, triggered_by_user_expand=True)
+        if self._full_trace_enabled():
+            self._ui_trace("tree", "expand_route", panel_key=panel_key, item=None, route=route)
 
     def _apply_source_folder_load_model_tail(self, parent_index, items, previous_child_paths, panel_key):
         model = self.source_sharepoint_model
@@ -16656,6 +16624,14 @@ class MainWindow(QMainWindow):
                     self._schedule_snapshot_branch_refresh(panel_key, delay_ms=0)
                 if not (panel_key == "source" and self._expand_all_pending.get("source")):
                     self._schedule_progress_summary_refresh()
+                if panel_key == "source" and self._expand_all_pending.get("source"):
+                    QTimer.singleShot(
+                        0,
+                        lambda: self._safe_invoke(
+                            "source_model_expand_all_continue",
+                            self._source_model_expand_all_tick,
+                        ),
+                    )
                 return
 
             if not self._tree_item_is_alive(item):
@@ -18831,6 +18807,9 @@ class MainWindow(QMainWindow):
         self._expand_all_processed[panel_key] = 0
         if panel_key == "source":
             self._source_expand_all_folder_load_log_counter = 0
+            model_queue = getattr(self, "_expand_all_source_model_queue", None)
+            if model_queue is not None:
+                model_queue.clear()
 
     def _expand_all_progress_text(self, panel_key, prefix):
         processed_map = getattr(self, "_expand_all_processed", {}) or {}
@@ -18981,7 +18960,27 @@ class MainWindow(QMainWindow):
                 return True
         return False
 
+    def _source_model_tree_has_unloaded_folder_nodes(self) -> bool:
+        model = getattr(self, "source_sharepoint_model", None)
+        if model is None:
+            return False
+        for ix in model.iter_depth_first():
+            pl = ix.data(Qt.UserRole) or {}
+            if pl.get("placeholder") or not pl.get("is_folder"):
+                continue
+            if pl.get("load_failed"):
+                continue
+            if pl.get("children_loaded"):
+                continue
+            drive_id = self._resolve_tree_item_drive_id("source", pl)
+            if not drive_id or not pl.get("id"):
+                continue
+            return True
+        return False
+
     def _tree_has_unloaded_folder_nodes(self, panel_key):
+        if panel_key == "source" and self._source_tree_uses_model_view():
+            return self._source_model_tree_has_unloaded_folder_nodes()
         tree = self.source_tree_widget if panel_key == "source" else self.destination_tree_widget
         if tree is None:
             return False
@@ -19045,6 +19044,18 @@ class MainWindow(QMainWindow):
         return True
 
     def _count_expandable_tree_nodes(self, panel_key):
+        if panel_key == "source" and self._source_tree_uses_model_view():
+            model = getattr(self, "source_sharepoint_model", None)
+            if model is None:
+                return 0
+            count = 0
+            for ix in model.iter_depth_first():
+                pl = ix.data(Qt.UserRole) or {}
+                if pl.get("placeholder"):
+                    continue
+                if pl.get("is_folder"):
+                    count += 1
+            return count
         tree = self.source_tree_widget if panel_key == "source" else self.destination_tree_widget
         if tree is None:
             return 0
@@ -19441,17 +19452,232 @@ class MainWindow(QMainWindow):
         self._workspace_ui_snapshot_dirty_panels.discard(panel_key)
         self._persist_workspace_ui_state_safely()
 
+    def _source_model_expand_all_key(self, index):
+        pl = index.data(Qt.UserRole) or {}
+        if pl.get("placeholder") or not pl.get("is_folder"):
+            return None
+        drive_id = self._resolve_tree_item_drive_id("source", pl)
+        item_id = pl.get("id", "")
+        if not drive_id or not item_id:
+            return None
+        return f"{drive_id}:{item_id}"
+
+    def _begin_source_model_expand_all(self):
+        panel_key = "source"
+        tree = self.source_tree_widget
+        model = getattr(self, "source_sharepoint_model", None)
+        if tree is None or model is None:
+            return
+        self._expand_all_pending[panel_key] = True
+        self._reset_expand_all_progress(panel_key)
+        self._expand_all_max_per_tick[panel_key] = 1
+        self._set_expand_all_button_label(panel_key, True)
+        self._update_expand_all_status(panel_key, "Expanding branches...", loading=True)
+        root = QModelIndex()
+        for r in range(model.rowCount(root)):
+            ix = model.index(r, 0, root)
+            pl = ix.data(Qt.UserRole) or {}
+            if pl.get("placeholder") or not pl.get("is_folder"):
+                continue
+            key = self._source_model_expand_all_key(ix)
+            if key:
+                self._expand_all_seen[panel_key].add(key)
+            self._expand_all_source_model_queue.append(QPersistentModelIndex(ix))
+        self._source_model_expand_all_tick()
+
+    def _source_model_expand_all_tick(self):
+        if not self._expand_all_pending.get("source"):
+            return
+        tree = self.source_tree_widget
+        model = getattr(self, "source_sharepoint_model", None)
+        if tree is None or model is None:
+            self._finish_source_model_expand_all()
+            return
+
+        processed = 0
+        max_per_tick = max(1, int((self._expand_all_max_per_tick or {}).get("source", 1)))
+        tick_budget_ms = 24
+        tick_start = time.perf_counter()
+
+        while (
+            self._expand_all_source_model_queue
+            and processed < max_per_tick
+            and ((time.perf_counter() - tick_start) * 1000.0) < tick_budget_ms
+        ):
+            pending_count = len(self.pending_folder_loads.get("source", set()))
+            max_inflight_loads = 3
+            if pending_count >= max_inflight_loads:
+                break
+
+            pmi = self._expand_all_source_model_queue.popleft()
+            if not pmi.isValid():
+                continue
+            index = QModelIndex(pmi)
+            pl = index.data(Qt.UserRole) or {}
+            if pl.get("placeholder") or not pl.get("is_folder"):
+                continue
+
+            tree.expand(index)
+            processed += 1
+            key = self._source_model_expand_all_key(index)
+            if key:
+                panel_ps = self._expand_all_processed_seen["source"]
+                if key not in panel_ps:
+                    panel_ps.add(key)
+                    self._expand_all_processed["source"] += 1
+
+            pl = index.data(Qt.UserRole) or {}
+            if pl.get("children_loaded") or pl.get("load_failed"):
+                for r in range(model.rowCount(index)):
+                    cix = model.index(r, 0, index)
+                    cpl = cix.data(Qt.UserRole) or {}
+                    if cpl.get("placeholder") or not cpl.get("is_folder"):
+                        continue
+                    ck = self._source_model_expand_all_key(cix)
+                    if ck:
+                        self._expand_all_seen["source"].add(ck)
+                    self._expand_all_source_model_queue.append(QPersistentModelIndex(cix))
+                continue
+
+            route = self._source_model_request_folder_children_load(index, triggered_by_user_expand=False)
+            if route == "throttled":
+                self._expand_all_source_model_queue.appendleft(pmi)
+                break
+            if route == "started":
+                self._expand_all_source_model_queue.append(QPersistentModelIndex(index))
+                break
+
+            pl2 = index.data(Qt.UserRole) or {}
+            if pl2.get("children_loaded") or pl2.get("load_failed"):
+                for r in range(model.rowCount(index)):
+                    cix = model.index(r, 0, index)
+                    cpl = cix.data(Qt.UserRole) or {}
+                    if cpl.get("placeholder") or not cpl.get("is_folder"):
+                        continue
+                    ck = self._source_model_expand_all_key(cix)
+                    if ck:
+                        self._expand_all_seen["source"].add(ck)
+                    self._expand_all_source_model_queue.append(QPersistentModelIndex(cix))
+                continue
+
+            drive_id = self._resolve_tree_item_drive_id("source", pl2)
+            item_id = pl2.get("id", "")
+            pending_key = f"{drive_id}:{item_id}" if drive_id and item_id else ""
+            if pending_key and pending_key in self.pending_folder_loads.get("source", set()):
+                self._expand_all_source_model_queue.append(QPersistentModelIndex(index))
+                break
+
+        if self._expand_all_source_model_queue or self.pending_folder_loads.get("source"):
+            self._update_expand_all_status("source", "Expanding branches...", loading=True)
+            QTimer.singleShot(
+                20,
+                lambda: self._safe_invoke(
+                    "source_model_expand_all_tick",
+                    self._source_model_expand_all_tick,
+                ),
+            )
+            return
+
+        if self._source_model_tree_has_unloaded_folder_nodes():
+            self._update_expand_all_status("source", "Expanding branches...", loading=True)
+            QTimer.singleShot(
+                50,
+                lambda: self._safe_invoke(
+                    "source_model_expand_all_reconcile",
+                    self._source_model_expand_all_tick,
+                ),
+            )
+            return
+
+        self._finish_source_model_expand_all()
+
+    def _finish_source_model_expand_all(self):
+        panel_key = "source"
+        tree = self.source_tree_widget
+        if tree is not None:
+            tree.setUpdatesEnabled(False)
+            tree.blockSignals(True)
+            try:
+                tree.expandAll()
+            finally:
+                tree.blockSignals(False)
+                tree.setUpdatesEnabled(True)
+                tree.viewport().update()
+        log_info(
+            "expand_all_source_model_complete",
+            folder_count=self._count_expandable_tree_nodes(panel_key),
+        )
+        self._expand_all_pending[panel_key] = False
+        self._reset_expand_all_progress(panel_key)
+        self._expand_all_deferred_refresh[panel_key] = True
+        pending_selected_path = str(self._pending_workspace_post_expand_selection.get(panel_key, "") or "")
+        if pending_selected_path:
+            self._restore_selected_tree_path(panel_key, pending_selected_path)
+            self._pending_workspace_post_expand_selection[panel_key] = ""
+        if self._expand_all_deferred_refresh.get(panel_key):
+            self._expand_all_deferred_refresh[panel_key] = False
+            self._refresh_source_projection("source_projection_expand_all_complete")
+            if self._source_column_refresh_pending:
+                self._source_column_refresh_pending = False
+                self._refresh_tree_column_width("source")
+            if (
+                getattr(self, "destination_tree_widget", None) is not None
+                and self.planned_moves
+                and not getattr(self, "_sharepoint_lazy_mode", False)
+            ):
+                self._schedule_deferred_destination_materialization("source_expand_all_complete", delay_ms=120)
+        if self._source_restore_materialization_queue:
+            self._schedule_source_restore_materialization_queue(
+                "source_expand_all_complete",
+                delay_ms=0,
+            )
+        if self._pending_snapshot_branch_refresh.get("source"):
+            self._schedule_snapshot_branch_refresh("source", delay_ms=0)
+        if self._source_projection_refresh_paths:
+            phase_name, trigger_path = self._source_projection_refresh_context
+            self._schedule_source_projection_refresh_for_paths(
+                set(self._source_projection_refresh_paths),
+                phase_name,
+                trigger_path,
+                delay_ms=0,
+            )
+        elif self._source_projection_refresh_context:
+            phase_name, trigger_path = self._source_projection_refresh_context
+            self._schedule_source_projection_refresh(
+                phase_name,
+                trigger_path,
+                delay_ms=0,
+            )
+        self._try_flush_destination_future_model_after_source_restore("source_expand_all_complete")
+        intent_map = getattr(self, "_workspace_restore_expanded_all_intent", None)
+        if isinstance(intent_map, dict):
+            intent_map[panel_key] = False
+        self._sync_expand_all_button_from_tree(panel_key, fallback_expanded=True)
+        self._update_expand_all_status(panel_key, "All loaded branches expanded.", loading=False)
+        self._refresh_runtime_tree_snapshot(panel_key)
+        self._workspace_ui_snapshot_dirty_panels.discard(panel_key)
+        self._schedule_progress_summary_refresh()
+        self._persist_workspace_ui_state_safely()
+
     def handle_expand_all(self, panel_key):
         tree = self.source_tree_widget if panel_key == "source" else self.destination_tree_widget
         if tree is None:
             return
         if panel_key == "source" and self._source_tree_uses_model_view():
-            self._set_tree_status_message(
-                panel_key,
-                "Expand All is not available while the faster source tree is on. "
-                "Turn it off under Settings, restart the app, or clear OZLINK_SOURCE_QTREEVIEW if your PC sets it.",
-                loading=False,
-            )
+            if self._expand_all_pending.get("source"):
+                self._collapse_loaded_branches_for_panel(
+                    "source",
+                    status_message="Expand cancelled; branches collapsed.",
+                )
+                return
+            expand_button = self._expand_all_button_for_panel("source")
+            if expand_button is not None and expand_button.text() == "Collapse All":
+                self._collapse_loaded_branches_for_panel("source", status_message="Loaded branches collapsed.")
+                return
+            if self._can_fast_bulk_expand("source"):
+                self._fast_expand_all_loaded_tree("source")
+                return
+            self._begin_source_model_expand_all()
             return
         if self._expand_all_pending.get(panel_key):
             self._collapse_loaded_branches_for_panel(
