@@ -29,6 +29,7 @@ class TransferStep:
     source_item_id: str = ""
     destination_drive_id: str = ""
     destination_item_id: str = ""
+    step_uid: str = ""
 
     def to_json_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -44,6 +45,8 @@ class ProposedFolderStep:
     destination_path: str
     parent_path: str
     status: str
+    destination_drive_id: str = ""
+    destination_parent_item_id: str = ""
 
     def to_json_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -61,6 +64,7 @@ class SimulationManifest:
     transfer_steps: list[dict[str, Any]] = field(default_factory=list)
     proposed_folder_steps: list[dict[str, Any]] = field(default_factory=list)
     notes: str = ""
+    execution_options: dict[str, Any] = field(default_factory=dict)
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
@@ -72,6 +76,7 @@ class SimulationManifest:
             "transfer_steps": list(self.transfer_steps),
             "proposed_folder_steps": list(self.proposed_folder_steps),
             "notes": self.notes,
+            "execution_options": dict(self.execution_options),
         }
 
 
@@ -82,21 +87,35 @@ def _utc_now_iso() -> str:
 def _planned_move_to_step(index: int, move: dict[str, Any]) -> TransferStep:
     src = move.get("source") or {}
     dest = move.get("destination") or {}
+    # Transfer runner addresses a copy step by destination parent + destination leaf.
+    # For per-file moves, leaf must be the move target (usually filename), not the
+    # selected destination folder name.
+    destination_leaf = str(
+        move.get("target_name", "")
+        or move.get("destination_name", "")
+        or move.get("source_name", "")
+        or dest.get("name", "")
+        or src.get("name", "")
+        or ""
+    )
+    request_id = str(move.get("request_id", "") or "").strip()
+    step_uid = f"{request_id or 'NOREQ'}::{index}"
     return TransferStep(
         index=index,
         operation="copy",
         source_path=str(move.get("source_path", "") or ""),
         destination_path=str(move.get("destination_path", "") or ""),
         source_name=str(move.get("source_name", "") or src.get("name", "") or ""),
-        destination_name=str(move.get("destination_name", "") or dest.get("name", "") or ""),
+        destination_name=destination_leaf,
         is_source_folder=bool(src.get("is_folder", False)),
-        request_id=str(move.get("request_id", "") or ""),
+        request_id=request_id,
         status=str(move.get("status", "") or "Draft"),
         allocation_method=str(move.get("allocation_method", "") or ""),
         source_drive_id=str(src.get("drive_id", "") or move.get("source_drive_id", "") or ""),
         source_item_id=str(src.get("id", "") or move.get("source_id", "") or ""),
         destination_drive_id=str(dest.get("drive_id", "") or move.get("destination_drive_id", "") or ""),
         destination_item_id=str(dest.get("id", "") or move.get("destination_id", "") or ""),
+        step_uid=step_uid,
     )
 
 
@@ -108,6 +127,8 @@ def _proposed_to_step(index: int, pf: ProposedFolder) -> ProposedFolderStep:
         destination_path=str(pf.DestinationPath or ""),
         parent_path=str(pf.ParentPath or ""),
         status=str(pf.Status or "Proposed"),
+        destination_drive_id=str(getattr(pf, "DestinationDriveId", "") or ""),
+        destination_parent_item_id=str(getattr(pf, "DestinationParentItemId", "") or ""),
     )
 
 
@@ -118,6 +139,7 @@ def build_simulation_manifest(
     draft_id: str = "",
     tenant_hint: str = "",
     notes: str = "",
+    manifest_version: int = 1,
 ) -> dict[str, Any]:
     """Return a JSON-serialisable manifest dict (simulation / handoff only)."""
     steps = [_planned_move_to_step(i, m).to_json_dict() for i, m in enumerate(planned_moves or [])]
@@ -125,7 +147,7 @@ def build_simulation_manifest(
         _proposed_to_step(i, pf).to_json_dict() for i, pf in enumerate(proposed_folders or [])
     ]
     doc = SimulationManifest(
-        manifest_version=1,
+        manifest_version=int(manifest_version or 1),
         kind="simulation",
         generated_at_utc=_utc_now_iso(),
         draft_id=str(draft_id or ""),
@@ -133,6 +155,10 @@ def build_simulation_manifest(
         transfer_steps=steps,
         proposed_folder_steps=proposed,
         notes=str(notes or ""),
+        execution_options={
+            "governance_schema": "ozlink/v1",
+            "verify_integrity": True,
+        },
     )
     return doc.to_json_dict()
 
@@ -143,3 +169,32 @@ def write_manifest_json(path: str | Path, manifest: dict[str, Any]) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     text = json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"
     p.write_text(text, encoding="utf-8")
+
+
+def upconvert_manifest_v1_to_v2(manifest: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """
+    Return (manifest_copy, changed) with v2-compatible transfer step uids.
+
+    - Leaves unknown fields untouched.
+    - Adds `step_uid` to transfer rows when missing.
+    - Updates `manifest_version` to 2 when source is v1.
+    """
+    if not isinstance(manifest, dict):
+        return (manifest, False)
+    out = json.loads(json.dumps(manifest))
+    changed = False
+    version = int(out.get("manifest_version", 1) or 1)
+    transfer_steps = list(out.get("transfer_steps") or [])
+    for i, step in enumerate(transfer_steps):
+        if not isinstance(step, dict):
+            continue
+        if str(step.get("step_uid", "") or "").strip():
+            continue
+        req = str(step.get("request_id", "") or "").strip() or "NOREQ"
+        idx = int(step.get("index", i))
+        step["step_uid"] = f"{req}::{idx}"
+        changed = True
+    if version <= 1:
+        out["manifest_version"] = 2
+        changed = True
+    return (out, changed)

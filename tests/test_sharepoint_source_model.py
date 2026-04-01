@@ -18,7 +18,7 @@ class SharePointSourceTreeModelTests(unittest.TestCase):
         m = SharePointSourceTreeModel()
         m.reset_root_payloads(
             [
-                {"id": "r1", "name": "Root", "is_folder": True, "drive_id": "d1", "tree_role": "source", "base_display_label": "Folder: Root"},
+                {"id": "r1", "name": "Root", "is_folder": True, "drive_id": "d1", "tree_role": "source", "base_display_label": "Root"},
             ]
         )
         ix = m.find_index_by_drive_item("d1", "r1")
@@ -36,7 +36,7 @@ class SharePointSourceTreeModelTests(unittest.TestCase):
                     "is_folder": True,
                     "drive_id": "d",
                     "tree_role": "source",
-                    "base_display_label": "Folder: P",
+                    "base_display_label": "P",
                 },
             ]
         )
@@ -50,7 +50,7 @@ class SharePointSourceTreeModelTests(unittest.TestCase):
                     "is_folder": False,
                     "drive_id": "d",
                     "tree_role": "source",
-                    "base_display_label": "File: C",
+                    "base_display_label": "C",
                 },
             ],
         )

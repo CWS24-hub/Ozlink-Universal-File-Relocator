@@ -14,6 +14,10 @@ class AllocationRow:
     RequestedBy: str
     RequestedDate: str
     Status: str = "Pending"
+    SourceDriveId: str = ""
+    SourceItemId: str = ""
+    DestinationDriveId: str = ""
+    DestinationParentItemId: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AllocationRow":
@@ -27,6 +31,10 @@ class AllocationRow:
             RequestedBy=str(data.get("RequestedBy", "")),
             RequestedDate=str(data.get("RequestedDate", "")),
             Status=str(data.get("Status", "Pending")),
+            SourceDriveId=str(data.get("SourceDriveId", "")),
+            SourceItemId=str(data.get("SourceItemId", "")),
+            DestinationDriveId=str(data.get("DestinationDriveId", "")),
+            DestinationParentItemId=str(data.get("DestinationParentItemId", "")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -41,6 +49,8 @@ class ProposedFolder:
     FolderName: str
     DestinationPath: str
     DestinationId: str = ""
+    DestinationDriveId: str = ""
+    DestinationParentItemId: str = ""
     ParentPath: str = ""
     IsSelectable: bool = True
     IsProposed: bool = True
@@ -54,6 +64,8 @@ class ProposedFolder:
             DestinationId=str(data.get("DestinationId", "")),
             FolderName=str(data.get("FolderName", "")),
             DestinationPath=str(data.get("DestinationPath", "")),
+            DestinationDriveId=str(data.get("DestinationDriveId", "")),
+            DestinationParentItemId=str(data.get("DestinationParentItemId", "")),
             ParentPath=str(data.get("ParentPath", "")),
             IsSelectable=bool(data.get("IsSelectable", True)),
             IsProposed=bool(data.get("IsProposed", True)),

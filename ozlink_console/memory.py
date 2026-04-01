@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .logger import log_info, log_trace, log_warn
+from .version_info import APP_VERSION
 from .models import AllocationRow, ProposedFolder, SessionState, MemoryManifest
 from .paths import (
     memory_root,
@@ -173,7 +174,10 @@ class MemoryManager:
     def _latest_backup_file(self, backup_root: Path, prefixes: tuple[str, ...], *, require_populated: bool = False) -> Path | None:
         candidates: list[Path] = []
         for prefix in prefixes:
-            candidates.extend(sorted(backup_root.glob(f"{prefix}_*.json"), key=lambda item: item.stat().st_mtime, reverse=True))
+            candidates.extend(backup_root.glob(f"{prefix}_*.json"))
+        # Backup file names are timestamped (`<prefix>_YYYYMMDD-HHMMSS-fff.json`), so name sort
+        # is enough and avoids thousands of expensive stat() calls on slow/cloud-backed folders.
+        candidates.sort(key=lambda item: item.name, reverse=True)
 
         for path in candidates:
             if not require_populated:
@@ -267,6 +271,22 @@ class MemoryManager:
                 backup_allocations,
                 backup_proposed,
             ))
+
+        # Startup fast-path: if active Python-scope memory already has a populated candidate,
+        # skip global/legacy scans. Those scans are only needed for migration/fallback and can
+        # be very slow on large OneDrive-backed backup folders.
+        has_local_populated = any(
+            bool(c.get("populated")) and str(c.get("name", "")).startswith("python_live_")
+            for c in candidates
+        )
+        if has_local_populated:
+            log_trace(
+                "memory",
+                "discover_restore_candidates_fast_path",
+                candidate_count=len(candidates),
+                candidate_names=[str(c.get("name", "")) for c in candidates],
+            )
+            return candidates
 
         global_root = memory_root()
         if self.root != global_root:
@@ -801,6 +821,7 @@ class MemoryManager:
             "CreatedOn": datetime.now().isoformat(timespec="seconds"),
             "LastUpdatedOn": datetime.now().isoformat(timespec="seconds"),
             "Version": "Python-PySide6-v1",
+            "AppVersion": APP_VERSION,
         }
         from .paths import requests_root
         out = requests_root() / f"{request_id}.json"

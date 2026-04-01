@@ -20,7 +20,7 @@ class TransferJobRunnerTests(unittest.TestCase):
         self.assertFalse(is_absolute_local_path(""))
 
     def test_validate_manifest_version(self):
-        errs = validate_manifest({"manifest_version": 2, "transfer_steps": []})
+        errs = validate_manifest({"manifest_version": 3, "transfer_steps": []})
         self.assertTrue(any("Unsupported" in e for e in errs))
 
     def test_validate_manifest_ok(self):
@@ -58,6 +58,70 @@ class TransferJobRunnerTests(unittest.TestCase):
             }
             r = run_manifest_local_filesystem(manifest, dry_run=True)
             self.assertTrue(any(x.status == "dry_run" for x in r.records))
+
+    def test_pilot_filter_by_step_index(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            src = td / "a.txt"
+            src.write_text("x", encoding="utf-8")
+            dst = td / "b.txt"
+            manifest = {
+                "manifest_version": 1,
+                "kind": "simulation",
+                "transfer_steps": [
+                    {
+                        "index": 0,
+                        "operation": "copy",
+                        "source_path": str(src),
+                        "destination_path": str(dst),
+                        "source_name": "a.txt",
+                        "destination_name": "b.txt",
+                        "is_source_folder": False,
+                        "request_id": "",
+                        "status": "Draft",
+                        "allocation_method": "",
+                        "step_uid": "REQ::0",
+                    }
+                ],
+                "proposed_folder_steps": [],
+                "execution_options": {"pilot_transfer_step_indices": [999]},
+            }
+            r = run_manifest_local_filesystem(manifest, dry_run=False)
+            self.assertTrue(any("pilot_transfer_step_indices filter" in x.detail for x in r.records))
+
+    def test_pilot_filter_by_step_uid(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            src = td / "a.txt"
+            src.write_text("x", encoding="utf-8")
+            dst = td / "b.txt"
+            manifest = {
+                "manifest_version": 1,
+                "kind": "simulation",
+                "transfer_steps": [
+                    {
+                        "index": 0,
+                        "operation": "copy",
+                        "source_path": str(src),
+                        "destination_path": str(dst),
+                        "source_name": "a.txt",
+                        "destination_name": "b.txt",
+                        "is_source_folder": False,
+                        "request_id": "",
+                        "status": "Draft",
+                        "allocation_method": "",
+                        "step_uid": "REQ::0",
+                    }
+                ],
+                "proposed_folder_steps": [],
+                "execution_options": {"pilot_transfer_step_uids": ["REQ::1"]},
+            }
+            r = run_manifest_local_filesystem(manifest, dry_run=False)
+            self.assertTrue(any("pilot_transfer_step_uids filter" in x.detail for x in r.records))
             self.assertFalse(dst.exists())
 
     def test_run_copy_file_execute(self):
@@ -92,6 +156,47 @@ class TransferJobRunnerTests(unittest.TestCase):
             self.assertEqual(dst.read_text(encoding="utf-8"), "hello")
             self.assertTrue(logf.is_file())
             self.assertEqual(sum(1 for x in r.records if x.status == "ok"), 1)
+            tr = [x for x in r.records if x.phase == "transfer"][0]
+            self.assertTrue(tr.integrity_verified)
+            self.assertEqual(len(tr.source_sha256), 64)
+            self.assertEqual(tr.source_sha256, tr.dest_sha256)
+            self.assertTrue(r.job_id)
+            audit = logf.with_suffix(".audit.jsonl")
+            self.assertTrue(audit.is_file())
+            rep = logf.parent / f"{logf.stem}_report.json"
+            self.assertTrue(rep.is_file())
+
+    def test_run_copy_file_execute_without_integrity_check(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            src = td / "a.txt"
+            src.write_text("hello", encoding="utf-8")
+            dst = td / "out" / "b.txt"
+            manifest = {
+                "manifest_version": 1,
+                "execution_options": {"verify_integrity": False},
+                "transfer_steps": [
+                    {
+                        "index": 0,
+                        "operation": "copy",
+                        "source_path": str(src),
+                        "destination_path": str(dst),
+                        "source_name": "a.txt",
+                        "destination_name": "b.txt",
+                        "is_source_folder": False,
+                        "request_id": "",
+                        "status": "Draft",
+                        "allocation_method": "",
+                    }
+                ],
+                "proposed_folder_steps": [],
+            }
+            r = run_manifest_local_filesystem(manifest, dry_run=False)
+            self.assertTrue(dst.is_file())
+            tr = [x for x in r.records if x.phase == "transfer"][0]
+            self.assertIsNone(tr.integrity_verified)
 
     def test_skip_sharepoint_style_paths(self):
         manifest = {
@@ -113,9 +218,9 @@ class TransferJobRunnerTests(unittest.TestCase):
             "proposed_folder_steps": [],
         }
         r = run_manifest_local_filesystem(manifest, dry_run=False)
-        self.assertTrue(any("not a local absolute path" in x.detail for x in r.records))
+        self.assertTrue(any("SharePoint-style paths" in x.detail or "Graph ids" in x.detail for x in r.records))
 
-    def test_graph_ids_skip(self):
+    def test_graph_ids_skip_without_signed_in_client(self):
         manifest = {
             "manifest_version": 1,
             "transfer_steps": [
@@ -133,13 +238,322 @@ class TransferJobRunnerTests(unittest.TestCase):
                     "source_drive_id": "d1",
                     "source_item_id": "i1",
                     "destination_drive_id": "d2",
-                    "destination_item_id": "",
+                    "destination_item_id": "parent-folder-id",
                 }
             ],
             "proposed_folder_steps": [],
         }
-        r = run_manifest_local_filesystem(manifest, dry_run=False)
-        self.assertTrue(any("Graph" in x.detail for x in r.records))
+        r = run_manifest_local_filesystem(manifest, dry_run=False, graph_client=None)
+        self.assertTrue(
+            any("sign-in" in x.detail.lower() or "graph client" in x.detail.lower() for x in r.records)
+        )
+
+    def test_pilot_max_graph_operations_caps_live_graph_steps(self):
+        from unittest.mock import MagicMock
+
+        mock_g = MagicMock()
+        mock_g.start_drive_item_copy.return_value = "https://monitor"
+        mock_g.wait_graph_async_operation.return_value = None
+        mock_g.create_child_folder.return_value = None
+
+        manifest = {
+            "manifest_version": 1,
+            "execution_options": {"pilot_max_graph_operations": 2},
+            "proposed_folder_steps": [
+                {
+                    "index": 0,
+                    "operation": "ensure_folder",
+                    "folder_name": "A",
+                    "destination_path": "Site / Lib / A",
+                    "destination_drive_id": "d1",
+                    "destination_parent_item_id": "p1",
+                },
+                {
+                    "index": 1,
+                    "operation": "ensure_folder",
+                    "folder_name": "B",
+                    "destination_path": "Site / Lib / B",
+                    "destination_drive_id": "d1",
+                    "destination_parent_item_id": "p1",
+                },
+            ],
+            "transfer_steps": [
+                {
+                    "index": 0,
+                    "operation": "copy",
+                    "source_path": "Lib\\a",
+                    "destination_path": "Root\\b",
+                    "source_name": "a",
+                    "destination_name": "b",
+                    "is_source_folder": False,
+                    "request_id": "",
+                    "status": "Draft",
+                    "allocation_method": "",
+                    "source_drive_id": "d1",
+                    "source_item_id": "i1",
+                    "destination_drive_id": "d2",
+                    "destination_item_id": "parent1",
+                },
+                {
+                    "index": 1,
+                    "operation": "copy",
+                    "source_path": "Lib\\c",
+                    "destination_path": "Root\\d",
+                    "source_name": "c",
+                    "destination_name": "d",
+                    "is_source_folder": False,
+                    "request_id": "",
+                    "status": "Draft",
+                    "allocation_method": "",
+                    "source_drive_id": "d1",
+                    "source_item_id": "i2",
+                    "destination_drive_id": "d2",
+                    "destination_item_id": "parent2",
+                },
+            ],
+        }
+        r = run_manifest_local_filesystem(manifest, dry_run=False, graph_client=mock_g)
+        self.assertEqual(mock_g.create_child_folder.call_count, 2)
+        self.assertEqual(mock_g.start_drive_item_copy.call_count, 0)
+        skipped = [x for x in r.records if x.status == "skipped" and "pilot_max" in x.detail]
+        self.assertEqual(len(skipped), 2)
+
+    def test_pilot_max_spans_proposed_then_transfer(self):
+        from unittest.mock import MagicMock
+
+        mock_g = MagicMock()
+        mock_g.start_drive_item_copy.return_value = "https://monitor"
+        mock_g.wait_graph_async_operation.return_value = None
+        mock_g.create_child_folder.return_value = None
+
+        manifest = {
+            "manifest_version": 1,
+            "execution_options": {"pilot_max_graph_operations": 2},
+            "proposed_folder_steps": [
+                {
+                    "index": 0,
+                    "operation": "ensure_folder",
+                    "folder_name": "A",
+                    "destination_path": "Site / Lib / A",
+                    "destination_drive_id": "d1",
+                    "destination_parent_item_id": "p1",
+                },
+            ],
+            "transfer_steps": [
+                {
+                    "index": 0,
+                    "operation": "copy",
+                    "source_path": "Lib\\a",
+                    "destination_path": "Root\\b",
+                    "source_name": "a",
+                    "destination_name": "b",
+                    "is_source_folder": False,
+                    "request_id": "",
+                    "status": "Draft",
+                    "allocation_method": "",
+                    "source_drive_id": "d1",
+                    "source_item_id": "i1",
+                    "destination_drive_id": "d2",
+                    "destination_item_id": "parent1",
+                },
+                {
+                    "index": 1,
+                    "operation": "copy",
+                    "source_path": "Lib\\c",
+                    "destination_path": "Root\\d",
+                    "source_name": "c",
+                    "destination_name": "d",
+                    "is_source_folder": False,
+                    "request_id": "",
+                    "status": "Draft",
+                    "allocation_method": "",
+                    "source_drive_id": "d1",
+                    "source_item_id": "i2",
+                    "destination_drive_id": "d2",
+                    "destination_item_id": "parent2",
+                },
+            ],
+        }
+        r = run_manifest_local_filesystem(manifest, dry_run=False, graph_client=mock_g)
+        self.assertEqual(mock_g.create_child_folder.call_count, 1)
+        self.assertEqual(mock_g.start_drive_item_copy.call_count, 1)
+        skipped = [x for x in r.records if x.status == "skipped" and "pilot_max" in x.detail]
+        self.assertEqual(len(skipped), 1)
+
+    def test_pilot_limit_ignored_for_dry_run(self):
+        from unittest.mock import MagicMock
+
+        mock_g = MagicMock()
+        manifest = {
+            "manifest_version": 1,
+            "execution_options": {"pilot_max_graph_operations": 1},
+            "proposed_folder_steps": [
+                {
+                    "index": 0,
+                    "operation": "ensure_folder",
+                    "folder_name": "A",
+                    "destination_path": "Site / Lib / A",
+                    "destination_drive_id": "d1",
+                    "destination_parent_item_id": "p1",
+                },
+            ],
+            "transfer_steps": [],
+        }
+        r = run_manifest_local_filesystem(manifest, dry_run=True, graph_client=mock_g)
+        mock_g.create_child_folder.assert_not_called()
+        self.assertTrue(any(x.status == "dry_run" for x in r.records))
+
+    def test_pilot_caps_even_when_graph_copy_fails(self):
+        from unittest.mock import MagicMock
+
+        mock_g = MagicMock()
+        mock_g.start_drive_item_copy.side_effect = Exception("boom")
+        mock_g.wait_graph_async_operation.return_value = None
+        mock_g.create_child_folder.return_value = None
+
+        manifest = {
+            "manifest_version": 1,
+            "execution_options": {"pilot_max_graph_operations": 1},
+            "proposed_folder_steps": [],
+            "transfer_steps": [
+                {
+                    "index": 0,
+                    "operation": "copy",
+                    "source_path": "Lib\\a",
+                    "destination_path": "Root\\b",
+                    "source_name": "a",
+                    "destination_name": "b",
+                    "is_source_folder": False,
+                    "request_id": "",
+                    "status": "Draft",
+                    "allocation_method": "",
+                    "source_drive_id": "d1",
+                    "source_item_id": "i1",
+                    "destination_drive_id": "d2",
+                    "destination_item_id": "parent1",
+                },
+                {
+                    "index": 1,
+                    "operation": "copy",
+                    "source_path": "Lib\\c",
+                    "destination_path": "Root\\d",
+                    "source_name": "c",
+                    "destination_name": "d",
+                    "is_source_folder": False,
+                    "request_id": "",
+                    "status": "Draft",
+                    "allocation_method": "",
+                    "source_drive_id": "d1",
+                    "source_item_id": "i2",
+                    "destination_drive_id": "d2",
+                    "destination_item_id": "parent2",
+                },
+            ],
+        }
+
+        r = run_manifest_local_filesystem(manifest, dry_run=False, graph_client=mock_g)
+        self.assertEqual(mock_g.start_drive_item_copy.call_count, 1)
+
+        failed = [x for x in r.records if x.phase == "transfer" and x.status == "failed"]
+        self.assertEqual(len(failed), 1)
+
+        skipped = [x for x in r.records if x.phase == "transfer" and x.status == "skipped"]
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("pilot_max_graph_operations reached", skipped[0].detail)
+
+    def test_pilot_proposed_folder_name_filter(self):
+        from unittest.mock import MagicMock
+
+        mock_g = MagicMock()
+        mock_g.start_drive_item_copy.return_value = "https://monitor"
+        mock_g.wait_graph_async_operation.return_value = None
+        mock_g.create_child_folder.return_value = None
+
+        manifest = {
+            "manifest_version": 1,
+            "execution_options": {"pilot_max_graph_operations": 2, "pilot_proposed_folder_name": "Active Clients"},
+            "proposed_folder_steps": [
+                {
+                    "index": 0,
+                    "operation": "ensure_folder",
+                    "folder_name": "Employee Resumes",
+                    "destination_path": "Site / Lib / Employee Resumes",
+                    "destination_drive_id": "d1",
+                    "destination_parent_item_id": "p1",
+                },
+                {
+                    "index": 1,
+                    "operation": "ensure_folder",
+                    "folder_name": "Active Clients",
+                    "destination_path": "Site / Lib / Active Clients",
+                    "destination_drive_id": "d1",
+                    "destination_parent_item_id": "p1",
+                },
+                {
+                    "index": 2,
+                    "operation": "ensure_folder",
+                    "folder_name": "Stationery",
+                    "destination_path": "Site / Lib / Stationery",
+                    "destination_drive_id": "d1",
+                    "destination_parent_item_id": "p1",
+                },
+            ],
+            "transfer_steps": [
+                {
+                    "index": 0,
+                    "operation": "copy",
+                    "source_path": "Lib\\a",
+                    "destination_path": "Root\\b",
+                    "source_name": "a",
+                    "destination_name": "b",
+                    "is_source_folder": False,
+                    "request_id": "",
+                    "status": "Draft",
+                    "allocation_method": "",
+                    "source_drive_id": "d1",
+                    "source_item_id": "i1",
+                    "destination_drive_id": "d2",
+                    "destination_item_id": "parent1",
+                }
+            ],
+        }
+
+        r = run_manifest_local_filesystem(manifest, dry_run=False, graph_client=mock_g)
+        self.assertEqual(mock_g.create_child_folder.call_count, 1)
+        self.assertEqual(mock_g.create_child_folder.call_args[0][2], "Active Clients")
+        self.assertEqual(mock_g.start_drive_item_copy.call_count, 1)
+        self.assertTrue(any(x.status == "skipped" for x in r.records if x.phase == "proposed_folder"))
+
+    def test_graph_copy_dry_run_does_not_call_graph(self):
+        from unittest.mock import MagicMock
+
+        manifest = {
+            "manifest_version": 1,
+            "transfer_steps": [
+                {
+                    "index": 0,
+                    "operation": "copy",
+                    "source_path": "Lib\\a",
+                    "destination_path": "Root\\b",
+                    "source_name": "a",
+                    "destination_name": "b.txt",
+                    "is_source_folder": False,
+                    "request_id": "",
+                    "status": "Draft",
+                    "allocation_method": "",
+                    "source_drive_id": "d1",
+                    "source_item_id": "i1",
+                    "destination_drive_id": "d2",
+                    "destination_item_id": "parent1",
+                }
+            ],
+            "proposed_folder_steps": [],
+        }
+        mock_g = MagicMock()
+        r = run_manifest_local_filesystem(manifest, dry_run=True, graph_client=mock_g)
+        mock_g.start_drive_item_copy.assert_not_called()
+        tr = [x for x in r.records if x.phase == "transfer"][0]
+        self.assertEqual(tr.status, "dry_run")
 
     def test_summary_counts(self):
         m = {
@@ -160,6 +574,29 @@ class TransferJobRunnerTests(unittest.TestCase):
         s = manifest_execution_summary(m)
         self.assertEqual(s["local_filesystem_transfer"], 1)
         self.assertEqual(s["local_mkdir"], 1)
+        self.assertEqual(s.get("graph_folder_create", 0), 0)
+
+    def test_summary_counts_graph_proposed_folder(self):
+        m = {
+            "manifest_version": 1,
+            "transfer_steps": [],
+            "proposed_folder_steps": [
+                {
+                    "index": 0,
+                    "operation": "ensure_folder",
+                    "folder_name": "New",
+                    "destination_path": "Site / Lib / A / New",
+                    "parent_path": "",
+                    "status": "Proposed",
+                    "destination_drive_id": "drive-1",
+                    "destination_parent_item_id": "parent-1",
+                }
+            ],
+        }
+        s = manifest_execution_summary(m)
+        self.assertEqual(s["graph_folder_create"], 1)
+        self.assertEqual(s["local_mkdir"], 0)
+        self.assertEqual(s["proposed_skipped_non_local"], 0)
 
     def test_round_trip_load_json(self):
         import tempfile

@@ -1,8 +1,17 @@
 from __future__ import annotations
 
+"""JSON line logs under ``logs_root()``.
+
+SharePoint Graph sync uses structured ``message`` keys such as ``graph_resolve_*`` and
+``graph_refresh_*`` (fields: ``phase``, ``reason``, ``move_index``, ``candidates_tried``, etc.).
+Set environment variable ``OZLINK_FULL_TRACE=1`` for per-candidate path-miss traces during
+resolution (can be large).
+"""
+
 import json
 import logging
 import os
+
 from datetime import datetime
 from pathlib import Path
 from .paths import logs_root

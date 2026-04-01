@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import time
 import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -32,6 +33,7 @@ AUTH_CONFIG = {
         "User.Read",
         "Sites.Read.All",
         "Files.Read.All",
+        "Files.ReadWrite.All",
         "Group.Read.All",
         "Directory.Read.All",
     ],
@@ -120,10 +122,13 @@ class GraphClient:
             "message": message,
         }
 
-    def open_device_login_page(self) -> None:
+    def open_device_login_page(self) -> bool:
         if not self.device_flow:
             raise RuntimeError("Device flow has not been initialized.")
-        webbrowser.open(self.device_flow["verification_uri"])
+        uri = self.device_flow.get("verification_uri")
+        if not uri:
+            return False
+        return bool(webbrowser.open(uri))
 
     def acquire_token(self) -> Dict[str, Any]:
         if not self.device_flow:
@@ -729,6 +734,31 @@ class GraphClient:
     def get_drive_item(self, drive_id: str, item_id: str) -> Dict[str, Any]:
         return self.get(f"{AUTH_CONFIG['graph_base']}/drives/{drive_id}/items/{item_id}")
 
+    def get_drive_item_optional(self, drive_id: str, item_id: str) -> Optional[Dict[str, Any]]:
+        """Same as ``get_drive_item`` but returns None on 404 (deleted, wrong drive, or moved beyond this drive)."""
+        drive_id = str(drive_id or "").strip()
+        item_id = str(item_id or "").strip()
+        if not drive_id or not item_id:
+            return None
+        try:
+            return self.get_drive_item(drive_id, item_id)
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                return None
+            raise
+
+    def get_drive_root_item(self, drive_id: str) -> Optional[Dict[str, Any]]:
+        """Return the library root driveItem (used as parent when paths start at first-level folder)."""
+        drive_id = str(drive_id or "").strip()
+        if not drive_id:
+            return None
+        try:
+            return self.get(f"{AUTH_CONFIG['graph_base']}/drives/{drive_id}/root")
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                return None
+            raise
+
     def get_drive_item_by_path(self, drive_id: str, relative_path: str) -> Optional[Dict[str, Any]]:
         """
         Resolve a path relative to the document library root (e.g. FTBMRoot/Admin/Folder) to a driveItem.
@@ -761,6 +791,155 @@ class GraphClient:
                 )
                 return None
             raise
+
+    # -------------------------------------------------------------------------
+    # Drive mutations (copy / create folder) — requires Files.ReadWrite.All consent
+    # -------------------------------------------------------------------------
+    def start_drive_item_copy(
+        self,
+        *,
+        source_drive_id: str,
+        source_item_id: str,
+        dest_drive_id: str,
+        dest_parent_item_id: str,
+        name: Optional[str] = None,
+        conflict_behavior: str = "rename",
+    ) -> str:
+        """POST /copy; returns async monitor URL from the ``Location`` response header."""
+        source_drive_id = str(source_drive_id or "").strip()
+        source_item_id = str(source_item_id or "").strip()
+        dest_drive_id = str(dest_drive_id or "").strip()
+        dest_parent_item_id = str(dest_parent_item_id or "").strip()
+        if not source_drive_id or not source_item_id or not dest_drive_id or not dest_parent_item_id:
+            raise ValueError("start_drive_item_copy requires source/destination drive and item ids.")
+
+        enc_drive = quote(source_drive_id, safe="")
+        enc_item = quote(source_item_id, safe="")
+        url = f"{AUTH_CONFIG['graph_base']}/drives/{enc_drive}/items/{enc_item}/copy"
+        body: Dict[str, Any] = {
+            "parentReference": {"driveId": dest_drive_id, "id": dest_parent_item_id},
+            "@microsoft.graph.conflictBehavior": str(conflict_behavior or "rename"),
+        }
+        if name:
+            body["name"] = str(name).strip()
+
+        headers = dict(self.get_headers())
+        headers["Content-Type"] = "application/json"
+
+        def _post() -> requests.Response:
+            return requests.post(url, headers=headers, json=body, timeout=120)
+
+        response = _post()
+        if response.status_code == 401 and self._try_acquire_token_silent(force_refresh=True):
+            headers = dict(self.get_headers())
+            headers["Content-Type"] = "application/json"
+            response = requests.post(url, headers=headers, json=body, timeout=120)
+        if response.status_code == 429:
+            time.sleep(float(response.headers.get("Retry-After", "10")))
+            headers = dict(self.get_headers())
+            headers["Content-Type"] = "application/json"
+            response = requests.post(url, headers=headers, json=body, timeout=120)
+
+        if response.status_code != 202:
+            response.raise_for_status()
+
+        loc = response.headers.get("Location") or response.headers.get("location")
+        if not loc:
+            raise RuntimeError("Copy returned 202 but no Location header for progress polling.")
+        log_trace(
+            "graph",
+            "drive_item_copy_started",
+            source_drive_suffix=source_drive_id[-12:] if len(source_drive_id) > 12 else source_drive_id,
+            dest_drive_suffix=dest_drive_id[-12:] if len(dest_drive_id) > 12 else dest_drive_id,
+        )
+        return str(loc).strip()
+
+    def wait_graph_async_operation(
+        self,
+        monitor_url: str,
+        *,
+        timeout_sec: float = 600.0,
+        poll_interval_sec: float = 1.0,
+    ) -> Dict[str, Any]:
+        """Poll a Graph async monitor URL until completion or failure."""
+        deadline = time.monotonic() + max(30.0, float(timeout_sec))
+        monitor_url = str(monitor_url or "").strip()
+        if not monitor_url:
+            raise ValueError("monitor_url is required")
+
+        last_payload: Dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            headers = dict(self.get_headers())
+            response = requests.get(monitor_url, headers=headers, timeout=120)
+            if response.status_code == 401 and self._try_acquire_token_silent(force_refresh=True):
+                headers = dict(self.get_headers())
+                response = requests.get(monitor_url, headers=headers, timeout=120)
+            if response.status_code == 429:
+                time.sleep(float(response.headers.get("Retry-After", "5")))
+                continue
+            response.raise_for_status()
+            try:
+                last_payload = response.json()
+            except Exception:
+                last_payload = {}
+
+            status = str(last_payload.get("status", "") or "").lower()
+            if status in ("completed", "completedwithwarnings"):
+                log_trace("graph", "async_operation_done", status=status)
+                return last_payload
+            if status in ("failed",):
+                err = last_payload.get("error") or last_payload
+                raise RuntimeError(f"Graph async operation failed: {err!r}")
+            time.sleep(max(0.2, float(poll_interval_sec)))
+
+        raise TimeoutError(f"Graph async operation timed out after {timeout_sec}s: {monitor_url[:120]!r}…")
+
+    def create_child_folder(
+        self,
+        drive_id: str,
+        parent_item_id: str,
+        name: str,
+        *,
+        conflict_behavior: str = "fail",
+    ) -> Dict[str, Any]:
+        """Create a folder under a parent driveItem (synchronous)."""
+        drive_id = str(drive_id or "").strip()
+        parent_item_id = str(parent_item_id or "").strip()
+        name = str(name or "").strip()
+        if not drive_id or not parent_item_id or not name:
+            raise ValueError("create_child_folder requires drive_id, parent_item_id, and name.")
+
+        enc_drive = quote(drive_id, safe="")
+        enc_parent = quote(parent_item_id, safe="")
+        url = f"{AUTH_CONFIG['graph_base']}/drives/{enc_drive}/items/{enc_parent}/children"
+        body: Dict[str, Any] = {
+            "name": name,
+            "folder": {},
+            "@microsoft.graph.conflictBehavior": str(conflict_behavior or "fail"),
+        }
+        headers = dict(self.get_headers())
+        headers["Content-Type"] = "application/json"
+
+        response = requests.post(url, headers=headers, json=body, timeout=120)
+        if response.status_code == 401 and self._try_acquire_token_silent(force_refresh=True):
+            headers = dict(self.get_headers())
+            headers["Content-Type"] = "application/json"
+            response = requests.post(url, headers=headers, json=body, timeout=120)
+        if response.status_code == 429:
+            time.sleep(float(response.headers.get("Retry-After", "10")))
+            headers = dict(self.get_headers())
+            headers["Content-Type"] = "application/json"
+            response = requests.post(url, headers=headers, json=body, timeout=120)
+
+        response.raise_for_status()
+        payload = response.json()
+        log_trace(
+            "graph",
+            "create_child_folder_ok",
+            drive_id_suffix=drive_id[-12:] if len(drive_id) > 12 else drive_id,
+            name_excerpt=name[:80],
+        )
+        return payload
 
     def count_drive_items_recursive_split(self, drive_id: str) -> tuple[int, int]:
         """Return ``(file_count, folder_count)`` under the library root (recursive, paged).
@@ -1030,6 +1209,65 @@ class GraphClient:
             for item in items
             if item.get("id")
         ]
+
+    def list_drive_folder_descendant_files_normalized(
+        self,
+        drive_id: str,
+        folder_item_id: str,
+        *,
+        site_id: str = "",
+        site_name: str = "",
+        library_id: str = "",
+        library_name: str = "",
+        tree_role: str = "",
+        folder_item_path: str = "",
+        max_files: int = 5000,
+    ) -> List[Dict[str, Any]]:
+        """
+        Walk a folder tree via Graph children calls and return normalized **file** rows only.
+
+        Used to turn one folder selection into many per-file planned moves (separate Graph copy steps).
+        """
+        drive_id = str(drive_id or "").strip()
+        folder_item_id = str(folder_item_id or "").strip()
+        if not drive_id or not folder_item_id:
+            return []
+
+        files: List[Dict[str, Any]] = []
+        stack: List[tuple[str, str]] = [(folder_item_id, str(folder_item_path or "").strip() or "/")]
+        seen_folders: set[str] = {folder_item_id}
+        lib_id = library_id or drive_id
+
+        while stack:
+            cur_id, cur_path = stack.pop()
+            children = self.list_drive_item_children_normalized(
+                drive_id,
+                cur_id,
+                site_id=site_id,
+                site_name=site_name,
+                library_id=lib_id,
+                library_name=library_name,
+                tree_role=tree_role,
+                parent_item_path=cur_path,
+            )
+            for ch in children:
+                cid = str(ch.get("id") or "").strip()
+                if not cid:
+                    continue
+                if ch.get("is_folder"):
+                    if cid not in seen_folders:
+                        seen_folders.add(cid)
+                        stack.append((cid, str(ch.get("item_path") or "").strip() or "/"))
+                else:
+                    files.append(ch)
+                    if len(files) >= max(1, int(max_files)):
+                        log_info(
+                            "graph_folder_descendant_files_cap",
+                            cap=int(max_files),
+                            drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+                        )
+                        return files
+        return files
 
     def list_drive_all_items_normalized(
         self,
