@@ -16957,7 +16957,8 @@ class MainWindow(QMainWindow):
             self._log_restore_exception("destination_root_load_flush_after_future_bind", exc)
 
     def _destination_chunked_bind_node_threshold(self):
-        return 550
+        # Below this path count, sync bind may still be acceptable if allocation overlay is light.
+        return 480
 
     def _destination_future_bind_should_chunk_async(self, model, *, on_complete):
         """Use QTimer-sliced bind when the unique-path map is large or allocation merge will be heavy.
@@ -16976,6 +16977,11 @@ class MainWindow(QMainWindow):
         if n_paths >= 100 and alloc >= 20:
             return True
         if n_paths >= 60 and alloc >= 45:
+            return True
+        # Medium overlays: sync descendant application still walks the full tree; prefer chunked slices.
+        if n_paths >= 150 and alloc >= 14:
+            return True
+        if n_paths >= 85 and alloc >= 32:
             return True
         return False
 
@@ -17009,6 +17015,7 @@ class MainWindow(QMainWindow):
                     self._future_bind_nodes_built = 0
                     roots = [self._build_destination_future_nested(model_nodes, p) for p in top_level_paths]
                     dmodel.reset_nested(roots)
+                    QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
                     visible_future_branch_count = sum(
                         1 for _semantic_path, n in model_nodes.items() if n.get("node_state") != "real"
                     )
@@ -17084,6 +17091,7 @@ class MainWindow(QMainWindow):
                 self._future_bind_nodes_built = 0
                 for semantic_path in top_level_paths:
                     tree.addTopLevelItem(self._build_destination_tree_item_from_future_model(model_nodes, semantic_path))
+                QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
 
                 visible_future_branch_count = 0
                 for _semantic_path, node in model_nodes.items():
@@ -17238,6 +17246,7 @@ class MainWindow(QMainWindow):
                         for semantic_path in top_level_paths
                     ]
                     dm.reset_nested(nested_roots)
+                    QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
                     visible_future_branch_count = sum(
                         1 for _p, n in model_nodes.items() if n.get("node_state") != "real"
                     )
@@ -17246,6 +17255,7 @@ class MainWindow(QMainWindow):
                         tix = dm.index(r, 0, QModelIndex())
                         self._refresh_destination_item_visibility_index(tix, expand=True)
                     flat_items = dm.iter_depth_first()
+                    QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
                     st["flat_items"] = flat_items
                 else:
                     tree.clear()
@@ -17253,6 +17263,7 @@ class MainWindow(QMainWindow):
                         tree.addTopLevelItem(
                             self._build_destination_tree_item_from_future_model(model_nodes, semantic_path)
                         )
+                    QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
                     visible_future_branch_count = sum(
                         1 for _p, n in model_nodes.items() if n.get("node_state") != "real"
                     )
@@ -17263,6 +17274,7 @@ class MainWindow(QMainWindow):
                     for index in range(tree.topLevelItemCount()):
                         for item in self._iter_tree_items(tree.topLevelItem(index)):
                             flat_items.append(item)
+                    QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
                     st["flat_items"] = flat_items
                 st["alloc_i"] = 0
                 st["descendant_applied"] = 0
