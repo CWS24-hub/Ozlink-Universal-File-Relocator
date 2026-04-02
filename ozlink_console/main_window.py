@@ -14605,6 +14605,8 @@ class MainWindow(QMainWindow):
         descendants = self._collect_source_descendants_for_projection(source_root_data, move)
         descendants = self._sort_descendants_for_allocation_apply(descendants)
         child_map_cache = {}
+        pending_leaf_batches = {}
+        visibility_targets = {}
         added_count = 0
         for desc_index, descendant_data in enumerate(descendants):
             if desc_index > 0 and desc_index % 50 == 0:
@@ -14633,8 +14635,6 @@ class MainWindow(QMainWindow):
                     continue
             current_parent_ix = parent_ix
             current_parent_data = parent_data
-            visibility_refresh_parents = []
-            seen_vis = set()
             for index, segment in enumerate(relative_segments):
                 branch_path = self._canonical_destination_projection_path(
                     "\\".join([allocation_destination_path] + relative_segments[: index + 1])
@@ -14644,26 +14644,36 @@ class MainWindow(QMainWindow):
                     current_parent_ix, branch_path, child_map_cache
                 )
                 if existing_child is None:
-                    self._remove_placeholder_children(current_parent_ix)
                     new_pl = self._build_projected_allocation_descendant_payload(
                         descendant_data if is_leaf else {"name": segment, "real_name": segment, "is_folder": True},
                         branch_path,
                         current_parent_data,
                     )
-                    model.append_child_payloads(current_parent_ix, [new_pl])
-                    new_row = model.rowCount(current_parent_ix) - 1
-                    existing_child = model.index(new_row, 0, current_parent_ix)
-                    pk = self._destination_child_map_cache_key_index(current_parent_ix)
-                    self._destination_apply_invalidate_child_map_cache_key(child_map_cache, pk)
-                    if pk not in seen_vis:
-                        seen_vis.add(pk)
-                        visibility_refresh_parents.append(current_parent_ix)
                     if is_leaf:
+                        pk = self._destination_child_map_cache_key_index(current_parent_ix)
+                        batch = pending_leaf_batches.setdefault(
+                            pk, {"parent_ix": current_parent_ix, "payloads": []}
+                        )
+                        batch["payloads"].append(new_pl)
+                        visibility_targets[pk] = current_parent_ix
                         added_count += 1
+                        existing_child = current_parent_ix
+                    else:
+                        self._allocation_apply_flush_pending_model(
+                            model, child_map_cache, pending_leaf_batches, current_parent_ix
+                        )
+                        self._remove_placeholder_children(current_parent_ix)
+                        model.append_child_payloads(current_parent_ix, [new_pl])
+                        new_row = model.rowCount(current_parent_ix) - 1
+                        existing_child = model.index(new_row, 0, current_parent_ix)
+                        pk = self._destination_child_map_cache_key_index(current_parent_ix)
+                        self._destination_merge_new_children_into_index_map_cache(child_map_cache, current_parent_ix, 1)
+                        visibility_targets[pk] = current_parent_ix
                 current_parent_ix = existing_child
                 current_parent_data = current_parent_ix.data(Qt.UserRole) or {}
-            for rp in visibility_refresh_parents:
-                self._refresh_destination_item_visibility_index(rp, expand=True)
+        self._allocation_apply_flush_all_pending_model(model, child_map_cache, pending_leaf_batches)
+        for rp in visibility_targets.values():
+            self._refresh_destination_item_visibility_index(rp, expand=True)
         return added_count
 
     def _allocation_projection_relative_source_segments(self, source_root_path, descendant_source_path):
@@ -14745,6 +14755,8 @@ class MainWindow(QMainWindow):
         descendants = self._collect_source_descendants_for_projection(source_root_data, move)
         descendants = self._sort_descendants_for_allocation_apply(descendants)
         child_map_cache = {}
+        pending_leaf_batches = {}
+        visibility_targets = {}
 
         added_count = 0
         for desc_index, descendant_data in enumerate(descendants):
@@ -14779,8 +14791,6 @@ class MainWindow(QMainWindow):
 
             current_parent_item = parent_item
             current_parent_data = parent_data
-            visibility_refresh_parents = []
-            seen_vis = set()
             for index, segment in enumerate(relative_segments):
                 branch_path = self._canonical_destination_projection_path(
                     "\\".join([allocation_destination_path] + relative_segments[: index + 1])
@@ -14790,26 +14800,38 @@ class MainWindow(QMainWindow):
                     current_parent_item, branch_path, child_map_cache
                 )
                 if existing_child is None:
-                    self._remove_placeholder_children(current_parent_item)
                     new_child = self._build_projected_allocation_descendant_item(
                         descendant_data if is_leaf else {"name": segment, "real_name": segment, "is_folder": True},
                         branch_path,
                         current_parent_data,
                     )
-                    current_parent_item.addChild(new_child)
-                    existing_child = new_child
-                    pk = self._destination_child_map_cache_key_widget(current_parent_item)
-                    self._destination_apply_invalidate_child_map_cache_key(child_map_cache, pk)
-                    if pk not in seen_vis:
-                        seen_vis.add(pk)
-                        visibility_refresh_parents.append(current_parent_item)
                     if is_leaf:
+                        pk = self._destination_child_map_cache_key_widget(current_parent_item)
+                        batch = pending_leaf_batches.setdefault(
+                            pk, {"parent_item": current_parent_item, "items": []}
+                        )
+                        batch["items"].append(new_child)
+                        visibility_targets[pk] = current_parent_item
                         added_count += 1
+                        existing_child = current_parent_item
+                    else:
+                        self._allocation_apply_flush_pending_widget(
+                            child_map_cache, pending_leaf_batches, current_parent_item
+                        )
+                        self._remove_placeholder_children(current_parent_item)
+                        current_parent_item.addChild(new_child)
+                        existing_child = new_child
+                        pk = self._destination_child_map_cache_key_widget(current_parent_item)
+                        self._destination_merge_new_widgets_into_child_map_cache(
+                            child_map_cache, current_parent_item, [new_child]
+                        )
+                        visibility_targets[pk] = current_parent_item
 
                 current_parent_item = existing_child
                 current_parent_data = current_parent_item.data(0, Qt.UserRole) or {}
-            for rp in visibility_refresh_parents:
-                self._refresh_destination_item_visibility(rp, expand=True)
+        self._allocation_apply_flush_all_pending_widget(child_map_cache, pending_leaf_batches)
+        for rp in visibility_targets.values():
+            self._refresh_destination_item_visibility(rp, expand=True)
 
         if len(descendants) > 0 and added_count == 0:
             sample = []
@@ -18888,6 +18910,93 @@ class MainWindow(QMainWindow):
 
     def _destination_apply_invalidate_child_map_cache_key(self, cache: dict, cache_key: int) -> None:
         cache.pop(cache_key, None)
+
+    def _destination_merge_new_children_into_index_map_cache(self, child_map_cache: dict, parent_ix: QModelIndex, n_new: int) -> None:
+        """Extend a warm per-parent semantic map with the last n_new rows (avoids full sibling rescan)."""
+        if n_new <= 0:
+            return
+        pk = self._destination_child_map_cache_key_index(parent_ix)
+        sub = child_map_cache.get(pk)
+        model = getattr(self, "destination_planning_model", None)
+        if model is None:
+            return
+        rc = model.rowCount(parent_ix)
+        start = max(0, rc - n_new)
+        if isinstance(sub, dict):
+            for r in range(start, rc):
+                ix = model.index(r, 0, parent_ix)
+                try:
+                    child_data = ix.data(Qt.UserRole) or {}
+                except Exception:
+                    continue
+                sem = self._destination_semantic_path(child_data)
+                if sem:
+                    sub[sem] = ix
+        # Cold cache (sub missing): leave absent; next lookup rebuilds full map.
+
+    def _allocation_apply_flush_pending_model(self, model, child_map_cache: dict, pending_batches: dict, parent_ix: QModelIndex) -> None:
+        pk = self._destination_child_map_cache_key_index(parent_ix)
+        batch = pending_batches.pop(pk, None)
+        if not batch:
+            return
+        pls = batch.get("payloads") or []
+        if not pls:
+            return
+        pix = batch.get("parent_ix")
+        if pix is None or not pix.isValid():
+            return
+        self._remove_placeholder_children(pix)
+        model.append_child_payloads(pix, pls)
+        self._destination_merge_new_children_into_index_map_cache(child_map_cache, pix, len(pls))
+
+    def _allocation_apply_flush_all_pending_model(self, model, child_map_cache: dict, pending_batches: dict) -> None:
+        for pk in list(pending_batches.keys()):
+            batch = pending_batches.get(pk)
+            if not batch:
+                continue
+            pix = batch.get("parent_ix")
+            if pix is not None and pix.isValid():
+                self._allocation_apply_flush_pending_model(model, child_map_cache, pending_batches, pix)
+
+    def _destination_merge_new_widgets_into_child_map_cache(self, child_map_cache: dict, parent_item, new_items: list) -> None:
+        if not new_items:
+            return
+        pk = self._destination_child_map_cache_key_widget(parent_item)
+        sub = child_map_cache.get(pk)
+        if isinstance(sub, dict):
+            for it in new_items:
+                try:
+                    child_data = it.data(0, Qt.UserRole) or {}
+                except RuntimeError:
+                    continue
+                sem = self._destination_semantic_path(child_data)
+                if sem:
+                    sub[sem] = it
+
+    def _allocation_apply_flush_pending_widget(self, child_map_cache: dict, pending_batches: dict, parent_item) -> None:
+        pk = self._destination_child_map_cache_key_widget(parent_item)
+        batch = pending_batches.pop(pk, None)
+        if not batch:
+            return
+        items = batch.get("items") or []
+        if not items:
+            return
+        pit = batch.get("parent_item")
+        if pit is None:
+            return
+        self._remove_placeholder_children(pit)
+        start = pit.childCount()
+        pit.insertChildren(start, items)
+        self._destination_merge_new_widgets_into_child_map_cache(child_map_cache, pit, items)
+
+    def _allocation_apply_flush_all_pending_widget(self, child_map_cache: dict, pending_batches: dict) -> None:
+        for pk in list(pending_batches.keys()):
+            batch = pending_batches.get(pk)
+            if not batch:
+                continue
+            pit = batch.get("parent_item")
+            if pit is not None:
+                self._allocation_apply_flush_pending_widget(child_map_cache, pending_batches, pit)
 
     def _find_destination_child_by_path_index_cached(self, parent_ix: QModelIndex, destination_path: str, cache: dict):
         dm = getattr(self, "destination_planning_model", None)
