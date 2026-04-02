@@ -16960,6 +16960,82 @@ class MainWindow(QMainWindow):
         # Below this path count, sync bind may still be acceptable if allocation overlay is light.
         return 480
 
+    def _destination_chunked_bind_flat_collect_budget(self) -> int:
+        """ QModelIndex / QTreeWidgetItem rows to append per collect_flat timer slice. """
+        return 240
+
+    def _destination_chunked_bind_collect_model_indices_slice(self, st, dm, budget: int) -> bool:
+        """Depth-first pre-order walk matching ``DestinationPlanningTreeModel.iter_depth_first``; returns True if more remain."""
+        flat_items = st.setdefault("flat_items", [])
+        stack = st.get("flat_collect_stack")
+        if stack is None:
+            stack = [(QModelIndex(), 0)]
+            st["flat_collect_stack"] = stack
+        while budget > 0 and stack:
+            parent, r = stack[-1]
+            rc = dm.rowCount(parent)
+            if r >= rc:
+                stack.pop()
+                continue
+            ix = dm.index(r, 0, parent)
+            stack[-1] = (parent, r + 1)
+            flat_items.append(ix)
+            budget -= 1
+            if dm.rowCount(ix) > 0:
+                stack.append((ix, 0))
+        return bool(stack)
+
+    def _destination_chunked_bind_collect_widget_items_slice(self, st, tree, budget: int) -> bool:
+        """Matches ``_iter_tree_items`` pre-order; returns True if more remain."""
+        flat_items = st.setdefault("flat_items", [])
+        stack = st.get("widget_flat_stack")
+        if stack is None:
+            stack = [("top", 0)]
+            st["widget_flat_stack"] = stack
+        while budget > 0 and stack:
+            top = stack[-1]
+            if top[0] == "top":
+                _, i = top
+                n = tree.topLevelItemCount()
+                if i >= n:
+                    stack.pop()
+                    continue
+                it = tree.topLevelItem(i)
+                stack[-1] = ("top", i + 1)
+                flat_items.append(it)
+                budget -= 1
+                try:
+                    cc = it.childCount() if it is not None else 0
+                except RuntimeError:
+                    cc = 0
+                if cc > 0:
+                    stack.append((it, 0))
+            else:
+                item, j = top
+                try:
+                    cc = item.childCount()
+                except RuntimeError:
+                    stack.pop()
+                    continue
+                if j >= cc:
+                    stack.pop()
+                    continue
+                try:
+                    ch = item.child(j)
+                except RuntimeError:
+                    stack[-1] = (item, j + 1)
+                    continue
+                stack[-1] = (item, j + 1)
+                flat_items.append(ch)
+                budget -= 1
+                try:
+                    ccc = ch.childCount() if ch is not None else 0
+                except RuntimeError:
+                    ccc = 0
+                if ccc > 0:
+                    stack.append((ch, 0))
+        return bool(stack)
+
     def _destination_future_bind_should_chunk_async(self, model, *, on_complete):
         """Use QTimer-sliced bind when the unique-path map is large or allocation merge will be heavy.
 
@@ -17254,9 +17330,10 @@ class MainWindow(QMainWindow):
                     for r in range(dm.rowCount(QModelIndex())):
                         tix = dm.index(r, 0, QModelIndex())
                         self._refresh_destination_item_visibility_index(tix, expand=True)
-                    flat_items = dm.iter_depth_first()
+                    st["flat_items"] = []
+                    st["flat_collect_stack"] = None
+                    st["widget_flat_stack"] = None
                     QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
-                    st["flat_items"] = flat_items
                 else:
                     tree.clear()
                     for semantic_path in top_level_paths:
@@ -17270,12 +17347,10 @@ class MainWindow(QMainWindow):
                     st["visible_future_branch_count"] = visible_future_branch_count
                     for index in range(tree.topLevelItemCount()):
                         self._refresh_destination_item_visibility(tree.topLevelItem(index), expand=True)
-                    flat_items = []
-                    for index in range(tree.topLevelItemCount()):
-                        for item in self._iter_tree_items(tree.topLevelItem(index)):
-                            flat_items.append(item)
+                    st["flat_items"] = []
+                    st["flat_collect_stack"] = None
+                    st["widget_flat_stack"] = None
                     QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
-                    st["flat_items"] = flat_items
                 st["alloc_i"] = 0
                 st["descendant_applied"] = 0
                 st["allocation_pass"] = 0
@@ -17289,45 +17364,52 @@ class MainWindow(QMainWindow):
                 st["normalized_targets"] = normalized_targets
                 st["destination_projection_eager_all"] = self._destination_projection_eager_expand_all_destination()
                 st["allocation_descendants_deferred"] = 0
-                restore_items = list(flat_items)
-                dm = getattr(self, "destination_planning_model", None)
-                if dm is not None:
-                    normalized_restore_items = []
-                    for it in restore_items:
-                        if isinstance(it, QModelIndex):
-                            try:
-                                normalized_restore_items.append(QPersistentModelIndex(it))
-                            except Exception:
-                                continue
-                        else:
-                            normalized_restore_items.append(it)
-                    restore_items = normalized_restore_items
-
-                def _chunked_restore_sort_key(it):
-                    if isinstance(it, (QModelIndex, QPersistentModelIndex)):
-                        if not it.isValid():
-                            return 0
-                        if dm is not None and it.model() is not dm:
-                            return 0
-                        try:
-                            nd = it.data(Qt.UserRole) or {}
-                        except Exception:
-                            return 0
-                    else:
-                        try:
-                            nd = it.data(0, Qt.UserRole) or {}
-                        except Exception:
-                            return 0
-                    return len(self._path_segments(self._tree_item_path(nd)))
-
-                restore_items.sort(key=_chunked_restore_sort_key)
-                st["restore_items"] = restore_items
-                st["restore_i"] = 0
-                st["phase"] = "allocation"
+                st["phase"] = "collect_flat"
                 self._set_tree_status_message("destination", "Merging destination structure…", loading=True)
             except Exception as exc:
                 _fail(exc, phase_name="chunked_destination_bind.build")
                 return
+            QTimer.singleShot(0, self._run_destination_chunked_bind_tick)
+            return
+
+        if phase == "collect_flat":
+            budget = self._destination_chunked_bind_flat_collect_budget()
+            dm = getattr(self, "destination_planning_model", None)
+            try:
+                if self._destination_tree_uses_model_view():
+                    if dm is None:
+                        raise RuntimeError("no destination planning model")
+                    more = self._destination_chunked_bind_collect_model_indices_slice(st, dm, budget)
+                else:
+                    if tree is None:
+                        raise RuntimeError("no destination tree")
+                    more = self._destination_chunked_bind_collect_widget_items_slice(st, tree, budget)
+            except Exception as exc:
+                _fail(exc, phase_name="chunked_destination_bind.collect_flat")
+                return
+            if more:
+                QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+                QTimer.singleShot(0, self._run_destination_chunked_bind_tick)
+                return
+            flat_items = st.get("flat_items") or []
+            restore_items = []
+            if self._destination_tree_uses_model_view() and dm is not None:
+                for it in flat_items:
+                    if isinstance(it, QModelIndex) and it.isValid() and it.model() is dm:
+                        restore_items.append(QPersistentModelIndex(it))
+                    elif isinstance(it, QPersistentModelIndex) and it.isValid():
+                        try:
+                            if it.model() is dm:
+                                restore_items.append(it)
+                        except RuntimeError:
+                            continue
+            else:
+                restore_items = list(flat_items)
+            st["restore_items"] = restore_items
+            st["restore_i"] = 0
+            st["flat_collect_stack"] = None
+            st["widget_flat_stack"] = None
+            st["phase"] = "allocation"
             QTimer.singleShot(0, self._run_destination_chunked_bind_tick)
             return
 
