@@ -14872,16 +14872,14 @@ class MainWindow(QMainWindow):
     def _destination_bind_should_apply_allocation_descendants_now(self, allocation_semantic_path, normalized_targets):
         """Whether to materialize all projected descendants during bind (eager).
 
-        Default is **lazy**: allocation shells stay light; descendants hydrate on expand via
-        ``_load_destination_projected_descendants`` / ``_load_destination_projected_descendants_index``,
-        or after bind via ``_hydrate_destination_allocations_for_expanded_paths_*`` when signals were blocked.
-
-        Only **expand-all** intent keeps eager bulk projection so Explorer-style expand-everything still works.
+        Always **False**: projected descendants stay lazy on bind. Expand-all and session restore
+        hydrate progressively via the destination expand-all queue, expand signals, and
+        ``_hydrate_destination_allocations_for_expanded_paths_*`` after bind (signals unblocked).
 
         ``allocation_semantic_path`` and ``normalized_targets`` are retained for call-site compatibility.
         """
         _ = (allocation_semantic_path, normalized_targets)
-        return bool(self._destination_projection_eager_expand_all_destination())
+        return False
 
     def _destination_incremental_merge_root_needed_now(self, projected_root_semantic_path, normalized_targets):
         if self._destination_projection_eager_expand_all_destination():
@@ -16833,7 +16831,7 @@ class MainWindow(QMainWindow):
 
     def _hydrate_destination_allocations_for_expanded_paths_model(self, expanded_paths) -> None:
         """Materialize projected descendants for expanded [Allocated] folders (signals may have been blocked during bind)."""
-        if not expanded_paths or self._destination_projection_eager_expand_all_destination():
+        if not expanded_paths:
             return
         tree = getattr(self, "destination_tree_widget", None)
         dm = getattr(self, "destination_planning_model", None)
@@ -16859,7 +16857,7 @@ class MainWindow(QMainWindow):
             self._load_destination_projected_descendants_index(ix)
 
     def _hydrate_destination_allocations_for_expanded_paths_widget(self, expanded_paths) -> None:
-        if not expanded_paths or self._destination_projection_eager_expand_all_destination():
+        if not expanded_paths:
             return
         tree = getattr(self, "destination_tree_widget", None)
         if tree is None:
@@ -16891,7 +16889,7 @@ class MainWindow(QMainWindow):
 
     def _hydrate_destination_prefix_chain_for_path_model(self, selected_path: str) -> None:
         """Walk prefix paths and hydrate planned allocation folders so deep selection can resolve."""
-        if not selected_path or self._destination_projection_eager_expand_all_destination():
+        if not selected_path:
             return
         dm = getattr(self, "destination_planning_model", None)
         if dm is None:
@@ -16917,7 +16915,7 @@ class MainWindow(QMainWindow):
                 QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
 
     def _hydrate_destination_prefix_chain_for_path_widget(self, selected_path: str) -> None:
-        if not selected_path or self._destination_projection_eager_expand_all_destination():
+        if not selected_path:
             return
         canon = self._canonical_destination_projection_path(selected_path) or self.normalize_memory_path(selected_path)
         if not canon:
@@ -16941,9 +16939,6 @@ class MainWindow(QMainWindow):
                 QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
 
     def _post_chunked_bind_lazy_destination_hydrate(self, expanded_paths, selected_path: str) -> None:
-        if self._destination_projection_eager_expand_all_destination():
-            self._restore_selected_tree_path("destination", selected_path)
-            return
         self._hydrate_destination_allocations_for_expanded_paths(set(expanded_paths or set()))
         if self._destination_tree_uses_model_view():
             self._hydrate_destination_prefix_chain_for_path_model(selected_path)
@@ -17394,8 +17389,6 @@ class MainWindow(QMainWindow):
                     )
                     self._schedule_refresh_destination_tree_indicators()
                     self._restore_expanded_tree_paths("destination", destination_expanded_paths)
-                    if self._destination_projection_eager_expand_all_destination():
-                        self._restore_selected_tree_path("destination", destination_selected_path)
                     self._refresh_expand_all_button_for_panel("destination")
                     wall_ms = round((time.perf_counter() - t0) * 1000.0, 1)
                     self._log_restore_phase(
@@ -17423,10 +17416,9 @@ class MainWindow(QMainWindow):
                     return visible_future_branch_count, visible_descendant_count
                 finally:
                     tree.blockSignals(False)
-                    if not self._destination_projection_eager_expand_all_destination():
-                        self._hydrate_destination_allocations_for_expanded_paths_model(destination_expanded_paths)
-                        self._hydrate_destination_prefix_chain_for_path_model(destination_selected_path)
-                        self._restore_selected_tree_path("destination", destination_selected_path)
+                    self._hydrate_destination_allocations_for_expanded_paths_model(destination_expanded_paths)
+                    self._hydrate_destination_prefix_chain_for_path_model(destination_selected_path)
+                    self._restore_selected_tree_path("destination", destination_selected_path)
             except Exception as exc:
                 self._log_restore_phase(
                     "destination_future_model_bind_failed",
@@ -17479,8 +17471,6 @@ class MainWindow(QMainWindow):
                 )
                 self._schedule_refresh_destination_tree_indicators()
                 self._restore_expanded_tree_paths("destination", destination_expanded_paths)
-                if self._destination_projection_eager_expand_all_destination():
-                    self._restore_selected_tree_path("destination", destination_selected_path)
                 self._refresh_expand_all_button_for_panel("destination")
 
                 wall_ms = round((time.perf_counter() - t0) * 1000.0, 1)
@@ -17509,10 +17499,9 @@ class MainWindow(QMainWindow):
                 return visible_future_branch_count, visible_descendant_count
             finally:
                 tree.blockSignals(False)
-                if not self._destination_projection_eager_expand_all_destination():
-                    self._hydrate_destination_allocations_for_expanded_paths_widget(destination_expanded_paths)
-                    self._hydrate_destination_prefix_chain_for_path_widget(destination_selected_path)
-                    self._restore_selected_tree_path("destination", destination_selected_path)
+                self._hydrate_destination_allocations_for_expanded_paths_widget(destination_expanded_paths)
+                self._hydrate_destination_prefix_chain_for_path_widget(destination_selected_path)
+                self._restore_selected_tree_path("destination", destination_selected_path)
         except Exception as exc:
             self._log_restore_phase(
                 "destination_future_model_bind_failed",
@@ -17663,7 +17652,6 @@ class MainWindow(QMainWindow):
                     if k:
                         normalized_targets.add(k)
                 st["normalized_targets"] = normalized_targets
-                st["destination_projection_eager_all"] = self._destination_projection_eager_expand_all_destination()
                 st["allocation_descendants_deferred"] = 0
                 st["pm_lookup"] = self._build_planned_move_destination_lookup()
                 st["allocation_pairs"] = []
@@ -17783,18 +17771,9 @@ class MainWindow(QMainWindow):
 
                                 dm.update_payload_for_index(item, _mut_nd)
                         else:
-                            sem = self._destination_semantic_path(node_data)
-                            nt = st.get("normalized_targets") or set()
-                            if st.get("destination_projection_eager_all") or self._destination_bind_should_apply_allocation_descendants_now(
-                                sem, nt
-                            ):
-                                st["descendant_applied"] = int(st.get("descendant_applied", 0) or 0) + int(
-                                    self._apply_allocation_descendants_to_item(item, move)
-                                )
-                            else:
-                                st["allocation_descendants_deferred"] = int(
-                                    st.get("allocation_descendants_deferred", 0) or 0
-                                ) + 1
+                            st["allocation_descendants_deferred"] = int(
+                                st.get("allocation_descendants_deferred", 0) or 0
+                            ) + 1
                     elif item.childCount() > 0 and self._destination_allocation_folder_shows_materialized_children(item):
                         nd = dict(node_data)
                         if not bool(nd.get("children_loaded")):
@@ -17802,16 +17781,7 @@ class MainWindow(QMainWindow):
                             nd["projection_unresolved_terminal"] = False
                             item.setData(0, Qt.UserRole, nd)
                     else:
-                        sem = self._destination_semantic_path(node_data)
-                        nt = st.get("normalized_targets") or set()
-                        if st.get("destination_projection_eager_all") or self._destination_bind_should_apply_allocation_descendants_now(
-                            sem, nt
-                        ):
-                            st["descendant_applied"] = int(st.get("descendant_applied", 0) or 0) + int(
-                                self._apply_allocation_descendants_to_item(item, move)
-                            )
-                        else:
-                            st["allocation_descendants_deferred"] = int(st.get("allocation_descendants_deferred", 0) or 0) + 1
+                        st["allocation_descendants_deferred"] = int(st.get("allocation_descendants_deferred", 0) or 0) + 1
                     if st["allocation_pass"] % 2 == 0:
                         QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
             except Exception as exc:
@@ -17877,7 +17847,6 @@ class MainWindow(QMainWindow):
         if phase == "finalize":
             lazy_exp_paths = set(st.get("destination_expanded_paths") or set())
             lazy_sel = str(st.get("destination_selected_path", "") or "")
-            lazy_eager = bool(st.get("destination_projection_eager_all"))
             vf = int(st.get("visible_future_branch_count", 0) or 0)
             da = int(st.get("descendant_applied", 0) or 0)
             t_bind = float(st.get("bind_t0") or time.perf_counter())
@@ -17892,8 +17861,6 @@ class MainWindow(QMainWindow):
                         deferred_allocation_count=deferred_n,
                         bind_generation=st.get("gen"),
                     )
-                if lazy_eager:
-                    self._restore_selected_tree_path("destination", lazy_sel)
                 self._refresh_expand_all_button_for_panel("destination")
                 top_n = self._planning_tree_top_level_count(tree) if tree is not None else 0
                 self._log_restore_phase(
@@ -17932,8 +17899,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
                 self._destination_chunked_bind_state = None
-            if not lazy_eager:
-                QTimer.singleShot(0, partial(self._post_chunked_bind_lazy_destination_hydrate, lazy_exp_paths, lazy_sel))
+            QTimer.singleShot(0, partial(self._post_chunked_bind_lazy_destination_hydrate, lazy_exp_paths, lazy_sel))
             if callable(on_complete):
                 try:
                     on_complete(vf, da)
@@ -18010,8 +17976,7 @@ class MainWindow(QMainWindow):
         destination_selected_path = str(ui_state.get("destination_selected_path", "") or "")
         nt = self._destination_bind_normalized_expanded_targets(destination_expanded_paths)
         merge_roots_before = len(entry_roots)
-        if not self._destination_projection_eager_expand_all_destination():
-            entry_roots = [p for p in entry_roots if self._destination_incremental_merge_root_needed_now(p, nt)]
+        entry_roots = [p for p in entry_roots if self._destination_incremental_merge_root_needed_now(p, nt)]
         if merge_roots_before != len(entry_roots):
             self._log_restore_phase(
                 "destination_incremental_merge_entry_roots_filtered",
@@ -29501,6 +29466,11 @@ class MainWindow(QMainWindow):
         folder_count = self._count_expandable_tree_nodes(panel_key)
         if folder_count > 12000 and self._tree_has_unloaded_folder_nodes(panel_key):
             return False
+        if panel_key == "destination" and self._destination_tree_uses_model_view():
+            # Planning + lazy projection can expose tens of thousands of folder rows; one-shot
+            # expandAll() blocks the GUI thread. Use progressive model expand-all instead.
+            if folder_count > 700:
+                return False
         if panel_key == "destination":
             if self._destination_full_tree_worker is not None and self._destination_full_tree_worker.isRunning():
                 return False
@@ -30191,6 +30161,54 @@ class MainWindow(QMainWindow):
             return None
         return f"{drive_id}:{item_id}"
 
+    def _destination_expand_all_reseed_collapsed_folders(self, max_enqueue: int) -> int:
+        """Find collapsed folders that already have model children and enqueue them for progressive expand.
+
+        Avoids a blocking ``expandAll()`` at the end of destination model expand-all.
+        """
+        if max_enqueue <= 0:
+            return 0
+        tree = getattr(self, "destination_tree_widget", None)
+        model = getattr(self, "destination_planning_model", None)
+        if tree is None or model is None:
+            return 0
+        panel_key = "destination"
+        added = 0
+        stack = []
+        root = QModelIndex()
+        for r in range(model.rowCount(root)):
+            stack.append(model.index(r, 0, root))
+        visited = 0
+        max_visit = 24000
+        while stack and added < max_enqueue and visited < max_visit:
+            ix = stack.pop()
+            visited += 1
+            if not ix.isValid():
+                continue
+            pl = ix.data(Qt.UserRole) or {}
+            if pl.get("placeholder") or not pl.get("is_folder"):
+                continue
+            try:
+                rc = model.rowCount(ix)
+            except Exception:
+                rc = 0
+            if rc > 0:
+                try:
+                    expanded = tree.isExpanded(ix)
+                except Exception:
+                    expanded = False
+                if not expanded:
+                    key = self._destination_model_expand_all_key(ix)
+                    if key:
+                        self._expand_all_seen[panel_key].add(key)
+                    self._expand_all_destination_model_queue.append(QPersistentModelIndex(ix))
+                    added += 1
+                    continue
+            if rc > 0:
+                for r in range(rc - 1, -1, -1):
+                    stack.append(model.index(r, 0, ix))
+        return added
+
     def _begin_destination_model_expand_all(self):
         panel_key = "destination"
         tree = getattr(self, "destination_tree_widget", None)
@@ -30201,7 +30219,11 @@ class MainWindow(QMainWindow):
         self._reset_expand_all_progress(panel_key)
         self._expand_all_max_per_tick[panel_key] = 3 if getattr(self, "_sharepoint_lazy_mode", False) else 2
         self._set_expand_all_button_label(panel_key, True)
-        self._update_expand_all_status(panel_key, "Expanding branches...", loading=True)
+        self._update_expand_all_status(
+            panel_key,
+            "Expanding all destination branches…",
+            loading=True,
+        )
         root = QModelIndex()
         for r in range(model.rowCount(root)):
             ix = model.index(r, 0, root)
@@ -30296,9 +30318,30 @@ class MainWindow(QMainWindow):
             break
 
         if self._expand_all_destination_model_queue or self.pending_folder_loads.get("destination"):
-            self._update_expand_all_status("destination", "Expanding branches...", loading=True)
+            self._update_expand_all_status(
+                "destination",
+                "Expanding all destination branches…",
+                loading=True,
+            )
             QTimer.singleShot(
                 20,
+                lambda: self._safe_invoke(
+                    "destination_model_expand_all_tick",
+                    self._destination_model_expand_all_tick,
+                ),
+            )
+            return
+
+        reseeded = self._destination_expand_all_reseed_collapsed_folders(112)
+        if reseeded:
+            self._update_expand_all_status(
+                "destination",
+                "Expanding all destination branches…",
+                loading=True,
+            )
+            QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+            QTimer.singleShot(
+                18,
                 lambda: self._safe_invoke(
                     "destination_model_expand_all_tick",
                     self._destination_model_expand_all_tick,
@@ -30323,14 +30366,7 @@ class MainWindow(QMainWindow):
         panel_key = "destination"
         tree = getattr(self, "destination_tree_widget", None)
         if tree is not None:
-            tree.setUpdatesEnabled(False)
-            tree.blockSignals(True)
-            try:
-                tree.expandAll()
-            finally:
-                tree.blockSignals(False)
-                tree.setUpdatesEnabled(True)
-                tree.viewport().update()
+            tree.viewport().update()
         log_info(
             "expand_all_destination_model_complete",
             folder_count=self._count_expandable_tree_nodes(panel_key),
