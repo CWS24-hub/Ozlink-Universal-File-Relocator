@@ -8,7 +8,7 @@ expand affordance without materializing child rows.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import QAbstractItemModel, QModelIndex, Qt
 from PySide6.QtGui import QBrush
@@ -48,7 +48,7 @@ class _Node:
 
 
 class SharePointSourceTreeModel(QAbstractItemModel):
-    def __init__(self, parent=None, column_labels=None):
+    def __init__(self, parent=None, column_labels=None, source_index_key_fn: Optional[Callable[[Dict[str, Any]], str]] = None):
         super().__init__(parent)
         labels = list(column_labels) if column_labels else list(EXPLORER_COLUMN_LABELS)
         while len(labels) < EXPLORER_COLUMN_COUNT:
@@ -56,6 +56,9 @@ class SharePointSourceTreeModel(QAbstractItemModel):
         self._column_labels = labels[:EXPLORER_COLUMN_COUNT]
         self._invisible = _Node(None, -1, {}, [])
         self._invisible._children = []
+        # Canonical path key -> node (O(1) lookup for find_visible_source_item_by_path when fn is set).
+        self._source_index_key_fn = source_index_key_fn
+        self._path_to_node: Dict[str, _Node] = {}
 
     def _node(self, index: QModelIndex) -> Optional[_Node]:
         if not index.isValid():
@@ -171,9 +174,74 @@ class SharePointSourceTreeModel(QAbstractItemModel):
             c.row = i
             c.parent = parent_node
 
+    def _path_key_for_payload(self, payload: Dict[str, Any]) -> str:
+        fn = self._source_index_key_fn
+        if fn is None:
+            return ""
+        try:
+            return str(fn(payload) or "").strip()
+        except Exception:
+            return ""
+
+    def _iter_subtree_nodes(self, node: _Node):
+        yield node
+        ch = node._children
+        if not ch:
+            return
+        for c in ch:
+            yield from self._iter_subtree_nodes(c)
+
+    def _unregister_subtree_paths(self, node: _Node) -> None:
+        if self._source_index_key_fn is None:
+            return
+        for n in self._iter_subtree_nodes(node):
+            if n.is_placeholder():
+                continue
+            k = self._path_key_for_payload(n.payload)
+            if k and self._path_to_node.get(k) is n:
+                del self._path_to_node[k]
+
+    def _register_subtree_paths(self, node: _Node) -> None:
+        if self._source_index_key_fn is None:
+            return
+        for n in self._iter_subtree_nodes(node):
+            if n.is_placeholder():
+                continue
+            k = self._path_key_for_payload(n.payload)
+            if k:
+                self._path_to_node[k] = n
+
+    def _rebuild_path_index(self) -> None:
+        self._path_to_node.clear()
+        if self._source_index_key_fn is None:
+            return
+        for c in self._invisible._children or []:
+            self._register_subtree_paths(c)
+
+    def _index_for_node(self, node: _Node) -> QModelIndex:
+        if node is None or node.parent is None:
+            return QModelIndex()
+        pnode = node.parent
+        siblings = pnode._children or []
+        try:
+            row = siblings.index(node)
+        except ValueError:
+            return QModelIndex()
+        parent_ix = QModelIndex() if pnode.parent is None else self._index_for_node(pnode)
+        return self.index(row, 0, parent_ix)
+
+    def find_index_for_canonical_source_path(self, canonical_key: str) -> QModelIndex:
+        if not canonical_key or self._source_index_key_fn is None:
+            return QModelIndex()
+        node = self._path_to_node.get(canonical_key)
+        if node is None:
+            return QModelIndex()
+        return self._index_for_node(node)
+
     def clear(self) -> None:
         self.beginResetModel()
         self._invisible._children = []
+        self._path_to_node.clear()
         self.endResetModel()
 
     def reset_root_payloads(self, payloads: List[Dict[str, Any]]) -> None:
@@ -188,6 +256,7 @@ class SharePointSourceTreeModel(QAbstractItemModel):
         self._invisible._children = children
         self._reindex(self._invisible)
         self.endResetModel()
+        self._rebuild_path_index()
 
     def set_empty_library_message(self, text: str) -> None:
         payload = {
@@ -200,6 +269,7 @@ class SharePointSourceTreeModel(QAbstractItemModel):
         self._invisible._children = [_Node(self._invisible, 0, payload, [])]
         self._reindex(self._invisible)
         self.endResetModel()
+        self._rebuild_path_index()
 
     def replace_all_children(self, parent: QModelIndex, child_payloads: List[Dict[str, Any]]) -> None:
         """Remove existing rows under ``parent`` and insert new child nodes from payloads."""
@@ -208,6 +278,8 @@ class SharePointSourceTreeModel(QAbstractItemModel):
             return
         old_count = self.rowCount(parent)
         if old_count:
+            for old_child in list(parent_node._children or []):
+                self._unregister_subtree_paths(old_child)
             self.beginRemoveRows(parent, 0, old_count - 1)
             parent_node._children = []
             self.endRemoveRows()
@@ -223,6 +295,7 @@ class SharePointSourceTreeModel(QAbstractItemModel):
             parent_node._children = [_Node(parent_node, 0, empty_pl, [])]
             self._reindex(parent_node)
             self.endInsertRows()
+            self._register_subtree_paths(parent_node._children[0])
             return
         self.beginInsertRows(parent, 0, n - 1)
         new_children: List[_Node] = []
@@ -235,6 +308,8 @@ class SharePointSourceTreeModel(QAbstractItemModel):
         parent_node._children = new_children
         self._reindex(parent_node)
         self.endInsertRows()
+        for c in new_children:
+            self._register_subtree_paths(c)
 
     def set_loading_children(self, parent: QModelIndex) -> None:
         parent_node = self._node(parent)
@@ -242,6 +317,8 @@ class SharePointSourceTreeModel(QAbstractItemModel):
             return
         old_count = self.rowCount(parent)
         if old_count:
+            for old_child in list(parent_node._children or []):
+                self._unregister_subtree_paths(old_child)
             self.beginRemoveRows(parent, 0, old_count - 1)
             parent_node._children = []
             self.endRemoveRows()
@@ -260,7 +337,15 @@ class SharePointSourceTreeModel(QAbstractItemModel):
         node = self._node(index)
         if node is None:
             return
+        old_snapshot = dict(node.payload)
+        old_key = self._path_key_for_payload(old_snapshot)
         mutator(node.payload)
+        new_key = self._path_key_for_payload(node.payload)
+        if self._source_index_key_fn is not None:
+            if old_key and self._path_to_node.get(old_key) is node:
+                del self._path_to_node[old_key]
+            if new_key and not node.is_placeholder():
+                self._path_to_node[new_key] = node
         parent = index.parent()
         row = index.row()
         top_left = self.index(row, 0, parent)

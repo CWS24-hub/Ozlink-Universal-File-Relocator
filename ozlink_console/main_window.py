@@ -3703,7 +3703,11 @@ class MainWindow(QMainWindow):
 
         if panel_key == "source" and getattr(self, "_source_tree_model_view", False):
             tree = QTreeView()
-            self.source_sharepoint_model = SharePointSourceTreeModel(parent=tree, column_labels=hdr_labels)
+            self.source_sharepoint_model = SharePointSourceTreeModel(
+                parent=tree,
+                column_labels=hdr_labels,
+                source_index_key_fn=self._source_payload_index_key,
+            )
             tree.setModel(self.source_sharepoint_model)
             sharepoint_model_view = True
         elif panel_key == "destination" and getattr(self, "_destination_tree_model_view", False):
@@ -12002,6 +12006,17 @@ class MainWindow(QMainWindow):
                 if dev:
                     _perf_explorer_log("find_visible_source_item_by_path", elapsed_ms=perf.elapsed(), match="no_model")
                 return None
+            path_ix = model.find_index_for_canonical_source_path(normalized_target)
+            if path_ix.isValid():
+                self._source_lookup_cache_put(normalized_target, path_ix)
+                if dev:
+                    _perf_explorer_log(
+                        "find_visible_source_item_by_path",
+                        elapsed_ms=perf.elapsed(),
+                        match="model_path_index",
+                        scanned_nodes=0,
+                    )
+                return path_ix
             scanned_nodes = 0
             for ix in model.iter_depth_first():
                 scanned_nodes += 1
@@ -13762,6 +13777,18 @@ class MainWindow(QMainWindow):
                     return "\\".join(trimmed)
 
         return "\\".join(segments)
+
+    def _source_payload_index_key(self, payload: dict) -> str:
+        """Canonical path key for SharePointSourceTreeModel path index (must match find_visible_source_item_by_path)."""
+        if not isinstance(payload, dict) or payload.get("placeholder"):
+            return ""
+        mem = self.normalize_memory_path(
+            payload.get("display_path")
+            or payload.get("item_path")
+            or payload.get("source_path")
+            or ""
+        )
+        return self._canonical_source_projection_path(mem) or ""
 
     def _normalized_path_variants(self, path, tree_role=""):
         if tree_role == "source":
