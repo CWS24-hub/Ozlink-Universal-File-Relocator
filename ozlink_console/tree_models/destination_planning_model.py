@@ -220,6 +220,14 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         for n in self._iter_subtree_nodes(node):
             self._bucket_add_node(n)
 
+    def _register_subtree_paths_from_roots(self, roots: List[_Node]) -> None:
+        """Register path index entries for many new subtree roots in one pass (e.g. batched append)."""
+        if self._destination_index_key_fn is None or not roots:
+            return
+        for root in roots:
+            for n in self._iter_subtree_nodes(root):
+                self._bucket_add_node(n)
+
     def _rebuild_path_index(self) -> None:
         self._path_to_nodes.clear()
         if self._destination_index_key_fn is None:
@@ -317,8 +325,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         parent_node._children = new_children
         self._reindex(parent_node)
         self.endInsertRows()
-        for c in new_children:
-            self._register_subtree_paths(c)
+        self._register_subtree_paths_from_roots(new_children)
         self.destination_structure_changed.emit()
 
     def set_loading_children(self, parent: QModelIndex) -> None:
@@ -372,8 +379,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             parent_node._children.append(_Node(parent_node, start + i, pl, ch))
         self._reindex(parent_node)
         self.endInsertRows()
-        for i in range(n):
-            self._register_subtree_paths(parent_node._children[start + i])
+        self._register_subtree_paths_from_roots(parent_node._children[start : start + n])
         self.destination_structure_changed.emit()
 
     def update_payload_for_index(self, index: QModelIndex, mutator) -> None:
