@@ -1437,34 +1437,34 @@ class MainWindow(QMainWindow):
     def _apply_theme(self):
         self.setStyleSheet("""
             QWidget#Root {
-                background-color: #0B0F18;
-                color: #E8EDF7;
+                background-color: #111315;
+                color: #ECEFF2;
             }
 
             QWidget {
                 background-color: transparent;
-                color: #E8EDF7;
+                color: #ECEFF2;
                 font-family: "Segoe UI", "Segoe UI Variable", sans-serif;
                 font-size: 10pt;
             }
 
             QFrame#TopBar {
-                background-color: #080C14;
-                border-bottom: 1px solid #1A2336;
+                background-color: #141619;
+                border-bottom: 1px solid #262A30;
             }
 
             QFrame#LeftNav {
-                background-color: #080C14;
-                border-right: 1px solid #151C2E;
+                background-color: #16181B;
+                border-right: 1px solid #2A2E36;
             }
 
             QFrame#ContentArea {
-                background-color: #0B0F18;
+                background-color: #111315;
             }
 
             QFrame#BottomStatusBar {
-                background-color: #080C14;
-                border-top: 1px solid #151C2E;
+                background-color: #141619;
+                border-top: 1px solid #262A30;
             }
 
             QFrame#PageCard {
@@ -1478,15 +1478,15 @@ class MainWindow(QMainWindow):
             }
 
             QFrame#SectionBox {
-                background-color: #0F141F;
-                border: 1px solid #232F45;
-                border-radius: 8px;
+                background-color: #1A1D22;
+                border: 1px solid #2E333D;
+                border-radius: 10px;
             }
 
             QFrame#HeroCard {
-                background-color: #101827;
-                border: 1px solid #283548;
-                border-radius: 10px;
+                background-color: #1D2128;
+                border: 1px solid #343A45;
+                border-radius: 12px;
             }
 
             QFrame#InsightCard {
@@ -1502,51 +1502,51 @@ class MainWindow(QMainWindow):
             }
 
             QFrame#MetricCard {
-                background-color: #121A28;
-                border: 1px solid #2A3A55;
-                border-radius: 8px;
+                background-color: #1B2027;
+                border: 1px solid #333A45;
+                border-radius: 10px;
             }
 
             QFrame#SoftBanner {
-                background-color: #121A28;
-                border: 1px solid #2A3A55;
-                border-radius: 8px;
+                background-color: #1D222A;
+                border: 1px solid #353C48;
+                border-radius: 10px;
             }
 
             QFrame#TreeSurface {
-                background-color: #0A0E16;
-                border: 1px solid #1E2A3F;
-                border-radius: 6px;
+                background-color: #171A20;
+                border: 1px solid #2B313B;
+                border-radius: 8px;
             }
 
             QFrame#TabSurface {
-                background-color: #101827;
-                border: 1px solid #283548;
-                border-radius: 6px;
+                background-color: #1C2027;
+                border: 1px solid #343A45;
+                border-radius: 8px;
             }
 
             QFrame#StatRibbon {
-                background-color: #0D121C;
-                border: 1px solid #1E2A3F;
-                border-radius: 8px;
+                background-color: #181C22;
+                border: 1px solid #303641;
+                border-radius: 10px;
             }
 
             QFrame#PlanningContextBar {
-                background-color: #101827;
-                border: 1px solid #283548;
-                border-radius: 8px;
+                background-color: #1B1F26;
+                border: 1px solid #333947;
+                border-radius: 10px;
             }
 
             QFrame#SurfaceCard {
-                background-color: #121A28;
-                border: 1px solid #2A3A55;
-                border-radius: 8px;
+                background-color: #1A1E24;
+                border: 1px solid #2F3540;
+                border-radius: 10px;
             }
 
             QFrame#BadgeChip {
-                background-color: #121A28;
-                border: 1px solid #2A3A55;
-                border-radius: 8px;
+                background-color: #1A1E24;
+                border: 1px solid #2F3540;
+                border-radius: 10px;
             }
 
             QLabel#AppTitle {
@@ -1576,9 +1576,15 @@ class MainWindow(QMainWindow):
             }
 
             QLabel#CardTitle {
-                font-size: 22pt;
+                font-size: 19pt;
                 font-weight: 700;
-                color: #F3F7FF;
+                color: #F4F7FC;
+            }
+
+            QLabel#PageTitle {
+                font-size: 15pt;
+                font-weight: 700;
+                color: #F4F7FC;
             }
 
             QLabel#CardBody {
@@ -1589,14 +1595,14 @@ class MainWindow(QMainWindow):
             QLabel#HeaderEyebrow {
                 font-size: 10pt;
                 font-weight: 700;
-                color: #78A8FF;
+                color: #9AA8BF;
                 text-transform: uppercase;
             }
 
             QLabel#SectionTitle {
                 font-size: 12pt;
                 font-weight: 700;
-                color: #EAF0FF;
+                color: #E8EDF7;
             }
 
             QLabel#StatusGood {
@@ -1633,7 +1639,7 @@ class MainWindow(QMainWindow):
             }
 
             QLabel#SummaryLabel {
-                color: #8CA0D2;
+                color: #96A4BB;
                 font-size: 10pt;
                 text-transform: uppercase;
             }
@@ -1683,86 +1689,88 @@ class MainWindow(QMainWindow):
             }
 
             QPushButton {
-                background-color: #08101D;
-                border: 1px solid #233B6C;
-                color: #EAF0FF;
-                padding: 10px 16px;
-                min-height: 18px;
+                background-color: #1A1F27;
+                border: 1px solid #343B48;
+                color: #E8EDF7;
+                padding: 8px 14px;
+                min-height: 28px;
+                border-radius: 8px;
             }
 
             QPushButton:hover {
-                background-color: #0F1930;
-                border: 1px solid #2E8BFF;
+                background-color: #232A35;
+                border: 1px solid #4F8CFF;
             }
 
             QPushButton:pressed {
-                background-color: #132242;
+                background-color: #2A3340;
             }
 
             QPushButton#PrimaryButton {
-                background-color: #2E6DFF;
-                border: 1px solid #5F95FF;
-                color: white;
+                background-color: #4F8CFF;
+                border: 1px solid #74A3FF;
+                color: #F8FAFC;
                 font-weight: 700;
+                min-height: 30px;
             }
 
             QPushButton#PrimaryButton:hover {
-                background-color: #3B7CFF;
+                background-color: #5A95FF;
             }
 
             QPushButton#SecondaryButton {
-                background-color: #151C2E;
-                border: 1px solid #2F3F5C;
+                background-color: #20252D;
+                border: 1px solid #3A4250;
                 color: #E8EDF7;
                 padding: 8px 14px;
-                min-height: 22px;
+                min-height: 30px;
                 font-weight: 600;
-                border-radius: 6px;
+                border-radius: 8px;
             }
 
             QPushButton#SecondaryButton:hover {
-                background-color: #1C2740;
-                border: 1px solid #3B82F6;
+                background-color: #292F39;
+                border: 1px solid #4F8CFF;
             }
 
             QPushButton#TertiaryButton {
                 background-color: transparent;
-                border: 1px solid #2F3F5C;
-                color: #9DB4E8;
+                border: 1px solid #3A4250;
+                color: #B9C3D4;
                 padding: 6px 12px;
-                min-height: 22px;
+                min-height: 30px;
                 font-weight: 600;
-                border-radius: 6px;
+                border-radius: 8px;
             }
 
             QPushButton#TertiaryButton:hover {
-                background-color: #151C2E;
-                border: 1px solid #3B82F6;
+                background-color: #20252D;
+                border: 1px solid #4F8CFF;
                 color: #E8EDF7;
             }
 
             QToolButton#OverflowMenuButton {
-                background-color: #151C2E;
-                border: 1px solid #2F3F5C;
-                color: #B8C9F0;
-                border-radius: 6px;
+                background-color: #20252D;
+                border: 1px solid #3A4250;
+                color: #C9D2E1;
+                border-radius: 8px;
                 min-width: 36px;
-                min-height: 30px;
+                min-height: 32px;
                 padding: 4px 8px;
-                font-size: 16pt;
+                font-size: 15pt;
                 font-weight: 700;
             }
 
             QToolButton#OverflowMenuButton:hover {
-                background-color: #1C2740;
-                border: 1px solid #3B82F6;
+                background-color: #292F39;
+                border: 1px solid #4F8CFF;
                 color: #F4F7FC;
             }
 
             QFrame#PlanningActionStrip {
-                background-color: #121A28;
-                border: 1px solid #2A3A55;
-                border-radius: 8px;
+                background-color: #1A1E24;
+                border: 1px solid #2F3540;
+                border-radius: 10px;
             }
 
             QPushButton#PanelToggleButton {
@@ -2052,11 +2060,11 @@ class MainWindow(QMainWindow):
     def build_top_bar(self):
         self.top_bar = QFrame()
         self.top_bar.setObjectName("TopBar")
-        self.top_bar.setFixedHeight(64)
+        self.top_bar.setFixedHeight(56)
 
         top_layout = QHBoxLayout(self.top_bar)
-        top_layout.setContentsMargins(14, 8, 18, 8)
-        top_layout.setSpacing(16)
+        top_layout.setContentsMargins(12, 6, 14, 6)
+        top_layout.setSpacing(12)
 
         brand_wrap = QHBoxLayout()
         brand_wrap.setSpacing(12)
@@ -2084,7 +2092,7 @@ class MainWindow(QMainWindow):
         brand_wrap.addLayout(brand_text_layout)
 
         badges_wrap = QHBoxLayout()
-        badges_wrap.setSpacing(10)
+        badges_wrap.setSpacing(8)
 
         def _badge_chip(caption: str, value_label: QLabel) -> QFrame:
             chip = QFrame()
@@ -2111,8 +2119,8 @@ class MainWindow(QMainWindow):
 
         self.top_connect_btn = QPushButton("Connect")
         self.top_connect_btn.setObjectName("PrimaryButton")
-        self.top_connect_btn.setMinimumWidth(132)
-        self.top_connect_btn.setMinimumHeight(32)
+        self.top_connect_btn.setMinimumWidth(118)
+        self.top_connect_btn.setMinimumHeight(30)
         self.top_connect_btn.setToolTip("Connect to Microsoft 365 (SharePoint)")
         self.top_connect_btn.clicked.connect(self.handle_connect)
 
@@ -2193,7 +2201,7 @@ class MainWindow(QMainWindow):
         self.content_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         content_layout = QVBoxLayout(self.content_area)
-        content_layout.setContentsMargins(18, 18, 18, 18)
+        content_layout.setContentsMargins(16, 14, 16, 14)
         content_layout.setSpacing(0)
 
         self.pages = QStackedWidget()
@@ -2226,7 +2234,7 @@ class MainWindow(QMainWindow):
         page = QWidget()
         outer = QVBoxLayout(page)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(12)
+        outer.setSpacing(10)
 
         self.dashboard_stack = QStackedWidget()
 
@@ -2550,23 +2558,24 @@ class MainWindow(QMainWindow):
         page = QWidget()
         outer = QVBoxLayout(page)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(3)
+        outer.setSpacing(8)
 
         header = QFrame()
         header.setObjectName("HeroCard")
         header_shell_layout = QVBoxLayout(header)
-        header_shell_layout.setContentsMargins(12, 10, 12, 10)
-        header_shell_layout.setSpacing(8)
+        header_shell_layout.setContentsMargins(10, 8, 10, 8)
+        header_shell_layout.setSpacing(6)
 
         header_top_bar = QHBoxLayout()
         header_top_bar.setContentsMargins(0, 0, 0, 0)
         header_top_bar.setSpacing(8)
 
         title = QLabel("Planning Workspace")
-        title.setObjectName("CardTitle")
+        title.setObjectName("PageTitle")
+        self.planning_header_title_label = title
         self.planning_header_toggle_button = QPushButton("Collapse Header")
         self.planning_header_toggle_button.setObjectName("PanelToggleButton")
-        self.planning_header_toggle_button.setMinimumHeight(22)
+        self.planning_header_toggle_button.setMinimumHeight(28)
         self.planning_header_toggle_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.planning_header_toggle_button.clicked.connect(self.toggle_planning_header_collapsed)
         header_top_bar.addWidget(title, 0, Qt.AlignLeft | Qt.AlignVCenter)
@@ -2819,8 +2828,8 @@ class MainWindow(QMainWindow):
         counts_wrap.addStretch()
 
         header_action_panel = QWidget()
-        header_action_panel.setMinimumWidth(360)
-        header_action_panel.setMaximumWidth(520)
+        header_action_panel.setMinimumWidth(300)
+        header_action_panel.setMaximumWidth(460)
         header_action_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         header_action_wrap = QVBoxLayout(header_action_panel)
         header_action_wrap.setContentsMargins(0, 0, 0, 0)
@@ -2834,12 +2843,15 @@ class MainWindow(QMainWindow):
         self.action_buttons["Propose Folder"].setObjectName("SecondaryButton")
         self.action_buttons["Unassign"].setObjectName("SecondaryButton")
         self.action_buttons["Assign individually…"].setObjectName("TertiaryButton")
+        self.action_buttons["Assign individually…"].setToolTip(
+            "Create one planned move per selected source file or expand selected folder rows."
+        )
 
         self.test_mode_toggle = QPushButton("Test Mode: Off")
         self.test_mode_toggle.setObjectName("TertiaryButton")
         self.test_mode_toggle.setCheckable(True)
         self.test_mode_toggle.setChecked(False)
-        self.test_mode_toggle.setMinimumHeight(28)
+        self.test_mode_toggle.setMinimumHeight(30)
         self.test_mode_toggle.setMinimumWidth(110)
         self.test_mode_toggle.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
         self.test_mode_toggle.setToolTip("Store a test submission without locking the live draft.")
@@ -2856,6 +2868,8 @@ class MainWindow(QMainWindow):
         submit_row = QHBoxLayout()
         submit_row.setContentsMargins(0, 0, 0, 0)
         submit_row.addStretch()
+        self.action_buttons["Submit Request to Ozlink IT"].setMinimumHeight(32)
+        self.action_buttons["Submit Request to Ozlink IT"].setMinimumWidth(198)
         submit_row.addWidget(self.action_buttons["Submit Request to Ozlink IT"], 0, Qt.AlignRight)
         header_action_wrap.addLayout(submit_row)
 
@@ -3148,16 +3162,16 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
+        layout.setSpacing(10)
 
         hero = QFrame()
         hero.setObjectName("HeroCard")
         hero_layout = QVBoxLayout(hero)
-        hero_layout.setContentsMargins(18, 16, 18, 16)
+        hero_layout.setContentsMargins(16, 14, 16, 14)
         hero_layout.setSpacing(8)
 
         title = QLabel("Requests")
-        title.setObjectName("CardTitle")
+        title.setObjectName("PageTitle")
         body = QLabel(
             "Review submitted and test request batches created from the Planning Workspace. "
             "This page is read-only and shows exactly what has been packaged for Ozlink IT."
@@ -3203,7 +3217,9 @@ class MainWindow(QMainWindow):
         actions_row = QHBoxLayout()
         actions_row.setContentsMargins(0, 0, 0, 0)
         actions_row.setSpacing(8)
-        self.requests_refresh_btn = QPushButton("Refresh")
+        self.requests_refresh_btn = QPushButton("↻")
+        self.requests_refresh_btn.setObjectName("TertiaryButton")
+        self.requests_refresh_btn.setFixedWidth(40)
         self.requests_refresh_btn.setToolTip("Reload submission batches from this device.")
         self.requests_refresh_btn.clicked.connect(self.refresh_requests_page)
         self.requests_export_zip_btn = QPushButton("Export Zip")
@@ -3232,14 +3248,14 @@ class MainWindow(QMainWindow):
 
         content = QGridLayout()
         content.setContentsMargins(0, 0, 0, 0)
-        content.setHorizontalSpacing(12)
-        content.setVerticalSpacing(12)
+        content.setHorizontalSpacing(10)
+        content.setVerticalSpacing(10)
 
         table_box = QFrame()
         table_box.setObjectName("SectionBox")
         table_layout = QVBoxLayout(table_box)
-        table_layout.setContentsMargins(14, 14, 14, 14)
-        table_layout.setSpacing(8)
+        table_layout.setContentsMargins(12, 12, 12, 12)
+        table_layout.setSpacing(10)
         table_title = QLabel("Submission Batches")
         table_title.setObjectName("SectionTitle")
         self.requests_table = self.build_workflow_table([
@@ -3262,8 +3278,8 @@ class MainWindow(QMainWindow):
         details_box = QFrame()
         details_box.setObjectName("SectionBox")
         details_layout = QVBoxLayout(details_box)
-        details_layout.setContentsMargins(14, 14, 14, 14)
-        details_layout.setSpacing(8)
+        details_layout.setContentsMargins(12, 12, 12, 12)
+        details_layout.setSpacing(10)
         details_title = QLabel("Request Details")
         details_title.setObjectName("SectionTitle")
         self.requests_detail_text = QTextEdit()
@@ -3598,12 +3614,19 @@ class MainWindow(QMainWindow):
 
         title = QLabel(title_text)
         title.setObjectName("SectionTitle")
-        refresh_cache_button = QPushButton("Refresh Cache")
-        refresh_cache_button.setMinimumHeight(24)
+        refresh_cache_button = QPushButton("↻")
+        refresh_cache_button.setObjectName("TertiaryButton")
+        refresh_cache_button.setToolTip("Refresh cache for this tree")
+        refresh_cache_button.setMinimumHeight(30)
+        refresh_cache_button.setFixedWidth(38)
         refresh_cache_button.clicked.connect(
             lambda _=False, panel_key=panel_key: self.handle_refresh_cache_for_panel(panel_key)
         )
-        expand_button = QPushButton("Expand All")
+        expand_button = QPushButton("⤢")
+        expand_button.setObjectName("TertiaryButton")
+        expand_button.setToolTip("Expand all folders in this tree")
+        expand_button.setMinimumHeight(30)
+        expand_button.setFixedWidth(38)
         expand_button.clicked.connect(lambda _=False, panel_key=panel_key: self.handle_expand_all(panel_key))
         if panel_key == "source":
             self.source_expand_all_button = expand_button
@@ -7030,8 +7053,12 @@ class MainWindow(QMainWindow):
 
     def _planning_header_collapsed_height(self):
         if not hasattr(self, "planning_header_toggle_button"):
-            return 40
-        return max(38, self.planning_header_toggle_button.sizeHint().height() + 12)
+            return 48
+        toggle_h = self.planning_header_toggle_button.sizeHint().height()
+        title_h = 20
+        if hasattr(self, "planning_header_title_label") and self.planning_header_title_label is not None:
+            title_h = self.planning_header_title_label.sizeHint().height()
+        return max(48, max(toggle_h, title_h) + 18)
 
     def _apply_planning_header_collapsed_state(self, collapsed):
         header_content = getattr(self, "planning_header_content", None)
@@ -7576,10 +7603,10 @@ class MainWindow(QMainWindow):
         page = QWidget()
         outer = QVBoxLayout(page)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(14)
+        outer.setSpacing(10)
 
         page_title = QLabel("Execution")
-        page_title.setObjectName("CardTitle")
+        page_title.setObjectName("PageTitle")
         outer.addWidget(page_title)
 
         intro = QLabel(
@@ -7593,7 +7620,7 @@ class MainWindow(QMainWindow):
         plan_card = QFrame()
         plan_card.setObjectName("SurfaceCard")
         plan_layout = QVBoxLayout(plan_card)
-        plan_layout.setContentsMargins(18, 16, 18, 16)
+        plan_layout.setContentsMargins(16, 14, 16, 14)
         plan_layout.setSpacing(10)
         plan_title = QLabel("Plan & manifest")
         plan_title.setObjectName("SectionTitle")
@@ -7632,7 +7659,7 @@ class MainWindow(QMainWindow):
         run_card = QFrame()
         run_card.setObjectName("SurfaceCard")
         run_layout = QVBoxLayout(run_card)
-        run_layout.setContentsMargins(18, 16, 18, 16)
+        run_layout.setContentsMargins(16, 14, 16, 14)
         run_layout.setSpacing(10)
         run_title = QLabel("Run")
         run_title.setObjectName("SectionTitle")
@@ -7662,7 +7689,7 @@ class MainWindow(QMainWindow):
         scope_card = QFrame()
         scope_card.setObjectName("SurfaceCard")
         scope_layout = QVBoxLayout(scope_card)
-        scope_layout.setContentsMargins(18, 16, 18, 16)
+        scope_layout.setContentsMargins(16, 14, 16, 14)
         scope_layout.setSpacing(8)
         scope_title = QLabel("Scope & recursive options")
         scope_title.setObjectName("SectionTitle")
@@ -7732,7 +7759,7 @@ class MainWindow(QMainWindow):
         status_card = QFrame()
         status_card.setObjectName("SurfaceCard")
         status_layout = QVBoxLayout(status_card)
-        status_layout.setContentsMargins(18, 14, 18, 14)
+        status_layout.setContentsMargins(16, 12, 16, 12)
         status_layout.setSpacing(4)
         status_title = QLabel("Status")
         status_title.setObjectName("SectionTitle")
@@ -7755,12 +7782,12 @@ class MainWindow(QMainWindow):
         page = QWidget()
         outer = QVBoxLayout(page)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(12)
+        outer.setSpacing(10)
 
         card = QFrame()
         card.setObjectName("SectionBox")
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(20, 20, 20, 20)
+        card_layout.setContentsMargins(16, 14, 16, 14)
         card_layout.setSpacing(14)
 
         title = QLabel("Microsoft Graph cache")
@@ -7821,7 +7848,7 @@ class MainWindow(QMainWindow):
         ui_card = QFrame()
         ui_card.setObjectName("SectionBox")
         ui_card_layout = QVBoxLayout(ui_card)
-        ui_card_layout.setContentsMargins(20, 20, 20, 20)
+        ui_card_layout.setContentsMargins(16, 14, 16, 14)
         ui_card_layout.setSpacing(14)
 
         ui_title = QLabel("Planning workspace — faster source and destination trees (optional)")
