@@ -1437,114 +1437,114 @@ class MainWindow(QMainWindow):
     def _apply_theme(self):
         self.setStyleSheet("""
             QWidget#Root {
-                background-color: #111315;
-                color: #ECEFF2;
+                background-color: #0B0D10;
+                color: #E8EAED;
             }
 
             QWidget {
                 background-color: transparent;
-                color: #ECEFF2;
+                color: #E8EAED;
                 font-family: "Segoe UI", "Segoe UI Variable", sans-serif;
                 font-size: 10pt;
             }
 
             QFrame#TopBar {
-                background-color: #141619;
-                border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+                background-color: #0F1218;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.055);
             }
 
             QFrame#LeftNav {
-                background-color: #16181B;
-                border-right: 1px solid rgba(255, 255, 255, 0.05);
+                background-color: #10141C;
+                border-right: 1px solid rgba(255, 255, 255, 0.045);
             }
 
             QFrame#ContentArea {
-                background-color: #111315;
+                background-color: #0B0D10;
             }
 
             QFrame#BottomStatusBar {
-                background-color: #141619;
-                border-top: 1px solid rgba(255, 255, 255, 0.06);
+                background-color: #0F1218;
+                border-top: 1px solid rgba(255, 255, 255, 0.055);
             }
 
             QFrame#PageCard {
-                background-color: #0F141F;
-                border: 1px solid #232F45;
+                background-color: #12151C;
+                border: none;
             }
 
             QFrame#InfoBanner {
-                background-color: #042C08;
-                border: 1px solid #0F7A20;
+                background-color: #052E1A;
+                border: none;
             }
 
             QFrame#SectionBox {
-                background-color: #1C1F26;
+                background-color: #151922;
                 border: none;
                 border-radius: 12px;
             }
 
             QFrame#HeroCard {
-                background-color: #22262E;
+                background-color: #1A1F2A;
                 border: none;
                 border-radius: 12px;
             }
 
             QFrame#InsightCard {
-                background-color: #1C1F26;
+                background-color: #161B24;
                 border: none;
                 border-radius: 12px;
             }
 
             QFrame#TopMetaCard {
-                background-color: #22262E;
+                background-color: #1C2230;
                 border: none;
                 border-radius: 12px;
             }
 
             QFrame#MetricCard {
-                background-color: #20242C;
+                background-color: #181E28;
                 border: none;
                 border-radius: 12px;
             }
 
             QFrame#SoftBanner {
-                background-color: #242830;
+                background-color: #1E2430;
                 border: none;
                 border-radius: 12px;
             }
 
             QFrame#TreeSurface {
-                background-color: #191C22;
+                background-color: #0E1118;
                 border: none;
                 border-radius: 10px;
             }
 
             QFrame#TabSurface {
-                background-color: #1E222A;
+                background-color: #161B24;
                 border: none;
                 border-radius: 10px;
             }
 
             QFrame#StatRibbon {
-                background-color: #20242C;
+                background-color: #181E28;
                 border: none;
                 border-radius: 12px;
             }
 
             QFrame#PlanningContextBar {
-                background-color: #22262E;
+                background-color: #1A1F2A;
                 border: none;
                 border-radius: 12px;
             }
 
             QFrame#SurfaceCard {
-                background-color: #1E222A;
+                background-color: #161B24;
                 border: none;
                 border-radius: 12px;
             }
 
             QFrame#BadgeChip {
-                background-color: #1E222A;
+                background-color: #141A24;
                 border: none;
                 border-radius: 10px;
             }
@@ -1558,14 +1558,14 @@ class MainWindow(QMainWindow):
 
             QLabel#AppSubtitle {
                 font-size: 9.5pt;
-                color: #7C9BD9;
+                color: #5ECAD0;
                 font-weight: 600;
             }
 
             QLabel#NavHeader {
                 font-size: 11px;
                 font-weight: 700;
-                color: #8B9DC5;
+                color: #8B98AE;
                 letter-spacing: 0.12em;
                 text-transform: uppercase;
             }
@@ -1589,13 +1589,19 @@ class MainWindow(QMainWindow):
 
             QLabel#CardBody {
                 font-size: 11pt;
-                color: #A9B8DF;
+                color: #A8B4C8;
+            }
+
+            QLabel#PlanningFlowHint {
+                font-size: 10pt;
+                color: #7DD3E8;
+                font-weight: 500;
             }
 
             QLabel#HeaderEyebrow {
                 font-size: 10pt;
                 font-weight: 700;
-                color: #9AA8BF;
+                color: #8B98AE;
                 text-transform: uppercase;
             }
 
@@ -1606,29 +1612,29 @@ class MainWindow(QMainWindow):
             }
 
             QLabel#StatusGood {
-                color: #7AE3A0;
+                color: #4ADE80;
                 font-weight: 600;
                 padding: 5px 12px;
-                background-color: rgba(52, 211, 153, 0.10);
-                border: 1px solid rgba(52, 211, 153, 0.35);
-                border-radius: 6px;
+                background-color: rgba(74, 222, 128, 0.12);
+                border: none;
+                border-radius: 8px;
             }
 
             QLabel#StatusBad {
-                color: #FCA5A5;
+                color: #FB7185;
                 font-weight: 600;
                 padding: 5px 12px;
-                background-color: rgba(248, 113, 113, 0.10);
-                border: 1px solid rgba(248, 113, 113, 0.30);
-                border-radius: 6px;
+                background-color: rgba(251, 113, 133, 0.12);
+                border: none;
+                border-radius: 8px;
             }
 
             QLabel#MutedText {
-                color: #8CA0D2;
+                color: #8896AB;
             }
 
             QLabel#FooterText {
-                color: #7E92C5;
+                color: #7C8A9E;
                 font-size: 10pt;
             }
 
@@ -1645,12 +1651,12 @@ class MainWindow(QMainWindow):
             }
 
             QLabel#ContextText {
-                color: #B7C7EF;
+                color: #B4C2D6;
                 font-size: 10.5pt;
             }
 
             QLabel#DetailLabel {
-                color: #9EB2E3;
+                color: #94A8BF;
                 font-size: 10pt;
                 font-weight: 600;
             }
@@ -1661,7 +1667,7 @@ class MainWindow(QMainWindow):
             }
 
             QLabel#TopMetaLabel {
-                color: #90A6D8;
+                color: #7C90A8;
                 font-size: 9.5pt;
             }
 
@@ -1672,25 +1678,47 @@ class MainWindow(QMainWindow):
             }
 
             QLabel#PanelSubtitle {
-                color: #8CA0D2;
+                color: #8896AB;
                 font-size: 10pt;
             }
 
             QLabel#MetricValue {
                 font-size: 22pt;
                 font-weight: 700;
-                color: #F3F7FF;
+                color: #F4F7FB;
             }
 
             QLabel#MetricLabel {
-                color: #9EB2E3;
+                color: #94A8BF;
                 font-size: 10pt;
                 font-weight: 600;
             }
 
+            QCheckBox {
+                color: #D1D9E6;
+                spacing: 8px;
+            }
+
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+                border-radius: 4px;
+                border: 1px solid #3D4A5C;
+                background-color: #121722;
+            }
+
+            QCheckBox::indicator:hover {
+                border: 1px solid #2DD4BF;
+            }
+
+            QCheckBox::indicator:checked {
+                background-color: #0D9488;
+                border: 1px solid #2DD4BF;
+            }
+
             QPushButton {
-                background-color: #1A1F27;
-                border: 1px solid #343B48;
+                background-color: #161B24;
+                border: none;
                 color: #E8EDF7;
                 padding: 8px 14px;
                 min-height: 28px;
@@ -1698,29 +1726,28 @@ class MainWindow(QMainWindow):
             }
 
             QPushButton:hover {
-                background-color: #232A35;
-                border: 1px solid #4F8CFF;
+                background-color: #1E2530;
             }
 
             QPushButton:pressed {
-                background-color: #2A3340;
+                background-color: #222A36;
             }
 
             QPushButton#PrimaryButton {
-                background-color: #4F8CFF;
-                border: 1px solid #74A3FF;
-                color: #F8FAFC;
+                background-color: #0D9488;
+                border: none;
+                color: #F0FDFA;
                 font-weight: 700;
                 min-height: 30px;
             }
 
             QPushButton#PrimaryButton:hover {
-                background-color: #5A95FF;
+                background-color: #14B8A6;
             }
 
             QPushButton#SecondaryButton {
-                background-color: #20252D;
-                border: 1px solid #3A4250;
+                background-color: #161B24;
+                border: none;
                 color: #E8EDF7;
                 padding: 8px 14px;
                 min-height: 30px;
@@ -1729,14 +1756,13 @@ class MainWindow(QMainWindow):
             }
 
             QPushButton#SecondaryButton:hover {
-                background-color: #292F39;
-                border: 1px solid #4F8CFF;
+                background-color: #1E2530;
             }
 
             QPushButton#TertiaryButton {
                 background-color: transparent;
-                border: 1px solid #3A4250;
-                color: #B9C3D4;
+                border: none;
+                color: #A8B4C8;
                 padding: 6px 12px;
                 min-height: 30px;
                 font-weight: 600;
@@ -1744,98 +1770,73 @@ class MainWindow(QMainWindow):
             }
 
             QPushButton#TertiaryButton:hover {
-                background-color: #20252D;
-                border: 1px solid #4F8CFF;
+                background-color: #161B24;
                 color: #E8EDF7;
             }
 
             QToolButton#OverflowMenuButton {
-                background-color: #20252D;
-                border: 1px solid #3A4250;
-                color: #C9D2E1;
+                background-color: #161B24;
+                border: none;
+                color: #C5D0E0;
                 border-radius: 8px;
-                min-width: 34px;
-                max-width: 34px;
-                min-height: 34px;
-                max-height: 34px;
+                min-width: 36px;
+                max-width: 36px;
+                min-height: 36px;
+                max-height: 36px;
                 padding: 0px;
                 font-size: 14pt;
                 font-weight: 700;
             }
 
             QToolButton#OverflowMenuButton:hover {
-                background-color: #292F39;
-                border: 1px solid #4F8CFF;
-                color: #F4F7FC;
-            }
-
-            QFrame#PlanningActionStrip {
-                background-color: #1E222A;
-                border: none;
-                border-radius: 12px;
+                background-color: #1E2530;
+                color: #5EEAD4;
             }
 
             QPushButton#IconToolButton {
                 background-color: transparent;
-                border: 1px solid #3A4250;
-                color: #B9C3D4;
-                min-width: 34px;
-                max-width: 34px;
-                min-height: 34px;
-                max-height: 34px;
+                border: none;
+                color: #9CA8BC;
+                min-width: 36px;
+                max-width: 36px;
+                min-height: 36px;
+                max-height: 36px;
                 padding: 0px;
-                font-size: 14pt;
+                font-size: 15pt;
                 font-weight: 600;
                 border-radius: 8px;
             }
 
             QPushButton#IconToolButton:hover {
-                background-color: #20252D;
-                border: 1px solid #4F8CFF;
-                color: #E8EDF7;
-            }
-
-            QPushButton#PanelToggleButton {
-                background-color: #1A2438;
-                border: 1px solid #334155;
-                color: #CBD5F5;
-                font-weight: 600;
-                padding: 6px 12px;
-                border-radius: 6px;
-            }
-
-            QPushButton#PanelToggleButton:hover {
-                background-color: #243047;
-                border: 1px solid #3B82F6;
-                color: #F8FAFF;
+                background-color: #161B24;
+                color: #5EEAD4;
             }
 
             QPushButton#NavButton {
                 text-align: left;
                 padding: 9px 12px;
                 font-size: 11pt;
-                border: 1px solid transparent;
+                border: none;
                 background-color: transparent;
                 border-radius: 6px;
             }
 
             QPushButton#NavButton:hover {
-                background-color: #121A28;
-                border: 1px solid #2A3A55;
+                background-color: #121722;
             }
 
             QPushButton#NavButtonActive {
                 text-align: left;
                 padding: 9px 12px;
                 font-size: 11pt;
-                color: #F8FAFF;
-                background-color: #1D4ED8;
-                border: 1px solid #3B82F6;
+                color: #ECFEFF;
+                background-color: #134E4A;
+                border: none;
                 border-radius: 6px;
             }
 
             QToolButton {
-                color: #9DB4E8;
+                color: #94A8BF;
                 background-color: transparent;
                 border: none;
                 font-weight: 600;
@@ -1843,41 +1844,43 @@ class MainWindow(QMainWindow):
             }
 
             QToolButton:hover {
-                color: #E8EDF7;
+                color: #5EEAD4;
             }
 
             QLineEdit {
-                background-color: #02060C;
-                border: 1px solid #2C456F;
+                background-color: #0E1118;
+                border: none;
                 color: #EAF0FF;
                 padding: 8px 10px;
                 min-height: 20px;
+                border-radius: 8px;
             }
 
             QLineEdit:focus {
-                border: 1px solid #2E8BFF;
+                border: 1px solid #2DD4BF;
             }
 
             QComboBox {
-                background-color: #08101D;
-                border: 1px solid #2C456F;
+                background-color: #0E1118;
+                border: none;
                 color: #F3F7FF;
                 padding: 6px 36px 6px 10px;
                 min-height: 22px;
-                selection-background-color: #1849B7;
+                border-radius: 8px;
+                selection-background-color: #0F766E;
                 selection-color: #F8FBFF;
             }
 
             QComboBox:focus {
-                border: 1px solid #2E8BFF;
+                border: 1px solid #2DD4BF;
             }
 
             QComboBox::drop-down {
                 subcontrol-origin: padding;
                 subcontrol-position: top right;
-                border-left: 1px solid #2C456F;
+                border-left: 1px solid #2A3444;
                 width: 28px;
-                background-color: #0C1527;
+                background-color: #121722;
             }
 
             QComboBox::down-arrow {
@@ -1887,80 +1890,99 @@ class MainWindow(QMainWindow):
             }
 
             QComboBox QAbstractItemView {
-                background-color: #08101D;
-                border: 1px solid #2C456F;
+                background-color: #121722;
+                border: none;
                 color: #F3F7FF;
-                selection-background-color: #1849B7;
+                selection-background-color: #0F766E;
                 selection-color: #FFFFFF;
                 outline: 0;
+                padding: 4px;
             }
 
             QMenu {
-                background-color: #08101D;
-                color: #FFFFFF;
-                border: 1px solid #365A97;
-                padding: 6px 2px;
+                background-color: #121722;
+                color: #E8EDF7;
+                border: none;
+                padding: 8px 4px;
                 opacity: 1;
             }
 
             QMenu::item {
-                background-color: #08101D;
-                color: #FFFFFF;
-                padding: 8px 24px 8px 14px;
-                margin: 1px 4px;
+                background-color: transparent;
+                color: #E8EDF7;
+                padding: 10px 28px 10px 16px;
+                margin: 2px 6px;
+                border-radius: 8px;
             }
 
             QMenu::item:selected {
-                background-color: #20499E;
-                color: #FFFFFF;
-                border: 1px solid #5F95FF;
+                background-color: #1E3A3A;
+                color: #F0FDFA;
             }
 
             QMenu::item:disabled {
-                background-color: #08101D;
-                color: #B2C4E8;
+                background-color: transparent;
+                color: #5C6B7E;
             }
 
             QMenu::separator {
                 height: 1px;
-                background-color: #20355E;
-                margin: 6px 10px;
+                background-color: rgba(255, 255, 255, 0.08);
+                margin: 8px 14px;
+            }
+
+            QMenu#PlanningOverflowMenu {
+                background-color: #151922;
+                padding: 10px 6px;
+                border-radius: 10px;
+            }
+
+            QMenu#PlanningOverflowMenu::item {
+                padding: 11px 32px 11px 18px;
+                margin: 2px 8px;
+                min-height: 20px;
+            }
+
+            QMenu#PlanningOverflowMenu::item:selected {
+                background-color: #134E4A;
+                color: #CCFBF1;
             }
 
             QTreeWidget, QTreeView {
-                background-color: #16191F;
+                background-color: #121722;
                 border: none;
                 color: #E8EDF7;
                 padding: 4px;
             }
 
             QScrollBar:horizontal {
-                background-color: #07101F;
-                height: 16px;
-                margin: 0px 16px 0px 16px;
-                border: 1px solid #20355E;
+                background-color: #0A0D12;
+                height: 14px;
+                margin: 0px 14px 0px 14px;
+                border: none;
+                border-radius: 4px;
             }
 
             QScrollBar::handle:horizontal {
-                background-color: #3B82F6;
+                background-color: #2A9D8F;
                 min-width: 40px;
                 border-radius: 4px;
-                border: 1px solid #93C5FD;
+                border: none;
             }
 
             QScrollBar::handle:horizontal:hover {
-                background-color: #5F95FF;
-                border: 1px solid #BFDBFE;
+                background-color: #3ECFB8;
             }
 
             QScrollBar::handle:horizontal:pressed {
-                background-color: #2E6DFF;
+                background-color: #0D9488;
             }
 
             QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
-                background-color: #0C1831;
-                width: 16px;
+                background-color: #0E1118;
+                width: 14px;
                 subcontrol-origin: margin;
+                border: none;
             }
 
             QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
@@ -1968,32 +1990,33 @@ class MainWindow(QMainWindow):
             }
 
             QScrollBar:vertical {
-                background-color: #07101F;
-                width: 16px;
-                margin: 16px 0px 16px 0px;
-                border: 1px solid #20355E;
+                background-color: #0A0D12;
+                width: 14px;
+                margin: 14px 0px 14px 0px;
+                border: none;
+                border-radius: 4px;
             }
 
             QScrollBar::handle:vertical {
-                background-color: #3B82F6;
+                background-color: #2A9D8F;
                 min-height: 48px;
                 border-radius: 4px;
-                border: 1px solid #93C5FD;
+                border: none;
             }
 
             QScrollBar::handle:vertical:hover {
-                background-color: #5F95FF;
-                border: 1px solid #BFDBFE;
+                background-color: #3ECFB8;
             }
 
             QScrollBar::handle:vertical:pressed {
-                background-color: #2E6DFF;
+                background-color: #0D9488;
             }
 
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                background-color: #0C1831;
-                height: 16px;
+                background-color: #0E1118;
+                height: 14px;
                 subcontrol-origin: margin;
+                border: none;
             }
 
             QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
@@ -2005,28 +2028,28 @@ class MainWindow(QMainWindow):
             }
 
             QTreeWidget::item:selected, QTreeView::item:selected {
-                background-color: #163C8F;
-                color: #FFFFFF;
+                background-color: #134E4A;
+                color: #F0FDFA;
             }
 
             QTreeWidget::item:hover, QTreeView::item:hover {
-                background-color: #0C1831;
+                background-color: #1A222E;
             }
 
             QTableWidget {
-                background-color: #16191F;
+                background-color: #121722;
                 border: none;
                 color: #E8EDF7;
-                gridline-color: rgba(255, 255, 255, 0.06);
+                gridline-color: rgba(255, 255, 255, 0.05);
             }
 
             QHeaderView::section {
-                background-color: #0C1527;
+                background-color: #0E1118;
                 color: #F3F7FF;
                 padding: 8px 6px;
                 border: none;
-                border-right: 1px solid #183055;
-                border-bottom: 1px solid #183055;
+                border-right: 1px solid rgba(255, 255, 255, 0.06);
+                border-bottom: 1px solid rgba(255, 255, 255, 0.06);
                 font-weight: 700;
             }
 
@@ -2035,12 +2058,12 @@ class MainWindow(QMainWindow):
             }
 
             QTableWidget::item:selected {
-                background-color: #163C8F;
+                background-color: #134E4A;
                 color: #FFFFFF;
             }
 
             QTextEdit#DetailsNotes {
-                background-color: #16191F;
+                background-color: #121722;
                 border: none;
                 color: #E8EDF7;
                 padding: 10px;
@@ -2049,14 +2072,14 @@ class MainWindow(QMainWindow):
 
             QTabWidget::pane {
                 border: none;
-                background-color: #1E222A;
+                background-color: #161B24;
                 top: 0px;
                 border-radius: 0 0 10px 10px;
             }
 
             QTabBar::tab {
                 background-color: transparent;
-                color: #9AA8BF;
+                color: #8896AB;
                 padding: 10px 18px;
                 border: none;
                 margin-right: 4px;
@@ -2065,16 +2088,20 @@ class MainWindow(QMainWindow):
             }
 
             QTabBar::tab:selected {
-                background-color: #1E222A;
-                color: #F4F7FC;
+                background-color: #161B24;
+                color: #CCFBF1;
+            }
+
+            QTabBar::tab:hover:!selected {
+                color: #5EEAD4;
             }
 
             QSplitter::handle {
-                background-color: rgba(255, 255, 255, 0.04);
+                background-color: rgba(255, 255, 255, 0.035);
             }
 
             QSplitter::handle:hover {
-                background-color: rgba(79, 140, 255, 0.35);
+                background-color: rgba(45, 212, 191, 0.35);
             }
         """)
 
@@ -2093,7 +2120,7 @@ class MainWindow(QMainWindow):
         self.logo_block = QFrame()
         self.logo_block.setFixedSize(28, 28)
         self.logo_block.setStyleSheet(
-            "background-color:#3B6FE6; border:none; border-radius:8px;"
+            "background-color:#0D9488; border:none; border-radius:8px;"
         )
 
         brand_text_layout = QVBoxLayout()
@@ -2595,9 +2622,9 @@ class MainWindow(QMainWindow):
         title = QLabel("Planning Workspace")
         title.setObjectName("PageTitle")
         self.planning_header_title_label = title
-        self.planning_header_toggle_button = QPushButton("Collapse Header")
-        self.planning_header_toggle_button.setObjectName("PanelToggleButton")
-        self.planning_header_toggle_button.setMinimumHeight(28)
+        self.planning_header_toggle_button = QPushButton("▴")
+        self.planning_header_toggle_button.setObjectName("IconToolButton")
+        self.planning_header_toggle_button.setToolTip("Collapse planning header")
         self.planning_header_toggle_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.planning_header_toggle_button.clicked.connect(self.toggle_planning_header_collapsed)
         header_top_bar.addWidget(title, 0, Qt.AlignLeft | Qt.AlignVCenter)
@@ -2772,38 +2799,12 @@ class MainWindow(QMainWindow):
         self.destination_platform_detail_stack.addWidget(dest_loc_widget)
 
         self.action_buttons = {}
-        for text in [
-            "Propose Folder",
-            "Assign",
-            "Unassign",
-            "Assign individually…",
-            "Import Draft",
-            "Export Draft",
-            "Unlock Draft",
-            "Submit Request to Ozlink IT"
-        ]:
-            btn = QPushButton(text)
-            if text == "Submit Request to Ozlink IT":
-                btn.setObjectName("PrimaryButton")
-                btn.setFixedWidth(220)
-            elif text == "Assign individually…":
-                btn.setMinimumHeight(28)
-                btn.setMinimumWidth(140)
-                btn.setToolTip(
-                    "Add one planned move per selected source file, or expand folders into per-file moves (Graph)."
-                )
-            elif text in ["Import Draft", "Export Draft", "Unlock Draft"]:
-                btn.setMinimumHeight(24)
-            self.action_buttons[text] = btn
-
-        self.action_buttons["Assign"].clicked.connect(self.handle_assign)
-        self.action_buttons["Unassign"].clicked.connect(self.handle_unassign)
-        self.action_buttons["Propose Folder"].clicked.connect(self.handle_new_proposed_folder)
-        self.action_buttons["Assign individually…"].clicked.connect(self.handle_assign_individual_from_selection)
-        self.action_buttons["Import Draft"].clicked.connect(self._handle_import_draft)
-        self.action_buttons["Export Draft"].clicked.connect(self._handle_export_draft)
-        self.action_buttons["Unlock Draft"].clicked.connect(self._handle_unlock_draft)
-        self.action_buttons["Submit Request to Ozlink IT"].clicked.connect(self._handle_submit_request)
+        submit_btn = QPushButton("Submit Request to Ozlink IT")
+        submit_btn.setObjectName("PrimaryButton")
+        submit_btn.setFixedWidth(220)
+        submit_btn.setMinimumHeight(32)
+        self.action_buttons["Submit Request to Ozlink IT"] = submit_btn
+        submit_btn.clicked.connect(self._handle_submit_request)
 
         counts_wrap = QHBoxLayout()
         counts_wrap.setContentsMargins(0, 0, 0, 0)
@@ -2850,74 +2851,17 @@ class MainWindow(QMainWindow):
         counts_wrap.addStretch()
 
         header_action_panel = QWidget()
-        header_action_panel.setMinimumWidth(300)
-        header_action_panel.setMaximumWidth(460)
+        header_action_panel.setMinimumWidth(260)
+        header_action_panel.setMaximumWidth(420)
         header_action_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         header_action_wrap = QVBoxLayout(header_action_panel)
         header_action_wrap.setContentsMargins(0, 0, 0, 0)
-        header_action_wrap.setSpacing(8)
-
-        for _draft_key in ("Import Draft", "Export Draft", "Unlock Draft"):
-            self.action_buttons[_draft_key].setParent(header_action_panel)
-            self.action_buttons[_draft_key].hide()
-
-        self.action_buttons["Assign"].setObjectName("SecondaryButton")
-        self.action_buttons["Propose Folder"].setObjectName("SecondaryButton")
-        self.action_buttons["Unassign"].setObjectName("SecondaryButton")
-        self.action_buttons["Assign individually…"].setObjectName("TertiaryButton")
-        self.action_buttons["Assign individually…"].setToolTip(
-            "Create one planned move per selected source file or expand selected folder rows."
-        )
-
-        self.test_mode_toggle = QPushButton("Test Mode: Off")
-        self.test_mode_toggle.setObjectName("TertiaryButton")
-        self.test_mode_toggle.setCheckable(True)
-        self.test_mode_toggle.setChecked(False)
-        self.test_mode_toggle.setMinimumHeight(30)
-        self.test_mode_toggle.setMinimumWidth(110)
-        self.test_mode_toggle.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
-        self.test_mode_toggle.setToolTip("Store a test submission without locking the live draft.")
-        def _handle_test_mode_toggled(checked):
-            self._submission_test_mode = bool(checked)
-            self.test_mode_toggle.setText("Test Mode: On" if checked else "Test Mode: Off")
-        self.test_mode_toggle.toggled.connect(_handle_test_mode_toggled)
-        toggle_row = QHBoxLayout()
-        toggle_row.setContentsMargins(0, 0, 0, 0)
-        toggle_row.addStretch()
-        toggle_row.addWidget(self.test_mode_toggle, 0, Qt.AlignRight)
-        header_action_wrap.addLayout(toggle_row)
+        header_action_wrap.setSpacing(10)
 
         submit_row = QHBoxLayout()
         submit_row.setContentsMargins(0, 0, 0, 0)
+        submit_row.setSpacing(10)
         submit_row.addStretch()
-        self.action_buttons["Submit Request to Ozlink IT"].setMinimumHeight(32)
-        self.action_buttons["Submit Request to Ozlink IT"].setMinimumWidth(198)
-        submit_row.addWidget(self.action_buttons["Submit Request to Ozlink IT"], 0, Qt.AlignRight)
-        header_action_wrap.addLayout(submit_row)
-
-        planning_action_strip = QFrame()
-        planning_action_strip.setObjectName("PlanningActionStrip")
-        pas_layout = QVBoxLayout(planning_action_strip)
-        pas_layout.setContentsMargins(14, 12, 14, 12)
-        pas_layout.setSpacing(10)
-        pas_label = QLabel("Map selection")
-        pas_label.setObjectName("SummaryLabel")
-        pas_actions = QHBoxLayout()
-        pas_actions.setContentsMargins(0, 0, 0, 0)
-        pas_actions.setSpacing(8)
-        pas_actions.addWidget(self.action_buttons["Assign"])
-        pas_actions.addWidget(self.action_buttons["Propose Folder"])
-        pas_actions.addWidget(self.action_buttons["Unassign"])
-        pas_actions.addStretch()
-        pas_layout.addWidget(pas_label)
-        pas_layout.addLayout(pas_actions)
-        header_action_wrap.addWidget(planning_action_strip)
-
-        secondary_actions_row = QHBoxLayout()
-        secondary_actions_row.setContentsMargins(0, 0, 0, 0)
-        secondary_actions_row.setSpacing(8)
-        secondary_actions_row.addWidget(self.action_buttons["Assign individually…"])
-        secondary_actions_row.addStretch()
 
         self._planning_draft_overflow_btn = QToolButton(header_action_panel)
         self._planning_draft_overflow_btn.setObjectName("OverflowMenuButton")
@@ -2926,6 +2870,8 @@ class MainWindow(QMainWindow):
         self._planning_draft_overflow_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self._planning_draft_overflow_btn.setCursor(Qt.PointingHandCursor)
         _draft_menu = QMenu(self._planning_draft_overflow_btn)
+        _draft_menu.setObjectName("PlanningOverflowMenu")
+        _draft_menu.setMinimumWidth(200)
         _act_imp = _draft_menu.addAction("Import Draft")
         _act_imp.triggered.connect(self._handle_import_draft)
         _act_exp = _draft_menu.addAction("Export Draft")
@@ -2933,9 +2879,19 @@ class MainWindow(QMainWindow):
         _act_unl = _draft_menu.addAction("Unlock Draft")
         _act_unl.triggered.connect(self._handle_unlock_draft)
         self._planning_draft_overflow_btn.setMenu(_draft_menu)
-        secondary_actions_row.addWidget(self._planning_draft_overflow_btn, 0, Qt.AlignRight)
+        submit_row.addWidget(self._planning_draft_overflow_btn, 0, Qt.AlignRight)
 
-        header_action_wrap.addLayout(secondary_actions_row)
+        self.action_buttons["Submit Request to Ozlink IT"].setMinimumWidth(198)
+        submit_row.addWidget(self.action_buttons["Submit Request to Ozlink IT"], 0, Qt.AlignRight)
+        header_action_wrap.addLayout(submit_row)
+
+        self._planning_map_hint = QLabel(
+            "Select items in the trees, then right-click a source or destination row to assign, "
+            "unassign, or add a proposed folder."
+        )
+        self._planning_map_hint.setObjectName("PlanningFlowHint")
+        self._planning_map_hint.setWordWrap(True)
+        header_action_wrap.addWidget(self._planning_map_hint)
         header_action_wrap.addStretch()
 
         selectors_row = QGridLayout()
@@ -3109,9 +3065,9 @@ class MainWindow(QMainWindow):
         self.workspace_tabs.setMinimumHeight(268)
         self.workspace_tabs.setMaximumHeight(380)
         self.workspace_tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        self.workspace_tabs_toggle_button = QPushButton("Collapse Panel")
-        self.workspace_tabs_toggle_button.setObjectName("PanelToggleButton")
-        self.workspace_tabs_toggle_button.setMinimumHeight(22)
+        self.workspace_tabs_toggle_button = QPushButton("▴")
+        self.workspace_tabs_toggle_button.setObjectName("IconToolButton")
+        self.workspace_tabs_toggle_button.setToolTip("Collapse bottom panel")
         self.workspace_tabs_toggle_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.workspace_tabs_toggle_button.clicked.connect(self.toggle_workspace_tabs_collapsed)
         self.workspace_tabs.setCornerWidget(self.workspace_tabs_toggle_button, Qt.TopRightCorner)
@@ -3637,13 +3593,13 @@ class MainWindow(QMainWindow):
         title.setObjectName("SectionTitle")
         refresh_cache_button = QPushButton("↻")
         refresh_cache_button.setObjectName("IconToolButton")
-        refresh_cache_button.setToolTip("Refresh cache for this tree")
+        refresh_cache_button.setToolTip("Refresh folder cache for this tree")
         refresh_cache_button.clicked.connect(
             lambda _=False, panel_key=panel_key: self.handle_refresh_cache_for_panel(panel_key)
         )
         expand_button = QPushButton("⤢")
         expand_button.setObjectName("IconToolButton")
-        expand_button.setToolTip("Expand all folders in this tree")
+        expand_button.setToolTip("Expand all folders in this tree (may load in the background)")
         expand_button.clicked.connect(lambda _=False, panel_key=panel_key: self.handle_expand_all(panel_key))
         if panel_key == "source":
             self.source_expand_all_button = expand_button
@@ -7090,12 +7046,14 @@ class MainWindow(QMainWindow):
             header_frame.setMinimumHeight(collapsed_height)
             header_frame.setMaximumHeight(collapsed_height)
             header_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            toggle_button.setText("Expand Header")
+            toggle_button.setText("▾")
+            toggle_button.setToolTip("Expand planning header")
         else:
             header_frame.setMinimumHeight(self._planning_header_expanded_min_height)
             header_frame.setMaximumHeight(16777215)
             header_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
-            toggle_button.setText("Collapse Header")
+            toggle_button.setText("▴")
+            toggle_button.setToolTip("Collapse planning header")
         header_frame.updateGeometry()
         header_frame.repaint()
 
@@ -7119,13 +7077,15 @@ class MainWindow(QMainWindow):
             self.workspace_tabs.setMinimumHeight(collapsed_height)
             self.workspace_tabs.setMaximumHeight(collapsed_height)
             self.workspace_tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            self.workspace_tabs_toggle_button.setText("Expand Panel")
+            self.workspace_tabs_toggle_button.setText("▾")
+            self.workspace_tabs_toggle_button.setToolTip("Expand bottom panel")
             self.workspace_tabs.setDocumentMode(True)
         else:
             self.workspace_tabs.setMinimumHeight(self._workspace_tabs_expanded_min_height)
             self.workspace_tabs.setMaximumHeight(self._workspace_tabs_expanded_max_height)
             self.workspace_tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-            self.workspace_tabs_toggle_button.setText("Collapse Panel")
+            self.workspace_tabs_toggle_button.setText("▴")
+            self.workspace_tabs_toggle_button.setToolTip("Collapse bottom panel")
             self.workspace_tabs.setDocumentMode(False)
         self.workspace_tabs.updateGeometry()
         self.workspace_tabs.repaint()
@@ -7862,6 +7822,38 @@ class MainWindow(QMainWindow):
 
         outer.addWidget(card)
 
+        self._settings_admin_submissions_card = QFrame()
+        self._settings_admin_submissions_card.setObjectName("SectionBox")
+        admin_card_layout = QVBoxLayout(self._settings_admin_submissions_card)
+        admin_card_layout.setContentsMargins(16, 14, 16, 14)
+        admin_card_layout.setSpacing(12)
+
+        admin_title = QLabel("Planning & submissions (administrator)")
+        admin_title.setObjectName("CardTitle")
+
+        admin_intro = QLabel(
+            "Test mode records submission batches without locking the live planning draft. "
+            "Use it when validating the request workflow."
+        )
+        admin_intro.setObjectName("CardBody")
+        admin_intro.setWordWrap(True)
+
+        self.test_mode_toggle = QCheckBox("Test mode for submissions (no live draft lock)")
+        self.test_mode_toggle.setChecked(False)
+        self.test_mode_toggle.setToolTip(
+            "When enabled, submissions are stored as test batches without locking the live draft."
+        )
+        self.test_mode_toggle.toggled.connect(
+            lambda checked: setattr(self, "_submission_test_mode", bool(checked))
+        )
+
+        admin_card_layout.addWidget(admin_title)
+        admin_card_layout.addWidget(admin_intro)
+        admin_card_layout.addWidget(self.test_mode_toggle)
+        admin_card_layout.addStretch()
+
+        outer.addWidget(self._settings_admin_submissions_card)
+
         ui_card = QFrame()
         ui_card.setObjectName("SectionBox")
         ui_card_layout = QVBoxLayout(ui_card)
@@ -7984,6 +7976,7 @@ class MainWindow(QMainWindow):
         outer.addWidget(self._settings_advanced_wrap)
 
         is_admin = self.current_session_context.get("user_role", "user") == "admin"
+        self._settings_admin_submissions_card.setVisible(is_admin)
         self._settings_advanced_wrap.setVisible(is_admin)
         self._refresh_execution_path_toggle_status()
         outer.addStretch()
@@ -8158,10 +8151,10 @@ class MainWindow(QMainWindow):
             btn.setVisible(name in allowed_pages)
 
         self._update_planning_workspace_access()
-        if hasattr(self, "test_mode_toggle"):
+        if hasattr(self, "_settings_admin_submissions_card"):
             is_admin = role == "admin"
-            self.test_mode_toggle.setVisible(is_admin)
-            if not is_admin:
+            self._settings_admin_submissions_card.setVisible(is_admin)
+            if hasattr(self, "test_mode_toggle") and not is_admin:
                 self.test_mode_toggle.setChecked(False)
         if hasattr(self, "requests_delete_test_btn"):
             self.requests_delete_test_btn.setVisible(role == "admin")
