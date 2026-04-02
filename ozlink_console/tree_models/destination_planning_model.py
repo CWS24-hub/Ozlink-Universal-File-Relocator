@@ -4,7 +4,7 @@ QAbstractItemModel for destination planning tree (v2 / QTreeView path).
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QAbstractItemModel, QModelIndex, Qt, Signal
 from PySide6.QtGui import QBrush
@@ -42,7 +42,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
 
     destination_structure_changed = Signal()
 
-    def __init__(self, parent=None, column_labels=None):
+    def __init__(self, parent=None, column_labels=None, destination_index_key_fn: Optional[Callable[[Dict[str, Any]], str]] = None):
         super().__init__(parent)
         labels = list(column_labels) if column_labels else list(EXPLORER_COLUMN_LABELS)
         while len(labels) < EXPLORER_COLUMN_COUNT:
@@ -50,6 +50,8 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         self._column_labels = labels[:EXPLORER_COLUMN_COUNT]
         self._invisible = _Node(None, -1, {}, [])
         self._invisible._children = []
+        self._destination_index_key_fn = destination_index_key_fn
+        self._path_to_nodes: Dict[str, List[_Node]] = {}
 
     def _node(self, index: QModelIndex) -> Optional[_Node]:
         if not index.isValid():
@@ -164,9 +166,94 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             c.row = i
             c.parent = parent_node
 
+    def _path_key_for_payload(self, payload: Dict[str, Any]) -> str:
+        fn = self._destination_index_key_fn
+        if fn is None:
+            return ""
+        try:
+            return str(fn(payload) or "").strip()
+        except Exception:
+            return ""
+
+    def _iter_subtree_nodes(self, node: _Node):
+        yield node
+        ch = node._children
+        if not ch:
+            return
+        for c in ch:
+            yield from self._iter_subtree_nodes(c)
+
+    def _bucket_remove_node(self, node: _Node, payload_snapshot: Optional[Dict[str, Any]] = None) -> None:
+        pl = payload_snapshot if payload_snapshot is not None else node.payload
+        k = self._path_key_for_payload(pl)
+        if not k:
+            return
+        lst = self._path_to_nodes.get(k)
+        if not lst:
+            return
+        try:
+            lst.remove(node)
+        except ValueError:
+            pass
+        if not lst:
+            del self._path_to_nodes[k]
+
+    def _bucket_add_node(self, node: _Node) -> None:
+        if self._destination_index_key_fn is None or node.is_placeholder():
+            return
+        k = self._path_key_for_payload(node.payload)
+        if not k:
+            return
+        lst = self._path_to_nodes.setdefault(k, [])
+        if node not in lst:
+            lst.append(node)
+
+    def _unregister_subtree_paths(self, node: _Node) -> None:
+        if self._destination_index_key_fn is None:
+            return
+        for n in self._iter_subtree_nodes(node):
+            self._bucket_remove_node(n)
+
+    def _register_subtree_paths(self, node: _Node) -> None:
+        if self._destination_index_key_fn is None:
+            return
+        for n in self._iter_subtree_nodes(node):
+            self._bucket_add_node(n)
+
+    def _rebuild_path_index(self) -> None:
+        self._path_to_nodes.clear()
+        if self._destination_index_key_fn is None:
+            return
+        for c in self._invisible._children or []:
+            self._register_subtree_paths(c)
+
+    def _index_for_node(self, node: _Node) -> QModelIndex:
+        if node is None or node.parent is None:
+            return QModelIndex()
+        pnode = node.parent
+        siblings = pnode._children or []
+        try:
+            row = siblings.index(node)
+        except ValueError:
+            return QModelIndex()
+        parent_ix = QModelIndex() if pnode.parent is None else self._index_for_node(pnode)
+        return self.index(row, 0, parent_ix)
+
+    def find_indices_for_canonical_destination_path(self, canonical_key: str) -> List[QModelIndex]:
+        if not canonical_key or self._destination_index_key_fn is None:
+            return []
+        nodes = self._path_to_nodes.get(canonical_key) or []
+        out: List[QModelIndex] = []
+        for n in nodes:
+            ix = self._index_for_node(n)
+            if ix.isValid():
+                out.append(ix)
+        return out
+
     def clear(self) -> None:
         self.beginResetModel()
         self._invisible._children = []
+        self._path_to_nodes.clear()
         self.endResetModel()
         self.destination_structure_changed.emit()
 
@@ -179,6 +266,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         self._invisible._children = children
         self._reindex(self._invisible)
         self.endResetModel()
+        self._rebuild_path_index()
         self.destination_structure_changed.emit()
 
     def set_empty_library_message(self, text: str) -> None:
@@ -192,6 +280,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         self._invisible._children = [_Node(self._invisible, 0, payload, [])]
         self._reindex(self._invisible)
         self.endResetModel()
+        self._rebuild_path_index()
         self.destination_structure_changed.emit()
 
     def replace_all_children(self, parent: QModelIndex, child_payloads: List[Dict[str, Any]]) -> None:
@@ -200,6 +289,8 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             return
         old_count = self.rowCount(parent)
         if old_count:
+            for old_child in list(parent_node._children or []):
+                self._unregister_subtree_paths(old_child)
             self.beginRemoveRows(parent, 0, old_count - 1)
             parent_node._children = []
             self.endRemoveRows()
@@ -215,6 +306,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             parent_node._children = [_Node(parent_node, 0, empty_pl, [])]
             self._reindex(parent_node)
             self.endInsertRows()
+            self._register_subtree_paths(parent_node._children[0])
             self.destination_structure_changed.emit()
             return
         self.beginInsertRows(parent, 0, n - 1)
@@ -225,6 +317,8 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         parent_node._children = new_children
         self._reindex(parent_node)
         self.endInsertRows()
+        for c in new_children:
+            self._register_subtree_paths(c)
         self.destination_structure_changed.emit()
 
     def set_loading_children(self, parent: QModelIndex) -> None:
@@ -233,6 +327,8 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             return
         old_count = self.rowCount(parent)
         if old_count:
+            for old_child in list(parent_node._children or []):
+                self._unregister_subtree_paths(old_child)
             self.beginRemoveRows(parent, 0, old_count - 1)
             parent_node._children = []
             self.endRemoveRows()
@@ -254,6 +350,8 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             return
         for row in range(len(parent_node._children) - 1, -1, -1):
             if parent_node._children[row].payload.get("placeholder"):
+                victim = parent_node._children[row]
+                self._unregister_subtree_paths(victim)
                 self.beginRemoveRows(parent, row, row)
                 parent_node._children.pop(row)
                 self.endRemoveRows()
@@ -274,13 +372,18 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             parent_node._children.append(_Node(parent_node, start + i, pl, ch))
         self._reindex(parent_node)
         self.endInsertRows()
+        for i in range(n):
+            self._register_subtree_paths(parent_node._children[start + i])
         self.destination_structure_changed.emit()
 
     def update_payload_for_index(self, index: QModelIndex, mutator) -> None:
         node = self._node(index)
         if node is None:
             return
+        old_snapshot = dict(node.payload)
+        self._bucket_remove_node(node, old_snapshot)
         mutator(node.payload)
+        self._bucket_add_node(node)
         parent = index.parent()
         row = index.row()
         top_left = self.index(row, 0, parent)
@@ -355,6 +458,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         self._invisible._children = children
         self._reindex(self._invisible)
         self.endResetModel()
+        self._rebuild_path_index()
         self.destination_structure_changed.emit()
 
     def _make_nested_node(self, parent_node: _Node, row: int, pl: Dict[str, Any], kids: List[NestedSpec]) -> _Node:
@@ -386,6 +490,8 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         if parent_node is None or not parent_node._children or row < 0 or row >= len(parent_node._children):
             return None
         nested = self._serialize_nested_node(parent_node._children[row])
+        removed = parent_node._children[row]
+        self._unregister_subtree_paths(removed)
         self.beginRemoveRows(parent_ix, row, row)
         parent_node._children.pop(row)
         self._reindex(parent_node)
@@ -405,5 +511,6 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         parent_node._children.append(new_node)
         self._reindex(parent_node)
         self.endInsertRows()
+        self._register_subtree_paths(new_node)
         self.destination_structure_changed.emit()
         return self.index(row, 0, parent_ix)

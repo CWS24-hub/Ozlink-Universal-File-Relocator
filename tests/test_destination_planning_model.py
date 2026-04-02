@@ -103,3 +103,36 @@ def test_destination_structure_changed_signal_on_mutations():
         ],
     )
     assert sum(hits) > before
+
+
+def test_destination_path_index_multi_candidate():
+    def key_fn(pl):
+        return str(pl.get("item_path", "") or "").strip()
+
+    model = DestinationPlanningTreeModel(destination_index_key_fn=key_fn)
+    model.reset_root_payloads(
+        [
+            {
+                "base_display_label": "Folder: Root",
+                "name": "Root",
+                "is_folder": True,
+                "item_path": "Root",
+            }
+        ]
+    )
+    ixs = model.find_indices_for_canonical_destination_path("Root")
+    assert len(ixs) == 1
+    root_ix = model.index(0, 0, QModelIndex())
+    model.replace_all_children(
+        root_ix,
+        [
+            {
+                "base_display_label": "File: a.txt",
+                "name": "a.txt",
+                "is_folder": False,
+                "item_path": r"Root\a.txt",
+            }
+        ],
+    )
+    ixs2 = model.find_indices_for_canonical_destination_path(r"Root\a.txt")
+    assert len(ixs2) == 1

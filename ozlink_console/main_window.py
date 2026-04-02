@@ -3712,7 +3712,11 @@ class MainWindow(QMainWindow):
             sharepoint_model_view = True
         elif panel_key == "destination" and getattr(self, "_destination_tree_model_view", False):
             tree = DestinationPlanningTreeView()
-            self.destination_planning_model = DestinationPlanningTreeModel(parent=tree, column_labels=hdr_labels)
+            self.destination_planning_model = DestinationPlanningTreeModel(
+                parent=tree,
+                column_labels=hdr_labels,
+                destination_index_key_fn=self._destination_payload_index_key,
+            )
             self.destination_planning_model.destination_structure_changed.connect(
                 self._on_destination_planning_model_structure_changed
             )
@@ -13790,6 +13794,19 @@ class MainWindow(QMainWindow):
         )
         return self._canonical_source_projection_path(mem) or ""
 
+    def _destination_payload_index_key(self, payload: dict) -> str:
+        """Canonical path key for DestinationPlanningTreeModel index (must match _destination_parent_match_details)."""
+        if not isinstance(payload, dict) or payload.get("placeholder"):
+            return ""
+        mem = self.normalize_memory_path(
+            payload.get("display_path")
+            or payload.get("item_path")
+            or payload.get("destination_path")
+            or payload.get("source_path")
+            or ""
+        )
+        return self._canonical_destination_projection_path(mem) or ""
+
     def _normalized_path_variants(self, path, tree_role=""):
         if tree_role == "source":
             path = self._canonical_source_projection_path(path)
@@ -19211,6 +19228,26 @@ class MainWindow(QMainWindow):
                 if dev:
                     _perf_explorer_log("find_visible_destination_item_by_path", elapsed_ms=perf.elapsed(), match="no_model")
                 return None
+            candidate_ixs = model.find_indices_for_canonical_destination_path(normalized_target)
+            if candidate_ixs:
+                selected = self._select_canonical_destination_item(candidate_ixs)
+                if selected is not None and selected.isValid():
+                    node_data = selected.data(Qt.UserRole) or {}
+                    visible_path = self._tree_item_path(node_data)
+                    if visible_path:
+                        match_details = self._destination_parent_match_details(destination_path, visible_path)
+                        if match_details["exact_match"]:
+                            if normalized_target:
+                                dest_cache[normalized_target] = QPersistentModelIndex(selected)
+                            if dev:
+                                _perf_explorer_log(
+                                    "find_visible_destination_item_by_path",
+                                    elapsed_ms=perf.elapsed(),
+                                    match="model_path_index",
+                                    scanned_nodes=len(candidate_ixs),
+                                    candidate_matches=len(candidate_ixs),
+                                )
+                            return selected
             emit_restore_match_logs = bool(getattr(self, "_verbose_destination_match_logging", False))
             matches = []
             scanned_nodes = 0
