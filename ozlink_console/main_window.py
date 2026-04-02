@@ -1710,6 +1710,61 @@ class MainWindow(QMainWindow):
                 background-color: #3B7CFF;
             }
 
+            QPushButton#SecondaryButton {
+                background-color: #151C2E;
+                border: 1px solid #2F3F5C;
+                color: #E8EDF7;
+                padding: 8px 14px;
+                min-height: 22px;
+                font-weight: 600;
+                border-radius: 6px;
+            }
+
+            QPushButton#SecondaryButton:hover {
+                background-color: #1C2740;
+                border: 1px solid #3B82F6;
+            }
+
+            QPushButton#TertiaryButton {
+                background-color: transparent;
+                border: 1px solid #2F3F5C;
+                color: #9DB4E8;
+                padding: 6px 12px;
+                min-height: 22px;
+                font-weight: 600;
+                border-radius: 6px;
+            }
+
+            QPushButton#TertiaryButton:hover {
+                background-color: #151C2E;
+                border: 1px solid #3B82F6;
+                color: #E8EDF7;
+            }
+
+            QToolButton#OverflowMenuButton {
+                background-color: #151C2E;
+                border: 1px solid #2F3F5C;
+                color: #B8C9F0;
+                border-radius: 6px;
+                min-width: 36px;
+                min-height: 30px;
+                padding: 4px 8px;
+                font-size: 16pt;
+                font-weight: 700;
+            }
+
+            QToolButton#OverflowMenuButton:hover {
+                background-color: #1C2740;
+                border: 1px solid #3B82F6;
+                color: #F4F7FC;
+            }
+
+            QFrame#PlanningActionStrip {
+                background-color: #121A28;
+                border: 1px solid #2A3A55;
+                border-radius: 8px;
+            }
+
             QPushButton#PanelToggleButton {
                 background-color: #1A2438;
                 border: 1px solid #334155;
@@ -2701,13 +2756,12 @@ class MainWindow(QMainWindow):
                 btn.setObjectName("PrimaryButton")
                 btn.setFixedWidth(220)
             elif text == "Assign individually…":
-                btn.setMinimumHeight(24)
-                btn.setMinimumWidth(168)
+                btn.setMinimumHeight(28)
+                btn.setMinimumWidth(140)
                 btn.setToolTip(
                     "Add one planned move per selected source file, or expand folders into per-file moves (Graph)."
                 )
             elif text in ["Import Draft", "Export Draft", "Unlock Draft"]:
-                btn.setFixedWidth(118)
                 btn.setMinimumHeight(24)
             self.action_buttons[text] = btn
 
@@ -2719,17 +2773,6 @@ class MainWindow(QMainWindow):
         self.action_buttons["Export Draft"].clicked.connect(self._handle_export_draft)
         self.action_buttons["Unlock Draft"].clicked.connect(self._handle_unlock_draft)
         self.action_buttons["Submit Request to Ozlink IT"].clicked.connect(self._handle_submit_request)
-
-        for key in [
-            "Propose Folder",
-            "Assign",
-            "Unassign",
-            "Assign individually…",
-            "Import Draft",
-            "Export Draft",
-            "Unlock Draft",
-        ]:
-            self.action_buttons[key].setObjectName("")
 
         counts_wrap = QHBoxLayout()
         counts_wrap.setContentsMargins(0, 0, 0, 0)
@@ -2776,15 +2819,27 @@ class MainWindow(QMainWindow):
         counts_wrap.addStretch()
 
         header_action_panel = QWidget()
-        header_action_panel.setMaximumWidth(420)
-        header_action_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Maximum)
+        header_action_panel.setMinimumWidth(360)
+        header_action_panel.setMaximumWidth(520)
+        header_action_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         header_action_wrap = QVBoxLayout(header_action_panel)
         header_action_wrap.setContentsMargins(0, 0, 0, 0)
-        header_action_wrap.setSpacing(3)
+        header_action_wrap.setSpacing(8)
+
+        for _draft_key in ("Import Draft", "Export Draft", "Unlock Draft"):
+            self.action_buttons[_draft_key].setParent(header_action_panel)
+            self.action_buttons[_draft_key].hide()
+
+        self.action_buttons["Assign"].setObjectName("SecondaryButton")
+        self.action_buttons["Propose Folder"].setObjectName("SecondaryButton")
+        self.action_buttons["Unassign"].setObjectName("SecondaryButton")
+        self.action_buttons["Assign individually…"].setObjectName("TertiaryButton")
+
         self.test_mode_toggle = QPushButton("Test Mode: Off")
+        self.test_mode_toggle.setObjectName("TertiaryButton")
         self.test_mode_toggle.setCheckable(True)
         self.test_mode_toggle.setChecked(False)
-        self.test_mode_toggle.setMinimumHeight(24)
+        self.test_mode_toggle.setMinimumHeight(28)
         self.test_mode_toggle.setMinimumWidth(110)
         self.test_mode_toggle.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
         self.test_mode_toggle.setToolTip("Store a test submission without locking the live draft.")
@@ -2797,14 +2852,53 @@ class MainWindow(QMainWindow):
         toggle_row.addStretch()
         toggle_row.addWidget(self.test_mode_toggle, 0, Qt.AlignRight)
         header_action_wrap.addLayout(toggle_row)
-        header_action_wrap.addWidget(self.action_buttons["Submit Request to Ozlink IT"], 0, Qt.AlignRight)
+
+        submit_row = QHBoxLayout()
+        submit_row.setContentsMargins(0, 0, 0, 0)
+        submit_row.addStretch()
+        submit_row.addWidget(self.action_buttons["Submit Request to Ozlink IT"], 0, Qt.AlignRight)
+        header_action_wrap.addLayout(submit_row)
+
+        planning_action_strip = QFrame()
+        planning_action_strip.setObjectName("PlanningActionStrip")
+        pas_layout = QVBoxLayout(planning_action_strip)
+        pas_layout.setContentsMargins(12, 10, 12, 10)
+        pas_layout.setSpacing(8)
+        pas_label = QLabel("Map selection")
+        pas_label.setObjectName("SummaryLabel")
+        pas_actions = QHBoxLayout()
+        pas_actions.setContentsMargins(0, 0, 0, 0)
+        pas_actions.setSpacing(8)
+        pas_actions.addWidget(self.action_buttons["Assign"])
+        pas_actions.addWidget(self.action_buttons["Propose Folder"])
+        pas_actions.addWidget(self.action_buttons["Unassign"])
+        pas_actions.addStretch()
+        pas_layout.addWidget(pas_label)
+        pas_layout.addLayout(pas_actions)
+        header_action_wrap.addWidget(planning_action_strip)
+
         secondary_actions_row = QHBoxLayout()
         secondary_actions_row.setContentsMargins(0, 0, 0, 0)
-        secondary_actions_row.setSpacing(4)
+        secondary_actions_row.setSpacing(8)
         secondary_actions_row.addWidget(self.action_buttons["Assign individually…"])
-        secondary_actions_row.addWidget(self.action_buttons["Unlock Draft"])
-        secondary_actions_row.addWidget(self.action_buttons["Export Draft"])
-        secondary_actions_row.addWidget(self.action_buttons["Import Draft"])
+        secondary_actions_row.addStretch()
+
+        self._planning_draft_overflow_btn = QToolButton(header_action_panel)
+        self._planning_draft_overflow_btn.setObjectName("OverflowMenuButton")
+        self._planning_draft_overflow_btn.setText("⋮")
+        self._planning_draft_overflow_btn.setToolTip("Draft actions: import, export, unlock")
+        self._planning_draft_overflow_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._planning_draft_overflow_btn.setCursor(Qt.PointingHandCursor)
+        _draft_menu = QMenu(self._planning_draft_overflow_btn)
+        _act_imp = _draft_menu.addAction("Import Draft")
+        _act_imp.triggered.connect(self._handle_import_draft)
+        _act_exp = _draft_menu.addAction("Export Draft")
+        _act_exp.triggered.connect(self._handle_export_draft)
+        _act_unl = _draft_menu.addAction("Unlock Draft")
+        _act_unl.triggered.connect(self._handle_unlock_draft)
+        self._planning_draft_overflow_btn.setMenu(_draft_menu)
+        secondary_actions_row.addWidget(self._planning_draft_overflow_btn, 0, Qt.AlignRight)
+
         header_action_wrap.addLayout(secondary_actions_row)
         header_action_wrap.addStretch()
 
@@ -2833,8 +2927,8 @@ class MainWindow(QMainWindow):
         stat_ribbon = QFrame()
         stat_ribbon.setObjectName("StatRibbon")
         stat_ribbon_layout = QHBoxLayout(stat_ribbon)
-        stat_ribbon_layout.setContentsMargins(10, 8, 10, 8)
-        stat_ribbon_layout.setSpacing(6)
+        stat_ribbon_layout.setContentsMargins(12, 10, 12, 10)
+        stat_ribbon_layout.setSpacing(8)
         stat_ribbon_layout.addLayout(counts_wrap)
 
         planning_ctx_bar = QFrame()
