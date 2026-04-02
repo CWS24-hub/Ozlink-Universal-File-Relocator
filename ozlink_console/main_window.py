@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QDialogButtonBox, QFormLayout, QTreeView, QFileSystemModel,
     QSpinBox,
+    QToolButton,
 )
 from PySide6.QtCore import (
     Qt,
@@ -1436,39 +1437,39 @@ class MainWindow(QMainWindow):
     def _apply_theme(self):
         self.setStyleSheet("""
             QWidget#Root {
-                background-color: #05070B;
-                color: #EAF0FF;
+                background-color: #0B0F18;
+                color: #E8EDF7;
             }
 
             QWidget {
                 background-color: transparent;
-                color: #EAF0FF;
-                font-family: Segoe UI;
+                color: #E8EDF7;
+                font-family: "Segoe UI", "Segoe UI Variable", sans-serif;
                 font-size: 10pt;
             }
 
             QFrame#TopBar {
-                background-color: #000000;
-                border-bottom: 1px solid #1B2C54;
+                background-color: #080C14;
+                border-bottom: 1px solid #1A2336;
             }
 
             QFrame#LeftNav {
-                background-color: #000000;
-                border-right: 1px solid #10203E;
+                background-color: #080C14;
+                border-right: 1px solid #151C2E;
             }
 
             QFrame#ContentArea {
-                background-color: #05070B;
+                background-color: #0B0F18;
             }
 
             QFrame#BottomStatusBar {
-                background-color: #000000;
-                border-top: 1px solid #10203E;
+                background-color: #080C14;
+                border-top: 1px solid #151C2E;
             }
 
             QFrame#PageCard {
-                background-color: #05070B;
-                border: 1px solid #536B9F;
+                background-color: #0F141F;
+                border: 1px solid #232F45;
             }
 
             QFrame#InfoBanner {
@@ -1477,66 +1478,101 @@ class MainWindow(QMainWindow):
             }
 
             QFrame#SectionBox {
-                background-color: #05070B;
-                border: 1px solid #536B9F;
+                background-color: #0F141F;
+                border: 1px solid #232F45;
+                border-radius: 8px;
             }
 
             QFrame#HeroCard {
-                background-color: #07101F;
-                border: 1px solid #32548F;
+                background-color: #101827;
+                border: 1px solid #283548;
+                border-radius: 10px;
             }
 
             QFrame#InsightCard {
-                background-color: #08101D;
-                border: 1px solid #284471;
+                background-color: #0F141F;
+                border: 1px solid #232F45;
+                border-radius: 8px;
             }
 
             QFrame#TopMetaCard {
-                background-color: #07101F;
-                border: 1px solid #27406B;
+                background-color: #101827;
+                border: 1px solid #283548;
+                border-radius: 8px;
             }
 
             QFrame#MetricCard {
-                background-color: #091224;
-                border: 1px solid #284471;
+                background-color: #121A28;
+                border: 1px solid #2A3A55;
+                border-radius: 8px;
             }
 
             QFrame#SoftBanner {
-                background-color: #0A1730;
-                border: 1px solid #21457D;
+                background-color: #121A28;
+                border: 1px solid #2A3A55;
+                border-radius: 8px;
             }
 
             QFrame#TreeSurface {
-                background-color: #071225;
-                border: 1px solid #20355E;
+                background-color: #0A0E16;
+                border: 1px solid #1E2A3F;
+                border-radius: 6px;
             }
 
             QFrame#TabSurface {
-                background-color: #07101F;
-                border: 1px solid #284471;
+                background-color: #101827;
+                border: 1px solid #283548;
+                border-radius: 6px;
+            }
+
+            QFrame#StatRibbon {
+                background-color: #0D121C;
+                border: 1px solid #1E2A3F;
+                border-radius: 8px;
+            }
+
+            QFrame#PlanningContextBar {
+                background-color: #101827;
+                border: 1px solid #283548;
+                border-radius: 8px;
+            }
+
+            QFrame#SurfaceCard {
+                background-color: #121A28;
+                border: 1px solid #2A3A55;
+                border-radius: 8px;
+            }
+
+            QFrame#BadgeChip {
+                background-color: #121A28;
+                border: 1px solid #2A3A55;
+                border-radius: 8px;
             }
 
             QLabel#AppTitle {
-                font-size: 20pt;
+                font-size: 15pt;
                 font-weight: 700;
-                color: #F3F7FF;
+                color: #F4F7FC;
+                letter-spacing: -0.02em;
             }
 
             QLabel#AppSubtitle {
-                font-size: 11pt;
-                color: #2E8BFF;
+                font-size: 9.5pt;
+                color: #7C9BD9;
                 font-weight: 600;
             }
 
             QLabel#NavHeader {
-                font-size: 18px;
+                font-size: 11px;
                 font-weight: 700;
-                color: #EAF0FF;
+                color: #8B9DC5;
+                letter-spacing: 0.12em;
+                text-transform: uppercase;
             }
 
             QLabel#NavSubHeader {
-                font-size: 11px;
-                color: #7E92C5;
+                font-size: 10px;
+                color: #5C6B89;
             }
 
             QLabel#CardTitle {
@@ -1564,13 +1600,21 @@ class MainWindow(QMainWindow):
             }
 
             QLabel#StatusGood {
-                color: #66D97A;
-                font-weight: 700;
+                color: #7AE3A0;
+                font-weight: 600;
+                padding: 5px 12px;
+                background-color: rgba(52, 211, 153, 0.10);
+                border: 1px solid rgba(52, 211, 153, 0.35);
+                border-radius: 6px;
             }
 
             QLabel#StatusBad {
-                color: #FF5D5D;
-                font-weight: 700;
+                color: #FCA5A5;
+                font-weight: 600;
+                padding: 5px 12px;
+                background-color: rgba(248, 113, 113, 0.10);
+                border: 1px solid rgba(248, 113, 113, 0.30);
+                border-radius: 6px;
             }
 
             QLabel#MutedText {
@@ -1667,38 +1711,54 @@ class MainWindow(QMainWindow):
             }
 
             QPushButton#PanelToggleButton {
-                background-color: #FFB020;
-                border: 1px solid #FFD27A;
-                color: #091224;
-                font-weight: 800;
-                padding: 8px 14px;
+                background-color: #1A2438;
+                border: 1px solid #334155;
+                color: #CBD5F5;
+                font-weight: 600;
+                padding: 6px 12px;
+                border-radius: 6px;
             }
 
             QPushButton#PanelToggleButton:hover {
-                background-color: #FFC44D;
-                border: 1px solid #FFE2A6;
+                background-color: #243047;
+                border: 1px solid #3B82F6;
+                color: #F8FAFF;
             }
 
             QPushButton#NavButton {
                 text-align: left;
-                padding: 12px 18px;
-                font-size: 12pt;
+                padding: 9px 12px;
+                font-size: 11pt;
                 border: 1px solid transparent;
                 background-color: transparent;
+                border-radius: 6px;
             }
 
             QPushButton#NavButton:hover {
-                background-color: #0A1631;
-                border-left: 4px solid #2E8BFF;
+                background-color: #121A28;
+                border: 1px solid #2A3A55;
             }
 
             QPushButton#NavButtonActive {
                 text-align: left;
-                padding: 12px 18px;
-                font-size: 12pt;
-                color: white;
-                background-color: #0F57FF;
-                border: 1px solid #2C6FFF;
+                padding: 9px 12px;
+                font-size: 11pt;
+                color: #F8FAFF;
+                background-color: #1D4ED8;
+                border: 1px solid #3B82F6;
+                border-radius: 6px;
+            }
+
+            QToolButton {
+                color: #9DB4E8;
+                background-color: transparent;
+                border: none;
+                font-weight: 600;
+                padding: 6px 4px;
+            }
+
+            QToolButton:hover {
+                color: #E8EDF7;
             }
 
             QLineEdit {
@@ -1902,50 +1962,64 @@ class MainWindow(QMainWindow):
             }
 
             QTabWidget::pane {
-                border: 1px solid #284471;
-                background-color: #07101F;
+                border: 1px solid #283548;
+                background-color: #101827;
                 top: -1px;
+                border-radius: 0 0 8px 8px;
             }
 
             QTabBar::tab {
-                background-color: #091224;
-                color: #AFC0E8;
-                padding: 8px 14px;
-                border: 1px solid #21385F;
-                margin-right: 4px;
+                background-color: #0D121C;
+                color: #8FA3CC;
+                padding: 8px 16px;
+                border: 1px solid #232F45;
+                margin-right: 2px;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
             }
 
             QTabBar::tab:selected {
-                background-color: #12356F;
-                color: #FFFFFF;
-                border-color: #2E6DFF;
+                background-color: #1A2438;
+                color: #F4F7FC;
+                border-color: #3B82F6;
+                border-bottom-color: #1A2438;
+            }
+
+            QSplitter::handle {
+                background-color: #1E2A3F;
+            }
+
+            QSplitter::handle:hover {
+                background-color: #3B82F6;
             }
         """)
 
     def build_top_bar(self):
         self.top_bar = QFrame()
         self.top_bar.setObjectName("TopBar")
-        self.top_bar.setFixedHeight(92)
+        self.top_bar.setFixedHeight(64)
 
         top_layout = QHBoxLayout(self.top_bar)
-        top_layout.setContentsMargins(16, 12, 20, 12)
-        top_layout.setSpacing(18)
+        top_layout.setContentsMargins(14, 8, 18, 8)
+        top_layout.setSpacing(16)
 
         brand_wrap = QHBoxLayout()
-        brand_wrap.setSpacing(14)
+        brand_wrap.setSpacing(12)
 
         self.logo_block = QFrame()
-        self.logo_block.setFixedSize(34, 34)
-        self.logo_block.setStyleSheet("background-color:#2E6DFF; border:1px solid #5F95FF;")
+        self.logo_block.setFixedSize(30, 30)
+        self.logo_block.setStyleSheet(
+            "background-color:#2563EB; border:1px solid #60A5FA; border-radius:8px;"
+        )
 
         brand_text_layout = QVBoxLayout()
         brand_text_layout.setContentsMargins(0, 0, 0, 0)
-        brand_text_layout.setSpacing(2)
+        brand_text_layout.setSpacing(0)
 
-        self.app_title = QLabel("Ozlink IT – SharePoint File Relocation Console")
+        self.app_title = QLabel("Ozlink Relocation Console")
         self.app_title.setObjectName("AppTitle")
 
-        self.app_subtitle = QLabel("Connect")
+        self.app_subtitle = QLabel("Microsoft 365 · Planning")
         self.app_subtitle.setObjectName("AppSubtitle")
 
         brand_text_layout.addWidget(self.app_title)
@@ -1953,56 +2027,44 @@ class MainWindow(QMainWindow):
 
         brand_wrap.addWidget(self.logo_block)
         brand_wrap.addLayout(brand_text_layout)
-        brand_wrap.addStretch()
 
-        right_wrap = QHBoxLayout()
-        right_wrap.setContentsMargins(0, 0, 0, 0)
-        right_wrap.setSpacing(8)
+        badges_wrap = QHBoxLayout()
+        badges_wrap.setSpacing(10)
 
-        meta_card = QFrame()
-        meta_card.setObjectName("TopMetaCard")
-        meta_layout = QGridLayout(meta_card)
-        meta_layout.setContentsMargins(10, 6, 10, 6)
-        meta_layout.setHorizontalSpacing(10)
-        meta_layout.setVerticalSpacing(1)
+        def _badge_chip(caption: str, value_label: QLabel) -> QFrame:
+            chip = QFrame()
+            chip.setObjectName("BadgeChip")
+            lay = QVBoxLayout(chip)
+            lay.setContentsMargins(10, 6, 10, 6)
+            lay.setSpacing(2)
+            cap = QLabel(caption)
+            cap.setObjectName("TopMetaLabel")
+            value_label.setObjectName("TopMetaValue")
+            lay.addWidget(cap)
+            lay.addWidget(value_label)
+            return chip
 
-        operator_caption = QLabel("Operator")
-        operator_caption.setObjectName("TopMetaLabel")
         self.operator_label = QLabel("Not Signed In")
-        self.operator_label.setObjectName("TopMetaValue")
-
-        tenant_caption = QLabel("Tenant")
-        tenant_caption.setObjectName("TopMetaLabel")
         self.top_tenant_label = QLabel("Not Connected")
-        self.top_tenant_label.setObjectName("TopMetaValue")
-
-        meta_layout.addWidget(operator_caption, 0, 0)
-        meta_layout.addWidget(self.operator_label, 0, 1)
-        meta_layout.addWidget(tenant_caption, 1, 0)
-        meta_layout.addWidget(self.top_tenant_label, 1, 1)
-        meta_layout.setColumnStretch(1, 1)
-
-        self.top_connect_btn = QPushButton("Connect to Microsoft 365")
-        self.top_connect_btn.setObjectName("PrimaryButton")
-        self.top_connect_btn.setFixedWidth(170)
-        self.top_connect_btn.setMinimumHeight(26)
-        self.top_connect_btn.clicked.connect(self.handle_connect)
+        badges_wrap.addWidget(_badge_chip("Operator", self.operator_label))
+        badges_wrap.addWidget(_badge_chip("Tenant", self.top_tenant_label))
 
         self.session_badge = QLabel("■ Session: Not Connected")
         self.session_badge.setObjectName("StatusBad")
-        self.session_badge.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.session_badge.setAlignment(Qt.AlignCenter | Qt.AlignVCenter)
+        badges_wrap.addWidget(self.session_badge, 0, Qt.AlignVCenter)
 
-        status_wrap = QVBoxLayout()
-        status_wrap.setContentsMargins(0, 0, 0, 0)
-        status_wrap.setSpacing(4)
-        status_wrap.addWidget(self.session_badge)
-        status_wrap.addWidget(self.top_connect_btn, 0, Qt.AlignRight)
+        self.top_connect_btn = QPushButton("Connect")
+        self.top_connect_btn.setObjectName("PrimaryButton")
+        self.top_connect_btn.setMinimumWidth(132)
+        self.top_connect_btn.setMinimumHeight(32)
+        self.top_connect_btn.setToolTip("Connect to Microsoft 365 (SharePoint)")
+        self.top_connect_btn.clicked.connect(self.handle_connect)
 
-        right_wrap.addWidget(meta_card, 1)
-        right_wrap.addLayout(status_wrap)
-
-        top_layout.addLayout(brand_wrap, 1)
-        top_layout.addLayout(right_wrap, 0)
+        top_layout.addLayout(brand_wrap, 0)
+        top_layout.addStretch(1)
+        top_layout.addLayout(badges_wrap, 0)
+        top_layout.addWidget(self.top_connect_btn, 0, Qt.AlignVCenter)
 
         self.root_layout.addWidget(self.top_bar)
 
@@ -2019,16 +2081,16 @@ class MainWindow(QMainWindow):
     def build_left_nav(self):
         self.left_nav = QFrame()
         self.left_nav.setObjectName("LeftNav")
-        self.left_nav.setFixedWidth(235)
+        self.left_nav.setFixedWidth(200)
 
         nav_layout = QVBoxLayout(self.left_nav)
-        nav_layout.setContentsMargins(18, 18, 18, 18)
-        nav_layout.setSpacing(14)
+        nav_layout.setContentsMargins(12, 14, 12, 14)
+        nav_layout.setSpacing(10)
 
-        nav_header = QLabel("Navigation")
+        nav_header = QLabel("Menu")
         nav_header.setObjectName("NavHeader")
 
-        nav_subheader = QLabel("Client Planning Workspace")
+        nav_subheader = QLabel("Workspace")
         nav_subheader.setObjectName("NavSubHeader")
 
         nav_layout.addWidget(nav_header)
@@ -2036,7 +2098,7 @@ class MainWindow(QMainWindow):
 
         divider = QFrame()
         divider.setFixedHeight(1)
-        divider.setStyleSheet("background-color:#0C2312; border:none;")
+        divider.setStyleSheet("background-color:#1E2A3F; border:none;")
         nav_layout.addWidget(divider)
 
         buttons = [
@@ -2060,11 +2122,11 @@ class MainWindow(QMainWindow):
 
         bottom_divider = QFrame()
         bottom_divider.setFixedHeight(1)
-        bottom_divider.setStyleSheet("background-color:#0C2312; border:none;")
+        bottom_divider.setStyleSheet("background-color:#1E2A3F; border:none;")
         nav_layout.addWidget(bottom_divider)
 
-        self.mode_label = QLabel("Client-facing planning mode")
-        self.mode_label.setObjectName("FooterText")
+        self.mode_label = QLabel("Client planning mode")
+        self.mode_label.setObjectName("NavSubHeader")
         nav_layout.addWidget(self.mode_label)
 
         self.main_wrap.addWidget(self.left_nav)
@@ -2076,7 +2138,7 @@ class MainWindow(QMainWindow):
         self.content_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         content_layout = QVBoxLayout(self.content_area)
-        content_layout.setContentsMargins(24, 24, 24, 24)
+        content_layout.setContentsMargins(18, 18, 18, 18)
         content_layout.setSpacing(0)
 
         self.pages = QStackedWidget()
@@ -2085,7 +2147,7 @@ class MainWindow(QMainWindow):
         self.dashboard_page = self.build_dashboard_page()
         self.planning_page = self.build_planning_page()
         self.settings_page = self.build_settings_page()
-        self.audit_page = self.build_placeholder_page("Audit")
+        self.audit_page = self.build_audit_page()
         self.execution_page = self.build_execution_page()
         self.requests_page = self.build_requests_page()
 
@@ -2270,12 +2332,10 @@ class MainWindow(QMainWindow):
 
         intro_layout.addWidget(intro_title)
         intro_layout.addWidget(intro_body)
-        intro_layout.addSpacing(8)
-        intro_layout.addWidget(self.dashboard_next_step)
 
         cards_row = QHBoxLayout()
         cards_row.setContentsMargins(0, 0, 0, 0)
-        cards_row.setSpacing(14)
+        cards_row.setSpacing(12)
 
         session_card = QFrame()
         session_card.setObjectName("SectionBox")
@@ -2400,8 +2460,26 @@ class MainWindow(QMainWindow):
         progress_layout.addLayout(progress_button_row)
         progress_layout.addStretch()
 
+        next_card = QFrame()
+        next_card.setObjectName("SectionBox")
+        next_layout = QVBoxLayout(next_card)
+        next_layout.setContentsMargins(18, 16, 18, 16)
+        next_layout.setSpacing(8)
+        next_title = QLabel("Next actions")
+        next_title.setObjectName("SectionTitle")
+        next_body = QLabel(
+            "Pick source and destination libraries, then map content in the Planning Workspace. Submit when the plan is ready for Ozlink IT."
+        )
+        next_body.setObjectName("CardBody")
+        next_body.setWordWrap(True)
+        next_layout.addWidget(next_title)
+        next_layout.addWidget(next_body)
+        next_layout.addWidget(self.dashboard_next_step)
+        next_layout.addStretch()
+
         cards_row.addWidget(session_card, 1)
         cards_row.addWidget(progress_card, 1)
+        cards_row.addWidget(next_card, 1)
 
         dashboard_layout.addWidget(intro_panel)
         dashboard_layout.addLayout(cards_row)
@@ -2422,8 +2500,8 @@ class MainWindow(QMainWindow):
         header = QFrame()
         header.setObjectName("HeroCard")
         header_shell_layout = QVBoxLayout(header)
-        header_shell_layout.setContentsMargins(9, 7, 9, 7)
-        header_shell_layout.setSpacing(6)
+        header_shell_layout.setContentsMargins(12, 10, 12, 10)
+        header_shell_layout.setSpacing(8)
 
         header_top_bar = QHBoxLayout()
         header_top_bar.setContentsMargins(0, 0, 0, 0)
@@ -2752,11 +2830,25 @@ class MainWindow(QMainWindow):
         context_row.setColumnStretch(0, 1)
         context_row.setColumnStretch(1, 1)
 
-        header_layout.addLayout(counts_wrap, 0, 0, 1, 3)
+        stat_ribbon = QFrame()
+        stat_ribbon.setObjectName("StatRibbon")
+        stat_ribbon_layout = QHBoxLayout(stat_ribbon)
+        stat_ribbon_layout.setContentsMargins(10, 8, 10, 8)
+        stat_ribbon_layout.setSpacing(6)
+        stat_ribbon_layout.addLayout(counts_wrap)
+
+        planning_ctx_bar = QFrame()
+        planning_ctx_bar.setObjectName("PlanningContextBar")
+        planning_ctx_layout = QVBoxLayout(planning_ctx_bar)
+        planning_ctx_layout.setContentsMargins(12, 10, 12, 10)
+        planning_ctx_layout.setSpacing(8)
+        planning_ctx_layout.addLayout(selectors_row)
+        planning_ctx_layout.addLayout(context_row)
+
+        header_layout.addWidget(stat_ribbon, 0, 0, 1, 3)
         header_layout.addWidget(header_action_panel, 0, 3, 3, 1, Qt.AlignTop | Qt.AlignRight)
-        header_layout.addLayout(selectors_row, 1, 0, 1, 3)
-        header_layout.addLayout(context_row, 2, 0, 1, 3)
-        header_layout.addWidget(self.planning_loading_banner, 3, 0, 1, 4)
+        header_layout.addWidget(planning_ctx_bar, 1, 0, 1, 3)
+        header_layout.addWidget(self.planning_loading_banner, 2, 0, 1, 4)
         header_layout.setColumnStretch(0, 2)
         header_layout.setColumnStretch(1, 2)
         header_layout.setColumnStretch(2, 2)
@@ -2877,10 +2969,10 @@ class MainWindow(QMainWindow):
         middle_wrap.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         self.workspace_tabs = QTabWidget()
+        self.workspace_tabs.addTab(self.details_box, "Selection Details")
         self.workspace_tabs.addTab(self.planned_moves_box, "Planned Moves")
         self.workspace_tabs.addTab(self.suggestions_box, "Suggestions")
         self.workspace_tabs.addTab(self.needs_review_box, "Needs Review")
-        self.workspace_tabs.addTab(self.details_box, "Selection Details")
         self._workspace_tabs_expanded_min_height = 240
         self._workspace_tabs_expanded_max_height = 340
         self._workspace_tabs_collapsed = False
@@ -2979,9 +3071,11 @@ class MainWindow(QMainWindow):
         body.setObjectName("CardBody")
         body.setWordWrap(True)
 
-        actions_row = QHBoxLayout()
-        actions_row.setContentsMargins(0, 0, 0, 0)
-        actions_row.setSpacing(10)
+        summary_strip = QFrame()
+        summary_strip.setObjectName("StatRibbon")
+        summary_layout = QHBoxLayout(summary_strip)
+        summary_layout.setContentsMargins(12, 10, 12, 10)
+        summary_layout.setSpacing(10)
         self.requests_live_count = QLabel("0")
         self.requests_live_count.setObjectName("MetricValue")
         self.requests_test_count = QLabel("0")
@@ -2989,40 +3083,58 @@ class MainWindow(QMainWindow):
         self.requests_total_moves = QLabel("0")
         self.requests_total_moves.setObjectName("MetricValue")
         for caption, label in [
-            ("Live Batches", self.requests_live_count),
-            ("Test Batches", self.requests_test_count),
-            ("Submitted Moves", self.requests_total_moves),
+            ("Live batches", self.requests_live_count),
+            ("Test batches", self.requests_test_count),
+            ("Submitted moves", self.requests_total_moves),
         ]:
             chip = QFrame()
-            chip.setObjectName("TreeSurface")
+            chip.setObjectName("MetricCard")
             chip_layout = QVBoxLayout(chip)
-            chip_layout.setContentsMargins(12, 8, 12, 8)
+            chip_layout.setContentsMargins(14, 10, 14, 10)
             chip_layout.setSpacing(2)
             chip_layout.addWidget(label)
             chip_label = QLabel(caption)
             chip_label.setObjectName("SummaryLabel")
             chip_layout.addWidget(chip_label)
-            actions_row.addWidget(chip)
-        actions_row.addStretch()
-        self.requests_refresh_btn = QPushButton("Refresh Requests")
+            summary_layout.addWidget(chip)
+        summary_layout.addStretch()
+
+        actions_bar = QFrame()
+        actions_bar.setObjectName("SurfaceCard")
+        actions_outer = QVBoxLayout(actions_bar)
+        actions_outer.setContentsMargins(14, 12, 14, 12)
+        actions_outer.setSpacing(8)
+        actions_caption = QLabel("Actions")
+        actions_caption.setObjectName("SectionTitle")
+        actions_row = QHBoxLayout()
+        actions_row.setContentsMargins(0, 0, 0, 0)
+        actions_row.setSpacing(8)
+        self.requests_refresh_btn = QPushButton("Refresh")
+        self.requests_refresh_btn.setToolTip("Reload submission batches from this device.")
         self.requests_refresh_btn.clicked.connect(self.refresh_requests_page)
-        actions_row.addWidget(self.requests_refresh_btn, 0, Qt.AlignRight)
         self.requests_export_zip_btn = QPushButton("Export Zip")
         self.requests_export_zip_btn.setEnabled(False)
         self.requests_export_zip_btn.clicked.connect(self.handle_export_request_zip)
-        actions_row.addWidget(self.requests_export_zip_btn, 0, Qt.AlignRight)
         self.requests_email_btn = QPushButton("Email Ozlink IT")
         self.requests_email_btn.setEnabled(False)
         self.requests_email_btn.clicked.connect(self.handle_email_request_batch)
-        actions_row.addWidget(self.requests_email_btn, 0, Qt.AlignRight)
-        self.requests_delete_test_btn = QPushButton("Delete Test Batch")
+        self.requests_delete_test_btn = QPushButton("Delete test batch")
         self.requests_delete_test_btn.setEnabled(False)
         self.requests_delete_test_btn.clicked.connect(self.handle_delete_test_request)
-        actions_row.addWidget(self.requests_delete_test_btn, 0, Qt.AlignRight)
+        actions_row.addWidget(self.requests_refresh_btn)
+        actions_row.addWidget(self.requests_export_zip_btn)
+        actions_row.addWidget(self.requests_email_btn)
+        actions_row.addWidget(self.requests_delete_test_btn)
+        actions_row.addStretch()
+        actions_outer.addWidget(actions_caption)
+        actions_outer.addLayout(actions_row)
 
         hero_layout.addWidget(title)
         hero_layout.addWidget(body)
-        hero_layout.addLayout(actions_row)
+
+        layout.addWidget(hero)
+        layout.addWidget(summary_strip)
+        layout.addWidget(actions_bar)
 
         content = QGridLayout()
         content.setContentsMargins(0, 0, 0, 0)
@@ -3073,7 +3185,6 @@ class MainWindow(QMainWindow):
         content.setColumnStretch(0, 3)
         content.setColumnStretch(1, 2)
 
-        layout.addWidget(hero)
         layout.addLayout(content, 1)
         return page
 
@@ -3388,8 +3499,8 @@ class MainWindow(QMainWindow):
         box = QFrame()
         box.setObjectName("SectionBox")
         layout = QVBoxLayout(box)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
 
         title = QLabel(title_text)
         title.setObjectName("SectionTitle")
@@ -5894,29 +6005,17 @@ class MainWindow(QMainWindow):
         box.setMinimumWidth(0)
         box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         layout = QVBoxLayout(box)
-        layout.setContentsMargins(6, 4, 6, 4)
-        layout.setSpacing(3)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(10)
 
         title = QLabel("Selection Details")
         title.setObjectName("SectionTitle")
 
-        content_grid = QGridLayout()
-        content_grid.setContentsMargins(0, 0, 0, 0)
-        content_grid.setHorizontalSpacing(7)
-        content_grid.setVerticalSpacing(3)
-
-        summary_card = QFrame()
-        summary_card.setObjectName("TreeSurface")
-        summary_card.setMinimumWidth(0)
-        summary_layout = QVBoxLayout(summary_card)
-        summary_layout.setContentsMargins(5, 5, 5, 5)
-        summary_layout.setSpacing(2)
-
         self.details_fields = {}
 
         actions_row = QHBoxLayout()
-        actions_row.setContentsMargins(0, 1, 0, 0)
-        actions_row.setSpacing(5)
+        actions_row.setContentsMargins(0, 0, 0, 0)
+        actions_row.setSpacing(6)
 
         self.details_action_buttons = {}
         for index, (text, handler) in enumerate([
@@ -5927,8 +6026,8 @@ class MainWindow(QMainWindow):
             ("Go to Destination", self.handle_go_to_destination),
         ]):
             button = QPushButton(text)
-            button.setMinimumHeight(18)
-            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            button.setMinimumHeight(28)
+            button.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
             button.clicked.connect(handler)
             button.setEnabled(False)
             self.details_action_buttons[text] = button
@@ -5938,38 +6037,31 @@ class MainWindow(QMainWindow):
         metadata_wrap.setObjectName("TreeSurface")
         metadata_wrap.setMinimumWidth(0)
         metadata_layout = QVBoxLayout(metadata_wrap)
-        metadata_layout.setContentsMargins(5, 5, 5, 5)
-        metadata_layout.setSpacing(3)
-        metadata_title = QLabel("Item Metadata")
+        metadata_layout.setContentsMargins(8, 8, 8, 8)
+        metadata_layout.setSpacing(4)
+        metadata_title = QLabel("Metadata")
         metadata_title.setObjectName("HeaderEyebrow")
         metadata_layout.addWidget(metadata_title)
         self.details_metadata_summary = QTextEdit()
         self.details_metadata_summary.setReadOnly(True)
         self.details_metadata_summary.setObjectName("DetailsNotes")
-        self.details_metadata_summary.setMinimumHeight(64)
+        self.details_metadata_summary.setMinimumHeight(80)
         self.details_metadata_summary.setPlainText("Select an item to review its metadata.")
         metadata_layout.addWidget(self.details_metadata_summary, 1)
 
-        summary_layout.addWidget(metadata_wrap, 1)
-        summary_layout.addLayout(actions_row)
-
-        side_stack = QVBoxLayout()
-        side_stack.setContentsMargins(0, 0, 0, 0)
-        side_stack.setSpacing(4)
-
         preview_card = QFrame()
         preview_card.setObjectName("TreeSurface")
-        preview_card.setMinimumWidth(140)
+        preview_card.setMinimumWidth(160)
         preview_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         preview_layout = QVBoxLayout(preview_card)
-        preview_layout.setContentsMargins(5, 5, 5, 5)
-        preview_layout.setSpacing(2)
+        preview_layout.setContentsMargins(8, 8, 8, 8)
+        preview_layout.setSpacing(4)
         preview_title = QLabel("Preview")
         preview_title.setObjectName("HeaderEyebrow")
         self.details_preview = QTextEdit()
         self.details_preview.setReadOnly(True)
         self.details_preview.setObjectName("DetailsNotes")
-        self.details_preview.setMinimumHeight(64)
+        self.details_preview.setMinimumHeight(80)
         self.details_preview.setPlainText("Preview not available in this version.")
         preview_layout.addWidget(preview_title)
         preview_layout.addWidget(self.details_preview, 1)
@@ -5982,15 +6074,15 @@ class MainWindow(QMainWindow):
         self.details_notes.setPlainText("Selection guidance and allocation notes will appear here.")
         self.details_notes.hide()
 
-        side_stack.addWidget(preview_card, 1)
-
-        content_grid.addWidget(summary_card, 0, 0)
-        content_grid.addLayout(side_stack, 0, 1)
-        content_grid.setColumnStretch(0, 7)
-        content_grid.setColumnStretch(1, 3)
+        meta_preview_row = QHBoxLayout()
+        meta_preview_row.setContentsMargins(0, 0, 0, 0)
+        meta_preview_row.setSpacing(10)
+        meta_preview_row.addWidget(metadata_wrap, 11)
+        meta_preview_row.addWidget(preview_card, 9)
 
         layout.addWidget(title)
-        layout.addLayout(content_grid, 1)
+        layout.addLayout(meta_preview_row, 1)
+        layout.addLayout(actions_row)
 
         return box
 
@@ -7348,33 +7440,71 @@ class MainWindow(QMainWindow):
         layout.addWidget(card)
         return page
 
+    def build_audit_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
+
+        card = QFrame()
+        card.setObjectName("HeroCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(40, 48, 40, 48)
+        card_layout.setSpacing(16)
+        card_layout.setAlignment(Qt.AlignCenter)
+
+        glyph = QLabel("◆")
+        glyph.setObjectName("MetricValue")
+        glyph.setAlignment(Qt.AlignCenter)
+        glyph.setStyleSheet("color: #475569; font-size: 42pt;")
+
+        title = QLabel("Audit")
+        title.setObjectName("CardTitle")
+        title.setAlignment(Qt.AlignCenter)
+
+        subtitle = QLabel(
+            "A detailed audit trail for sign-ins, exports, and execution events will appear here in a future release. "
+            "Your planning and request history remain available on the Requests page."
+        )
+        subtitle.setObjectName("MutedText")
+        subtitle.setWordWrap(True)
+        subtitle.setAlignment(Qt.AlignCenter)
+
+        card_layout.addWidget(glyph)
+        card_layout.addWidget(title)
+        card_layout.addWidget(subtitle)
+        card_layout.addStretch()
+
+        layout.addWidget(card, 1)
+        return page
+
     def build_execution_page(self):
         page = QWidget()
         outer = QVBoxLayout(page)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(12)
+        outer.setSpacing(14)
 
-        card = QFrame()
-        card.setObjectName("SectionBox")
-        card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(20, 20, 20, 20)
-        card_layout.setSpacing(14)
-
-        title = QLabel("Execution")
-        title.setObjectName("CardTitle")
+        page_title = QLabel("Execution")
+        page_title.setObjectName("CardTitle")
+        outer.addWidget(page_title)
 
         intro = QLabel(
-            "1. Save a manifest from your current plan, or open one from disk.\n"
-            "2. Preview logs what would happen; Run performs copies and folder creation.\n"
-            "Internal default: live runs use the snapshot / execution-plan pipeline (draft bundle + harness). "
-            "Legacy manifest + pilot cap is fallback only (Settings → internal admin: check “Legacy manifest execution”). "
-            "Local paths run on disk; SharePoint uses Graph when signed in. Saving from the plan loads the manifest here; work runs in the background."
+            "Load or save a manifest, preview with dry run, then run copies. "
+            "Default path uses the snapshot pipeline; legacy manifest mode is optional in Settings (internal)."
         )
-        intro.setObjectName("CardBody")
+        intro.setObjectName("MutedText")
         intro.setWordWrap(True)
+        outer.addWidget(intro)
 
+        plan_card = QFrame()
+        plan_card.setObjectName("SurfaceCard")
+        plan_layout = QVBoxLayout(plan_card)
+        plan_layout.setContentsMargins(18, 16, 18, 16)
+        plan_layout.setSpacing(10)
+        plan_title = QLabel("Plan & manifest")
+        plan_title.setObjectName("SectionTitle")
         btn_row = QHBoxLayout()
-        btn_row.setSpacing(10)
+        btn_row.setSpacing(8)
         self.execution_save_manifest_button = QPushButton("Save from current plan…")
         self.execution_save_manifest_button.setToolTip(
             "Export planned moves and proposed folders to JSON and load it here for preview or run."
@@ -7392,19 +7522,28 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.execution_open_manifest_button)
         btn_row.addWidget(self.execution_load_last_manifest_button)
         btn_row.addStretch()
-
         self.execution_manifest_path_label = QLabel("No manifest loaded.")
         self.execution_manifest_path_label.setObjectName("CardBody")
         self.execution_manifest_path_label.setWordWrap(True)
         self.execution_manifest_path_label.setStyleSheet("color: palette(mid);")
-
         self.execution_summary_text = QTextEdit()
         self.execution_summary_text.setReadOnly(True)
-        self.execution_summary_text.setMinimumHeight(160)
+        self.execution_summary_text.setMinimumHeight(140)
         self.execution_summary_text.setPlaceholderText("Save or open a manifest to see step counts.")
+        plan_layout.addWidget(plan_title)
+        plan_layout.addLayout(btn_row)
+        plan_layout.addWidget(self.execution_manifest_path_label)
+        plan_layout.addWidget(self.execution_summary_text, 1)
 
+        run_card = QFrame()
+        run_card.setObjectName("SurfaceCard")
+        run_layout = QVBoxLayout(run_card)
+        run_layout.setContentsMargins(18, 16, 18, 16)
+        run_layout.setSpacing(10)
+        run_title = QLabel("Run")
+        run_title.setObjectName("SectionTitle")
         run_row = QHBoxLayout()
-        run_row.setSpacing(10)
+        run_row.setSpacing(8)
         self.execution_dry_run_button = QPushButton("Preview (dry run)")
         self.execution_dry_run_button.setEnabled(False)
         self.execution_dry_run_button.setToolTip(
@@ -7413,6 +7552,7 @@ class MainWindow(QMainWindow):
         )
         self.execution_dry_run_button.clicked.connect(self._on_execution_dry_run_manifest)
         self.execution_run_button = QPushButton("Run copies & folders")
+        self.execution_run_button.setObjectName("PrimaryButton")
         self.execution_run_button.setEnabled(False)
         self.execution_run_button.setToolTip(
             "Run for real: internal default is snapshot pipeline execution from the current draft bundle. "
@@ -7422,16 +7562,21 @@ class MainWindow(QMainWindow):
         run_row.addWidget(self.execution_dry_run_button)
         run_row.addWidget(self.execution_run_button)
         run_row.addStretch()
+        run_layout.addWidget(run_title)
+        run_layout.addLayout(run_row)
 
-        browse_block = QVBoxLayout()
-        browse_block.setSpacing(6)
+        scope_card = QFrame()
+        scope_card.setObjectName("SurfaceCard")
+        scope_layout = QVBoxLayout(scope_card)
+        scope_layout.setContentsMargins(18, 16, 18, 16)
+        scope_layout.setSpacing(8)
+        scope_title = QLabel("Scope & recursive options")
+        scope_title.setObjectName("SectionTitle")
         browse_hint = QLabel(
-            "Browse-driven recursive mode (separate from Planned Moves subset): uses the folder selected in the "
-            "source tree and the destination tree. Requires SharePoint mode, sign-in, and snapshot pipeline execution."
+            "Browsed-folder recursive run uses the folders selected in Planning trees (SharePoint, signed in, snapshot pipeline)."
         )
         browse_hint.setWordWrap(True)
-        browse_hint.setObjectName("CardBody")
-        browse_block.addWidget(browse_hint)
+        browse_hint.setObjectName("MutedText")
         browse_btn_row = QHBoxLayout()
         self.execution_browsed_recursive_button = QPushButton("Run browsed folder recursively…")
         self.execution_browsed_recursive_button.setToolTip(
@@ -7442,8 +7587,6 @@ class MainWindow(QMainWindow):
         self.execution_browsed_recursive_button.clicked.connect(self._on_execution_browsed_recursive_run)
         browse_btn_row.addWidget(self.execution_browsed_recursive_button)
         browse_btn_row.addStretch()
-        browse_block.addLayout(browse_btn_row)
-
         scoped_col = QVBoxLayout()
         scoped_col.setSpacing(6)
         self.execution_snapshot_scoped_checkbox = QCheckBox("Run selected planned moves only (snapshot subset)")
@@ -7487,23 +7630,30 @@ class MainWindow(QMainWindow):
         scoped_col.addWidget(self.execution_snapshot_recursive_subtree_checkbox)
         self.execution_snapshot_scoped_checkbox.toggled.connect(self._on_execution_snapshot_scoped_toggled)
         self._on_execution_snapshot_scoped_toggled(self.execution_snapshot_scoped_checkbox.isChecked())
-        scoped_row = scoped_col
+        scope_layout.addWidget(scope_title)
+        scope_layout.addWidget(browse_hint)
+        scope_layout.addLayout(browse_btn_row)
+        scope_layout.addLayout(scoped_col)
 
+        status_card = QFrame()
+        status_card.setObjectName("SurfaceCard")
+        status_layout = QVBoxLayout(status_card)
+        status_layout.setContentsMargins(18, 14, 18, 14)
+        status_layout.setSpacing(4)
+        status_title = QLabel("Status")
+        status_title.setObjectName("SectionTitle")
         self.execution_status_label = QLabel("")
         self.execution_status_label.setObjectName("CardBody")
         self.execution_status_label.setWordWrap(True)
+        status_layout.addWidget(status_title)
+        status_layout.addWidget(self.execution_status_label)
 
-        card_layout.addWidget(title)
-        card_layout.addWidget(intro)
-        card_layout.addLayout(btn_row)
-        card_layout.addWidget(self.execution_manifest_path_label)
-        card_layout.addWidget(self.execution_summary_text, 1)
-        card_layout.addLayout(run_row)
-        card_layout.addLayout(browse_block)
-        card_layout.addLayout(scoped_row)
-        card_layout.addWidget(self.execution_status_label)
+        outer.addWidget(plan_card, 2)
+        outer.addWidget(run_card, 0)
+        outer.addWidget(scope_card, 1)
+        outer.addWidget(status_card, 0)
+        outer.addStretch(0)
 
-        outer.addWidget(card, 1)
         self._update_manifest_run_buttons_state()
         return page
 
@@ -7641,13 +7791,14 @@ class MainWindow(QMainWindow):
         ui_card_layout.addStretch()
 
         outer.addWidget(ui_card)
+
         internal_card = QFrame()
-        internal_card.setObjectName("SectionBox")
+        internal_card.setObjectName("SurfaceCard")
         internal_layout = QVBoxLayout(internal_card)
-        internal_layout.setContentsMargins(20, 20, 20, 20)
+        internal_layout.setContentsMargins(18, 16, 18, 16)
         internal_layout.setSpacing(10)
         internal_title = QLabel("Execution path (internal)")
-        internal_title.setObjectName("CardTitle")
+        internal_title.setObjectName("SectionTitle")
         self._settings_execution_path_toggle = QCheckBox(
             "Legacy manifest execution only (fallback / recovery)"
         )
@@ -7667,11 +7818,35 @@ class MainWindow(QMainWindow):
         internal_layout.addWidget(self._settings_execution_path_status)
         internal_layout.addWidget(self._settings_execution_path_hint)
         internal_layout.addStretch()
-        outer.addWidget(internal_card)
+
+        self._settings_advanced_wrap = QWidget()
+        adv_layout = QVBoxLayout(self._settings_advanced_wrap)
+        adv_layout.setContentsMargins(0, 8, 0, 0)
+        adv_layout.setSpacing(4)
+        self._settings_advanced_toggle = QToolButton()
+        self._settings_advanced_toggle.setText("Internal & advanced options")
+        self._settings_advanced_toggle.setCheckable(True)
+        self._settings_advanced_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._settings_advanced_toggle.setArrowType(Qt.RightArrow)
+
+        self._settings_advanced_inner = QWidget()
+        inner_adv = QVBoxLayout(self._settings_advanced_inner)
+        inner_adv.setContentsMargins(14, 4, 0, 0)
+        inner_adv.setSpacing(0)
+        inner_adv.addWidget(internal_card)
+        self._settings_advanced_inner.setVisible(False)
+
+        def _on_settings_advanced_toggled(checked: bool) -> None:
+            self._settings_advanced_inner.setVisible(bool(checked))
+            self._settings_advanced_toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+
+        self._settings_advanced_toggle.toggled.connect(_on_settings_advanced_toggled)
+        adv_layout.addWidget(self._settings_advanced_toggle)
+        adv_layout.addWidget(self._settings_advanced_inner)
+        outer.addWidget(self._settings_advanced_wrap)
+
         is_admin = self.current_session_context.get("user_role", "user") == "admin"
-        self._settings_execution_path_toggle.setVisible(is_admin)
-        self._settings_execution_path_status.setVisible(is_admin)
-        self._settings_execution_path_hint.setVisible(is_admin)
+        self._settings_advanced_wrap.setVisible(is_admin)
         self._refresh_execution_path_toggle_status()
         outer.addStretch()
         return page
@@ -7731,11 +7906,11 @@ class MainWindow(QMainWindow):
     def build_bottom_status_bar(self):
         self.bottom_bar = QFrame()
         self.bottom_bar.setObjectName("BottomStatusBar")
-        self.bottom_bar.setFixedHeight(54)
+        self.bottom_bar.setFixedHeight(44)
 
         layout = QHBoxLayout(self.bottom_bar)
-        layout.setContentsMargins(18, 8, 18, 8)
-        layout.setSpacing(22)
+        layout.setContentsMargins(14, 6, 14, 6)
+        layout.setSpacing(18)
 
         self.bottom_tenant = QLabel("Tenant: Not Connected")
         self.bottom_source = QLabel("Source: Not Set")
