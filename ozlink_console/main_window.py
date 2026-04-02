@@ -29466,6 +29466,11 @@ class MainWindow(QMainWindow):
         folder_count = self._count_expandable_tree_nodes(panel_key)
         if folder_count > 12000 and self._tree_has_unloaded_folder_nodes(panel_key):
             return False
+        if panel_key == "source" and self._source_tree_uses_model_view():
+            # SharePoint source model can still materialize a very wide/deep loaded subtree; one-shot
+            # expandAll() blocks the GUI thread. Use progressive model expand-all instead.
+            if folder_count > 700:
+                return False
         if panel_key == "destination" and self._destination_tree_uses_model_view():
             # Planning + lazy projection can expose tens of thousands of folder rows; one-shot
             # expandAll() blocks the GUI thread. Use progressive model expand-all instead.
@@ -29940,6 +29945,54 @@ class MainWindow(QMainWindow):
             return None
         return f"{drive_id}:{item_id}"
 
+    def _source_expand_all_reseed_collapsed_folders(self, max_enqueue: int) -> int:
+        """Find collapsed folders that already have model children and enqueue them for progressive expand.
+
+        Avoids a blocking ``expandAll()`` at the end of source SharePoint model expand-all.
+        """
+        if max_enqueue <= 0:
+            return 0
+        tree = getattr(self, "source_tree_widget", None)
+        model = getattr(self, "source_sharepoint_model", None)
+        if tree is None or model is None:
+            return 0
+        panel_key = "source"
+        added = 0
+        stack = []
+        root = QModelIndex()
+        for r in range(model.rowCount(root)):
+            stack.append(model.index(r, 0, root))
+        visited = 0
+        max_visit = 24000
+        while stack and added < max_enqueue and visited < max_visit:
+            ix = stack.pop()
+            visited += 1
+            if not ix.isValid():
+                continue
+            pl = ix.data(Qt.UserRole) or {}
+            if pl.get("placeholder") or not pl.get("is_folder"):
+                continue
+            try:
+                rc = model.rowCount(ix)
+            except Exception:
+                rc = 0
+            if rc > 0:
+                try:
+                    expanded = tree.isExpanded(ix)
+                except Exception:
+                    expanded = False
+                if not expanded:
+                    key = self._source_model_expand_all_key(ix)
+                    if key:
+                        self._expand_all_seen[panel_key].add(key)
+                    self._expand_all_source_model_queue.append(QPersistentModelIndex(ix))
+                    added += 1
+                    continue
+            if rc > 0:
+                for r in range(rc - 1, -1, -1):
+                    stack.append(model.index(r, 0, ix))
+        return added
+
     def _begin_source_model_expand_all(self):
         panel_key = "source"
         tree = self.source_tree_widget
@@ -29950,7 +30003,11 @@ class MainWindow(QMainWindow):
         self._reset_expand_all_progress(panel_key)
         self._expand_all_max_per_tick[panel_key] = 1
         self._set_expand_all_button_label(panel_key, True)
-        self._update_expand_all_status(panel_key, "Expanding branches...", loading=True)
+        self._update_expand_all_status(
+            panel_key,
+            "Expanding all source branches…",
+            loading=True,
+        )
         root = QModelIndex()
         for r in range(model.rowCount(root)):
             ix = model.index(r, 0, root)
@@ -30046,9 +30103,30 @@ class MainWindow(QMainWindow):
                 break
 
         if self._expand_all_source_model_queue or self.pending_folder_loads.get("source"):
-            self._update_expand_all_status("source", "Expanding branches...", loading=True)
+            self._update_expand_all_status(
+                "source",
+                "Expanding all source branches…",
+                loading=True,
+            )
             QTimer.singleShot(
                 20,
+                lambda: self._safe_invoke(
+                    "source_model_expand_all_tick",
+                    self._source_model_expand_all_tick,
+                ),
+            )
+            return
+
+        reseeded = self._source_expand_all_reseed_collapsed_folders(112)
+        if reseeded:
+            self._update_expand_all_status(
+                "source",
+                "Expanding all source branches…",
+                loading=True,
+            )
+            QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+            QTimer.singleShot(
+                18,
                 lambda: self._safe_invoke(
                     "source_model_expand_all_tick",
                     self._source_model_expand_all_tick,
@@ -30073,14 +30151,7 @@ class MainWindow(QMainWindow):
         panel_key = "source"
         tree = self.source_tree_widget
         if tree is not None:
-            tree.setUpdatesEnabled(False)
-            tree.blockSignals(True)
-            try:
-                tree.expandAll()
-            finally:
-                tree.blockSignals(False)
-                tree.setUpdatesEnabled(True)
-                tree.viewport().update()
+            tree.viewport().update()
         log_info(
             "expand_all_source_model_complete",
             folder_count=self._count_expandable_tree_nodes(panel_key),
