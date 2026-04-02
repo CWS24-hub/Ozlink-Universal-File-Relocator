@@ -26,6 +26,11 @@ AssignmentMode = Literal[
     "copy_recursive",
     "unknown",
 ]
+SourceRetentionPolicy = Literal[
+    "retain",
+    "cleanup_after_verified_transfer",
+    "archive_source",
+]
 
 
 def new_snapshot_id() -> str:
@@ -112,6 +117,7 @@ class CanonicalMappingItem:
     mapping_id: str
     item_type: ItemType
     source_path: str
+    """Path relative to the source document library root."""
     source_name: str
     source_graph_item_id: str | None = None
     source_graph_drive_id: str | None = None
@@ -135,7 +141,7 @@ class ProposedFolderMappingItem:
     proposed_id: str
     folder_name: str
     destination_path: str
-    """Parent folder path relative to the destination document library root."""
+    """Folder path relative to the destination document library root."""
     parent_path: str = ""
     """Optional parent path, library-relative (same rules as ``destination_path``)."""
     destination_drive_id: str | None = None
@@ -158,6 +164,7 @@ class CanonicalSubmittedSnapshot:
     destination: DestinationContextSnapshot
     mapping_items: list[CanonicalMappingItem] = field(default_factory=list)
     proposed_folder_items: list[ProposedFolderMappingItem] = field(default_factory=list)
+    source_retention_policy: SourceRetentionPolicy = "retain"
     execution_options: dict[str, Any] = field(default_factory=dict)
     snapshot_hash: str = ""
     snapshot_schema: str = SNAPSHOT_SCHEMA_V1
@@ -192,6 +199,7 @@ class CanonicalSubmittedSnapshot:
             },
             "mapping_items": [asdict(m) for m in self.mapping_items],
             "proposed_folder_items": [asdict(p) for p in self.proposed_folder_items],
+            "source_retention_policy": self.source_retention_policy,
             "execution_options": dict(self.execution_options),
             "snapshot_hash": self.snapshot_hash,
             "adapter_source": self.adapter_source,
@@ -228,6 +236,13 @@ def _parse_assignment(v: Any) -> AssignmentMode:
     if t in ("recursivemove", "recursive_move"):
         return "move_recursive"
     return "unknown"
+
+
+def _parse_source_retention_policy(v: Any) -> SourceRetentionPolicy:
+    t = str(v or "retain").strip().lower()
+    if t in ("retain", "cleanup_after_verified_transfer", "archive_source"):
+        return t  # type: ignore[return-value]
+    return "retain"
 
 
 def _parse_context_raw(src_raw: dict[str, Any]) -> dict[str, Any]:
@@ -429,6 +444,7 @@ def parse_canonical_submitted_snapshot_dict(raw: dict[str, Any]) -> CanonicalSub
         ),
         mapping_items=items,
         proposed_folder_items=proposed_items,
+        source_retention_policy=_parse_source_retention_policy(raw.get("source_retention_policy", "retain")),
         execution_options=dict(raw["execution_options"]) if isinstance(raw.get("execution_options"), dict) else {},
         snapshot_hash=str(raw.get("snapshot_hash", "") or ""),
         snapshot_schema=SNAPSHOT_SCHEMA_V1,

@@ -91,6 +91,17 @@ def log_error(message: str, **data) -> None:
     get_logger().error(message, extra={"data": data or None})
 
 
+def flush_logger() -> None:
+    """Force handlers to sync to disk (diagnostics during long Graph async waits)."""
+    if _LOGGER is None:
+        return
+    for h in _LOGGER.handlers:
+        try:
+            h.flush()
+        except Exception:
+            pass
+
+
 def trace_enabled() -> bool:
     """True when full trace is enabled (OZLINK_FULL_TRACE is 1/true/yes). App defaults this on at startup."""
     return os.environ.get("OZLINK_FULL_TRACE", "").strip().lower() in ("1", "true", "yes")

@@ -10,9 +10,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+import requests
+
 from ozlink_console.audit_log import append_audit_event
 from ozlink_console.integrity import verify_copied_file, verify_copied_tree
-from ozlink_console.logger import log_error, log_info
+from ozlink_console.logger import flush_logger, log_error, log_info
 
 SUPPORTED_MANIFEST_VERSIONS = frozenset({1, 2})
 
@@ -36,6 +38,50 @@ def _norm_path(p: str) -> Path:
 def _path_depth_for_sort(path: str) -> int:
     parts = [x for x in _norm_path(path).parts if x]
     return len(parts)
+
+
+def _graph_async_monitor_auth_poll_failure(exc: BaseException) -> bool:
+    """True when the async copy monitor poll failed with HTTP 401 (copy may still have completed)."""
+    return isinstance(exc, requests.HTTPError) and exc.response is not None and exc.response.status_code == 401
+
+
+def _verify_graph_copy_destination_item_present(
+    graph_client: Any,
+    step: dict[str, Any],
+    dest_name: str,
+) -> tuple[bool, str]:
+    """
+    Best-effort check that the destination driveItem exists at the planned path after a monitor error.
+    Used only to avoid false failures when Graph accepted the copy (202) but monitor GET returned 401.
+    """
+    get_by_path = getattr(graph_client, "get_drive_item_by_path", None)
+    if not callable(get_by_path):
+        return False, "no_get_drive_item_by_path"
+    drive_id = str(step.get("destination_drive_id", "") or "").strip()
+    dest_path = str(step.get("destination_path", "") or "").strip().replace("\\", "/")
+    name = str(dest_name or "").strip()
+    if not drive_id or not dest_path:
+        return False, "missing_destination_drive_or_path"
+
+    hit = get_by_path(drive_id, dest_path)
+    if isinstance(hit, dict) and str(hit.get("id") or "").strip():
+        resolved_name = str(hit.get("name") or "").strip()
+        if name and resolved_name and resolved_name.lower() != name.lower():
+            return False, f"name_mismatch_resolved={resolved_name!r}_expected={name!r}"
+        return True, "destination_path"
+
+    if name:
+        parent = dest_path.rstrip("/")
+        if parent:
+            combined = f"{parent}/{name}".replace("//", "/")
+            hit2 = get_by_path(drive_id, combined)
+            if isinstance(hit2, dict) and str(hit2.get("id") or "").strip():
+                resolved_name = str(hit2.get("name") or "").strip()
+                if name and resolved_name and resolved_name.lower() != name.lower():
+                    return False, f"name_mismatch_resolved={resolved_name!r}_expected={name!r}"
+                return True, "parent_plus_destination_name"
+
+    return False, "destination_item_not_found"
 
 
 def load_manifest_json(path: str | Path) -> dict[str, Any]:
@@ -546,6 +592,15 @@ def run_manifest_local_filesystem(
                     conflict_behavior=graph_conflict,
                 )
                 timeout_sec = folder_graph_timeout if is_folder else file_graph_timeout
+                log_info(
+                    "transfer_job_graph_copy_async_handoff",
+                    step_index=idx,
+                    is_folder=bool(is_folder),
+                    timeout_sec=float(timeout_sec),
+                    monitor_url_excerpt=str(monitor or "")[:220],
+                    destination_name_excerpt=str(dest_name or "")[:200] or None,
+                )
+                flush_logger()
                 graph_client.wait_graph_async_operation(monitor, timeout_sec=timeout_sec)
                 emit(
                     StepRunRecord(
@@ -556,6 +611,34 @@ def run_manifest_local_filesystem(
                     )
                 )
             except Exception as exc:
+                recovered = False
+                recovery_how = ""
+                if _graph_async_monitor_auth_poll_failure(exc):
+                    ok_probe, recovery_how = _verify_graph_copy_destination_item_present(
+                        graph_client, step, dest_name
+                    )
+                    if ok_probe:
+                        recovered = True
+                        log_info(
+                            "transfer_job_graph_copy_recovered_after_monitor_401",
+                            step_index=idx,
+                            destination_name_excerpt=str(dest_name or "")[:200] or None,
+                            recovery_probe=recovery_how,
+                            destination_path_excerpt=str(dst or "")[:220] or None,
+                        )
+                        flush_logger()
+                if recovered:
+                    emit(
+                        StepRunRecord(
+                            "transfer",
+                            idx,
+                            "ok",
+                            f"graph copy completed (name={dest_name!r}); "
+                            f"async monitor polling returned 401 but destination item was verified via path "
+                            f"({recovery_how})",
+                        )
+                    )
+                    continue
                 payload_hint = (
                     f"graph copy: {exc} "
                     f"(source_drive_id={src_drive_id!r}, source_item_id={src_item_id!r}, "
@@ -576,6 +659,7 @@ def run_manifest_local_filesystem(
                     destination_path=dst,
                     conflict_behavior=graph_conflict,
                     is_folder=bool(is_folder),
+                    recovered_after_monitor_401=False,
                 )
             continue
 

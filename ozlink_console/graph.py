@@ -12,8 +12,8 @@ import msal
 import pyperclip
 import requests
 
-from .logger import log_info, log_trace, log_warn
-from .paths import graph_cache_root
+from .logger import flush_logger, log_info, log_trace, log_warn
+from .paths import graph_cache_root, msal_token_cache_path
 
 
 def _graph_url_excerpt(url: str, max_len: int = 200) -> str:
@@ -84,12 +84,59 @@ class GraphClient:
         }
 
         self.app = None
+        self._token_cache: Optional[msal.SerializableTokenCache] = None
+
+    def _load_msal_token_cache(self) -> msal.SerializableTokenCache:
+        cache = msal.SerializableTokenCache()
+        path = msal_token_cache_path()
+        try:
+            if path.is_file():
+                raw = path.read_text(encoding="utf-8")
+                if raw.strip():
+                    cache.deserialize(raw)
+        except (OSError, ValueError) as exc:
+            log_warn("msal_token_cache_load_failed", error=str(exc)[:240])
+        return cache
+
+    def _persist_msal_token_cache(self) -> None:
+        cache = self._token_cache
+        if cache is None or not getattr(cache, "has_state_changed", False):
+            return
+        path = msal_token_cache_path()
+        tmp = path.with_suffix(".json.tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = cache.serialize()
+            tmp.write_text(data, encoding="utf-8")
+            tmp.replace(path)
+        except OSError as exc:
+            log_warn("msal_token_cache_persist_failed", error=str(exc)[:240])
+            try:
+                if tmp.is_file():
+                    tmp.unlink()
+            except OSError:
+                pass
+        finally:
+            cache.has_state_changed = False
+
+    def _clear_persistent_msal_token_cache_file(self) -> None:
+        try:
+            p = msal_token_cache_path()
+            if p.is_file():
+                p.unlink()
+            tmp = p.with_suffix(".json.tmp")
+            if tmp.is_file():
+                tmp.unlink()
+        except OSError as exc:
+            log_warn("msal_token_cache_remove_failed", error=str(exc)[:200])
 
     def _ensure_app(self):
         if self.app is None:
+            self._token_cache = self._load_msal_token_cache()
             self.app = msal.PublicClientApplication(
                 AUTH_CONFIG["client_id"],
                 authority=AUTH_CONFIG["authority"],
+                token_cache=self._token_cache,
             )
         return self.app
 
@@ -141,6 +188,7 @@ class GraphClient:
 
         self.token = result["access_token"]
         self.session_context["connected"] = True
+        self._persist_msal_token_cache()
         log_trace("graph_auth", "token_acquired_device_flow", connected=True)
         return result
 
@@ -176,6 +224,7 @@ class GraphClient:
 
         self.token = result["access_token"]
         self.session_context["connected"] = True
+        self._persist_msal_token_cache()
         return True
 
     def refresh_access_token_silently(self, *, force_refresh: bool = False) -> bool:
@@ -187,6 +236,9 @@ class GraphClient:
         self.device_flow = None
         self.profile = None
         self._drive_children_cache.clear()
+        self.app = None
+        self._token_cache = None
+        self._clear_persistent_msal_token_cache_file()
         self.session_context = {
             "connected": False,
             "user_role": "user",
@@ -852,7 +904,19 @@ class GraphClient:
             source_drive_suffix=source_drive_id[-12:] if len(source_drive_id) > 12 else source_drive_id,
             dest_drive_suffix=dest_drive_id[-12:] if len(dest_drive_id) > 12 else dest_drive_id,
         )
-        return str(loc).strip()
+        loc_s = str(loc).strip()
+        log_info(
+            "graph_async_copy_submitted",
+            phase="copy_post_accepted",
+            monitor_url_excerpt=loc_s[:220],
+            source_item_id_suffix=source_item_id[-16:] if len(source_item_id) > 16 else source_item_id,
+            dest_parent_item_id_suffix=dest_parent_item_id[-16:]
+            if len(dest_parent_item_id) > 16
+            else dest_parent_item_id,
+            copy_target_name=str(name or "")[:200] or None,
+        )
+        flush_logger()
+        return loc_s
 
     def wait_graph_async_operation(
         self,
@@ -862,19 +926,52 @@ class GraphClient:
         poll_interval_sec: float = 1.0,
     ) -> Dict[str, Any]:
         """Poll a Graph async monitor URL until completion or failure."""
-        deadline = time.monotonic() + max(30.0, float(timeout_sec))
+        effective_timeout = max(30.0, float(timeout_sec))
+        deadline = time.monotonic() + effective_timeout
         monitor_url = str(monitor_url or "").strip()
         if not monitor_url:
             raise ValueError("monitor_url is required")
 
+        wait_started = time.monotonic()
+        poll_count = 0
+        log_info(
+            "graph_async_wait_started",
+            monitor_url_excerpt=monitor_url[:220],
+            timeout_sec_config=float(timeout_sec),
+            effective_timeout_sec=float(effective_timeout),
+            poll_interval_sec=float(poll_interval_sec),
+        )
+        flush_logger()
+
         last_payload: Dict[str, Any] = {}
         while time.monotonic() < deadline:
+            poll_count += 1
             headers = dict(self.get_headers())
             response = requests.get(monitor_url, headers=headers, timeout=120)
+            retried_monitor_401 = False
             if response.status_code == 401 and self._try_acquire_token_silent(force_refresh=True):
+                retried_monitor_401 = True
                 headers = dict(self.get_headers())
                 response = requests.get(monitor_url, headers=headers, timeout=120)
+            if response.status_code == 401:
+                log_info(
+                    "graph_async_monitor_poll_401",
+                    poll_count=poll_count,
+                    elapsed_sec=round(time.monotonic() - wait_started, 3),
+                    retried_token_refresh=bool(retried_monitor_401),
+                    monitor_url_excerpt=monitor_url[:220],
+                    http_status=401,
+                )
+                flush_logger()
             if response.status_code == 429:
+                log_info(
+                    "graph_async_wait_poll",
+                    poll_count=poll_count,
+                    elapsed_sec=round(time.monotonic() - wait_started, 3),
+                    http_status=429,
+                    note="retry_after_sleep",
+                )
+                flush_logger()
                 time.sleep(float(response.headers.get("Retry-After", "5")))
                 continue
             response.raise_for_status()
@@ -884,14 +981,53 @@ class GraphClient:
                 last_payload = {}
 
             status = str(last_payload.get("status", "") or "").lower()
+            op_id = str(last_payload.get("id", "") or "").strip()
+            log_info(
+                "graph_async_wait_poll",
+                poll_count=poll_count,
+                elapsed_sec=round(time.monotonic() - wait_started, 3),
+                graph_status=status or None,
+                operation_id=op_id or None,
+                http_status=int(response.status_code),
+            )
+            flush_logger()
             if status in ("completed", "completedwithwarnings"):
                 log_trace("graph", "async_operation_done", status=status)
+                log_info(
+                    "graph_async_wait_completed",
+                    poll_count=poll_count,
+                    elapsed_sec=round(time.monotonic() - wait_started, 3),
+                    graph_status=status,
+                    operation_id=op_id or None,
+                )
+                flush_logger()
                 return last_payload
             if status in ("failed",):
                 err = last_payload.get("error") or last_payload
+                log_info(
+                    "graph_async_wait_failed",
+                    poll_count=poll_count,
+                    elapsed_sec=round(time.monotonic() - wait_started, 3),
+                    graph_status=status,
+                    operation_id=op_id or None,
+                    error_excerpt=repr(err)[:500],
+                )
+                flush_logger()
                 raise RuntimeError(f"Graph async operation failed: {err!r}")
             time.sleep(max(0.2, float(poll_interval_sec)))
 
+        elapsed = time.monotonic() - wait_started
+        log_info(
+            "graph_async_wait_timeout",
+            poll_count=poll_count,
+            elapsed_sec=round(elapsed, 3),
+            effective_timeout_sec=float(effective_timeout),
+            timeout_sec_config=float(timeout_sec),
+            monitor_url_excerpt=monitor_url[:220],
+            last_graph_status=str(last_payload.get("status", "") or "") or None,
+            last_operation_id=str(last_payload.get("id", "") or "").strip() or None,
+        )
+        flush_logger()
         raise TimeoutError(f"Graph async operation timed out after {timeout_sec}s: {monitor_url[:120]!r}…")
 
     def create_child_folder(

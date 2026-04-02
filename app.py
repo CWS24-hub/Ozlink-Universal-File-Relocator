@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QApplication
 
 from ozlink_console.logger import log_error, log_info, log_trace
 from ozlink_console.paths import logs_root
+from ozlink_console.dev_mode import apply_cli_dev_flag
 from ozlink_console.main_window import MainWindow
 
 
@@ -82,6 +83,7 @@ def _install_global_exception_hooks():
 
 
 def run_app():
+    apply_cli_dev_flag(sys.argv)
     # Full UI/graph trace off by default (large logs and JSON serialization can stall the UI thread).
     # Set OZLINK_FULL_TRACE=1 before launch when diagnosing projection/restore issues.
     os.environ.setdefault("OZLINK_FULL_TRACE", "0")

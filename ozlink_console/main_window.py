@@ -8,6 +8,7 @@ import subprocess
 import time
 import bisect
 import copy
+from functools import partial
 from collections import Counter, deque
 import ctypes
 import traceback
@@ -17,7 +18,7 @@ import math
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List
+from typing import Any, List
 import xml.etree.ElementTree as ET
 
 from PySide6.QtWidgets import (
@@ -28,6 +29,8 @@ from PySide6.QtWidgets import (
     QTabWidget, QMenu, QInputDialog, QTextEdit, QStyledItemDelegate,
     QStyle, QStyleOptionViewItem, QApplication, QFileDialog, QDialog,
     QCheckBox,
+    QButtonGroup,
+    QRadioButton,
     QDialogButtonBox, QFormLayout, QTreeView, QFileSystemModel,
     QSpinBox,
 )
@@ -46,8 +49,20 @@ from PySide6.QtCore import (
     QModelIndex,
     QPersistentModelIndex,
     QItemSelectionModel,
+    QByteArray,
 )
-from PySide6.QtGui import QBrush, QColor, QCursor, QDesktopServices, QGuiApplication, QPainter, QPolygon
+from PySide6.QtGui import (
+    QAction,
+    QBrush,
+    QColor,
+    QCursor,
+    QDesktopServices,
+    QFont,
+    QGuiApplication,
+    QKeySequence,
+    QPainter,
+    QPolygon,
+)
 
 from ozlink_console.graph import GraphClient
 from ozlink_console.tree_models.explorer_columns import (
@@ -60,6 +75,7 @@ from ozlink_console.tree_models.explorer_columns import (
 )
 from ozlink_console.tree_models.sharepoint_source_model import SharePointSourceTreeModel
 from ozlink_console.tree_models.destination_planning_model import DestinationPlanningTreeModel, NestedSpec
+from ozlink_console.dev_mode import is_dev_mode
 from ozlink_console.logger import log_error, log_info, log_trace, log_warn
 from ozlink_console.memory import MemoryManager
 from ozlink_console.models import AllocationRow, ProposedFolder, SessionState, SubmissionBatch
@@ -68,6 +84,19 @@ from ozlink_console.transfer_manifest import (
     build_simulation_manifest,
     upconvert_manifest_v1_to_v2,
     write_manifest_json,
+    _planned_move_to_step,
+)
+from ozlink_console.draft_snapshot.recursive_subtree_expansion import (
+    allocation_row_dict_for_expanded_file,
+    compose_path_under_folder,
+    deterministic_recursive_mapping_id,
+    file_level_allocation_method,
+    memory_canonical_to_graph_path,
+    normalize_graph_path,
+    planned_move_dict_for_expanded_file,
+    planned_move_folder_template_for_browser,
+    relative_suffix_under_folder,
+    synthetic_template_for_browser_run,
 )
 from ozlink_console.destination_semantic_index import (
     compute_incremental_merge_entry_roots,
@@ -115,6 +144,36 @@ class LoginWorker(QThread):
         except Exception as e:
             log_trace("worker", "LoginWorker_error", error_excerpt=str(e)[:500])
             self.error.emit(str(e))
+
+
+class SilentGraphSessionRestoreWorker(QThread):
+    """Background: MSAL silent token + /me profile after cold start (e.g. dev process respawn)."""
+
+    success = Signal(dict)
+    failed = Signal()
+
+    def __init__(self, graph):
+        super().__init__()
+        self.graph = graph
+
+    def run(self):
+        log_trace("worker", "SilentGraphSessionRestoreWorker_start")
+        try:
+            if not self.graph.refresh_access_token_silently(force_refresh=False):
+                log_trace("worker", "SilentGraphSessionRestoreWorker_no_cached_session")
+                self.failed.emit()
+                return
+            session_context = self.graph.build_session_context()
+            profile = session_context.get("profile") or {}
+            log_trace(
+                "worker",
+                "SilentGraphSessionRestoreWorker_success",
+                user_role=session_context.get("user_role", ""),
+            )
+            self.success.emit({"profile": profile, "session_context": session_context})
+        except Exception as e:
+            log_trace("worker", "SilentGraphSessionRestoreWorker_error", error_excerpt=str(e)[:500])
+            self.failed.emit()
 
 
 class DiscoverSitesWorker(QThread):
@@ -736,6 +795,51 @@ class ManifestRunWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class SnapshotPipelineRunWorker(QThread):
+    """Runs ``ExecutionOrchestrator.run_snapshot`` (harness-backed) off the UI thread."""
+
+    finished_ok = Signal(object, object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        *,
+        bundle_folder: str,
+        manifest_path: str,
+        environment_context: dict,
+        graph_client=None,
+        dry_run: bool = True,
+        snapshot_scoped_mode: str = "",
+        scoped_seed_mapping_ids: frozenset | None = None,
+    ):
+        super().__init__()
+        self._bundle_folder = str(bundle_folder or "")
+        self._manifest_path = str(manifest_path or "")
+        self._environment_context = dict(environment_context or {})
+        self._graph_client = graph_client
+        self._dry_run = bool(dry_run)
+        self._snapshot_scoped_mode = str(snapshot_scoped_mode or "").strip()
+        self._scoped_seed_mapping_ids = scoped_seed_mapping_ids
+
+    def run(self):
+        try:
+            from ozlink_console.execution import ExecutionOrchestrator
+
+            orch = ExecutionOrchestrator()
+            ctx, result = orch.run_snapshot(
+                manifest_path=self._manifest_path,
+                bundle_folder=self._bundle_folder,
+                dry_run=self._dry_run,
+                environment_context=self._environment_context,
+                graph_client=self._graph_client,
+                snapshot_scoped_mode=self._snapshot_scoped_mode,
+                scoped_seed_mapping_ids=self._scoped_seed_mapping_ids,
+            )
+            self.finished_ok.emit(ctx, result)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 def _m365_sign_in_error_dialog(message: str) -> tuple[str, str]:
     """Return (title, text) for sign-in failures so DNS/network issues read clearly."""
     raw = str(message or "")
@@ -765,6 +869,9 @@ def _m365_sign_in_error_dialog(message: str) -> tuple[str, str]:
             f"Technical details:\n{raw}",
         )
     return ("Error", raw)
+
+
+_JSON_PERSIST_OMIT = object()
 
 
 class MainWindow(QMainWindow):
@@ -846,6 +953,8 @@ class MainWindow(QMainWindow):
         self.loaded_root_request_signatures = {"source": None, "destination": None}
         self._startup_geometry_applied = False
         self._startup_post_show_logged = False
+        self._silent_graph_restore_scheduled = False
+        self._silent_graph_restore_worker = None
         self._was_maximized_before_login = False
         self.memory_manager = None
         self.active_draft_session_id = ""
@@ -857,6 +966,8 @@ class MainWindow(QMainWindow):
         self._memory_restore_in_progress = False
         self._memory_restore_background_trees = False
         self._memory_restore_complete = False
+        self._restore_abort_mode = False
+        self._restore_abort_reason = ""
         self._login_in_progress = False
         self._login_error_seen = False
         self._pending_library_reload_after_auth = None
@@ -978,6 +1089,7 @@ class MainWindow(QMainWindow):
         self._auth_attempt_sequence = 0
         self._active_auth_attempt_id = 0
         self.pending_root_drive_ids = {"source": "", "destination": ""}
+        self.pending_root_site_ids = {"source": "", "destination": ""}
         self.pending_folder_loads = {"source": set(), "destination": set()}
         self.current_profile = None
         self.discovered_sites = []
@@ -994,6 +1106,8 @@ class MainWindow(QMainWindow):
         self._destination_future_descendant_paths_sorted = []
         self._destination_future_descendant_presence_cache = {}
         self._manifest_run_worker = None
+        self._snapshot_pipeline_run_worker = None
+        self._snapshot_pipeline_ephemeral_bundle_dir = None
         self._execution_manifest_path = ""
         self._execution_manifest = None
         self._current_details_node_data = None
@@ -1074,6 +1188,21 @@ class MainWindow(QMainWindow):
         self.apply_role_visibility("user")
         self.update_session_state(False)
         log_info("MainWindow build marker.", build_marker="main_window_refresh_restore_v2")
+        self._setup_developer_menu()
+
+    def _setup_developer_menu(self):
+        if not is_dev_mode():
+            return
+        dev_menu = self.menuBar().addMenu("Developer")
+        restart = QAction("Restart App", self)
+        restart.setShortcut(QKeySequence("Ctrl+Shift+R"))
+        restart.triggered.connect(self._dev_restart_app)
+        dev_menu.addAction(restart)
+
+    def _dev_restart_app(self):
+        from ozlink_console.dev_restart import respawn_and_exit
+
+        respawn_and_exit()
 
     def _schedule_progress_summary_refresh(self, delay_ms: int = 180):
         if not hasattr(self, "_progress_summary_refresh_timer") or self._progress_summary_refresh_timer is None:
@@ -1094,6 +1223,24 @@ class MainWindow(QMainWindow):
             or pending_destination
             or getattr(self, "_lazy_destination_projection_pending_reason", "")
         )
+
+    def _workspace_ui_persist_should_defer(self) -> bool:
+        """True while restore/finalisation or destination materialisation is active — avoid forced draft save."""
+        if getattr(self, "_memory_restore_in_progress", False):
+            return True
+        if getattr(self, "_restore_finalization_deferred_active", False):
+            return True
+        if getattr(self, "_destination_chunked_bind_state", None) is not None:
+            return True
+        if getattr(self, "_destination_future_bind_sync_active", False):
+            return True
+        if getattr(self, "_destination_future_projection_async_state", None) is not None:
+            return True
+        if getattr(self, "_destination_snapshot_chunked_restore_active", False):
+            return True
+        if self._planning_workspace_is_busy():
+            return True
+        return False
 
     def _start_session_keepalive(self):
         timer = getattr(self, "_session_keepalive_timer", None)
@@ -1227,8 +1374,10 @@ class MainWindow(QMainWindow):
         self._source_background_preload_pending = True
         self._source_background_preload_queue = []
         self._source_background_preload_seen = set()
-        for index in range(tree.topLevelItemCount()):
-            self._queue_source_background_preload_item(tree.topLevelItem(index))
+        for top_row in self._iter_panel_top_level_rows("source"):
+            if isinstance(top_row, QModelIndex):
+                continue
+            self._queue_source_background_preload_item(top_row)
         self._schedule_source_background_preload(delay_ms=0)
 
     def _continue_source_background_preload(self, item=None):
@@ -3483,6 +3632,73 @@ class MainWindow(QMainWindow):
             else self.destination_tree_widget
         )
 
+    def _expand_source_tree_item(self, item) -> None:
+        """Expand one source-tree row for both QTreeWidget and QTreeView (model/view)."""
+        tree = getattr(self, "source_tree_widget", None)
+        if tree is None or item is None:
+            return
+        try:
+            if isinstance(tree, QTreeWidget):
+                if isinstance(item, QTreeWidgetItem):
+                    tree.expandItem(item)
+                else:
+                    log_trace(
+                        "ui",
+                        "expand_source_tree_item_skipped",
+                        reason="qtree_widget_expected_item",
+                        item_type=type(item).__name__,
+                    )
+                return
+            if isinstance(tree, QTreeView):
+                idx = item
+                if isinstance(item, QPersistentModelIndex):
+                    idx = QModelIndex(item)
+                if isinstance(idx, QModelIndex) and idx.isValid():
+                    if idx.column() != 0:
+                        idx = idx.siblingAtColumn(0)
+                    _fte = getattr(self, "_full_trace_enabled", None)
+                    if callable(_fte) and _fte() and getattr(self, "_go_to_source_trace_session", False):
+                        log_trace(
+                            "ui",
+                            "go_to_source_expand_source_tree_item",
+                            row=idx.row(),
+                            column=idx.column(),
+                        )
+                    tree.expand(idx)
+                else:
+                    log_trace(
+                        "ui",
+                        "expand_source_tree_item_skipped",
+                        reason="qtree_view_expected_index",
+                        item_type=type(item).__name__,
+                    )
+                return
+            if hasattr(tree, "expandItem") and isinstance(item, QTreeWidgetItem):
+                tree.expandItem(item)
+            elif hasattr(tree, "expand"):
+                idx = QModelIndex(item) if isinstance(item, QPersistentModelIndex) else item
+                if isinstance(idx, QModelIndex) and idx.isValid():
+                    if idx.column() != 0:
+                        idx = idx.siblingAtColumn(0)
+                    tree.expand(idx)
+                else:
+                    log_trace(
+                        "ui",
+                        "expand_source_tree_item_skipped",
+                        reason="unsupported_item_for_expand",
+                        tree_type=type(tree).__name__,
+                        item_type=type(item).__name__,
+                    )
+            else:
+                log_trace(
+                    "ui",
+                    "expand_source_tree_item_skipped",
+                    reason="unsupported_tree_widget",
+                    tree_type=type(tree).__name__,
+                )
+        except Exception as exc:
+            log_trace("ui", "expand_source_tree_item_failed", error=str(exc)[:200])
+
     def _apply_planning_panel_platform(self, panel_key: str, mode) -> None:
         """Sync header stacks, tree stack, and footer hint when source/destination platform changes."""
         mode = mode if mode in ("sharepoint", "local") else "sharepoint"
@@ -3558,6 +3774,10 @@ class MainWindow(QMainWindow):
 
     def _local_fs_node_from_index(self, tree_view: QTreeView, index: QModelIndex, tree_role: str):
         if index is None or not index.isValid():
+            return None
+        if index.column() != 0:
+            index = index.siblingAtColumn(0)
+        if not index.isValid():
             return None
         model = tree_view.model()
         if not isinstance(model, QFileSystemModel):
@@ -3770,6 +3990,16 @@ class MainWindow(QMainWindow):
     def _run_deferred_planning_refresh(self):
         if not getattr(self, "_deferred_planning_refresh_pending", False):
             return
+        if self._restore_abort_active():
+            self._deferred_planning_refresh_pending = False
+            self._deferred_planning_refresh_reasons = []
+            self._deferred_source_projection_paths = set()
+            self._log_restore_phase(
+                "deferred_planning_refresh_skipped",
+                reason="restore_abort_mode",
+                restore_abort_reason=str(getattr(self, "_restore_abort_reason", "") or ""),
+            )
+            return
 
         reasons = list(getattr(self, "_deferred_planning_refresh_reasons", []))
         combined_reason = "__".join(reasons) if reasons else "deferred_planning_refresh"
@@ -3885,29 +4115,42 @@ class MainWindow(QMainWindow):
         tree = self.source_tree_widget if panel_key == "source" else self.destination_tree_widget
         if tree is None:
             return False, False
-        if panel_key == "destination" and not callable(getattr(tree, "topLevelItemCount", None)):
+        if not callable(getattr(tree, "topLevelItemCount", None)):
             return self._panel_loaded_branch_state_planning_model(tree)
 
         has_loaded_branches = False
         all_loaded_branches_expanded = True
-        queue = [tree.topLevelItem(index) for index in range(tree.topLevelItemCount())]
+        queue = list(self._iter_panel_top_level_rows(panel_key))
         while queue:
             item = queue.pop(0)
             if item is None:
                 continue
-            node_data = item.data(0, Qt.UserRole) or {}
+            node_data = self.get_tree_item_node_data(item) or {}
             if node_data.get("placeholder"):
                 continue
             real_children = []
-            for index in range(item.childCount()):
-                child = item.child(index)
-                child_data = child.data(0, Qt.UserRole) or {}
-                if child_data.get("placeholder"):
-                    continue
-                real_children.append(child)
+            if isinstance(item, QModelIndex):
+                model = item.model()
+                if model is not None:
+                    for index in range(model.rowCount(item)):
+                        child = model.index(index, 0, item)
+                        child_data = child.data(Qt.UserRole) or {}
+                        if child_data.get("placeholder"):
+                            continue
+                        real_children.append(child)
+            else:
+                for index in range(item.childCount()):
+                    child = item.child(index)
+                    child_data = child.data(0, Qt.UserRole) or {}
+                    if child_data.get("placeholder"):
+                        continue
+                    real_children.append(child)
             if bool(node_data.get("is_folder")) and real_children:
                 has_loaded_branches = True
-                if not item.isExpanded():
+                if isinstance(item, QModelIndex):
+                    if not tree.isExpanded(item):
+                        all_loaded_branches_expanded = False
+                elif not item.isExpanded():
                     all_loaded_branches_expanded = False
             queue.extend(real_children)
         return has_loaded_branches, all_loaded_branches_expanded
@@ -3956,6 +4199,16 @@ class MainWindow(QMainWindow):
 
     def _persist_workspace_ui_state_safely(self):
         try:
+            if self._workspace_ui_persist_should_defer():
+                self._workspace_ui_snapshot_dirty_panels.update({"source", "destination"})
+                t = getattr(self, "_workspace_ui_persist_timer", None)
+                if t is not None:
+                    t.start(2000)
+                log_info(
+                    "Workspace UI persist deferred (restore or materialisation active).",
+                    workspace_ui_persist_deferred=True,
+                )
+                return
             self._save_draft_shell(force=True, include_workspace_ui=True)
         except Exception as exc:
             self._log_restore_exception("persist_workspace_ui_state", exc)
@@ -3990,9 +4243,8 @@ class MainWindow(QMainWindow):
 
     def _on_workspace_ui_persist_timer(self):
         try:
-            if self._planning_workspace_is_busy():
-                # Avoid heavy snapshot capture while expand/load bursts are active.
-                self._workspace_ui_persist_timer.start(1800)
+            if self._workspace_ui_persist_should_defer():
+                self._workspace_ui_persist_timer.start(2000)
                 return
             dirty_panels = set(self._workspace_ui_snapshot_dirty_panels or set())
             if not dirty_panels:
@@ -4015,6 +4267,9 @@ class MainWindow(QMainWindow):
         if not self._startup_post_show_logged:
             self._startup_post_show_logged = True
             self._schedule_safe_timer(0, "startup_post_show_log", self._log_post_startup_state)
+        if not self._silent_graph_restore_scheduled:
+            self._silent_graph_restore_scheduled = True
+            self._schedule_safe_timer(200, "silent_graph_session_restore", self._begin_silent_graph_session_restore)
 
     def show(self):
         print("[window-startup] show() called")
@@ -4375,6 +4630,35 @@ class MainWindow(QMainWindow):
     def _has_restored_runtime_state(self):
         return bool(self.planned_moves or self.proposed_folders or self._memory_restore_candidate or self._memory_restore_complete)
 
+    def _restore_abort_active(self) -> bool:
+        return bool(getattr(self, "_restore_abort_mode", False))
+
+    def _enter_restore_abort_mode(self, reason: str, *, phase: str = "") -> None:
+        if self._restore_abort_active():
+            return
+        self._restore_abort_mode = True
+        self._restore_abort_reason = str(reason or "restore_error")
+        self._restore_destination_overlay_pending = False
+        self._restore_finalization_deferred_active = False
+        self._restore_finalization_deferred_reason = ""
+        self._destination_restore_materialization_queue = []
+        self._destination_restore_materialization_seen = set()
+        self._source_restore_materialization_queue = []
+        self._source_restore_materialization_seen = set()
+        self._source_projection_refresh_paths = set()
+        self._deferred_planning_refresh_pending = False
+        self._deferred_planning_refresh_reasons = []
+        self._deferred_source_projection_paths = set()
+        self._memory_restore_in_progress = False
+        self._memory_restore_background_trees = False
+        # Keep autosave suppressed so partially-restored state cannot overwrite disk snapshot.
+        self._suppress_autosave = True
+        self._log_restore_phase(
+            "restore_abort_mode_entered",
+            reason=self._restore_abort_reason,
+            source_phase=phase,
+        )
+
     def _log_restore_exception(self, phase, exc):
         log_error(
             "Memory restore step failed.",
@@ -4382,6 +4666,11 @@ class MainWindow(QMainWindow):
             error=str(exc),
             traceback=traceback.format_exc(),
         )
+        if (
+            (getattr(self, "_memory_restore_in_progress", False) or getattr(self, "_memory_restore_background_trees", False))
+            and not self._restore_abort_active()
+        ):
+            self._enter_restore_abort_mode(str(exc), phase=str(phase))
 
     def _projection_diag_verbose_enabled(self):
         flag = os.environ.get("OZLINK_PROJECTION_DIAG_LOG", "").strip().lower()
@@ -4588,6 +4877,21 @@ class MainWindow(QMainWindow):
         for r in range(n):
             yield tree.topLevelItem(r)
 
+    def _iter_panel_top_level_rows(self, panel_key: str):
+        tree, _status = self._get_tree_and_status(panel_key)
+        if tree is None:
+            return
+        n = self._planning_tree_top_level_count(tree)
+        if isinstance(tree, QTreeView):
+            model = tree.model()
+            if model is None:
+                return
+            for r in range(n):
+                yield model.index(r, 0, QModelIndex())
+            return
+        for r in range(n):
+            yield tree.topLevelItem(r)
+
     def _safe_invoke(self, callback_name, fn, *args, **kwargs):
         should_log = self._should_log_safe_callback(callback_name)
         if should_log:
@@ -4739,10 +5043,17 @@ class MainWindow(QMainWindow):
             first_ix = model.index(0, 0, QModelIndex())
             first_data = first_ix.data(Qt.UserRole) or {}
             return not first_data.get("placeholder")
-        if tree.topLevelItemCount() == 0:
+        if self._planning_tree_top_level_count(tree) == 0:
             return False
-        first_item = tree.topLevelItem(0)
-        first_data = first_item.data(0, Qt.UserRole) or {}
+        if isinstance(tree, QTreeView):
+            model = tree.model()
+            if model is None:
+                return False
+            first_ix = model.index(0, 0, QModelIndex())
+            first_data = first_ix.data(Qt.UserRole) or {}
+        else:
+            first_item = tree.topLevelItem(0)
+            first_data = first_item.data(0, Qt.UserRole) or {}
         return not first_data.get("placeholder")
 
     def _cleanup_root_worker(self, panel_key, worker_id):
@@ -4873,6 +5184,8 @@ class MainWindow(QMainWindow):
             return
 
         try:
+            self._restore_abort_mode = False
+            self._restore_abort_reason = ""
             self._memory_restore_in_progress = True
             self._memory_restore_complete = False
             self._suppress_autosave = True
@@ -5610,7 +5923,7 @@ class MainWindow(QMainWindow):
             ("Open File", self.handle_open_selected_file),
             ("Open in SharePoint", self.handle_open_selected_in_browser),
             ("Copy Link", self.handle_copy_selected_link),
-            ("Open Source Folder", self.handle_open_selected_source_folder),
+            ("Go to source", lambda: self.handle_go_to_source(entry_point="selection_details_panel")),
             ("Go to Destination", self.handle_go_to_destination),
         ]):
             button = QPushButton(text)
@@ -5856,15 +6169,33 @@ class MainWindow(QMainWindow):
             return total_count
 
         def count_item(item):
+            if isinstance(item, QModelIndex):
+                data = item.data(Qt.UserRole) or {}
+                total = 0 if data.get("placeholder") else 1
+                model = item.model()
+                if model is None:
+                    return total
+                for i in range(model.rowCount(item)):
+                    total += count_item(model.index(i, 0, item))
+                return total
             data = item.data(0, Qt.UserRole) or {}
             total = 0 if data.get("placeholder") else 1
             for index in range(item.childCount()):
                 total += count_item(item.child(index))
             return total
 
+        def iter_top_rows(target_tree):
+            n = self._planning_tree_top_level_count(target_tree)
+            if isinstance(target_tree, QTreeView):
+                model = target_tree.model()
+                if model is None:
+                    return []
+                return [model.index(i, 0, QModelIndex()) for i in range(n)]
+            return [target_tree.topLevelItem(i) for i in range(n)]
+
         total_count = 0
-        for index in range(tree.topLevelItemCount()):
-            total_count += count_item(tree.topLevelItem(index))
+        for top_row in iter_top_rows(tree):
+            total_count += count_item(top_row)
         return total_count
 
     def _current_selected_source_drive_id(self):
@@ -6653,9 +6984,9 @@ class MainWindow(QMainWindow):
             return []
         visible_nodes = []
         seen_paths = set()
-        for index in range(tree.topLevelItemCount()):
-            for item in self._iter_tree_items(tree.topLevelItem(index)):
-                node_data = item.data(0, Qt.UserRole) or {}
+        for top_item in self._iter_panel_top_level_rows("source"):
+            for item in self._iter_tree_items(top_item):
+                node_data = self.get_tree_item_node_data(item) or {}
                 if node_data.get("placeholder"):
                     continue
                 canonical_path = self._canonical_source_projection_path(self._tree_item_path(node_data))
@@ -7035,9 +7366,9 @@ class MainWindow(QMainWindow):
         intro = QLabel(
             "1. Save a manifest from your current plan, or open one from disk.\n"
             "2. Preview logs what would happen; Run performs copies and folder creation.\n"
-            "Local paths run on disk; SharePoint steps run via Microsoft Graph when you are signed in and the manifest has ids. "
-            "For a large draft, use a pilot live run (limit Graph operations) to prove copy/create works before Gary submits. "
-            "Saving from the plan loads the manifest here automatically. Work runs in the background."
+            "Internal default: live runs use the snapshot / execution-plan pipeline (draft bundle + harness). "
+            "Legacy manifest + pilot cap is fallback only (Settings → internal admin: check “Legacy manifest execution”). "
+            "Local paths run on disk; SharePoint uses Graph when signed in. Saving from the plan loads the manifest here; work runs in the background."
         )
         intro.setObjectName("CardBody")
         intro.setWordWrap(True)
@@ -7084,13 +7415,79 @@ class MainWindow(QMainWindow):
         self.execution_run_button = QPushButton("Run copies & folders")
         self.execution_run_button.setEnabled(False)
         self.execution_run_button.setToolTip(
-            "Run for real: local copies/mkdir on this PC and SharePoint folder creates / copies via Graph when signed in. "
-            "You can optionally cap how many Graph operations run (pilot test)."
+            "Run for real: internal default is snapshot pipeline execution from the current draft bundle. "
+            "Legacy manifest path (with optional pilot cap) runs only when the internal legacy fallback toggle is enabled in Settings."
         )
         self.execution_run_button.clicked.connect(self._on_execution_run_manifest)
         run_row.addWidget(self.execution_dry_run_button)
         run_row.addWidget(self.execution_run_button)
         run_row.addStretch()
+
+        browse_block = QVBoxLayout()
+        browse_block.setSpacing(6)
+        browse_hint = QLabel(
+            "Browse-driven recursive mode (separate from Planned Moves subset): uses the folder selected in the "
+            "source tree and the destination tree. Requires SharePoint mode, sign-in, and snapshot pipeline execution."
+        )
+        browse_hint.setWordWrap(True)
+        browse_hint.setObjectName("CardBody")
+        browse_block.addWidget(browse_hint)
+        browse_btn_row = QHBoxLayout()
+        self.execution_browsed_recursive_button = QPushButton("Run browsed folder recursively…")
+        self.execution_browsed_recursive_button.setToolTip(
+            "Open a confirmation dialog. Does not use Planned Moves row selection. "
+            "Enumerates files via Graph, builds an ephemeral bundle for this run only."
+        )
+        self.execution_browsed_recursive_button.setEnabled(False)
+        self.execution_browsed_recursive_button.clicked.connect(self._on_execution_browsed_recursive_run)
+        browse_btn_row.addWidget(self.execution_browsed_recursive_button)
+        browse_btn_row.addStretch()
+        browse_block.addLayout(browse_btn_row)
+
+        scoped_col = QVBoxLayout()
+        scoped_col.setSpacing(6)
+        self.execution_snapshot_scoped_checkbox = QCheckBox("Run selected planned moves only (snapshot subset)")
+        self.execution_snapshot_scoped_checkbox.setToolTip(
+            "Snapshot pipeline only: uses planned moves selected on the Planned Moves tab. "
+            "Choose strict allowlist or dependency-complete mode below. Select rows before Preview or Run."
+        )
+        scoped_col.addWidget(self.execution_snapshot_scoped_checkbox)
+        scoped_mode_row = QHBoxLayout()
+        self.execution_snapshot_scoped_mode_group = QButtonGroup(self)
+        self.execution_snapshot_scoped_strict_radio = QRadioButton("Strict allowlist only")
+        self.execution_snapshot_scoped_dependency_radio = QRadioButton("Include required folder/path steps")
+        self.execution_snapshot_scoped_strict_radio.setToolTip(
+            "Execute only execution-plan steps whose mapping id matches the selection (no added mkdir/chain steps)."
+        )
+        self.execution_snapshot_scoped_dependency_radio.setToolTip(
+            "Include minimal destination-chain and path mkdir steps required for selected file transfers; "
+            "prefers chain steps over duplicate proposed-folder steps for the same path."
+        )
+        self.execution_snapshot_scoped_mode_group.addButton(self.execution_snapshot_scoped_strict_radio, 0)
+        self.execution_snapshot_scoped_mode_group.addButton(self.execution_snapshot_scoped_dependency_radio, 1)
+        self.execution_snapshot_scoped_strict_radio.setChecked(True)
+        scoped_mode_row.addWidget(self.execution_snapshot_scoped_strict_radio)
+        scoped_mode_row.addWidget(self.execution_snapshot_scoped_dependency_radio)
+        scoped_mode_row.addStretch()
+        scoped_col.addLayout(scoped_mode_row)
+        self.execution_snapshot_scoped_helper_label = QLabel("")
+        self.execution_snapshot_scoped_helper_label.setObjectName("CardBody")
+        self.execution_snapshot_scoped_helper_label.setWordWrap(True)
+        scoped_col.addWidget(self.execution_snapshot_scoped_helper_label)
+        self.execution_snapshot_recursive_subtree_checkbox = QCheckBox(
+            "Include entire subtree (recursive folder)"
+        )
+        self.execution_snapshot_recursive_subtree_checkbox.setToolTip(
+            "Snapshot subset only, optional: for selected folder rows, list all files under that folder via "
+            "Microsoft Graph and run only those file steps. Uses a temporary copy of the draft bundle for this run; "
+            "your saved draft is unchanged. Requires sign-in. Does not change behavior when unchecked "
+            "(draft-first folder expansion only)."
+        )
+        self.execution_snapshot_recursive_subtree_checkbox.setEnabled(False)
+        scoped_col.addWidget(self.execution_snapshot_recursive_subtree_checkbox)
+        self.execution_snapshot_scoped_checkbox.toggled.connect(self._on_execution_snapshot_scoped_toggled)
+        self._on_execution_snapshot_scoped_toggled(self.execution_snapshot_scoped_checkbox.isChecked())
+        scoped_row = scoped_col
 
         self.execution_status_label = QLabel("")
         self.execution_status_label.setObjectName("CardBody")
@@ -7102,6 +7499,8 @@ class MainWindow(QMainWindow):
         card_layout.addWidget(self.execution_manifest_path_label)
         card_layout.addWidget(self.execution_summary_text, 1)
         card_layout.addLayout(run_row)
+        card_layout.addLayout(browse_block)
+        card_layout.addLayout(scoped_row)
         card_layout.addWidget(self.execution_status_label)
 
         outer.addWidget(card, 1)
@@ -7242,6 +7641,38 @@ class MainWindow(QMainWindow):
         ui_card_layout.addStretch()
 
         outer.addWidget(ui_card)
+        internal_card = QFrame()
+        internal_card.setObjectName("SectionBox")
+        internal_layout = QVBoxLayout(internal_card)
+        internal_layout.setContentsMargins(20, 20, 20, 20)
+        internal_layout.setSpacing(10)
+        internal_title = QLabel("Execution path (internal)")
+        internal_title.setObjectName("CardTitle")
+        self._settings_execution_path_toggle = QCheckBox(
+            "Legacy manifest execution only (fallback / recovery)"
+        )
+        self._settings_execution_path_toggle.setChecked(False)
+        self._settings_execution_path_toggle.toggled.connect(self._on_settings_execution_path_toggle_changed)
+        self._settings_execution_path_status = QLabel("")
+        self._settings_execution_path_status.setObjectName("MutedText")
+        self._settings_execution_path_status.setWordWrap(True)
+        self._settings_execution_path_hint = QLabel(
+            "Default: snapshot pipeline is primary. Check this box to force legacy manifest + transfer runner (and legacy pilot dialog on live runs). "
+            "Rollback: set ENABLE_DRAFT_PIPELINE_EXECUTION=0 to force legacy everywhere, or =1 to force snapshot, overriding this toggle."
+        )
+        self._settings_execution_path_hint.setObjectName("MutedText")
+        self._settings_execution_path_hint.setWordWrap(True)
+        internal_layout.addWidget(internal_title)
+        internal_layout.addWidget(self._settings_execution_path_toggle)
+        internal_layout.addWidget(self._settings_execution_path_status)
+        internal_layout.addWidget(self._settings_execution_path_hint)
+        internal_layout.addStretch()
+        outer.addWidget(internal_card)
+        is_admin = self.current_session_context.get("user_role", "user") == "admin"
+        self._settings_execution_path_toggle.setVisible(is_admin)
+        self._settings_execution_path_status.setVisible(is_admin)
+        self._settings_execution_path_hint.setVisible(is_admin)
+        self._refresh_execution_path_toggle_status()
         outer.addStretch()
         return page
 
@@ -7250,6 +7681,28 @@ class MainWindow(QMainWindow):
 
     def _persist_settings_destination_qtreeview(self, checked: bool):
         QSettings().setValue("ui/destination_use_qtreeview", bool(checked))
+
+    def _on_settings_execution_path_toggle_changed(self, _checked: bool):
+        self._refresh_execution_path_toggle_status()
+
+    def _refresh_execution_path_toggle_status(self):
+        label = getattr(self, "_settings_execution_path_status", None)
+        if label is None:
+            return
+        enabled, source = self._resolve_draft_pipeline_toggle_state()
+        if source == "env":
+            if enabled:
+                label.setText(
+                    "Current execution path: snapshot pipeline (ENABLE_DRAFT_PIPELINE_EXECUTION forces on)."
+                )
+            else:
+                label.setText(
+                    "Current execution path: legacy manifest (ENABLE_DRAFT_PIPELINE_EXECUTION forces off)."
+                )
+        elif source == "ui":
+            label.setText("Current execution path: legacy manifest (internal fallback toggle is on).")
+        else:
+            label.setText("Current execution path: snapshot pipeline (default internal mode).")
 
     def _graph_settings_delta_sync_enabled(self) -> bool:
         env = os.environ.get("OZLINK_GRAPH_DELTA_SYNC", "").strip().lower()
@@ -7400,6 +7853,14 @@ class MainWindow(QMainWindow):
         if hasattr(self, "requests_delete_test_btn"):
             self.requests_delete_test_btn.setVisible(role == "admin")
             self.requests_delete_test_btn.setEnabled(False)
+        if hasattr(self, "_settings_execution_path_toggle"):
+            is_admin = role == "admin"
+            self._settings_execution_path_toggle.setVisible(is_admin)
+            if hasattr(self, "_settings_execution_path_hint"):
+                self._settings_execution_path_hint.setVisible(is_admin)
+            if hasattr(self, "_settings_execution_path_status"):
+                self._settings_execution_path_status.setVisible(is_admin)
+            self._refresh_execution_path_toggle_status()
 
         current_page_name = self.app_subtitle.text()
         if current_page_name not in allowed_pages:
@@ -7536,6 +7997,35 @@ class MainWindow(QMainWindow):
                 f"We could not automatically open your browser.\n\nPlease open this address manually:\n{verification_uri}",
             )
         return opened
+
+    def _begin_silent_graph_session_restore(self):
+        if self.current_session_context.get("connected"):
+            return
+        if self._login_in_progress:
+            return
+        w = getattr(self, "_silent_graph_restore_worker", None)
+        if w is not None and w.isRunning():
+            return
+        worker = SilentGraphSessionRestoreWorker(self.graph)
+        self._silent_graph_restore_worker = worker
+        worker.success.connect(
+            lambda payload: self._safe_invoke(
+                "silent_graph_restore.success",
+                self._on_silent_graph_session_restore_success,
+                payload,
+            )
+        )
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_silent_graph_session_restore_success(self, payload):
+        if self.current_session_context.get("connected"):
+            return
+        if self._login_in_progress:
+            return
+        if not isinstance(payload, dict):
+            return
+        self.on_login_success(payload, attempt_id=None)
 
     def _start_login_worker_after_browser_open(self, attempt_id=None):
         self.update_session_state(False, waiting=True)
@@ -8428,6 +8918,8 @@ class MainWindow(QMainWindow):
             return
 
         self._log_restore_phase("phase2_post_login_restore_enter")
+        self._restore_abort_mode = False
+        self._restore_abort_reason = ""
         self._memory_ui_rebind_in_progress = True
         self._memory_restore_in_progress = True
         self._memory_restore_background_trees = False
@@ -8462,6 +8954,13 @@ class MainWindow(QMainWindow):
             self._log_restore_phase("phase2_post_login_restore_exit")
 
     def _post_login_restore_phase4(self):
+        if self._restore_abort_active():
+            self._log_restore_phase(
+                "phase4_destination_overlay skipped",
+                reason="restore_abort_mode",
+                restore_abort_reason=str(getattr(self, "_restore_abort_reason", "") or ""),
+            )
+            return
         if not self._restore_destination_overlay_pending:
             self._log_restore_phase("phase4_destination_overlay skipped", reason="no proposed folders pending")
             self._finalize_memory_restore_if_ready("phase4_no_overlay_pending")
@@ -8537,6 +9036,18 @@ class MainWindow(QMainWindow):
             self._finalize_memory_restore_if_ready("phase4_complete")
 
     def _finalize_memory_restore_if_ready(self, reason=""):
+        if self._restore_abort_active():
+            self._memory_restore_in_progress = False
+            self._memory_restore_background_trees = False
+            self._memory_restore_complete = False
+            self._suppress_autosave = True
+            self._log_restore_phase(
+                "restore_finalization_skipped",
+                reason=reason,
+                stop_reason="restore_abort_mode",
+                restore_abort_reason=str(getattr(self, "_restore_abort_reason", "") or ""),
+            )
+            return False
         unresolved_count = self._unresolved_proposed_queue_size() + self._unresolved_allocation_queue_size()
         destination_queue_size = len(getattr(self, "_destination_restore_materialization_queue", []) or [])
         pending_destination_root_load = 1 if self.root_load_workers.get("destination") else 0
@@ -8659,6 +9170,13 @@ class MainWindow(QMainWindow):
         drive_id = str(drive_id or "").strip()
         if not drive_id or not getattr(self, "graph", None):
             return
+        if self._restore_abort_active() or getattr(self, "_memory_restore_in_progress", False):
+            self._log_restore_phase(
+                "drive_delta_sync_skipped",
+                drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+                reason="restore_busy_or_abort",
+            )
+            return
         if not self._graph_settings_delta_sync_enabled():
             log_trace(
                 "drive_delta_sync",
@@ -8702,6 +9220,13 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _on_drive_delta_sync_success(self, payload: dict, drive_id: str):
+        if self._restore_abort_active():
+            self._log_restore_phase(
+                "drive_delta_sync_success_ignored",
+                drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+                reason="restore_abort_mode",
+            )
+            return
         if payload.get("skipped"):
             log_trace(
                 "drive_delta_sync",
@@ -8762,10 +9287,9 @@ class MainWindow(QMainWindow):
             tree = self.source_tree_widget if panel_key == "source" else self.destination_tree_widget
             if tree is None:
                 continue
-            for ti in range(tree.topLevelItemCount()):
-                top = tree.topLevelItem(ti)
+            for top in self._iter_panel_top_level_rows(panel_key):
                 for item in self._iter_tree_items(top):
-                    node_data = item.data(0, Qt.UserRole) or {}
+                    node_data = self.get_tree_item_node_data(item) or {}
                     if node_data.get("placeholder"):
                         continue
                     item_id = str(node_data.get("id") or "").strip()
@@ -8776,13 +9300,19 @@ class MainWindow(QMainWindow):
                         continue
                     if panel_key == "destination" and self.node_is_planned_allocation(node_data):
                         node_data["children_loaded"] = False
-                        item.setData(0, Qt.UserRole, node_data)
+                        self.set_tree_item_node_data(item, node_data)
                         continue
                     node_data["children_loaded"] = False
                     node_data["load_failed"] = False
-                    item.setData(0, Qt.UserRole, node_data)
-                    if item.isExpanded():
-                        self.on_tree_item_expanded(panel_key, item)
+                    self.set_tree_item_node_data(item, node_data)
+                    if isinstance(item, QModelIndex):
+                        if panel_key == "source":
+                            tree_src = getattr(self, "source_tree_widget", None)
+                            if tree_src is not None and bool(tree_src.isExpanded(item)):
+                                self.on_tree_item_expanded(panel_key, item)
+                    else:
+                        if item.isExpanded():
+                            self.on_tree_item_expanded(panel_key, item)
 
     def _destination_live_refresh_still_blocked(self):
         if getattr(self, "_memory_restore_in_progress", False):
@@ -9278,6 +9808,7 @@ class MainWindow(QMainWindow):
 
     def reset_root_panels(self):
         self.pending_root_drive_ids = {"source": "", "destination": ""}
+        self.pending_root_site_ids = {"source": "", "destination": ""}
         self.pending_folder_loads = {"source": set(), "destination": set()}
         self._pending_source_navigation = None
         self._pending_destination_navigation = None
@@ -9371,6 +9902,52 @@ class MainWindow(QMainWindow):
                 tree_kind="qtreewidget",
             )
 
+    _JSON_PERSIST_MAX_DEPTH = 48
+
+    def _sanitize_value_for_json_persist(self, val, depth: int = 0):
+        """Recursively replace Qt GUI types with JSON-safe values; drop unsupported objects from dicts."""
+        if depth > self._JSON_PERSIST_MAX_DEPTH:
+            return _JSON_PERSIST_OMIT
+        if val is None or isinstance(val, (str, int, float, bool)):
+            return val
+        if isinstance(val, QColor):
+            return val.name(QColor.HexRgb) if val.isValid() else ""
+        if isinstance(val, QBrush):
+            c = val.color()
+            return c.name(QColor.HexRgb) if c.isValid() else ""
+        if isinstance(val, QFont):
+            return val.toString()
+        if isinstance(val, QByteArray):
+            if val.size() > 4096:
+                return ""
+            return bytes(val).hex()
+        if isinstance(val, dict):
+            out: dict = {}
+            for k, v in val.items():
+                sk = str(k)
+                sv = self._sanitize_value_for_json_persist(v, depth + 1)
+                if sv is _JSON_PERSIST_OMIT:
+                    continue
+                out[sk] = sv
+            return out
+        if isinstance(val, (list, tuple)):
+            acc: list = []
+            for x in val:
+                sx = self._sanitize_value_for_json_persist(x, depth + 1)
+                acc.append(None if sx is _JSON_PERSIST_OMIT else sx)
+            return acc
+        return _JSON_PERSIST_OMIT
+
+    def _sanitize_tree_snapshot_branch_for_persist(self, snap):
+        if not isinstance(snap, dict):
+            return
+        data = snap.get("data")
+        if isinstance(data, dict):
+            cleaned = self._sanitize_value_for_json_persist(data, 0)
+            snap["data"] = cleaned if isinstance(cleaned, dict) else {}
+        for ch in list(snap.get("children") or []):
+            self._sanitize_tree_snapshot_branch_for_persist(ch)
+
     def _serialize_source_model_subtree_snapshot(self, index, tree):
         model = index.model()
         if model is None:
@@ -9426,6 +10003,8 @@ class MainWindow(QMainWindow):
         if panel_key == "destination":
             for snap in snapshots:
                 self._normalize_destination_snapshot_tree_for_persist(snap)
+        for snap in snapshots:
+            self._sanitize_tree_snapshot_branch_for_persist(snap)
         return snapshots
 
     def _serialize_tree_item_snapshot(self, item):
@@ -10208,6 +10787,13 @@ class MainWindow(QMainWindow):
 
     def on_root_load_success(self, payload, worker_id):
         try:
+            if self._restore_abort_active():
+                self._log_restore_phase(
+                    "root_worker_success_skipped",
+                    reason="restore_abort_mode",
+                    restore_abort_reason=str(getattr(self, "_restore_abort_reason", "") or ""),
+                )
+                return
             self._log_restore_phase(
                 "root_worker_success handler",
                 payload_panel=payload.get("panel_key", ""),
@@ -10582,7 +11168,8 @@ class MainWindow(QMainWindow):
         if isinstance(row, QModelIndex):
             if not row.isValid():
                 return {}
-            return row.data(Qt.UserRole) or {}
+            data = self.get_tree_item_node_data(row)
+            return dict(data) if data else {}
         return row.data(0, Qt.UserRole) or {}
 
     def _source_tree_row_child_count(self, row):
@@ -10635,7 +11222,7 @@ class MainWindow(QMainWindow):
             if model is None:
                 return
             for ix in model.iter_depth_first():
-                yield ix.data(Qt.UserRole) or {}
+                yield self.get_tree_item_node_data(ix) or {}
             return
         for index in range(tree.topLevelItemCount()):
             for item in self._iter_tree_items(tree.topLevelItem(index)):
@@ -10927,7 +11514,7 @@ class MainWindow(QMainWindow):
             if not cached.isValid():
                 return None
             ix = QModelIndex(cached)
-            node_data = ix.data(Qt.UserRole) or {}
+            node_data = self.get_tree_item_node_data(ix) or {}
             visible_path = self._canonical_source_projection_path(self._tree_item_path(node_data))
             if visible_path and visible_path == normalized_target:
                 return ix
@@ -10967,7 +11554,7 @@ class MainWindow(QMainWindow):
             if model is None:
                 return None
             for ix in model.iter_depth_first():
-                node_data = ix.data(Qt.UserRole) or {}
+                node_data = self.get_tree_item_node_data(ix) or {}
                 if node_data.get("placeholder"):
                     continue
                 visible_path = self._canonical_source_projection_path(self._tree_item_path(node_data))
@@ -11062,10 +11649,6 @@ class MainWindow(QMainWindow):
     def _schedule_source_restore_materialization_queue(self, reason, trigger_path="", delay_ms=None):
         if self._expand_all_pending.get("source") and reason == "folder_load":
             return
-        if reason == "folder_load":
-            # Avoid cascaded restore queue churn on every source folder callback.
-            # Root-bind scheduling is sufficient to drive the queue deterministically.
-            return
         if (
             reason == "folder_load"
             and not getattr(self, "_memory_restore_in_progress", False)
@@ -11074,7 +11657,12 @@ class MainWindow(QMainWindow):
             # After restore finalization, avoid continuing restore-driven source
             # branch expansion in the background; user-driven expansion takes over.
             return
-        delay = self._restore_queue_tick_delay_ms if delay_ms is None else max(0, int(delay_ms))
+        # folder_load: schedule on the next event-loop turn (0 ms). A fixed tick delay
+        # after every successful folder load added ~45–60 ms per branch × dozens of paths,
+        # stretching startup while destination preview waited on pending_source_folder_loads.
+        if delay_ms is None:
+            delay_ms = 0 if reason == "folder_load" else self._restore_queue_tick_delay_ms
+        delay = max(0, int(delay_ms))
         QTimer.singleShot(
             delay,
             lambda: self._process_source_restore_materialization_queue(reason, trigger_path=trigger_path),
@@ -11266,6 +11854,14 @@ class MainWindow(QMainWindow):
             and reason == "folder_load"
         ):
             return
+
+        def _get_item_user_data(item):
+            if isinstance(item, QModelIndex):
+                return item.data(Qt.UserRole)
+            elif hasattr(item, "data"):
+                return item.data(0, Qt.UserRole)
+            return {}
+
         queue = self._source_restore_materialization_queue
         # Drain paths whose nodes are already expanded/loaded in one pass. Previously each
         # already-loaded pop consumed a full timer tick (~60ms), so 50+ branches added seconds
@@ -11291,7 +11887,7 @@ class MainWindow(QMainWindow):
                 )
                 break
 
-            node_data = item.data(0, Qt.UserRole) or {}
+            node_data = _get_item_user_data(item) or {}
             already_loaded = bool(node_data.get("children_loaded")) or not bool(node_data.get("is_folder"))
             pending_key = f"{node_data.get('drive_id', '')}:{node_data.get('id', '')}"
             if pending_key in self.pending_folder_loads["source"]:
@@ -11341,7 +11937,7 @@ class MainWindow(QMainWindow):
                 trigger_path=self.normalize_memory_path(trigger_path),
                 verbose=True,
             )
-            self.source_tree_widget.expandItem(item)
+            self._expand_source_tree_item(item)
             break
 
         if not queue:
@@ -16562,6 +17158,33 @@ class MainWindow(QMainWindow):
         self, reason, *, allow_defer=True, prefer_chunked_projection=False
     ):
         self._destination_future_model_last_blocked_source_restore = False
+
+        # Each destination folder_worker_success used to call this path and the cancel below
+        # would tear down fast-first-paint + background incremental merge, restarting the
+        # full chunked materialization on every load during restore.
+        if reason == "folder_worker_success":
+            if getattr(self, "_destination_future_projection_async_state", None) is not None:
+                self._log_restore_phase(
+                    "destination_future_model_materialize_skipped",
+                    reason=reason,
+                    skip_reason="projection_merge_in_progress",
+                )
+                return 0
+            if getattr(self, "_destination_chunked_bind_state", None) is not None:
+                self._log_restore_phase(
+                    "destination_future_model_materialize_skipped",
+                    reason=reason,
+                    skip_reason="chunked_bind_in_progress",
+                )
+                return 0
+            if getattr(self, "_destination_future_bind_sync_active", False):
+                self._log_restore_phase(
+                    "destination_future_model_materialize_skipped",
+                    reason=reason,
+                    skip_reason="bind_sync_in_progress",
+                )
+                return 0
+
         self._cancel_destination_future_async_projection(reason or "materialize")
         if getattr(self, "_destination_root_prime_pending", False) and reason not in {
             "folder_worker_success",
@@ -18878,12 +19501,22 @@ class MainWindow(QMainWindow):
                 if source_item is not None:
                     source_node = self._source_tree_row_payload(source_item)
 
-        return {
+        out = {
             "traceable_to_source": bool(source_path),
             "source_path": source_path,
             "source_node": dict(source_node) if isinstance(source_node, dict) else (source_node or {}),
             "move": move,
         }
+        if self._full_trace_enabled() and getattr(self, "_go_to_source_trace_session", False) and panel_key == "destination":
+            log_trace(
+                "ui",
+                "go_to_source_resolve_source_traceability",
+                panel_key=panel_key,
+                source_path_excerpt=str(source_path or "")[:400],
+                has_move=move is not None,
+                node_data_has_source_path=bool(str(node_data.get("source_path", "") or "").strip()),
+            )
+        return out
 
     def _resolve_selection_metadata(self, panel_key, node_data, traceability):
         raw = node_data.get("raw", {}) if isinstance(node_data.get("raw", {}), dict) else {}
@@ -19191,13 +19824,6 @@ class MainWindow(QMainWindow):
         dest_jump_target = ""
         dest_jump_enabled = False
 
-        node_origin = str(node_data.get("node_origin", "")).lower()
-        is_destination_real = panel_key == "destination" and not (
-            self.node_is_proposed(node_data)
-            or self.node_is_planned_allocation(node_data)
-            or node_origin in {"projectedallocationdescendant", "projecteddestination"}
-        )
-
         if panel_key == "source":
             open_target = node_data.get("local_path") or node_data.get("file_path") or node_data.get("web_url", "")
             browser_url = node_data.get("web_url", "")
@@ -19212,10 +19838,7 @@ class MainWindow(QMainWindow):
             open_target = source_node.get("local_path") or source_node.get("file_path") or source_node.get("web_url", "")
             browser_url = node_data.get("web_url", "")
             copy_link = browser_url or metadata["item_path"]
-            if is_destination_real and browser_url:
-                open_source_target = browser_url
-                open_source_mode = "open_destination_sharepoint"
-            elif traceability.get("source_path"):
+            if traceability.get("source_path"):
                 open_source_target = traceability.get("source_path", "")
                 open_source_mode = "select_traceable_source"
 
@@ -19242,15 +19865,15 @@ class MainWindow(QMainWindow):
                 "target": copy_link,
                 "tooltip": "Copy the SharePoint URL or best available path." if copy_link else "No usable link is available for this item.",
             },
-            "Open Source Folder": {
+            "Go to source": {
                 "enabled": bool(open_source_target),
                 "target": open_source_target,
                 "mode": open_source_mode,
                 "tooltip": (
-                    "Open this real destination folder in SharePoint."
-                    if open_source_mode == "open_destination_sharepoint"
-                    else "Select the related source folder in the source tree."
-                ) if open_source_target else "This item cannot be traced back to a source folder.",
+                    "Show and select the linked item in the Source Content tree (expands parents as needed)."
+                    if open_source_target
+                    else "This item cannot be traced to a path in the current source library."
+                ),
             },
             "Go to Destination": {
                 "enabled": dest_jump_enabled,
@@ -19262,6 +19885,16 @@ class MainWindow(QMainWindow):
                 ),
             },
         }
+        if self._full_trace_enabled() and getattr(self, "_go_to_source_trace_session", False) and panel_key == "destination":
+            gta = actions.get("Go to source", {})
+            log_trace(
+                "ui",
+                "go_to_source_resolve_selection_actions",
+                go_to_source_enabled=bool(gta.get("enabled")),
+                open_source_target_excerpt=str(gta.get("target", "") or "")[:400],
+                open_source_mode=str(gta.get("mode", "") or ""),
+                trace_source_path_excerpt=str(traceability.get("source_path", "") or "")[:400],
+            )
         return actions
 
     def _resolve_selected_item_context(self, panel_key, node_data):
@@ -19290,6 +19923,15 @@ class MainWindow(QMainWindow):
             traceable_to_source=traceability.get("traceable_to_source", False),
             selected_item_type=metadata["item_type"],
         )
+        if self._full_trace_enabled() and getattr(self, "_go_to_source_trace_session", False) and panel_key == "destination":
+            log_trace(
+                "ui",
+                "go_to_source_resolve_selected_item_context",
+                panel_key=panel_key,
+                traceable_to_source=traceability.get("traceable_to_source", False),
+                trace_source_path_excerpt=str(traceability.get("source_path", "") or "")[:400],
+                node_data_keys=sorted((node_data or {}).keys()),
+            )
         return context
 
     def _update_selection_details(self, context):
@@ -19356,17 +19998,74 @@ class MainWindow(QMainWindow):
                 target_path = parent_path
         source_item = self._find_visible_source_item_by_path(target_path)
         if source_item is None:
+            if self._full_trace_enabled() and getattr(self, "_go_to_source_trace_session", False):
+                log_trace(
+                    "ui",
+                    "go_to_source_select_by_path",
+                    phase="find_visible",
+                    found=False,
+                    target_path_excerpt=str(target_path or "")[:400],
+                    prefer_container=prefer_container,
+                )
             return False
+
+        tree = getattr(self, "source_tree_widget", None)
+        if tree is None:
+            if self._full_trace_enabled() and getattr(self, "_go_to_source_trace_session", False):
+                log_trace("ui", "go_to_source_select_by_path", phase="no_source_tree", found=False)
+            return False
+
+        if isinstance(source_item, QModelIndex):
+            if not source_item.isValid():
+                return False
+            if source_item.column() != 0:
+                source_item = source_item.siblingAtColumn(0)
+            if not source_item.isValid():
+                return False
+            parent = source_item.parent()
+            while parent.isValid():
+                tree.expand(parent)
+                parent = parent.parent()
+            tree.clearSelection()
+            tree.setCurrentIndex(source_item)
+            sm = tree.selectionModel()
+            if sm is not None:
+                sm.select(
+                    source_item,
+                    QItemSelectionModel.SelectionFlag.ClearAndSelect
+                    | QItemSelectionModel.SelectionFlag.Rows,
+                )
+            tree.scrollTo(source_item)
+            self.on_tree_selection_changed("source")
+            if self._full_trace_enabled() and getattr(self, "_go_to_source_trace_session", False):
+                log_trace(
+                    "ui",
+                    "go_to_source_select_by_path",
+                    phase="selected_model_index",
+                    found=True,
+                    row=source_item.row(),
+                    column=source_item.column(),
+                    target_path_excerpt=str(target_path or "")[:400],
+                )
+            return True
 
         parent = source_item.parent()
         while parent is not None:
             parent.setExpanded(True)
             parent = parent.parent()
-        self.source_tree_widget.clearSelection()
-        self.source_tree_widget.setCurrentItem(source_item)
+        tree.clearSelection()
+        tree.setCurrentItem(source_item)
         source_item.setSelected(True)
-        self.source_tree_widget.scrollToItem(source_item)
+        tree.scrollToItem(source_item)
         self.on_tree_selection_changed("source")
+        if self._full_trace_enabled() and getattr(self, "_go_to_source_trace_session", False):
+            log_trace(
+                "ui",
+                "go_to_source_select_by_path",
+                phase="selected_tree_widget_item",
+                found=True,
+                target_path_excerpt=str(target_path or "")[:400],
+            )
         return True
 
     def _build_source_navigation_paths(self, target_path):
@@ -19397,7 +20096,7 @@ class MainWindow(QMainWindow):
             if item is None:
                 break
 
-            node_data = item.data(0, Qt.UserRole) or {}
+            node_data = self._source_tree_row_payload(item)
             if not node_data.get("is_folder"):
                 queue.pop(0)
                 continue
@@ -19410,7 +20109,7 @@ class MainWindow(QMainWindow):
             if bool(node_data.get("children_loaded")):
                 continue
 
-            self.source_tree_widget.expandItem(item)
+            self._expand_source_tree_item(item)
             break
 
         if not queue and self._select_source_item_by_path(target_path, prefer_container=prefer_container):
@@ -19425,8 +20124,20 @@ class MainWindow(QMainWindow):
             if parent_path:
                 target_path = parent_path
         if not target_path:
+            if self._full_trace_enabled() and getattr(self, "_go_to_source_trace_session", False):
+                log_trace("ui", "go_to_source_start_navigation", outcome="empty_target", target_path_excerpt="")
             return False
+        if self._full_trace_enabled() and getattr(self, "_go_to_source_trace_session", False):
+            log_trace(
+                "ui",
+                "go_to_source_start_navigation",
+                outcome="try_select",
+                target_path_excerpt=str(target_path or "")[:400],
+                queue_len=len(self._build_source_navigation_paths(target_path)),
+            )
         if self._select_source_item_by_path(target_path, prefer_container=False):
+            if self._full_trace_enabled() and getattr(self, "_go_to_source_trace_session", False):
+                log_trace("ui", "go_to_source_start_navigation", outcome="immediate_select_ok")
             return True
 
         self._pending_source_navigation = {
@@ -19434,6 +20145,14 @@ class MainWindow(QMainWindow):
             "prefer_container": False,
             "queue": self._build_source_navigation_paths(target_path),
         }
+        if self._full_trace_enabled() and getattr(self, "_go_to_source_trace_session", False):
+            log_trace(
+                "ui",
+                "go_to_source_start_navigation",
+                outcome="deferred_pending_queue",
+                target_path_excerpt=str(target_path or "")[:400],
+                pending_queue_len=len(self._pending_source_navigation.get("queue") or []),
+            )
         self._process_pending_source_navigation("selection_request", trigger_path=target_path)
         return True
 
@@ -21164,14 +21883,15 @@ class MainWindow(QMainWindow):
             if panel_key == "source" and self._source_tree_uses_model_view():
                 ix = tree.currentIndex()
                 selected_items = [ix] if ix.isValid() else []
+            elif panel_key == "destination" and self._destination_tree_uses_model_view():
+                ix = tree.currentIndex()
+                selected_items = [ix] if ix.isValid() else []
             else:
                 selected_items = tree.selectedItems()
             if self._full_trace_enabled():
                 first = selected_items[0] if selected_items else None
-                if isinstance(first, QModelIndex):
-                    nd = (first.data(Qt.UserRole) or {}) if first is not None and first.isValid() else {}
-                else:
-                    nd = (first.data(0, Qt.UserRole) or {}) if first else {}
+                nd = self.get_tree_item_node_data(first) if first is not None else None
+                nd = nd or {}
                 log_trace(
                     "ui",
                     "tree_selection_changed",
@@ -21185,11 +21905,8 @@ class MainWindow(QMainWindow):
                 return
 
             first_sel = selected_items[0]
-            if isinstance(first_sel, QModelIndex):
-                node_data = first_sel.data(Qt.UserRole) or {}
-            else:
-                node_data = first_sel.data(0, Qt.UserRole) or {}
-            if node_data.get("placeholder"):
+            node_data = self.get_tree_item_node_data(first_sel)
+            if not node_data:
                 self.clear_selection_details()
                 return
 
@@ -21373,12 +22090,38 @@ class MainWindow(QMainWindow):
             selected_item_type=metadata["item_type"],
         )
 
-    def handle_open_selected_source_folder(self):
-        context = getattr(self, "_current_details_context", None)
+    def _handle_go_to_source_from_destination_menu(self, ctx, checked=False):
+        """Bound slot for destination context menu: ``triggered(bool)`` must not overwrite the frozen context dict."""
+        self.handle_go_to_source(ctx, entry_point="destination_context_menu")
+
+    def handle_go_to_source(self, context=None, *, entry_point="unknown"):
+        """Focus Source Content on the traced path (expand/select/scroll). Optional ``context`` for context-menu callers."""
+        details_ctx = getattr(self, "_current_details_context", None)
+        explicit_context_passed = context is not None
         if context is None:
-            QMessageBox.information(self, "Open Source Folder", "Select an item first.")
+            context = details_ctx
+        log_info(
+            "go_to_source_handle_entry",
+            entry_point=str(entry_point or "unknown"),
+            explicit_context_passed=explicit_context_passed,
+            fell_back_to_current_details=not explicit_context_passed,
+            panel_key=str((context or {}).get("panel_key", "")) if isinstance(context, dict) else "",
+            in_menu_session=bool(getattr(self, "_go_to_source_trace_session", False)),
+        )
+        if self._full_trace_enabled():
+            log_trace(
+                "ui",
+                "go_to_source_handle_entry",
+                explicit_context_passed=explicit_context_passed,
+                fell_back_to_current_details=not explicit_context_passed,
+                context_same_object_as_details=(context is not None and context is details_ctx),
+                panel_key=str((context or {}).get("panel_key", "")) if isinstance(context, dict) else "",
+                in_menu_session=bool(getattr(self, "_go_to_source_trace_session", False)),
+            )
+        if context is None:
+            QMessageBox.information(self, "Go to source", "Select an item first.")
             return
-        action = context["actions"].get("Open Source Folder", {})
+        action = context["actions"].get("Go to source", {})
         metadata = context["metadata"]
         if not action.get("enabled"):
             log_warn(
@@ -21397,16 +22140,19 @@ class MainWindow(QMainWindow):
                 item_path=metadata["item_path"],
                 tree_role=context["panel_key"],
                 node_origin=metadata["node_origin"],
-                action_name="Open Source Folder",
+                action_name="Go to source",
                 enabled=False,
                 traceable_to_source=context["traceability"].get("traceable_to_source", False),
                 selected_item_type=metadata["item_type"],
             )
-            QMessageBox.information(self, "Open Source Folder", "This item cannot be traced back to a source folder.")
+            QMessageBox.information(
+                self,
+                "Go to source",
+                "This item cannot be traced to a path in the current source library.",
+            )
             return
         target_path = action.get("target", "")
         mode = action.get("mode", "")
-        used_fallback = mode == "open_destination_sharepoint"
         log_info(
             "selection_action_open_source_folder_branch",
             item_name=metadata["item_name"],
@@ -21414,57 +22160,9 @@ class MainWindow(QMainWindow):
             tree_role=context["panel_key"],
             node_origin=metadata["node_origin"],
             has_source_traceability=context["traceability"].get("traceable_to_source", False),
-            used_fallback=used_fallback,
-            opened_url=target_path if used_fallback else "",
+            used_fallback=False,
+            opened_url="",
         )
-        if mode == "open_destination_sharepoint":
-            log_info(
-                "selection_action_open_source_folder_fallback_to_sharepoint",
-                item_name=metadata["item_name"],
-                item_path=metadata["item_path"],
-                tree_role=context["panel_key"],
-                node_origin=metadata["node_origin"],
-                has_source_traceability=context["traceability"].get("traceable_to_source", False),
-                used_fallback=True,
-                opened_url=target_path,
-            )
-            opened = QDesktopServices.openUrl(QUrl(target_path))
-            log_info(
-                "selection_action_open_source_folder",
-                item_name=metadata["item_name"],
-                item_path=metadata["item_path"],
-                tree_role=context["panel_key"],
-                node_origin=metadata["node_origin"],
-                action_name="Open Source Folder",
-                enabled=True,
-                traceable_to_source=context["traceability"].get("traceable_to_source", False),
-                selected_item_type=metadata["item_type"],
-            )
-            if not opened:
-                log_warn(
-                    "selection_action_open_source_folder_failed",
-                    item_name=metadata["item_name"],
-                    item_path=metadata["item_path"],
-                    tree_role=context["panel_key"],
-                    node_origin=metadata["node_origin"],
-                    has_source_traceability=context["traceability"].get("traceable_to_source", False),
-                    used_fallback=True,
-                    opened_url=target_path,
-                )
-                log_warn(
-                    "selection_action_failed",
-                    item_name=metadata["item_name"],
-                    item_path=metadata["item_path"],
-                    tree_role=context["panel_key"],
-                    node_origin=metadata["node_origin"],
-                    action_name="Open Source Folder",
-                    enabled=True,
-                    traceable_to_source=context["traceability"].get("traceable_to_source", False),
-                    selected_item_type=metadata["item_type"],
-                )
-                QMessageBox.information(self, "Open Source Folder", "Could not open the destination folder in SharePoint.")
-            return
-
         log_info(
             "selection_action_open_source_folder_trace_to_source",
             item_name=metadata["item_name"],
@@ -21476,16 +22174,60 @@ class MainWindow(QMainWindow):
             opened_url="",
         )
         prefer_container = mode == "select_source_container"
+        log_info(
+            "go_to_source_handle_navigate",
+            entry_point=str(entry_point or "unknown"),
+            target_path_excerpt=str(target_path or "")[:400],
+            prefer_container=prefer_container,
+        )
+        if self._full_trace_enabled():
+            log_trace(
+                "ui",
+                "go_to_source_handle_navigate",
+                target_path_excerpt=str(target_path or "")[:400],
+                prefer_container=prefer_container,
+                action_enabled=True,
+                in_menu_session=bool(getattr(self, "_go_to_source_trace_session", False)),
+            )
         navigated = self._select_source_item_by_path(target_path, prefer_container=prefer_container)
+        log_info(
+            "go_to_source_select_by_path",
+            entry_point=str(entry_point or "unknown"),
+            phase="immediate",
+            found=bool(navigated),
+            target_path_excerpt=str(target_path or "")[:400],
+            prefer_container=prefer_container,
+        )
         if not navigated:
+            if self._full_trace_enabled():
+                log_trace(
+                    "ui",
+                    "go_to_source_handle_fallback_start_navigation",
+                    target_path_excerpt=str(target_path or "")[:400],
+                    in_menu_session=bool(getattr(self, "_go_to_source_trace_session", False)),
+                )
             navigated = self._start_source_navigation(target_path, prefer_container=prefer_container)
+        deferred_pending = bool(getattr(self, "_pending_source_navigation", None))
+        log_info(
+            "go_to_source_handle_result",
+            entry_point=str(entry_point or "unknown"),
+            reported_navigated=bool(navigated),
+            deferred_navigation_pending=deferred_pending,
+        )
+        if self._full_trace_enabled():
+            log_trace(
+                "ui",
+                "go_to_source_handle_result",
+                navigated=bool(navigated),
+                in_menu_session=bool(getattr(self, "_go_to_source_trace_session", False)),
+            )
         log_info(
             "selection_action_open_source_folder",
             item_name=metadata["item_name"],
             item_path=metadata["item_path"],
             tree_role=context["panel_key"],
             node_origin=metadata["node_origin"],
-            action_name="Open Source Folder",
+            action_name="Go to source",
             enabled=True,
             traceable_to_source=context["traceability"].get("traceable_to_source", False),
             selected_item_type=metadata["item_type"],
@@ -21507,12 +22249,16 @@ class MainWindow(QMainWindow):
                 item_path=metadata["item_path"],
                 tree_role=context["panel_key"],
                 node_origin=metadata["node_origin"],
-                action_name="Open Source Folder",
+                action_name="Go to source",
                 enabled=True,
                 traceable_to_source=context["traceability"].get("traceable_to_source", False),
                 selected_item_type=metadata["item_type"],
             )
-            QMessageBox.information(self, "Open Source Folder", "The related source folder could not be located in the source tree.")
+            QMessageBox.information(
+                self,
+                "Go to source",
+                "The linked source path could not be found or revealed in the Source Content tree.",
+            )
 
     def handle_go_to_destination(self):
         context = getattr(self, "_current_details_context", None)
@@ -21552,14 +22298,47 @@ class MainWindow(QMainWindow):
         if item is None:
             return None
 
+        raw_row = None
+        raw_column = None
         if isinstance(item, QModelIndex):
-            node_data = item.data(Qt.UserRole) or {}
+            # Multi-column explorer models (destination/source QTreeView) attach Qt.UserRole only on column 0.
+            if item.isValid():
+                raw_row, raw_column = item.row(), item.column()
+            if item.isValid() and item.column() != 0:
+                item = item.siblingAtColumn(0)
+            node_data = item.data(Qt.UserRole) or {} if item.isValid() else {}
         else:
             node_data = item.data(0, Qt.UserRole) or {}
         if node_data.get("placeholder"):
             return None
 
-        return dict(node_data)
+        out = dict(node_data)
+        if self._full_trace_enabled() and getattr(self, "_go_to_source_trace_session", False):
+            log_trace(
+                "ui",
+                "go_to_source_get_tree_item_node_data",
+                raw_row=raw_row,
+                raw_column=raw_column,
+                normalized_column=(item.column() if isinstance(item, QModelIndex) and item.isValid() else None),
+                payload_keys=sorted(out.keys()),
+            )
+        return out
+
+    def set_tree_item_node_data(self, item, node_data: dict | None):
+        payload = dict(node_data or {})
+        if isinstance(item, QModelIndex):
+            model = item.model()
+            if model is None:
+                return
+
+            def _mut(p):
+                p.clear()
+                p.update(payload)
+
+            if hasattr(model, "update_payload_for_index"):
+                model.update_payload_for_index(item, _mut)
+            return
+        item.setData(0, Qt.UserRole, payload)
 
     def get_selected_tree_node_data(self, tree_role):
         if self._planning_browse_mode(tree_role) == "local":
@@ -21569,11 +22348,9 @@ class MainWindow(QMainWindow):
 
         tree = self.source_tree_widget if tree_role == "source" else self.destination_tree_widget
         if tree_role == "source" and self._source_tree_uses_model_view():
-            ix = tree.currentIndex()
-            return self.get_tree_item_node_data(ix)
+            return self.get_tree_item_node_data(tree.currentIndex())
         if tree_role == "destination" and self._destination_tree_uses_model_view():
-            ix = tree.currentIndex()
-            return self.get_tree_item_node_data(ix)
+            return self.get_tree_item_node_data(tree.currentIndex())
 
         selected_items = tree.selectedItems()
         if not selected_items:
@@ -21587,7 +22364,19 @@ class MainWindow(QMainWindow):
             if not ix.isValid():
                 tree.clearSelection()
                 return None
+            raw_column = int(ix.column())
+            if ix.column() != 0:
+                ix = ix.siblingAtColumn(0)
             tree.setCurrentIndex(ix)
+            if self._full_trace_enabled():
+                log_trace(
+                    "ui",
+                    "select_tree_item_at_position",
+                    tree_kind="QTreeView",
+                    row=ix.row(),
+                    raw_column_from_hit_test=raw_column,
+                    index_column_after_normalize=ix.column(),
+                )
             return ix
 
         item = tree.itemAt(position)
@@ -21753,100 +22542,133 @@ class MainWindow(QMainWindow):
 
     def show_destination_context_menu(self, position):
         tw = self._active_destination_tree_widget()
-        item = self.select_tree_item_at_position(tw, position)
-        node_data = (
-            self.get_selected_tree_node_data("destination")
-            if self._planning_browse_mode("destination") == "local"
-            else self.get_tree_item_node_data(item)
-        )
-        if node_data is None:
-            return
+        trace_menu = self._full_trace_enabled()
+        if trace_menu:
+            self._go_to_source_trace_session = True
+            log_trace("ui", "go_to_source_destination_context_menu", phase="session_start")
+        try:
+            item = self.select_tree_item_at_position(tw, position)
+            if item is None:
+                return
+            node_data = (
+                self._local_fs_node_from_index(tw, item, "destination")
+                if self._planning_browse_mode("destination") == "local"
+                else self.get_tree_item_node_data(item)
+            )
+            if trace_menu and isinstance(item, QModelIndex):
+                log_trace(
+                    "ui",
+                    "go_to_source_destination_context_menu",
+                    phase="hit_test",
+                    row=item.row(),
+                    column=item.column(),
+                    normalized_to_column_zero=(item.column() == 0),
+                    node_data_keys=sorted((node_data or {}).keys()),
+                    node_data_source_path_excerpt=str(node_data.get("source_path", "") or "")[:400],
+                )
+            if not node_data:
+                return
 
-        selected_source = self.get_selected_tree_node_data("source")
-        is_planned_allocation = self.node_is_planned_allocation(node_data)
-        is_proposed = self.node_is_proposed(node_data)
-        node_origin = str(node_data.get("node_origin", "")).lower()
-        is_local_fs_dest = node_origin == "localfilesystem"
-        is_projected_descendant = node_origin == "projectedallocationdescendant"
-        is_projected_destination = node_origin == "projecteddestination"
-        is_real_destination = not (is_planned_allocation or is_proposed or is_projected_descendant or is_projected_destination)
-        is_folder = bool(node_data.get("is_folder"))
+            selected_source = self.get_selected_tree_node_data("source")
+            is_planned_allocation = self.node_is_planned_allocation(node_data)
+            is_proposed = self.node_is_proposed(node_data)
+            node_origin = str(node_data.get("node_origin", "")).lower()
+            is_local_fs_dest = node_origin == "localfilesystem"
+            is_projected_descendant = node_origin == "projectedallocationdescendant"
+            is_projected_destination = node_origin == "projecteddestination"
+            is_real_destination = not (is_planned_allocation or is_proposed or is_projected_descendant or is_projected_destination)
+            is_folder = bool(node_data.get("is_folder"))
 
-        menu = QMenu(self)
-        menu.setAttribute(Qt.WA_TranslucentBackground, False)
+            menu = QMenu(self)
+            menu.setAttribute(Qt.WA_TranslucentBackground, False)
 
-        assign_action = menu.addAction("Assign Selected Source Here")
-        assign_action.setEnabled(
-            selected_source is not None
-            and self.node_is_valid_destination_target(node_data)
-            and not is_projected_descendant
-        )
-        assign_action.triggered.connect(self.handle_assign)
+            assign_action = menu.addAction("Assign Selected Source Here")
+            assign_action.setEnabled(
+                selected_source is not None
+                and self.node_is_valid_destination_target(node_data)
+                and not is_projected_descendant
+            )
+            assign_action.triggered.connect(self.handle_assign)
 
-        new_proposed_action = menu.addAction("New Proposed Folder Here")
-        new_proposed_action.setEnabled(
-            is_folder
-            and not is_planned_allocation
-            and not is_projected_descendant
-            and not is_local_fs_dest
-        )
-        new_proposed_action.triggered.connect(lambda: self.handle_new_proposed_folder(node_data))
+            new_proposed_action = menu.addAction("New Proposed Folder Here")
+            new_proposed_action.setEnabled(
+                is_folder
+                and not is_planned_allocation
+                and not is_projected_descendant
+                and not is_local_fs_dest
+            )
+            new_proposed_action.triggered.connect(lambda: self.handle_new_proposed_folder(node_data))
 
-        rename_proposed_action = menu.addAction("Rename Proposed Folder")
-        rename_proposed_action.setEnabled(is_proposed)
-        rename_proposed_action.triggered.connect(lambda: self.handle_rename_proposed_folder(item))
+            rename_proposed_action = menu.addAction("Rename Proposed Folder")
+            rename_proposed_action.setEnabled(is_proposed)
+            rename_proposed_action.triggered.connect(lambda: self.handle_rename_proposed_folder(item))
 
-        delete_proposed_action = menu.addAction("Delete Proposed Folder")
-        delete_proposed_action.setEnabled(is_proposed)
-        delete_proposed_action.triggered.connect(lambda: self.handle_delete_proposed_folder(item))
+            delete_proposed_action = menu.addAction("Delete Proposed Folder")
+            delete_proposed_action.setEnabled(is_proposed)
+            delete_proposed_action.triggered.connect(lambda: self.handle_delete_proposed_folder(item))
 
-        menu.addSeparator()
+            menu.addSeparator()
 
-        cut_action = menu.addAction("Cut")
-        cut_action.setEnabled(
-            self._build_destination_move_payload(node_data) is not None and not is_local_fs_dest
-        )
-        cut_action.triggered.connect(lambda: self.handle_cut_destination_item(node_data))
+            cut_action = menu.addAction("Cut")
+            cut_action.setEnabled(
+                self._build_destination_move_payload(node_data) is not None and not is_local_fs_dest
+            )
+            cut_action.triggered.connect(lambda: self.handle_cut_destination_item(node_data))
 
-        paste_action = menu.addAction("Paste Here")
-        paste_action.setEnabled(
-            bool(getattr(self, "_destination_cut_buffer", None))
-            and is_folder
-            and not is_planned_allocation
-            and not is_projected_descendant
-            and not is_local_fs_dest
-        )
-        paste_action.triggered.connect(lambda: self.handle_paste_destination_item(node_data))
+            paste_action = menu.addAction("Paste Here")
+            paste_action.setEnabled(
+                bool(getattr(self, "_destination_cut_buffer", None))
+                and is_folder
+                and not is_planned_allocation
+                and not is_projected_descendant
+                and not is_local_fs_dest
+            )
+            paste_action.triggered.connect(lambda: self.handle_paste_destination_item(node_data))
 
-        menu.addSeparator()
+            menu.addSeparator()
 
-        rename_planned_action = menu.addAction("Rename Planned Item")
-        rename_planned_action.setEnabled(is_planned_allocation or is_projected_descendant)
-        rename_planned_action.triggered.connect(lambda: self.handle_rename_planned_item(node_data))
+            rename_planned_action = menu.addAction("Rename Planned Item")
+            rename_planned_action.setEnabled(is_planned_allocation or is_projected_descendant)
+            rename_planned_action.triggered.connect(lambda: self.handle_rename_planned_item(node_data))
 
-        remove_planned_action = menu.addAction("Remove Planned Allocation")
-        remove_planned_action.setEnabled(is_planned_allocation)
-        remove_planned_action.triggered.connect(lambda: self.handle_remove_planned_allocation(node_data))
+            remove_planned_action = menu.addAction("Remove Planned Allocation")
+            remove_planned_action.setEnabled(is_planned_allocation)
+            remove_planned_action.triggered.connect(lambda: self.handle_remove_planned_allocation(node_data))
 
-        menu.addSeparator()
+            menu.addSeparator()
 
-        open_file_action = menu.addAction("Open File")
-        open_file_action.setEnabled(not is_folder)
-        open_file_action.triggered.connect(self.handle_open_selected_file)
+            open_file_action = menu.addAction("Open File")
+            open_file_action.setEnabled(not is_folder)
+            open_file_action.triggered.connect(self.handle_open_selected_file)
 
-        open_browser_action = menu.addAction("Open in SharePoint")
-        open_browser_action.setEnabled(bool(node_data.get("web_url")) or is_real_destination)
-        open_browser_action.triggered.connect(self.handle_open_selected_in_browser)
+            open_browser_action = menu.addAction("Open in SharePoint")
+            open_browser_action.setEnabled(bool(node_data.get("web_url")) or is_real_destination)
+            open_browser_action.triggered.connect(self.handle_open_selected_in_browser)
 
-        copy_link_action = menu.addAction("Copy Link")
-        copy_link_action.setEnabled(bool(node_data.get("web_url") or node_data.get("display_path") or node_data.get("item_path")))
-        copy_link_action.triggered.connect(self.handle_copy_selected_link)
+            copy_link_action = menu.addAction("Copy Link")
+            copy_link_action.setEnabled(bool(node_data.get("web_url") or node_data.get("display_path") or node_data.get("item_path")))
+            copy_link_action.triggered.connect(self.handle_copy_selected_link)
 
-        open_source_action = menu.addAction("Open Source Folder")
-        open_source_action.setEnabled(not is_real_destination or bool(node_data.get("web_url")))
-        open_source_action.triggered.connect(self.handle_open_selected_source_folder)
+            dest_ctx = self._resolve_selected_item_context("destination", dict(node_data))
+            go_action = dest_ctx["actions"].get("Go to source", {})
+            if trace_menu:
+                log_trace(
+                    "ui",
+                    "go_to_source_destination_context_menu",
+                    phase="before_exec",
+                    go_to_source_enabled=bool(go_action.get("enabled")),
+                    go_to_source_target_excerpt=str(go_action.get("target", "") or "")[:400],
+                )
+            go_to_source_action = menu.addAction("Go to source")
+            go_to_source_action.setEnabled(bool(go_action.get("enabled")))
+            go_to_source_action.setToolTip(str(go_action.get("tooltip") or ""))
+            go_to_source_action.triggered.connect(partial(self._handle_go_to_source_from_destination_menu, dest_ctx))
 
-        menu.exec(tw.viewport().mapToGlobal(position))
+            menu.exec(tw.viewport().mapToGlobal(position))
+        finally:
+            if trace_menu:
+                log_trace("ui", "go_to_source_destination_context_menu", phase="session_end")
+                self._go_to_source_trace_session = False
 
     def handle_open_source_item(self, node_data):
         if str(node_data.get("node_origin", "")).lower() == "localfilesystem":
@@ -23081,6 +23903,13 @@ class MainWindow(QMainWindow):
 
     def _try_refresh_planned_move_sources_after_source_root(self) -> None:
         """Best-effort: align stored source paths with SharePoint after the source library loads."""
+        if self._restore_abort_active() or getattr(self, "_memory_restore_in_progress", False):
+            self._log_restore_phase(
+                "graph_refresh_after_source_root_skipped",
+                reason="restore_busy_or_abort",
+                restore_abort_reason=str(getattr(self, "_restore_abort_reason", "") or ""),
+            )
+            return
         if not self.planned_moves:
             return
         src_ctx = self._graph_resolve_source_refresh_context()
@@ -23096,6 +23925,13 @@ class MainWindow(QMainWindow):
                 )
 
     def _try_resolve_planned_move_graph_ids_debounced(self) -> None:
+        if self._restore_abort_active() or getattr(self, "_memory_restore_in_progress", False):
+            self._log_restore_phase(
+                "graph_resolve_after_destination_root_skipped",
+                reason="restore_busy_or_abort",
+                restore_abort_reason=str(getattr(self, "_restore_abort_reason", "") or ""),
+            )
+            return
         if not self.planned_moves:
             return
         src_ctx = self._graph_resolve_source_refresh_context()
@@ -23205,6 +24041,7 @@ class MainWindow(QMainWindow):
             "execution_load_last_manifest_button",
             "execution_dry_run_button",
             "execution_run_button",
+            "execution_browsed_recursive_button",
         ):
             w = getattr(self, name, None)
             if w is not None:
@@ -23212,6 +24049,9 @@ class MainWindow(QMainWindow):
 
     def _update_manifest_run_buttons_state(self):
         if self._manifest_run_worker is not None:
+            self._set_manifest_run_buttons_enabled(False)
+            return
+        if self._snapshot_pipeline_run_worker is not None:
             self._set_manifest_run_buttons_enabled(False)
             return
         if getattr(self, "run_manifest_button", None) is not None:
@@ -23229,6 +24069,46 @@ class MainWindow(QMainWindow):
             self.execution_dry_run_button.setEnabled(has_manifest)
         if getattr(self, "execution_run_button", None) is not None:
             self.execution_run_button.setEnabled(has_manifest)
+        cb = getattr(self, "execution_snapshot_scoped_checkbox", None)
+        if cb is not None:
+            snap = self._draft_pipeline_execution_enabled()
+            cb.setEnabled(bool(has_manifest and snap))
+            self._on_execution_snapshot_scoped_toggled(bool(cb.isChecked()))
+        rec = getattr(self, "execution_snapshot_recursive_subtree_checkbox", None)
+        if rec is not None:
+            snap = self._draft_pipeline_execution_enabled()
+            rec.setEnabled(bool(has_manifest and snap and cb is not None and cb.isChecked()))
+        br_btn = getattr(self, "execution_browsed_recursive_button", None)
+        if br_btn is not None:
+            snap_on = self._draft_pipeline_execution_enabled()
+            br_btn.setEnabled(bool(has_manifest and snap_on))
+
+    def _on_execution_snapshot_scoped_toggled(self, checked: bool):
+        snap = self._draft_pipeline_execution_enabled()
+        has_manifest = getattr(self, "_execution_manifest", None) is not None
+        enable_modes = bool(checked and snap and has_manifest)
+        for name in (
+            "execution_snapshot_scoped_strict_radio",
+            "execution_snapshot_scoped_dependency_radio",
+        ):
+            w = getattr(self, name, None)
+            if w is not None:
+                w.setEnabled(enable_modes)
+        rec = getattr(self, "execution_snapshot_recursive_subtree_checkbox", None)
+        if rec is not None:
+            rec.setEnabled(enable_modes)
+            if not checked:
+                rec.setChecked(False)
+        hl = getattr(self, "execution_snapshot_scoped_helper_label", None)
+        if hl is not None:
+            if not checked:
+                hl.setText("Subset execution is off. Full snapshot plan will run.")
+            elif enable_modes:
+                hl.setText(
+                    "Subset execution is on. Select planned moves on the Planned Moves tab before Preview or Run."
+                )
+            else:
+                hl.setText("")
 
     def _execution_saved_manifest_path(self) -> str:
         return str(QSettings().value("execution/last_manifest_path", "") or "").strip()
@@ -23344,6 +24224,154 @@ class MainWindow(QMainWindow):
         if not path:
             return
         self._load_execution_manifest_from_path(str(path), error_title="Execution", silent_failures=False)
+
+    def _on_execution_browsed_recursive_run(self):
+        if not self._execution_manifest or not self._execution_manifest_path:
+            QMessageBox.information(self, "Execution", "Save or open a manifest first.")
+            return
+        if not self._draft_pipeline_execution_enabled():
+            QMessageBox.warning(
+                self,
+                "Browse recursive",
+                "Browse-driven recursive execution uses the snapshot pipeline only. "
+                "Disable the legacy execution-path toggle in Settings (internal), or set "
+                "ENABLE_DRAFT_PIPELINE_EXECUTION to on.",
+            )
+            return
+        if self._planning_browse_mode("source") != "sharepoint" or self._planning_browse_mode("destination") != "sharepoint":
+            QMessageBox.warning(
+                self,
+                "Browse recursive",
+                "Use SharePoint mode for both Source and Destination so Microsoft Graph can enumerate the folder.",
+            )
+            return
+        if not getattr(self.graph, "token", None):
+            QMessageBox.warning(
+                self,
+                "Browse recursive",
+                "Sign in to Microsoft 365 so the app can list files under the selected source folder.",
+            )
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Run browsed folder recursively")
+        # MainWindow theme sets QWidget { background: transparent }, which breaks native
+        # QRadioButton indicators on this dialog; draw explicit indicators for Move/Copy and mode radios.
+        dlg.setStyleSheet(
+            """
+            QRadioButton {
+                spacing: 8px;
+                color: #EAF0FF;
+            }
+            QRadioButton::indicator {
+                width: 16px;
+                height: 16px;
+            }
+            QRadioButton::indicator:unchecked {
+                border: 2px solid #5F95FF;
+                border-radius: 8px;
+                background-color: #08101D;
+            }
+            QRadioButton::indicator:checked {
+                border: 2px solid #2E6DFF;
+                border-radius: 8px;
+                background-color: #2E6DFF;
+            }
+            """
+        )
+        v = QVBoxLayout(dlg)
+        head = QLabel(
+            "Not Planned Moves execution. This run uses only the current source and destination tree "
+            "selections. It does not read the Planned Moves table."
+        )
+        head.setWordWrap(True)
+        v.addWidget(head)
+
+        src = self.get_selected_tree_node_data("source")
+        dst = self.get_selected_tree_node_data("destination")
+        src_txt, se = self._browsed_recursive_source_selection_summary_or_error(src)
+        dst_txt, de = self._browsed_recursive_destination_selection_summary_or_error(dst)
+
+        v.addWidget(QLabel("Source folder (current selection)"))
+        src_lbl = QLabel(src_txt or "—")
+        src_lbl.setWordWrap(True)
+        v.addWidget(src_lbl)
+        v.addWidget(QLabel("Destination root folder (required)"))
+        dst_lbl = QLabel(dst_txt or "—")
+        dst_lbl.setWordWrap(True)
+        v.addWidget(dst_lbl)
+
+        err_lbl = QLabel((se or de) if (se or de) else "")
+        err_lbl.setWordWrap(True)
+        err_lbl.setStyleSheet("color: #c62828;")
+        v.addWidget(err_lbl)
+
+        v.addWidget(QLabel("Operation per file"))
+        op_grp = QButtonGroup(dlg)
+        op_move = QRadioButton("Move")
+        op_copy = QRadioButton("Copy")
+        op_copy.setChecked(True)
+        op_grp.addButton(op_move, 0)
+        op_grp.addButton(op_copy, 1)
+        hop = QHBoxLayout()
+        hop.addWidget(op_move)
+        hop.addWidget(op_copy)
+        hop.addStretch()
+        v.addLayout(hop)
+
+        v.addWidget(QLabel("Scoped snapshot mode"))
+        mode_grp = QButtonGroup(dlg)
+        md_strict = QRadioButton("Strict allowlist only")
+        md_dep = QRadioButton("Include required folder/path steps")
+        md_strict.setChecked(True)
+        mode_grp.addButton(md_strict, 0)
+        mode_grp.addButton(md_dep, 1)
+        hmode = QHBoxLayout()
+        hmode.addWidget(md_strict)
+        hmode.addWidget(md_dep)
+        hmode.addStretch()
+        v.addLayout(hmode)
+
+        dry_cb = QCheckBox("Dry run (log only; no copies)")
+        dry_cb.setChecked(True)
+        v.addWidget(dry_cb)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText("Continue to preflight…")
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+        if se or de:
+            bb.button(QDialogButtonBox.Ok).setEnabled(False)
+
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        allocation_method = "copy" if op_copy.isChecked() else "move"
+        scoped_mode = "dependency_closure" if md_dep.isChecked() else "strict"
+        ctx, err = self._prepare_browsed_recursive_execution_context(
+            source_data=src,
+            dest_data=dst,
+            scoped_mode=scoped_mode,
+            allocation_method=allocation_method,
+        )
+        if err:
+            QMessageBox.warning(self, "Browse recursive", err)
+            return
+
+        self._start_manifest_run_worker(
+            self._execution_manifest,
+            self._execution_manifest_path,
+            dry_run=bool(dry_cb.isChecked()),
+            pilot_max_graph_operations=0,
+            pilot_proposed_folder_destination_paths=[],
+            pilot_transfer_destination_keys=[],
+            pilot_transfer_step_uids=[],
+            pilot_transfer_step_indices=[],
+            pilot_allocated_folder_identity="",
+            pilot_strict_file_mode=False,
+            browsed_recursive_context=ctx,
+        )
 
     def _on_execution_dry_run_manifest(self):
         if not self._execution_manifest or not self._execution_manifest_path:
@@ -24033,6 +25061,7 @@ class MainWindow(QMainWindow):
         pilot_max = int(pilot_sp.value()) if pilot_cb.isChecked() else 0
 
         proposed_dest_path = str(proposed_cb.currentData() or "").strip()
+        pilot_log_proposed_combo_initial = proposed_dest_path
         allocated_effective_folder = str(allocated_cb.currentData() or "").strip()
         file_dest_key = str(file_cb.currentData() or "").strip()
         # When the combobox is editable, users may manually type a filename without selecting
@@ -24232,6 +25261,89 @@ class MainWindow(QMainWindow):
                 )
                 return None
 
+        # Dependency-complete proposed mkdir chain: shallow combobox selection alone can omit
+        # intermediate proposed_folder_steps under a deeper allocated/file intent. Union with the
+        # ancestor chain of the deepest manifest proposed scope implied by allocated + transfer keys.
+        def _pilot_manifest_transfer_step_by_index(idx: int) -> dict[str, Any] | None:
+            if idx < 0:
+                return None
+            for s in transfer_steps:
+                if isinstance(s, dict) and int(s.get("index", -1)) == idx:
+                    return s
+            return None
+
+        def _pilot_deepest_manifest_proposed_scope() -> str:
+            candidates: list[str] = []
+            if allocated_effective_folder:
+                inf = _infer_proposed_destination_scope_for_identity(allocated_effective_folder)
+                if inf:
+                    candidates.append(str(inf).strip())
+                alloc_norm = _norm_identity_dir(str(allocated_effective_folder).strip())
+                if alloc_norm:
+                    candidates.append(alloc_norm)
+            seen_rk: set[str] = set()
+            for rk in transfer_keys:
+                if rk in seen_rk:
+                    continue
+                seen_rk.add(rk)
+                for st in (manifest_transfer_key_to_steps.get(rk) or [])[:1]:
+                    idx = int(st.get("index", -1))
+                    full = _pilot_manifest_transfer_step_by_index(idx)
+                    if not isinstance(full, dict):
+                        full = {
+                            "destination_path": str(st.get("destination_path", "") or ""),
+                            "destination_name": str(st.get("destination_name", "") or ""),
+                            "source_name": str(st.get("source_name", "") or ""),
+                            "is_source_folder": bool(st.get("is_folder", False)),
+                        }
+                    aid = _allocated_container_identity_for_transfer_step(full)
+                    if aid:
+                        inf2 = _infer_proposed_destination_scope_for_identity(aid)
+                        if inf2:
+                            candidates.append(str(inf2).strip())
+            if proposed_dest_path:
+                candidates.append(str(proposed_dest_path).strip())
+            candidates = [c for c in candidates if c]
+            if not candidates:
+                return ""
+            return max(
+                candidates,
+                key=lambda p: len([x for x in _norm_identity_dir(p).split("\\") if x]),
+            )
+
+        def _pilot_proposed_path_depth_for_sort(path: str) -> int:
+            return len([x for x in _norm_identity_dir(str(path or "")).split("\\") if x])
+
+        deepest_scope = _pilot_deepest_manifest_proposed_scope()
+        expanded_chain = _proposed_ancestor_chain_paths(deepest_scope) if deepest_scope else []
+        alloc_chain_merge: list[str] = []
+        if str(allocated_effective_folder or "").strip():
+            alloc_chain_merge = _proposed_ancestor_chain_paths(
+                _norm_identity_dir(str(allocated_effective_folder).strip())
+            )
+        merge_seen: set[str] = set()
+        merged_paths: list[str] = []
+        for src_list in (proposed_dest_paths, expanded_chain, alloc_chain_merge):
+            for p in src_list:
+                ps = str(p or "").strip()
+                if not ps:
+                    continue
+                lk = ps.lower()
+                if lk in merge_seen:
+                    continue
+                merge_seen.add(lk)
+                merged_paths.append(ps)
+        merged_paths.sort(key=_pilot_proposed_path_depth_for_sort)
+        proposed_dest_paths = merged_paths
+        log_info(
+            "pilot_dependency_scope",
+            selected_proposed_combo_initial=pilot_log_proposed_combo_initial or None,
+            proposed_dest_path_effective=str(proposed_dest_path or "").strip() or None,
+            inferred_deepest_scope=deepest_scope or None,
+            derived_proposed_folder_paths=list(proposed_dest_paths),
+            derived_transfer_keys=list(transfer_keys),
+        )
+
         # Cap exactly what we selected.
         # - If the checkbox is checked, we auto-calculate this value.
         # - If the checkbox is unchecked, we keep the existing safety behavior.
@@ -24250,6 +25362,9 @@ class MainWindow(QMainWindow):
 
         # Second return value is the proposed-folder destination_path so the runner can filter
         # precisely even when multiple clients use the same folder_name.
+        self._pilot_dialog_selected_proposed_combo_initial = (
+            str(pilot_log_proposed_combo_initial or "").strip() or None
+        )
         return (
             pilot_max,
             proposed_dest_paths,
@@ -24276,18 +25391,27 @@ class MainWindow(QMainWindow):
         if confirm != QMessageBox.Yes:
             return
 
-        pilot = self._dialog_pilot_max_graph_operations()
-        if pilot is None:
-            return
-        (
-            pilot_max,
-            pilot_proposed_folder_destination_paths,
-            pilot_transfer_destination_keys,
-            pilot_transfer_step_uids,
-            pilot_transfer_step_indices,
-            pilot_allocated_folder_identity,
-            pilot_strict_file_mode,
-        ) = pilot
+        if self._draft_pipeline_execution_enabled():
+            pilot_max = 0
+            pilot_proposed_folder_destination_paths: list[str] = []
+            pilot_transfer_destination_keys: list[str] = []
+            pilot_transfer_step_uids: list[str] = []
+            pilot_transfer_step_indices: list[int] = []
+            pilot_allocated_folder_identity = ""
+            pilot_strict_file_mode = False
+        else:
+            pilot = self._dialog_pilot_max_graph_operations()
+            if pilot is None:
+                return
+            (
+                pilot_max,
+                pilot_proposed_folder_destination_paths,
+                pilot_transfer_destination_keys,
+                pilot_transfer_step_uids,
+                pilot_transfer_step_indices,
+                pilot_allocated_folder_identity,
+                pilot_strict_file_mode,
+            ) = pilot
 
         self._start_manifest_run_worker(
             self._execution_manifest,
@@ -24596,19 +25720,43 @@ class MainWindow(QMainWindow):
                 return deepest[0]
         return ""
 
+    def _pilot_allocation_destinations_exact_match(self, a: str, b: str) -> bool:
+        """
+        True when normalized pilot destination identities are the same full path.
+
+        Do not use _paths_equivalent here: its path *suffix* variants can make
+        ``...\\Root\\Personal\\100GOPRO`` match ``...\\Root\\Personal`` via the shared
+        single-segment suffix ``Personal``, which would pick the wrong planned move.
+        """
+        x = self._pilot_norm_destination_identity(a)
+        y = self._pilot_norm_destination_identity(b)
+        return bool(x and y and x.lower() == y.lower())
+
     def _inject_pilot_allocated_subtree_step(
         self,
         run_manifest: dict,
         *,
         allocated_folder_identity: str,
         selected_step_indices: list[int],
+        selected_proposed_combo_initial: str | None = None,
     ) -> tuple[list[int], list[str], bool, bool]:
         """
         For pilot mode, if selection resolved to an ancestor folder-copy step, inject a
         synthetic transfer step that copies the exact selected allocated folder subtree.
+
+        Only live ``planned_moves`` (folder row exact match, or file row whose destination folder
+        matches exactly) may supply Graph ids. Manifest transfer rows are never used as a
+        template here — an exact manifest row without a matching planned move still means
+        unresolved allocated pilot scope (no shallow copy injection).
         """
         identity = self._pilot_norm_destination_identity(allocated_folder_identity)
         if not identity:
+            log_info(
+                "pilot_injection_diagnostic",
+                phase="abort_empty_allocated_identity",
+                allocated_identity_normalized=None,
+                raw_allocated_folder_identity=str(allocated_folder_identity or "")[:300] or None,
+            )
             return (selected_step_indices, [], False, False)
         transfer_steps = list((run_manifest or {}).get("transfer_steps") or [])
         max_index = max(
@@ -24619,21 +25767,54 @@ class MainWindow(QMainWindow):
         parent_identity = "\\".join(identity_parts[:-1]) if len(identity_parts) > 1 else ""
         leaf_name = identity_parts[-1] if identity_parts else ""
 
-        # Prefer live planned folder move; else a file move landing in this folder (Graph folder =
-        # parentReference of the file item). Manifest folder row is last resort.
+        candidate_destinations_checked: list[str] = []
+        folder_moves_scanned = 0
+        file_moves_scanned = 0
+        folder_scan_records: list[dict] = []
+        file_scan_records: list[dict] = []
+
         selected_move = None
         file_parent_move = None
         for move in list(getattr(self, "planned_moves", []) or []):
             src = move.get("source") if isinstance(move.get("source"), dict) else {}
             if not bool(src.get("is_folder", False)):
                 continue
+            folder_moves_scanned += 1
+            move_identity = ""
+            move_identity_exc: str | None = None
             try:
                 move_identity = self._pilot_planned_move_folder_identity(move)
-            except Exception:
+            except Exception as exc:
                 move_identity = ""
+                move_identity_exc = str(exc)[:200]
             if not move_identity:
+                folder_scan_records.append(
+                    {
+                        "scan_kind": "folder_planned_move",
+                        "scan_ordinal": folder_moves_scanned,
+                        "source_name": str(src.get("name", "") or "")[:120] or None,
+                        "raw_candidate_destination": None,
+                        "normalized_candidate_destination": None,
+                        "exact_match_vs_allocated": False,
+                        "exception": move_identity_exc,
+                    }
+                )
                 continue
-            if self._paths_equivalent(move_identity, identity, "destination"):
+            mi = self._pilot_norm_destination_identity(move_identity)
+            exact_f = self._pilot_allocation_destinations_exact_match(move_identity, identity)
+            folder_scan_records.append(
+                {
+                    "scan_kind": "folder_planned_move",
+                    "scan_ordinal": folder_moves_scanned,
+                    "source_name": str(src.get("name", "") or "")[:120] or None,
+                    "raw_candidate_destination": str(move_identity)[:300],
+                    "normalized_candidate_destination": str(mi)[:300] if mi else None,
+                    "exact_match_vs_allocated": bool(exact_f),
+                }
+            )
+            if mi and mi not in candidate_destinations_checked:
+                candidate_destinations_checked.append(mi)
+            if exact_f:
                 selected_move = move
                 break
 
@@ -24642,16 +25823,86 @@ class MainWindow(QMainWindow):
                 src = move.get("source") if isinstance(move.get("source"), dict) else {}
                 if bool(src.get("is_folder", False)):
                     continue
+                file_moves_scanned += 1
+                mid = ""
+                mid_exc: str | None = None
                 try:
                     mid = self._pilot_planned_move_folder_identity(move)
-                except Exception:
+                except Exception as exc:
                     mid = ""
-                if not mid or not self._paths_equivalent(mid, identity, "destination"):
+                    mid_exc = str(exc)[:200]
+                if not mid:
+                    file_scan_records.append(
+                        {
+                            "scan_kind": "file_planned_move_parent",
+                            "scan_ordinal": file_moves_scanned,
+                            "source_name": str(src.get("name", "") or "")[:120] or None,
+                            "raw_candidate_destination": None,
+                            "normalized_candidate_destination": None,
+                            "exact_match_vs_allocated": False,
+                            "parent_reference_id_present": False,
+                            "exception": mid_exc,
+                        }
+                    )
                     continue
+                mn = self._pilot_norm_destination_identity(mid)
+                exact_m = self._pilot_allocation_destinations_exact_match(mid, identity)
                 pr = src.get("parentReference") if isinstance(src.get("parentReference"), dict) else {}
-                if str(pr.get("id", "") or "").strip():
+                pr_id = str(pr.get("id", "") or "").strip()
+                file_scan_records.append(
+                    {
+                        "scan_kind": "file_planned_move_parent",
+                        "scan_ordinal": file_moves_scanned,
+                        "source_name": str(src.get("name", "") or "")[:120] or None,
+                        "raw_candidate_destination": str(mid)[:300],
+                        "normalized_candidate_destination": str(mn)[:300] if mn else None,
+                        "exact_match_vs_allocated": bool(exact_m),
+                        "parent_reference_id_present": bool(pr_id),
+                    }
+                )
+                if mn and mn not in candidate_destinations_checked:
+                    candidate_destinations_checked.append(mn)
+                if not exact_m:
+                    continue
+                if pr_id:
                     file_parent_move = move
                     break
+
+        attempted_exact_match_count = int(folder_moves_scanned + file_moves_scanned)
+
+        injection_branch = (
+            "selected_move"
+            if isinstance(selected_move, dict)
+            else ("file_parent_move" if isinstance(file_parent_move, dict) else "unresolved")
+        )
+        log_info(
+            "pilot_injection_diagnostic",
+            phase="scan_complete",
+            allocated_identity_normalized=str(identity)[:500],
+            planned_moves_total=len(list(getattr(self, "planned_moves", []) or [])),
+            folder_planned_moves_scanned=int(folder_moves_scanned),
+            file_planned_moves_scanned=int(file_moves_scanned),
+            folder_scan_records=folder_scan_records[:80],
+            file_scan_records=file_scan_records[:80],
+            folder_scan_truncated=bool(len(folder_scan_records) > 80),
+            file_scan_truncated=bool(len(file_scan_records) > 80),
+            selected_move_is_set=bool(isinstance(selected_move, dict)),
+            file_parent_move_is_set=bool(isinstance(file_parent_move, dict)),
+            injection_branch_chosen=injection_branch,
+            manifest_transfer_step_count=len(transfer_steps),
+            computed_new_index=int(new_index),
+        )
+
+        if not isinstance(selected_move, dict) and not isinstance(file_parent_move, dict):
+            log_info(
+                "pilot_allocation_unresolved",
+                allocated_identity=identity,
+                selected_proposed_combo_initial=selected_proposed_combo_initial,
+                attempted_exact_match_count=attempted_exact_match_count,
+                candidate_destinations_checked=candidate_destinations_checked[:25],
+                reason_for_stop="no_live_planned_folder_or_file_parent_exact_match",
+            )
+            return (selected_step_indices, [], False, False)
 
         src = {}
         dst = {}
@@ -24686,7 +25937,7 @@ class MainWindow(QMainWindow):
             source_drive_id = str(src.get("drive_id", "") or selected_move.get("source_drive_id", "") or "")
             source_item_id = str(src.get("id", "") or selected_move.get("source_id", "") or "")
             destination_drive_id = str(dst.get("drive_id", "") or selected_move.get("destination_drive_id", "") or "")
-        elif isinstance(file_parent_move, dict):
+        else:
             src = file_parent_move.get("source") if isinstance(file_parent_move.get("source"), dict) else {}
             dst = file_parent_move.get("destination") if isinstance(file_parent_move.get("destination"), dict) else {}
             pr = src.get("parentReference") if isinstance(src.get("parentReference"), dict) else {}
@@ -24712,26 +25963,58 @@ class MainWindow(QMainWindow):
             destination_drive_id = str(
                 dst.get("drive_id", "") or file_parent_move.get("destination_drive_id", "") or ""
             ).strip()
-        else:
-            template_step = None
-            for step in transfer_steps:
-                if not isinstance(step, dict):
-                    continue
-                sid = self._pilot_transfer_folder_step_identity(step)
-                if sid and self._paths_equivalent(sid, identity, "destination"):
-                    template_step = step
-                    break
-            if template_step is None:
-                return (selected_step_indices, [], False, False)
-            dest_path = str(parent_identity or template_step.get("destination_path", "") or "").strip()
-            source_path = str(template_step.get("source_path", "") or "")
-            source_name = str(template_step.get("source_name", "") or "")
-            request_id = str(template_step.get("request_id", "") or "")
-            status = str(template_step.get("status", "") or "Draft")
-            allocation_method = str(template_step.get("allocation_method", "") or "")
-            source_drive_id = str(template_step.get("source_drive_id", "") or "")
-            source_item_id = str(template_step.get("source_item_id", "") or "")
-            destination_drive_id = str(template_step.get("destination_drive_id", "") or "")
+
+        branch_after_build = "selected_move" if isinstance(selected_move, dict) else "file_parent_move"
+        log_info(
+            "pilot_injection_diagnostic",
+            phase="branch_build_fields",
+            injection_branch=branch_after_build,
+            allocated_identity_normalized=str(identity)[:500],
+            parent_identity_from_allocated=str(parent_identity)[:500] or None,
+            leaf_name_from_allocated=str(leaf_name)[:200] or None,
+            synthetic_destination_path_before_logical=str(dest_path)[:500] or None,
+            synthetic_destination_name_before_logical=str(dest_name)[:200] or None,
+        )
+
+        logical_dest = manifest_folder_copy_logical_path(dest_path, dest_name)
+        logical_norm = self._pilot_norm_destination_identity(logical_dest)
+        logical_exact_ok = self._pilot_allocation_destinations_exact_match(logical_norm, identity)
+        log_info(
+            "pilot_injection_diagnostic",
+            phase="pre_injection_logical_check",
+            injection_branch=branch_after_build,
+            allocated_identity_normalized=str(identity)[:500],
+            synthetic_destination_path=str(dest_path)[:500] or None,
+            synthetic_destination_name=str(dest_name)[:200] or None,
+            computed_logical_destination_raw=str(logical_dest)[:500] or None,
+            computed_logical_destination_normalized=str(logical_norm)[:500] or None,
+            logical_exact_match_vs_allocated=bool(logical_exact_ok),
+        )
+        if not logical_exact_ok:
+            log_info(
+                "pilot_allocation_unresolved",
+                allocated_identity=identity,
+                selected_proposed_combo_initial=selected_proposed_combo_initial,
+                attempted_exact_match_count=attempted_exact_match_count,
+                candidate_destinations_checked=candidate_destinations_checked[:25],
+                reason_for_stop="synthetic_destination_does_not_match_allocated_identity",
+                synthetic_destination_path=dest_path or None,
+                synthetic_destination_name=dest_name or None,
+                synthetic_logical_destination=logical_norm or None,
+            )
+            return (selected_step_indices, [], False, False)
+
+        log_info(
+            "pilot_injection_diagnostic",
+            phase="injecting_synthetic_step",
+            injection_branch=branch_after_build,
+            allocated_identity_normalized=str(identity)[:500],
+            synthetic_step_index=int(new_index),
+            synthetic_destination_path=str(dest_path)[:500] or None,
+            synthetic_destination_name=str(dest_name)[:200] or None,
+            synthetic_logical_destination_normalized=str(logical_norm)[:500] or None,
+            logical_exact_match_vs_allocated=True,
+        )
 
         synthetic_uid = f"SCOPE-SYN::{new_index}"
         synthetic_step = {
@@ -24793,7 +26076,452 @@ class MainWindow(QMainWindow):
             "proposed_ready": proposed_ready,
         }
 
+    def _mapping_id_for_planned_move_at_index(self, move: dict, row_index: int) -> str:
+        """Align with bundle adapter ``_allocation_row_to_mapping`` (``RequestId`` or ``alloc-{i}``)."""
+        rid = str((move or {}).get("request_id", "") or "").strip()
+        return rid if rid else f"alloc-{int(row_index)}"
+
+    def _planned_moves_selected_row_indices(self) -> list[int]:
+        table = getattr(self, "planned_moves_table", None)
+        moves = getattr(self, "planned_moves", None) or []
+        if table is None or not moves:
+            return []
+        rows: list[int] = []
+        for rng in table.selectedRanges():
+            for row in range(int(rng.topRow()), int(rng.bottomRow()) + 1):
+                if 0 <= row < len(moves):
+                    rows.append(row)
+        return rows
+
+    @staticmethod
+    def _planned_move_is_file_allocation(move: dict) -> bool:
+        src = (move or {}).get("source") if isinstance((move or {}).get("source"), dict) else {}
+        return not bool(src.get("is_folder", True))
+
+    def _derive_snapshot_scoped_file_seed_mapping_ids(self, selected_rows: list[int]) -> list[str]:
+        """Expand Planned Moves selection to file-level mapping ids using draft state only.
+
+        File rows contribute their own mapping id. Folder/container rows contribute every
+        file allocation in ``planned_moves`` whose canonical source path is a strict descendant
+        of the folder's canonical source path (siblings excluded).
+        """
+        moves = getattr(self, "planned_moves", None) or []
+        if not moves or not selected_rows:
+            return []
+        seeds: set[str] = set()
+        for row in selected_rows:
+            if row < 0 or row >= len(moves):
+                continue
+            move = moves[row]
+            mid = self._mapping_id_for_planned_move_at_index(move, row)
+            if self._planned_move_is_file_allocation(move):
+                seeds.add(mid)
+                continue
+            parent_path = self._canonical_source_projection_path(str((move or {}).get("source_path", "") or ""))
+            if not parent_path:
+                continue
+            for j, other in enumerate(moves):
+                if not self._planned_move_is_file_allocation(other):
+                    continue
+                child_path = self._canonical_source_projection_path(str((other or {}).get("source_path", "") or ""))
+                if not child_path:
+                    continue
+                if self.source_item_path_is_descendant_of(child_path, parent_path):
+                    seeds.add(self._mapping_id_for_planned_move_at_index(other, j))
+        return sorted(seeds)
+
+    def _collect_snapshot_scoped_request_ids_from_planned_moves_selection(self) -> list[str]:
+        """File-level seed mapping ids for scoped snapshot runs (draft ``planned_moves`` only)."""
+        return self._derive_snapshot_scoped_file_seed_mapping_ids(self._planned_moves_selected_row_indices())
+
+    def _graph_folder_expand_kwargs(self, move: dict) -> dict:
+        src = move.get("source") if isinstance(move.get("source"), dict) else {}
+        ss = getattr(self, "_draft_shell_state", None)
+        site_id = str(src.get("site_id") or (getattr(ss, "SelectedSourceSiteKey", "") if ss else "") or "")
+        site_name = str(src.get("site_name") or (getattr(ss, "SelectedSourceSite", "") if ss else "") or "")
+        library_name = str(src.get("library_name") or (getattr(ss, "SelectedSourceLibrary", "") if ss else "") or "")
+        drive_id = str(src.get("drive_id") or "").strip()
+        lib_id = str(src.get("library_id") or drive_id or "").strip()
+        return {
+            "site_id": site_id,
+            "site_name": site_name,
+            "library_id": lib_id,
+            "library_name": library_name,
+            "tree_role": "source",
+        }
+
+    def _graph_folder_expand_kwargs_from_tree_node(self, panel_key: str, node_data: dict) -> dict:
+        ss = getattr(self, "_draft_shell_state", None)
+        site_id = str(node_data.get("site_id") or "").strip()
+        site_name = str(node_data.get("site_name") or "").strip()
+        library_name = str(node_data.get("library_name") or "").strip()
+        if panel_key == "source":
+            site_id = site_id or str(getattr(ss, "SelectedSourceSiteKey", "") if ss else "")
+            site_name = site_name or str(getattr(ss, "SelectedSourceSite", "") if ss else "")
+            library_name = library_name or str(getattr(ss, "SelectedSourceLibrary", "") if ss else "")
+        else:
+            site_id = site_id or str(getattr(ss, "SelectedDestinationSiteKey", "") if ss else "")
+            site_name = site_name or str(getattr(ss, "SelectedDestinationSite", "") if ss else "")
+            library_name = library_name or str(getattr(ss, "SelectedDestinationLibrary", "") if ss else "")
+        drive_id = str(node_data.get("drive_id") or "").strip()
+        lib_id = str(node_data.get("library_id") or drive_id or "").strip()
+        return {
+            "site_id": site_id,
+            "site_name": site_name,
+            "library_id": lib_id,
+            "library_name": library_name,
+            "tree_role": panel_key,
+        }
+
+    @staticmethod
+    def _tree_node_is_folder_like_for_recursive_run(node_data: dict) -> bool:
+        if not node_data or node_data.get("placeholder"):
+            return False
+        if bool(node_data.get("is_folder")):
+            return True
+        tl = str(node_data.get("tree_label", "") or "").strip().lower()
+        bl = str(node_data.get("base_display_label", "") or "").strip().lower()
+        return tl == "folder" or bl.startswith("folder:")
+
+    def _browsed_recursive_source_selection_summary_or_error(self, src: dict | None) -> tuple[str, str]:
+        if not src:
+            return "", "Select a folder in the source tree (SharePoint mode)."
+        if src.get("placeholder"):
+            return "", "Source selection is a placeholder; choose a real folder."
+        if not self._tree_node_is_folder_like_for_recursive_run(src):
+            return "", "Source selection must be a folder, not a file."
+        drive = self._resolve_tree_item_drive_id("source", src)
+        iid = str(src.get("id") or "").strip()
+        if not drive or not iid:
+            return (
+                "",
+                "The source folder is missing Graph identifiers (drive or item id). Expand the folder or refresh the library.",
+            )
+        raw = self._tree_item_path(src)
+        canon = self._canonical_source_projection_path(raw)
+        label = str(src.get("display_path") or raw or canon or "").strip() or canon
+        return label, ""
+
+    def _browsed_recursive_destination_selection_summary_or_error(self, dst: dict | None) -> tuple[str, str]:
+        if not dst:
+            return "", "Select a destination folder in the destination tree (required root for copies)."
+        if dst.get("placeholder"):
+            return "", "Destination selection is a placeholder; choose a real folder."
+        if not self._tree_node_is_folder_like_for_recursive_run(dst):
+            return "", "Destination selection must be a folder (the root under which files will be created)."
+        drive = self._resolve_tree_item_drive_id("destination", dst)
+        iid = str(dst.get("id") or "").strip()
+        if not drive or not iid:
+            return (
+                "",
+                "The destination folder is missing Graph identifiers. Expand the destination tree or refresh.",
+            )
+        raw = self._tree_item_path(dst)
+        canon = self._canonical_destination_projection_path(raw)
+        label = str(dst.get("display_path") or raw or canon or "").strip() or canon
+        return label, ""
+
+    def _recursive_subtree_effective_destination_base(
+        self, folder_src_memory_path: str, folder_dst_memory_path: str
+    ) -> str:
+        """Mirror the selected source folder name under the destination root when needed.
+
+        Graph strict-descendant suffixes omit the selected folder boundary, so composing
+        ``destination_root + suffix`` places files directly under the root. When the user
+        selects e.g. source ``...\\100GOPRO`` and destination ``...\\Personal`` (proposed
+        parent), the intended landing zone is ``Personal\\100GOPRO\\…``, not
+        ``Personal\\<files>``. If the destination path already ends with the same leaf name
+        as the source folder (user selected the target folder itself), do not duplicate.
+        """
+        src_canon = self._canonical_source_projection_path(folder_src_memory_path).strip()
+        dst_canon = self._canonical_destination_projection_path(folder_dst_memory_path).strip()
+        src_segs = [s for s in str(src_canon).replace("/", "\\").split("\\") if s]
+        if not src_segs:
+            return dst_canon
+        leaf = str(src_segs[-1]).strip()
+        if not leaf:
+            return dst_canon
+        dst_segs = [s for s in str(dst_canon).replace("/", "\\").split("\\") if s]
+        if dst_segs and str(dst_segs[-1]).strip().lower() == leaf.lower():
+            return dst_canon
+        return compose_path_under_folder(dst_canon, leaf)
+
+    def _expand_browsed_recursive_subtree(
+        self,
+        source_data: dict,
+        dest_data: dict,
+        *,
+        allocation_method: str = "move",
+    ) -> tuple[list[str], list[dict], list[dict], int, str]:
+        """Graph-only subtree from source/destination tree selections (no Planned Moves)."""
+        graph = self.graph
+        drive_id = str(self._resolve_tree_item_drive_id("source", source_data) or "").strip()
+        item_id = str(source_data.get("id") or "").strip()
+        if not drive_id or not item_id:
+            return [], [], [], 0, "Internal error: missing source drive or item id."
+
+        folder_src_mem = self._canonical_source_projection_path(self._tree_item_path(source_data))
+        folder_dst_mem = self._canonical_destination_projection_path(self._tree_item_path(dest_data))
+        folder_dst_effective = self._recursive_subtree_effective_destination_base(
+            folder_src_mem, folder_dst_mem
+        )
+        folder_anchor_gp = memory_canonical_to_graph_path(folder_src_mem)
+        raw_ip = str(source_data.get("item_path") or "").strip()
+        if raw_ip.replace("\\", "/").lstrip().startswith("/"):
+            folder_walk_path = normalize_graph_path(raw_ip)
+        else:
+            folder_walk_path = folder_anchor_gp
+
+        ctx = self._graph_folder_expand_kwargs_from_tree_node("source", source_data)
+        try:
+            files = graph.list_drive_folder_descendant_files_normalized(
+                drive_id,
+                item_id,
+                folder_item_path=folder_walk_path if folder_walk_path else folder_anchor_gp,
+                **ctx,
+            )
+        except Exception as exc:
+            return [], [], [], 0, f"Could not list files under the source folder via Microsoft Graph:\n{exc}"
+
+        dest_drive = str(self._resolve_tree_item_drive_id("destination", dest_data) or "").strip()
+        dest_folder_id = str(dest_data.get("id") or "").strip()
+        dest_parent = dest_folder_id
+        allo_m = file_level_allocation_method(str(allocation_method or "move"))
+        meta = synthetic_template_for_browser_run()
+        dest_name = str(dest_data.get("name") or "").strip()
+        eff_segs = [s for s in str(folder_dst_effective).replace("/", "\\").split("\\") if s]
+        tpl_folder_name = eff_segs[-1] if eff_segs else dest_name
+        folder_tpl = planned_move_folder_template_for_browser(
+            meta=meta,
+            dest_folder_name=tpl_folder_name,
+            dest_drive_id=dest_drive,
+            dest_folder_item_id=dest_folder_id,
+            dest_folder_path=folder_dst_effective,
+        )
+
+        alloc_rows: list[dict] = []
+        planned_for_manifest: list[dict] = []
+        seeds: list[str] = []
+        seen: set[str] = set()
+
+        for fitem in sorted(files, key=lambda f: str(f.get("item_path") or "").lower()):
+            gid = str(fitem.get("id") or "").strip()
+            if not gid or gid in seen:
+                continue
+            f_gp = str(fitem.get("item_path") or "")
+            suf = relative_suffix_under_folder(folder_anchor_gp, f_gp)
+            if suf is None and folder_walk_path and folder_walk_path != folder_anchor_gp:
+                suf = relative_suffix_under_folder(folder_walk_path, f_gp)
+            if suf is None:
+                continue
+            seen.add(gid)
+            file_drive = str(fitem.get("drive_id") or drive_id or "").strip()
+            mid = deterministic_recursive_mapping_id(file_drive, gid)
+            fname = str(fitem.get("name") or "").strip() or (suf.replace("\\", "/").split("/")[-1])
+            src_mem = compose_path_under_folder(folder_src_mem, suf)
+            dst_mem = compose_path_under_folder(folder_dst_effective, suf)
+            alloc_rows.append(
+                allocation_row_dict_for_expanded_file(
+                    mapping_id=mid,
+                    file_name=fname,
+                    source_path=src_mem,
+                    destination_path=dst_mem,
+                    source_drive_id=file_drive,
+                    source_item_id=gid,
+                    destination_drive_id=dest_drive,
+                    destination_parent_item_id=dest_parent,
+                    allocation_method=allo_m,
+                    template_move=meta,
+                )
+            )
+            planned_for_manifest.append(
+                planned_move_dict_for_expanded_file(
+                    mapping_id=mid,
+                    file_name=fname,
+                    source_path=src_mem,
+                    destination_path=dst_mem,
+                    source_drive_id=file_drive,
+                    source_item_id=gid,
+                    destination_drive_id=dest_drive,
+                    destination_parent_item_id=dest_parent,
+                    allocation_method=allo_m,
+                    folder_template=folder_tpl,
+                )
+            )
+            seeds.append(mid)
+
+        return sorted(set(seeds)), alloc_rows, planned_for_manifest, len(seen), ""
+
+    def _prepare_browsed_recursive_execution_context(
+        self,
+        *,
+        source_data: dict,
+        dest_data: dict,
+        scoped_mode: str,
+        allocation_method: str,
+    ) -> tuple[dict | None, str]:
+        src_summary, se = self._browsed_recursive_source_selection_summary_or_error(source_data)
+        if se:
+            return None, se
+        dst_summary, de = self._browsed_recursive_destination_selection_summary_or_error(dest_data)
+        if de:
+            return None, de
+        seeds, allocs, moves, n, err = self._expand_browsed_recursive_subtree(
+            source_data,
+            dest_data,
+            allocation_method=allocation_method,
+        )
+        if err:
+            return None, err
+        if not seeds:
+            return (
+                None,
+                "No files were found under the selected source folder, or paths could not be aligned "
+                "with the library-relative subtree (strict boundary). Try another folder or refresh the tree.",
+            )
+        mode = str(scoped_mode or "strict").strip() or "strict"
+        if mode not in ("strict", "dependency_closure"):
+            mode = "strict"
+        return {
+            "scoped_ids": list(seeds),
+            "alloc_appends": list(allocs),
+            "manifest_moves": list(moves),
+            "expanded_file_count": int(n),
+            "source_summary": str(src_summary),
+            "dest_summary": str(dst_summary),
+            "scoped_mode": mode,
+            "allocation_method": str(allocation_method or "copy").strip().lower() or "copy",
+        }, ""
+
+    def _expand_snapshot_scoped_recursive_subtree(
+        self, selected_rows: list[int]
+    ) -> tuple[list[str], list[dict], list[dict], int, str]:
+        """Graph-expand selected folder rows to file-level seeds; optional error message if blocked.
+
+        Returns ``(seed_ids_sorted, allocation_queue_rows, planned_move_dicts, expanded_unique_file_count, error)``.
+        Overlapping folder selections union by Graph source item id (first folder in row order wins).
+        """
+        moves = getattr(self, "planned_moves", None) or []
+        seeds: list[str] = []
+        alloc_rows: list[dict] = []
+        planned_for_manifest: list[dict] = []
+        seen_file_ids: set[str] = set()
+        graph = self.graph
+
+        sorted_rows = sorted({int(r) for r in selected_rows if int(r) >= 0})
+        folder_jobs: list[tuple[int, dict]] = []
+        for row in sorted_rows:
+            if row >= len(moves):
+                continue
+            mv = moves[row]
+            if self._planned_move_is_file_allocation(mv):
+                seeds.append(self._mapping_id_for_planned_move_at_index(mv, row))
+            else:
+                folder_jobs.append((row, mv))
+
+        for row, folder_mv in sorted(folder_jobs, key=lambda x: x[0]):
+            src = folder_mv.get("source") if isinstance(folder_mv.get("source"), dict) else {}
+            drive_id = str(src.get("drive_id") or "").strip()
+            item_id = str(src.get("id") or "").strip()
+            if not drive_id or not item_id:
+                return (
+                    [],
+                    [],
+                    [],
+                    0,
+                    "Recursive subtree expansion needs Graph source drive and item ids on each selected folder row. "
+                    "Sign in, refresh the source tree, save the manifest from the current plan, then try again.",
+                )
+
+            folder_anchor_gp = memory_canonical_to_graph_path(
+                self._canonical_source_projection_path(str(folder_mv.get("source_path", "") or ""))
+            )
+            raw_ip = str(src.get("item_path") or "").strip()
+            if raw_ip.replace("\\", "/").lstrip().startswith("/"):
+                folder_walk_path = normalize_graph_path(raw_ip)
+            else:
+                folder_walk_path = folder_anchor_gp
+
+            ctx = self._graph_folder_expand_kwargs(folder_mv)
+            try:
+                files = graph.list_drive_folder_descendant_files_normalized(
+                    drive_id,
+                    item_id,
+                    folder_item_path=folder_walk_path if folder_walk_path else folder_anchor_gp,
+                    **ctx,
+                )
+            except Exception as exc:
+                return [], [], [], 0, f"Could not list files under a selected folder via Microsoft Graph:\n{exc}"
+
+            dest_drive = str((folder_mv.get("destination") or {}).get("drive_id") or "").strip()
+            dest_parent = str(folder_mv.get("destination_id") or "").strip()
+            folder_src_mem = str(folder_mv.get("source_path", "") or "").strip()
+            folder_dst_mem = str(folder_mv.get("destination_path", "") or "").strip()
+            folder_dst_effective = self._recursive_subtree_effective_destination_base(
+                folder_src_mem, folder_dst_mem
+            )
+            allo_m = file_level_allocation_method(str(folder_mv.get("allocation_method", "") or ""))
+
+            for fitem in sorted(files, key=lambda f: str(f.get("item_path") or "").lower()):
+                gid = str(fitem.get("id") or "").strip()
+                if not gid or gid in seen_file_ids:
+                    continue
+                f_gp = str(fitem.get("item_path") or "")
+                suf = relative_suffix_under_folder(folder_anchor_gp, f_gp)
+                if suf is None and folder_walk_path and folder_walk_path != folder_anchor_gp:
+                    suf = relative_suffix_under_folder(folder_walk_path, f_gp)
+                if suf is None:
+                    continue
+                seen_file_ids.add(gid)
+                file_drive = str(fitem.get("drive_id") or drive_id or "").strip()
+                mid = deterministic_recursive_mapping_id(file_drive, gid)
+                fname = str(fitem.get("name") or "").strip() or (suf.replace("\\", "/").split("/")[-1])
+                src_mem = compose_path_under_folder(folder_src_mem, suf)
+                dst_mem = compose_path_under_folder(folder_dst_effective, suf)
+                alloc_rows.append(
+                    allocation_row_dict_for_expanded_file(
+                        mapping_id=mid,
+                        file_name=fname,
+                        source_path=src_mem,
+                        destination_path=dst_mem,
+                        source_drive_id=file_drive,
+                        source_item_id=gid,
+                        destination_drive_id=dest_drive,
+                        destination_parent_item_id=dest_parent,
+                        allocation_method=allo_m,
+                        template_move=folder_mv,
+                    )
+                )
+                planned_for_manifest.append(
+                    planned_move_dict_for_expanded_file(
+                        mapping_id=mid,
+                        file_name=fname,
+                        source_path=src_mem,
+                        destination_path=dst_mem,
+                        source_drive_id=file_drive,
+                        source_item_id=gid,
+                        destination_drive_id=dest_drive,
+                        destination_parent_item_id=dest_parent,
+                        allocation_method=allo_m,
+                        folder_template=folder_mv,
+                    )
+                )
+                seeds.append(mid)
+
+        seeds_out = sorted(set(seeds))
+        return seeds_out, alloc_rows, planned_for_manifest, len(seen_file_ids), ""
+
     def _is_transfer_step_selected_for_preflight(self, step: dict, opts: dict[str, Any]) -> bool:
+        scoped_ids = {
+            str(x).strip()
+            for x in (opts.get("snapshot_scoped_request_ids") or [])
+            if str(x).strip()
+        }
+        if scoped_ids:
+            idx = int(step.get("index", -1))
+            rid = str(step.get("request_id", "") or "").strip()
+            mid = rid if rid else (f"alloc-{idx}" if idx >= 0 else "")
+            return bool(mid) and mid in scoped_ids
         idx = int(step.get("index", -1))
         dst = str(step.get("destination_path", "") or "").strip()
         dest_name = str(step.get("destination_name", "") or step.get("source_name", "") or "").strip()
@@ -24821,6 +26549,14 @@ class MainWindow(QMainWindow):
         return False
 
     def _is_proposed_step_selected_for_preflight(self, step: dict, opts: dict[str, Any]) -> bool:
+        scoped_req = {
+            str(x).strip()
+            for x in (opts.get("snapshot_scoped_request_ids") or [])
+            if str(x).strip()
+        }
+        if scoped_req:
+            # Planned-move subset only: proposed-folder manifest rows are out of scope unless we add explicit IDs later.
+            return False
         dst = str(step.get("destination_path", "") or "").strip()
         fname = str(step.get("folder_name", "") or "").strip()
         selected_paths = {
@@ -24835,10 +26571,34 @@ class MainWindow(QMainWindow):
             return False
         return True
 
-    def _is_transfer_step_graph_ready_for_preflight(self, step: dict) -> bool:
+    def _browsed_recursive_transfer_preflight_deferred_ready(self, step: dict, opts: dict[str, Any]) -> bool:
+        """True when browse-recursive + dependency_closure: folder Graph id may be created at run time."""
+        if not bool(opts.get("snapshot_browsed_recursive")):
+            return False
+        if str(opts.get("snapshot_scoped_mode") or "").strip() != "dependency_closure":
+            return False
         src = str(step.get("source_path", "") or "")
         dst = str(step.get("destination_path", "") or "")
         if is_absolute_local_path(src) and is_absolute_local_path(dst):
+            return False
+        if not (
+            str(step.get("source_drive_id", "") or "").strip()
+            and str(step.get("source_item_id", "") or "").strip()
+            and str(step.get("destination_drive_id", "") or "").strip()
+        ):
+            return False
+        if str(step.get("destination_item_id", "") or "").strip():
+            return False
+        return bool(str(dst or "").strip())
+
+    def _is_transfer_step_graph_ready_for_preflight(
+        self, step: dict, opts: dict[str, Any] | None = None
+    ) -> bool:
+        src = str(step.get("source_path", "") or "")
+        dst = str(step.get("destination_path", "") or "")
+        if is_absolute_local_path(src) and is_absolute_local_path(dst):
+            return True
+        if opts and self._browsed_recursive_transfer_preflight_deferred_ready(step, opts):
             return True
         return bool(
             str(step.get("source_drive_id", "") or "").strip()
@@ -24863,13 +26623,14 @@ class MainWindow(QMainWindow):
     ) -> list[dict[str, int | str | list[str]]]:
         opts = dict(after_manifest.get("execution_options") or {})
         rows: list[dict[str, int | str]] = []
+        transfer_readiness = lambda s: self._is_transfer_step_graph_ready_for_preflight(s, opts)
         for scope_name, before_steps, after_steps, selector, readiness in (
             (
                 "Transfer",
                 list((before_manifest or {}).get("transfer_steps") or []),
                 list((after_manifest or {}).get("transfer_steps") or []),
                 self._is_transfer_step_selected_for_preflight,
-                self._is_transfer_step_graph_ready_for_preflight,
+                transfer_readiness,
             ),
             (
                 "Proposed folders",
@@ -24921,15 +26682,28 @@ class MainWindow(QMainWindow):
         *,
         dry_run: bool,
         execution_mode: str = "FULL",
+        execution_scope: str = "FULL PLAN",
+        scoped_snapshot_note: str = "",
     ) -> bool:
         dlg = QDialog(self)
         dlg.setWindowTitle("Execution preflight assurance")
         v = QVBoxLayout(dlg)
+        scope_raw = str(execution_scope or "FULL PLAN").strip().upper()
+        scope_display = "SCOPED SUBSET" if scope_raw == "SCOPED SUBSET" else "FULL PLAN"
+        scope_line = QLabel(f"Execution scope: {scope_display}")
+        scope_line.setWordWrap(True)
+        scope_line.setObjectName("preflightExecutionScopeLine")
+        v.addWidget(scope_line)
         mode = str(execution_mode or "FULL").strip().upper()
         mode_line = QLabel(f"Execution mode: {mode} — all selected steps must be ready.")
         mode_line.setWordWrap(True)
         mode_line.setObjectName("preflightExecutionModeLine")
         v.addWidget(mode_line)
+        if str(scoped_snapshot_note or "").strip():
+            scoped_lbl = QLabel(str(scoped_snapshot_note).strip())
+            scoped_lbl.setWordWrap(True)
+            scoped_lbl.setObjectName("preflightScopedSnapshotNote")
+            v.addWidget(scoped_lbl)
         heading = QLabel(
             "Preflight check completed. Review readiness before execution.\n"
             "Auto-fixed means missing Graph IDs were resolved at runtime."
@@ -24995,6 +26769,106 @@ class MainWindow(QMainWindow):
         v.addWidget(buttons)
         return dlg.exec() == QDialog.Accepted
 
+    def _resolve_draft_pipeline_toggle_state(self) -> tuple[bool, str]:
+        """
+        Return (snapshot_pipeline_primary, source).
+
+        When True, live/dry execution prefers the snapshot pipeline (draft bundle export + harness).
+        When False, execution uses the legacy manifest worker path.
+
+        Precedence: ``ENABLE_DRAFT_PIPELINE_EXECUTION`` (env) overrides the Settings checkbox.
+        """
+        raw = str(os.getenv("ENABLE_DRAFT_PIPELINE_EXECUTION", "") or "").strip().lower()
+        if raw in {"1", "true", "yes", "on"}:
+            return True, "env"
+        if raw in {"0", "false", "no", "off"}:
+            return False, "env"
+        ui_toggle = getattr(self, "_settings_execution_path_toggle", None)
+        # Checked = opt into legacy manifest execution (internal fallback / recovery).
+        if ui_toggle is not None and bool(ui_toggle.isChecked()):
+            return False, "ui"
+        return True, "default"
+
+    def _draft_pipeline_execution_enabled(self) -> bool:
+        enabled, _source = self._resolve_draft_pipeline_toggle_state()
+        return bool(enabled)
+
+    def _build_connected_environment_context(self) -> dict:
+        src_ctx = self._graph_resolve_planning_context() or {}
+        session = dict(self.current_session_context or {})
+        site_ids = getattr(self, "pending_root_site_ids", None)
+        if not isinstance(site_ids, dict):
+            site_ids = {"source": "", "destination": ""}
+        return {
+            "tenant_id": str(session.get("tenant_id", "") or ""),
+            "tenant_domain": str(session.get("tenant_domain", "") or ""),
+            "client_key": str(session.get("client_key", "") or ""),
+            "source_drive_id": str(src_ctx.get("source_drive_id", "") or ""),
+            "destination_drive_id": str(src_ctx.get("dest_drive_id", "") or ""),
+            "source_site_id": str(site_ids.get("source", "") or ""),
+            "source_site_name": str(src_ctx.get("source_site_name", "") or ""),
+            "source_library_name": str(src_ctx.get("source_library_name", "") or ""),
+            "destination_site_id": str(site_ids.get("destination", "") or ""),
+            "destination_site_name": str(src_ctx.get("dest_site_name", "") or ""),
+            "destination_library_name": str(src_ctx.get("dest_library_name", "") or ""),
+        }
+
+    def _start_legacy_manifest_worker(
+        self,
+        *,
+        run_manifest: dict,
+        path: str,
+        dry_run: bool,
+        log_file: Path,
+        graph_client,
+        pilot_max_graph_operations: int,
+        preflight_transfer_updated: int,
+        preflight_proposed_updated: int,
+        readiness_before: dict,
+        readiness_after: dict,
+        injected_subtree: bool,
+    ) -> None:
+        _enabled, mode_source = self._resolve_draft_pipeline_toggle_state()
+        log_info(
+            "execution_path_selected",
+            path="legacy_manifest",
+            dry_run=bool(dry_run),
+            mode_source=mode_source,
+        )
+        worker = ManifestRunWorker(
+            run_manifest,
+            dry_run=dry_run,
+            log_file=str(log_file),
+            graph_client=graph_client,
+        )
+        self._manifest_run_worker = worker
+        worker.finished_ok.connect(self._on_manifest_run_finished)
+        worker.failed.connect(self._on_manifest_run_failed)
+        worker.finished.connect(self._on_manifest_run_worker_finished_cleanup)
+        self._set_manifest_run_buttons_enabled(False)
+        if getattr(self, "execution_status_label", None) is not None:
+            if not (preflight_transfer_updated or preflight_proposed_updated):
+                self.execution_status_label.setText("Running legacy manifest path in the background…")
+        worker.start()
+        log_info(
+            "transfer_manifest_run_started",
+            manifest_path=str(path),
+            dry_run=dry_run,
+            log_file=str(log_file),
+            pilot_max_graph_operations=int(pilot_max_graph_operations or 0) or None,
+            preflight_transfer_updated=int(preflight_transfer_updated or 0) or None,
+            preflight_proposed_updated=int(preflight_proposed_updated or 0) or None,
+            transfer_ready_before=readiness_before.get("transfer_ready"),
+            transfer_total_before=readiness_before.get("transfer_total"),
+            proposed_ready_before=readiness_before.get("proposed_ready"),
+            proposed_total_before=readiness_before.get("proposed_total"),
+            transfer_ready_after=readiness_after.get("transfer_ready"),
+            transfer_total_after=readiness_after.get("transfer_total"),
+            proposed_ready_after=readiness_after.get("proposed_ready"),
+            proposed_total_after=readiness_after.get("proposed_total"),
+            pilot_allocated_subtree_injected=bool(injected_subtree) or None,
+        )
+
     def _start_manifest_run_worker(
         self,
         manifest: dict,
@@ -25010,11 +26884,147 @@ class MainWindow(QMainWindow):
         pilot_transfer_step_indices: list[int] | None = None,
         pilot_allocated_folder_identity: str = "",
         pilot_strict_file_mode: bool = False,
+        browsed_recursive_context: dict | None = None,
     ):
         import copy
         import tempfile
 
+        if browsed_recursive_context is not None and not self._draft_pipeline_execution_enabled():
+            QMessageBox.warning(
+                self,
+                "Browse recursive",
+                "Browse-driven recursive execution requires the snapshot pipeline.",
+            )
+            return
+
         run_manifest = copy.deepcopy(manifest)
+        recursive_alloc_appends: list[dict] = []
+        recursive_manifest_moves: list[dict] = []
+        snapshot_recursive_expanded_file_count = 0
+        use_snapshot_recursive_subtree = False
+
+        def _append_recursive_manifest_transfer_steps(rm: dict, moves: list[dict]) -> None:
+            if not moves:
+                return
+            steps = list(rm.get("transfer_steps") or [])
+            max_i = max((int(s.get("index", -1)) for s in steps if isinstance(s, dict)), default=-1)
+            for j, mv in enumerate(moves):
+                steps.append(_planned_move_to_step(max_i + 1 + j, mv).to_json_dict())
+            rm["transfer_steps"] = steps
+            fixed_manifest, _ = upconvert_manifest_v1_to_v2(rm)
+            rm.clear()
+            rm.update(fixed_manifest)
+
+        if not self._draft_pipeline_execution_enabled():
+            _eo0 = dict(run_manifest.get("execution_options") or {})
+            for _k in (
+                "snapshot_scoped_request_ids",
+                "snapshot_scoped_mode",
+                "snapshot_recursive_subtree",
+                "snapshot_recursive_subtree_expanded_file_count",
+                "snapshot_browsed_recursive",
+                "snapshot_browsed_recursive_source_summary",
+                "snapshot_browsed_recursive_destination_summary",
+                "snapshot_browsed_recursive_allocation_method",
+            ):
+                _eo0.pop(_k, None)
+            run_manifest["execution_options"] = _eo0
+        if self._draft_pipeline_execution_enabled():
+            cb = getattr(self, "execution_snapshot_scoped_checkbox", None)
+            if browsed_recursive_context is not None:
+                br = dict(browsed_recursive_context)
+                scoped_ids = list(br.get("scoped_ids") or [])
+                recursive_alloc_appends = list(br.get("alloc_appends") or [])
+                recursive_manifest_moves = list(br.get("manifest_moves") or [])
+                snapshot_recursive_expanded_file_count = int(br.get("expanded_file_count") or 0)
+                use_snapshot_recursive_subtree = True
+                eo = dict(run_manifest.get("execution_options") or {})
+                eo["snapshot_scoped_request_ids"] = list(scoped_ids)
+                eo["snapshot_scoped_mode"] = str(br.get("scoped_mode") or "strict").strip() or "strict"
+                eo["snapshot_recursive_subtree"] = True
+                eo["snapshot_recursive_subtree_expanded_file_count"] = int(snapshot_recursive_expanded_file_count)
+                eo["snapshot_browsed_recursive"] = True
+                eo["snapshot_browsed_recursive_source_summary"] = str(br.get("source_summary") or "")
+                eo["snapshot_browsed_recursive_destination_summary"] = str(br.get("dest_summary") or "")
+                eo["snapshot_browsed_recursive_allocation_method"] = str(
+                    br.get("allocation_method") or "copy"
+                ).strip().lower() or "copy"
+                run_manifest["execution_options"] = eo
+                _append_recursive_manifest_transfer_steps(run_manifest, recursive_manifest_moves)
+                log_info(
+                    "snapshot_browsed_recursive_execution",
+                    scoped_mode=eo.get("snapshot_scoped_mode"),
+                    expanded_file_count=int(snapshot_recursive_expanded_file_count),
+                    seed_count=len(scoped_ids),
+                )
+            elif cb is not None and cb.isChecked():
+                selected_rows = self._planned_moves_selected_row_indices()
+                if not selected_rows:
+                    QMessageBox.warning(
+                        self,
+                        "Subset execution",
+                        "Snapshot subset is on, but no planned moves are selected.\n\n"
+                        "Select one or more rows on the Planned Moves tab, or turn off "
+                        "'Run selected planned moves only (snapshot subset)' to run the full plan.",
+                    )
+                    return
+                rec_cb = getattr(self, "execution_snapshot_recursive_subtree_checkbox", None)
+                use_snapshot_recursive_subtree = rec_cb is not None and rec_cb.isChecked()
+                if use_snapshot_recursive_subtree:
+                    if not getattr(self.graph, "token", None):
+                        QMessageBox.warning(
+                            self,
+                            "Recursive subtree",
+                            "Include entire subtree requires Microsoft 365 sign-in so the app can list files "
+                            "under the selected folder(s) via Graph.\n\n"
+                            "Sign in, then try again—or turn off this option to use draft-only folder expansion.",
+                        )
+                        return
+                    scoped_ids, alloc_app, mv_app, exp_count, err = self._expand_snapshot_scoped_recursive_subtree(
+                        selected_rows
+                    )
+                    if err:
+                        QMessageBox.warning(self, "Recursive subtree", err)
+                        return
+                    snapshot_recursive_expanded_file_count = int(exp_count or 0)
+                    recursive_alloc_appends = list(alloc_app or [])
+                    recursive_manifest_moves = list(mv_app or [])
+                    if not scoped_ids:
+                        QMessageBox.warning(
+                            self,
+                            "Recursive subtree",
+                            "No files were found under the selected folder row(s), and no file rows were selected.\n\n"
+                            "Select file rows, choose a folder that contains files in SharePoint, or turn off "
+                            "'Include entire subtree' and use draft-only expansion.",
+                        )
+                        return
+                else:
+                    scoped_ids = self._derive_snapshot_scoped_file_seed_mapping_ids(selected_rows)
+                    if not scoped_ids:
+                        QMessageBox.warning(
+                            self,
+                            "Subset execution",
+                            "No file allocations fall under the selected planned move(s) in the current draft.\n\n"
+                            "Select a folder that contains drafted file rows, select file rows directly, add "
+                            "file-level allocations under that source folder, or turn on "
+                            "'Include entire subtree (recursive folder)' to expand from Graph.",
+                        )
+                        return
+                eo = dict(run_manifest.get("execution_options") or {})
+                eo["snapshot_scoped_request_ids"] = list(scoped_ids)
+                if (
+                    getattr(self, "execution_snapshot_scoped_dependency_radio", None) is not None
+                    and self.execution_snapshot_scoped_dependency_radio.isChecked()
+                ):
+                    eo["snapshot_scoped_mode"] = "dependency_closure"
+                else:
+                    eo["snapshot_scoped_mode"] = "strict"
+                if use_snapshot_recursive_subtree:
+                    eo["snapshot_recursive_subtree"] = True
+                    eo["snapshot_recursive_subtree_expanded_file_count"] = int(snapshot_recursive_expanded_file_count)
+                run_manifest["execution_options"] = eo
+                if use_snapshot_recursive_subtree and recursive_manifest_moves:
+                    _append_recursive_manifest_transfer_steps(run_manifest, recursive_manifest_moves)
         preflight_base_manifest = copy.deepcopy(run_manifest)
         readiness_before = self._manifest_graph_readiness_counts(run_manifest)
         scoped_selection_requested = bool(
@@ -25045,17 +27055,17 @@ class MainWindow(QMainWindow):
         # Dialog may pass an allocated-folder value that is only the proposed shell (same as
         # the scoped proposed path). That would skip coercion/inference while still not being
         # a deeper subtree; treat it as unset so runtime can infer/inject the real child.
+        #
+        # Use strict full-path equality only: _paths_equivalent must NOT be used here — its
+        # suffix variants make Root\Personal\100GOPRO "match" Root\Personal via shared segment
+        # Personal, incorrectly clearing a deep allocated identity and falling back to shallow
+        # inference + Personal folder-copy injection (SCOPE-SYN with name=Personal).
         if allocated_for_injection and chain_paths:
             deepest_chain = self._pilot_norm_destination_identity(chain_paths[-1])
-            if deepest_chain:
-                ai = self._pilot_norm_destination_identity(allocated_for_injection)
-                d_low = self._pilot_norm_destination_identity(deepest_chain).lower()
-                a_low = ai.lower() if ai else ""
-                if a_low and d_low and (
-                    a_low == d_low
-                    or self._paths_equivalent(allocated_for_injection, deepest_chain, "destination")
-                ):
-                    allocated_for_injection = ""
+            if deepest_chain and self._pilot_allocation_destinations_exact_match(
+                allocated_for_injection, deepest_chain
+            ):
+                allocated_for_injection = ""
         # If pilot pins exactly one manifest folder-copy row and it is the proposed folder
         # itself (not a deeper allocated subtree), drop that pin so inference/injection can run.
         if (
@@ -25196,6 +27206,7 @@ class MainWindow(QMainWindow):
                 run_manifest,
                 allocated_folder_identity=str(allocated_for_injection),
                 selected_step_indices=list(pilot_transfer_step_indices or []),
+                selected_proposed_combo_initial=getattr(self, "_pilot_dialog_selected_proposed_combo_initial", None),
             )
             if not (injected_subtree or exact_allocated_match):
                 QMessageBox.warning(
@@ -25254,8 +27265,36 @@ class MainWindow(QMainWindow):
         graph_client = self.graph if getattr(self.graph, "token", None) else None
         preflight_transfer_updated, preflight_proposed_updated = self._preflight_enrich_manifest_graph_ids(run_manifest)
         readiness_after = self._manifest_graph_readiness_counts(run_manifest)
+        # Diagnostic: status-line "Preflight enriched … proposed=N" is N = rows that *gained* Graph
+        # ids in preflight, not pilot selected proposed-folder count or manifest proposed row totals.
+        _eo_diag = dict(run_manifest.get("execution_options") or {})
+        log_info(
+            "pilot_run_preflight_snapshot",
+            preflight_graph_rows_enriched_transfer=int(preflight_transfer_updated or 0),
+            preflight_graph_rows_enriched_proposed=int(preflight_proposed_updated or 0),
+            execution_options_pilot_proposed_paths=list(
+                _eo_diag.get("pilot_proposed_folder_destination_paths") or []
+            ),
+            execution_options_pilot_transfer_indices=list(_eo_diag.get("pilot_transfer_step_indices") or []),
+            execution_options_pilot_transfer_keys=list(_eo_diag.get("pilot_transfer_destination_keys") or []),
+            execution_options_pilot_transfer_uids=list(_eo_diag.get("pilot_transfer_step_uids") or []),
+            manifest_proposed_total=int(readiness_after.get("proposed_total", 0) or 0),
+            manifest_proposed_graph_ready=int(readiness_after.get("proposed_ready", 0) or 0),
+            manifest_transfer_total=int(readiness_after.get("transfer_total", 0) or 0),
+            manifest_transfer_graph_ready=int(readiness_after.get("transfer_ready", 0) or 0),
+        )
         preflight_rows = self._build_preflight_scope_summary(preflight_base_manifest, run_manifest)
         opts = dict(run_manifest.get("execution_options") or {})
+        if opts.get("snapshot_scoped_request_ids"):
+            transfer_row = next((r for r in preflight_rows if str(r.get("scope", "")) == "Transfer"), None)
+            if transfer_row is None or int(transfer_row.get("selected", 0) or 0) == 0:
+                QMessageBox.warning(
+                    self,
+                    "Subset execution",
+                    "No transfer steps in the loaded manifest match the selected planned moves. "
+                    "Save or open a manifest from the current plan, then try again.",
+                )
+                return
         unresolved_total = sum(int(r.get("unresolved", 0)) for r in preflight_rows)
         # Enforce strict prerequisite readiness for both FULL and PILOT live runs:
         # if preflight still has unresolved selected steps, block before execution.
@@ -25273,15 +27312,72 @@ class MainWindow(QMainWindow):
             )
             if unresolved_notes:
                 detail += "\n\nUnresolved examples:\n- " + "\n- ".join(unresolved_notes)
-            QMessageBox.warning(self, "Pilot preflight blocked", detail)
+            block_title = (
+                "Pilot preflight blocked"
+                if int(pilot_max_graph_operations or 0) > 0
+                else "Preflight blocked"
+            )
+            QMessageBox.warning(self, block_title, detail)
             if getattr(self, "execution_status_label", None) is not None:
-                self.execution_status_label.setText("Execution blocked: unresolved pilot prerequisites.")
+                self.execution_status_label.setText("Execution blocked: unresolved preflight prerequisites.")
             return
         run_mode = "PILOT" if int(pilot_max_graph_operations or 0) > 0 else "FULL"
+        scoped_ids = [str(x).strip() for x in (opts.get("snapshot_scoped_request_ids") or []) if str(x).strip()]
+        scoped_mode_opt = str(opts.get("snapshot_scoped_mode") or "strict").strip() or "strict"
+        if scoped_ids:
+            run_mode = "SCOPED"
+        scoped_note = ""
+        if scoped_ids:
+            transfer_sel = next(
+                (int(r.get("selected", 0) or 0) for r in preflight_rows if str(r.get("scope", "")) == "Transfer"),
+                0,
+            )
+            proposed_sel = next(
+                (int(r.get("selected", 0) or 0) for r in preflight_rows if str(r.get("scope", "")) == "Proposed folders"),
+                0,
+            )
+            if bool(opts.get("snapshot_browsed_recursive")):
+                exp_n = int(opts.get("snapshot_recursive_subtree_expanded_file_count") or 0)
+                src_l = str(opts.get("snapshot_browsed_recursive_source_summary") or "")
+                dst_l = str(opts.get("snapshot_browsed_recursive_destination_summary") or "")
+                scoped_note = (
+                    f"Browse recursive — not Planned Moves. Scoped mode: {scoped_mode_opt}. "
+                    f"{len(scoped_ids)} file-level mapping seed(s). "
+                    f"Preflight selection counts — Transfer={transfer_sel}, Proposed folders={proposed_sel}.\n\n"
+                    f"Source folder (Graph subtree root): {src_l}\n"
+                    f"Destination root mapping: {dst_l}\n\n"
+                    f"Recursive scope (Microsoft Graph): {exp_n} unique file(s). "
+                    "This run uses an ephemeral draft bundle only; the saved draft on disk is not modified."
+                )
+                if scoped_mode_opt == "dependency_closure":
+                    scoped_note += " Required destination path steps will be included automatically."
+                else:
+                    scoped_note += (
+                        " Strict allowlist: no automatic folder/path expansion beyond selected mapping ids."
+                    )
+            else:
+                scoped_note = (
+                    f"Snapshot scoped mode: {scoped_mode_opt}. Seed count: {len(scoped_ids)} planned move id(s). "
+                    f"Preflight selection counts — Transfer={transfer_sel}, Proposed folders={proposed_sel}."
+                )
+                if scoped_mode_opt == "dependency_closure":
+                    scoped_note += " Required destination path steps will be included automatically."
+                else:
+                    scoped_note += " Strict allowlist: no automatic folder/path expansion beyond selected mapping ids."
+                if bool(opts.get("snapshot_recursive_subtree")):
+                    exp_n = int(opts.get("snapshot_recursive_subtree_expanded_file_count") or 0)
+                    scoped_note += (
+                        f"\n\nRecursive folder scope (Microsoft Graph): {exp_n} unique file(s) expanded under the "
+                        "selected Planned Moves folder row(s). This run uses an ephemeral copy of the draft bundle "
+                        "only; the saved draft on disk is not modified."
+                    )
+        execution_scope = "SCOPED SUBSET" if scoped_ids else "FULL PLAN"
         if not self._show_preflight_assurance_dialog(
             preflight_rows,
             dry_run=dry_run,
             execution_mode=run_mode,
+            execution_scope=execution_scope,
+            scoped_snapshot_note=scoped_note,
         ):
             if getattr(self, "execution_status_label", None) is not None:
                 self.execution_status_label.setText("Execution cancelled after preflight review.")
@@ -25295,7 +27391,8 @@ class MainWindow(QMainWindow):
             )
             if getattr(self, "execution_status_label", None) is not None:
                 self.execution_status_label.setText(
-                    f"Preflight enriched ids: transfers={preflight_transfer_updated}, proposed={preflight_proposed_updated}. Running manifest..."
+                    f"Preflight: {preflight_transfer_updated} transfer row(s) and {preflight_proposed_updated} proposed row(s) "
+                    f"gained Graph IDs (not pilot step counts). Running manifest…"
                 )
         elif getattr(self, "execution_status_label", None) is not None:
             self.execution_status_label.setText(
@@ -25304,38 +27401,119 @@ class MainWindow(QMainWindow):
                 f"proposed ready {readiness_after['proposed_ready']}/{readiness_after['proposed_total']}."
             )
 
-        worker = ManifestRunWorker(
-            run_manifest,
-            dry_run=dry_run,
-            log_file=str(log_file),
-            graph_client=graph_client,
-        )
-        self._manifest_run_worker = worker
-        worker.finished_ok.connect(self._on_manifest_run_finished)
-        worker.failed.connect(self._on_manifest_run_failed)
-        worker.finished.connect(self._on_manifest_run_worker_finished_cleanup)
-        self._set_manifest_run_buttons_enabled(False)
-        if getattr(self, "execution_status_label", None) is not None:
-            if not (preflight_transfer_updated or preflight_proposed_updated):
-                self.execution_status_label.setText("Running manifest job in the background…")
-        worker.start()
-        log_info(
-            "transfer_manifest_run_started",
+        from ozlink_console.execution import ExecutionOrchestrator
+
+        orchestrator = ExecutionOrchestrator()
+        env_ctx = self._build_connected_environment_context()
+
+        if self._draft_pipeline_execution_enabled():
+            _enabled, mode_source = self._resolve_draft_pipeline_toggle_state()
+            log_info(
+                "execution_path_selected",
+                path="draft_pipeline",
+                dry_run=bool(dry_run),
+                mode_source=mode_source,
+            )
+            try:
+                bundle_folder = self.memory_manager.export_bundle(reason="Draft pipeline execution")
+            except Exception as exc:
+                log_error(
+                    "snapshot_pipeline_bundle_export_failed",
+                    error=str(exc)[:500],
+                    manifest_path=str(path),
+                )
+                QMessageBox.warning(
+                    self,
+                    "Snapshot pipeline",
+                    f"Could not export the draft bundle for pipeline execution:\n{exc}",
+                )
+                if getattr(self, "execution_status_label", None) is not None:
+                    self.execution_status_label.setText("Snapshot pipeline: bundle export failed.")
+                return
+            self._snapshot_pipeline_ephemeral_bundle_dir = None
+            if recursive_alloc_appends:
+                import shutil
+
+                ephemeral_root = Path(tempfile.mkdtemp(prefix="ozlink_recursive_snapshot_"))
+                export_src = Path(bundle_folder)
+                for src_f in export_src.iterdir():
+                    if src_f.is_file():
+                        shutil.copy2(src_f, ephemeral_root / src_f.name)
+                aq_path = ephemeral_root / "Draft-AllocationQueue.json"
+                try:
+                    payload = json.loads(aq_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    shutil.rmtree(ephemeral_root, ignore_errors=True)
+                    QMessageBox.warning(
+                        self,
+                        "Snapshot pipeline",
+                        f"Could not read the exported allocation queue for recursive subtree expansion:\n{exc}",
+                    )
+                    if getattr(self, "execution_status_label", None) is not None:
+                        self.execution_status_label.setText("Snapshot pipeline: ephemeral bundle preparation failed.")
+                    return
+                if not isinstance(payload, list):
+                    shutil.rmtree(ephemeral_root, ignore_errors=True)
+                    QMessageBox.warning(
+                        self,
+                        "Snapshot pipeline",
+                        "Draft-AllocationQueue.json in the export is not a JSON array; cannot inject Graph-expanded files.",
+                    )
+                    if getattr(self, "execution_status_label", None) is not None:
+                        self.execution_status_label.setText("Snapshot pipeline: ephemeral bundle preparation failed.")
+                    return
+                for row in recursive_alloc_appends:
+                    payload.append(row)
+                aq_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                bundle_folder = ephemeral_root
+                self._snapshot_pipeline_ephemeral_bundle_dir = str(ephemeral_root)
+            snap_env = dict(env_ctx)
+            snap_env["mode_source"] = mode_source
+            _seed_mode = str(opts.get("snapshot_scoped_mode") or "").strip() if scoped_ids else ""
+            _seeds = frozenset(scoped_ids) if scoped_ids else None
+            if _seeds:
+                log_info(
+                    "snapshot_scoped_execution",
+                    snapshot_scoped_mode=_seed_mode or None,
+                    scoped_seed_mapping_id_count=len(_seeds),
+                    dry_run=bool(dry_run),
+                )
+            worker = SnapshotPipelineRunWorker(
+                bundle_folder=str(bundle_folder),
+                manifest_path=str(path),
+                dry_run=bool(dry_run),
+                environment_context=snap_env,
+                graph_client=graph_client,
+                snapshot_scoped_mode=_seed_mode,
+                scoped_seed_mapping_ids=_seeds,
+            )
+            self._snapshot_pipeline_run_worker = worker
+            worker.finished_ok.connect(self._on_snapshot_pipeline_run_finished)
+            worker.failed.connect(self._on_snapshot_pipeline_run_failed)
+            worker.finished.connect(self._on_snapshot_pipeline_worker_finished_cleanup)
+            self._set_manifest_run_buttons_enabled(False)
+            if getattr(self, "execution_status_label", None) is not None:
+                self.execution_status_label.setText("Running snapshot pipeline in the background…")
+            worker.start()
+            return
+
+        orchestrator.run_manifest(
             manifest_path=str(path),
+            dry_run=bool(dry_run),
+            environment_context=env_ctx,
+        )
+        self._start_legacy_manifest_worker(
+            run_manifest=run_manifest,
+            path=path,
             dry_run=dry_run,
-            log_file=str(log_file),
-            pilot_max_graph_operations=int(pilot_max_graph_operations or 0) or None,
-            preflight_transfer_updated=int(preflight_transfer_updated or 0) or None,
-            preflight_proposed_updated=int(preflight_proposed_updated or 0) or None,
-            transfer_ready_before=readiness_before.get("transfer_ready"),
-            transfer_total_before=readiness_before.get("transfer_total"),
-            proposed_ready_before=readiness_before.get("proposed_ready"),
-            proposed_total_before=readiness_before.get("proposed_total"),
-            transfer_ready_after=readiness_after.get("transfer_ready"),
-            transfer_total_after=readiness_after.get("transfer_total"),
-            proposed_ready_after=readiness_after.get("proposed_ready"),
-            proposed_total_after=readiness_after.get("proposed_total"),
-            pilot_allocated_subtree_injected=bool(injected_subtree) or None,
+            log_file=log_file,
+            graph_client=graph_client,
+            pilot_max_graph_operations=pilot_max_graph_operations,
+            preflight_transfer_updated=preflight_transfer_updated,
+            preflight_proposed_updated=preflight_proposed_updated,
+            readiness_before=readiness_before,
+            readiness_after=readiness_after,
+            injected_subtree=injected_subtree,
         )
 
     def _run_transfer_manifest_from_path_with_dialogs(self, path: str):
@@ -25414,18 +27592,27 @@ class MainWindow(QMainWindow):
             )
             if confirm != QMessageBox.Yes:
                 return
-            pilot = self._dialog_pilot_max_graph_operations()
-            if pilot is None:
-                return
-            (
-                pilot_max,
-                pilot_proposed_folder_destination_paths,
-                pilot_transfer_destination_keys,
-                pilot_transfer_step_uids,
-                pilot_transfer_step_indices,
-                pilot_allocated_folder_identity,
-                pilot_strict_file_mode,
-            ) = pilot
+            if self._draft_pipeline_execution_enabled():
+                pilot_max = 0
+                pilot_proposed_folder_destination_paths = []
+                pilot_transfer_destination_keys = []
+                pilot_transfer_step_uids = []
+                pilot_transfer_step_indices = []
+                pilot_allocated_folder_identity = ""
+                pilot_strict_file_mode = False
+            else:
+                pilot = self._dialog_pilot_max_graph_operations()
+                if pilot is None:
+                    return
+                (
+                    pilot_max,
+                    pilot_proposed_folder_destination_paths,
+                    pilot_transfer_destination_keys,
+                    pilot_transfer_step_uids,
+                    pilot_transfer_step_indices,
+                    pilot_allocated_folder_identity,
+                    pilot_strict_file_mode,
+                ) = pilot
 
         self._start_manifest_run_worker(
             manifest,
@@ -25456,6 +27643,113 @@ class MainWindow(QMainWindow):
 
     def _on_manifest_run_failed(self, err):
         QMessageBox.warning(self, "Run manifest", err)
+
+    def _on_snapshot_pipeline_worker_finished_cleanup(self):
+        import shutil
+
+        ep = getattr(self, "_snapshot_pipeline_ephemeral_bundle_dir", None)
+        if ep:
+            try:
+                shutil.rmtree(str(ep), ignore_errors=True)
+            finally:
+                self._snapshot_pipeline_ephemeral_bundle_dir = None
+        self._snapshot_pipeline_run_worker = None
+        self._update_manifest_run_buttons_state()
+
+    def _on_snapshot_pipeline_run_finished(self, ctx, result):
+        from ozlink_console.execution.snapshot_summary import (
+            build_snapshot_run_result_summary,
+            format_first_failed_bridge_step_diagnostic,
+        )
+
+        summary = build_snapshot_run_result_summary(ctx, result)
+        errs = getattr(result, "errors", None) or []
+        err_tail = f"\n\nErrors:\n{errs}" if errs else ""
+        if summary.final_status == "completed":
+            QMessageBox.information(
+                self,
+                "Snapshot pipeline",
+                f"Snapshot pipeline completed.\n\n"
+                f"run_id={summary.run_id}\n"
+                f"snapshot_id={summary.snapshot_id or 'n/a'}\n"
+                f"plan_id={summary.plan_id or 'n/a'}\n"
+                f"status={summary.final_status}",
+            )
+            if getattr(self, "execution_status_label", None) is not None:
+                self.execution_status_label.setText(summary.one_line_internal())
+            return
+        bridge_diag = format_first_failed_bridge_step_diagnostic(result)
+        QMessageBox.warning(
+            self,
+            "Snapshot pipeline",
+            f"The snapshot pipeline did not complete successfully.\n\n"
+            f"run_id={summary.run_id}\n"
+            f"snapshot_id={summary.snapshot_id or 'n/a'}\n"
+            f"plan_id={summary.plan_id or 'n/a'}\n"
+            f"status={summary.final_status}\n"
+            f"failure_boundary={summary.failure_boundary or 'n/a'}\n"
+            f"boundary_detail={summary.boundary_detail or 'n/a'}\n"
+            f"stopped_at={summary.stopped_at or 'n/a'}\n"
+            f"stop_reason={summary.stop_reason or 'n/a'}"
+            f"{err_tail}"
+            f"{bridge_diag}",
+        )
+        if getattr(self, "execution_status_label", None) is not None:
+            self.execution_status_label.setText(summary.one_line_internal())
+
+    def _on_snapshot_pipeline_run_failed(self, err: str):
+        QMessageBox.warning(self, "Snapshot pipeline", str(err)[:2000])
+        if getattr(self, "execution_status_label", None) is not None:
+            self.execution_status_label.setText(
+                "Snapshot pipeline failed: boundary=runner (see logs: exception_type, execution_run_failed, snapshot_run_internal_summary)."
+            )
+
+    def _on_draft_pipeline_run_finished(self, result, fallback: dict):
+        snapshot_id = str(getattr(result, "snapshot_id", "") or "")
+        run_id = str(getattr(result, "run_id", "") or "")
+        plan_id = str(getattr(result, "plan_id", "") or "")
+        if bool(getattr(result, "success", False)):
+            if getattr(self, "execution_status_label", None) is not None:
+                self.execution_status_label.setText(
+                    f"Draft pipeline run completed (run_id={run_id or 'n/a'}, plan_id={plan_id or 'n/a'})."
+                )
+            log_info(
+                "draft_pipeline_live_entry_succeeded",
+                snapshot_id=snapshot_id or None,
+                run_id=run_id or None,
+                plan_id=plan_id or None,
+            )
+            return
+
+        log_error(
+            "draft_pipeline_live_entry_failed_fallback",
+            snapshot_id=snapshot_id or None,
+            run_id=run_id or None,
+            plan_id=plan_id or None,
+            bridge_summary=getattr(result, "bridge_summary", None),
+            compatibility_blocks=getattr(result, "compatibility_blocks", None),
+        )
+        if getattr(self, "execution_status_label", None) is not None:
+            self.execution_status_label.setText(
+                "Draft pipeline path reported failure; automatically falling back to legacy manifest path."
+            )
+        log_warn("execution_path_fallback", from_path="draft_pipeline", to_path="legacy_manifest")
+        self._start_legacy_manifest_worker(**fallback)
+
+    def _on_draft_pipeline_run_failed(self, err: str, fallback: dict):
+        log_error(
+            "draft_pipeline_live_entry_exception_fallback",
+            error=str(err)[:500],
+            snapshot_id=None,
+            run_id=None,
+            plan_id=None,
+        )
+        if getattr(self, "execution_status_label", None) is not None:
+            self.execution_status_label.setText(
+                "Draft pipeline path raised an exception; automatically falling back to legacy manifest path."
+            )
+        log_warn("execution_path_fallback", from_path="draft_pipeline", to_path="legacy_manifest")
+        self._start_legacy_manifest_worker(**fallback)
 
     def _on_run_transfer_manifest(self):
         path, _selected = QFileDialog.getOpenFileName(
@@ -26853,6 +29147,14 @@ class MainWindow(QMainWindow):
         return paths
 
     def _persist_planning_change(self, reason, *, notify_saved=False, source_projection_paths=None):
+        if self._restore_abort_active():
+            self._log_restore_phase(
+                "persist_planning_change_skipped",
+                reason=str(reason or ""),
+                stop_reason="restore_abort_mode",
+                restore_abort_reason=str(getattr(self, "_restore_abort_reason", "") or ""),
+            )
+            return
         self._invalidate_projection_lookup_caches(bump_generation=True)
         try:
             spaths = (

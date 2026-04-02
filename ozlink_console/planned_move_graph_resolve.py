@@ -9,6 +9,20 @@ from ozlink_console.graph import GraphClient
 from ozlink_console.logger import log_info, log_trace, log_warn
 
 
+def is_internal_proposed_destination_item_id(value: str) -> bool:
+    """
+    True for UI-only destination folder ids (not Microsoft Graph driveItem ids).
+
+    Planned moves and tree rows use ``PROP-*`` / ``INLINE-PROP-*`` placeholders; treating them as
+    real Graph ids skips path-based parent resolution and can send invalid parents to copy/mkdir.
+    """
+    s = str(value or "").strip()
+    if not s:
+        return False
+    u = s.upper()
+    return u.startswith("PROP-") or u.startswith("INLINE-PROP-")
+
+
 def _path_segments(path: str) -> list[str]:
     return [p for p in str(path or "").replace("\\", "/").strip("/").split("/") if p]
 
@@ -357,6 +371,11 @@ def enrich_single_planned_move(
     src_path = str(move.get("source_path") or src.get("display_path") or src.get("item_path") or "")
     dst_path = str(move.get("destination_path") or dst.get("display_path") or dst.get("item_path") or "")
 
+    raw_dest_id = str(dst.get("id") or move.get("destination_id") or "").strip()
+    if raw_dest_id and is_internal_proposed_destination_item_id(raw_dest_id):
+        dst.pop("id", None)
+        move.pop("destination_id", None)
+
     need_source = not str(src.get("id") or move.get("source_id") or "").strip()
     need_dest = not str(dst.get("id") or move.get("destination_id") or "").strip()
 
@@ -525,9 +544,12 @@ def enrich_proposed_folder_record(
     if not d_drive:
         log_warn("graph_resolve_proposed_skip", reason="missing_dest_drive_id", **plog)
         return False
-    if str(getattr(pf, "DestinationDriveId", "") or "").strip() and str(
-        getattr(pf, "DestinationParentItemId", "") or ""
-    ).strip():
+    dest_parent_cur = str(getattr(pf, "DestinationParentItemId", "") or "").strip()
+    if (
+        str(getattr(pf, "DestinationDriveId", "") or "").strip()
+        and dest_parent_cur
+        and not is_internal_proposed_destination_item_id(dest_parent_cur)
+    ):
         return False
 
     parent_path = str(getattr(pf, "ParentPath", "") or "").strip()

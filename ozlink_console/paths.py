@@ -82,6 +82,11 @@ def graph_cache_root() -> Path:
     return path
 
 
+def msal_token_cache_path() -> Path:
+    """MSAL delegated-token cache (refresh tokens). Stored under the app cache dir (user-local)."""
+    return cache_root() / "msal_token_cache.json"
+
+
 def normalize_manifest_path(path: str | None) -> str:
     """Normalize a stored path string the same way as ``MainWindow.normalize_memory_path``."""
     text = str(path or "").strip().replace("/", "\\")

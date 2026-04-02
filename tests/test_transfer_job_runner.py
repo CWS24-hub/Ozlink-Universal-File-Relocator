@@ -2,6 +2,8 @@ import json
 import unittest
 from pathlib import Path
 
+import requests
+
 from ozlink_console.transfer_job_runner import (
     is_absolute_local_path,
     load_manifest_json,
@@ -247,6 +249,124 @@ class TransferJobRunnerTests(unittest.TestCase):
         self.assertTrue(
             any("sign-in" in x.detail.lower() or "graph client" in x.detail.lower() for x in r.records)
         )
+
+    def test_graph_copy_ok_when_monitor_poll_401_but_destination_verified_by_path(self):
+        class _GraphMonitor401:
+            def start_drive_item_copy(self, **kwargs):
+                return "https://graph.microsoft.com/v1.0/monitor/fake"
+
+            def wait_graph_async_operation(self, monitor, timeout_sec=600.0):
+                r = requests.Response()
+                r.status_code = 401
+                err = requests.HTTPError("401 Client Error: Unauthorized", response=r)
+                raise err
+
+            def get_drive_item_by_path(self, drive_id, relative_path):
+                p = str(relative_path or "").replace("\\", "/")
+                if "GOPR0307.JPG" in p:
+                    return {"id": "dest-item-1", "name": "GOPR0307.JPG"}
+                return None
+
+        manifest = {
+            "manifest_version": 2,
+            "transfer_steps": [
+                {
+                    "index": 0,
+                    "operation": "copy",
+                    "is_source_folder": False,
+                    "source_name": "GOPR0307.JPG",
+                    "destination_name": "GOPR0307.JPG",
+                    "source_path": "",
+                    "destination_path": "Root/Personal/100GOPRO/GOPR0307.JPG",
+                    "source_drive_id": "src-drive",
+                    "source_item_id": "src-item",
+                    "destination_drive_id": "dst-drive",
+                    "destination_item_id": "parent-folder-id",
+                }
+            ],
+            "proposed_folder_steps": [],
+        }
+        r = run_manifest_local_filesystem(manifest, dry_run=False, graph_client=_GraphMonitor401())
+        tr = [x for x in r.records if x.phase == "transfer"][0]
+        self.assertEqual(tr.status, "ok")
+        self.assertIn("401", tr.detail)
+        self.assertIn("verified", tr.detail.lower())
+
+    def test_graph_copy_401_does_not_recover_when_destination_name_mismatches(self):
+        """REGRESSION: recovery requires resolved item name to match expected leaf (no false ok on wrong file)."""
+
+        class _Graph401WrongName:
+            def start_drive_item_copy(self, **kwargs):
+                return "https://graph.microsoft.com/v1.0/monitor/fake"
+
+            def wait_graph_async_operation(self, monitor, timeout_sec=600.0):
+                r = requests.Response()
+                r.status_code = 401
+                raise requests.HTTPError("401", response=r)
+
+            def get_drive_item_by_path(self, drive_id, relative_path):
+                if "GOPR0307.JPG" in str(relative_path).upper():
+                    return {"id": "x", "name": "OTHER.JPG"}
+                return None
+
+        manifest = {
+            "manifest_version": 2,
+            "transfer_steps": [
+                {
+                    "index": 0,
+                    "operation": "copy",
+                    "is_source_folder": False,
+                    "source_name": "GOPR0307.JPG",
+                    "destination_name": "GOPR0307.JPG",
+                    "source_path": "",
+                    "destination_path": "Root/Personal/100GOPRO/GOPR0307.JPG",
+                    "source_drive_id": "src-drive",
+                    "source_item_id": "src-item",
+                    "destination_drive_id": "dst-drive",
+                    "destination_item_id": "parent-folder-id",
+                }
+            ],
+            "proposed_folder_steps": [],
+        }
+        r = run_manifest_local_filesystem(manifest, dry_run=False, graph_client=_Graph401WrongName())
+        tr = [x for x in r.records if x.phase == "transfer"][0]
+        self.assertEqual(tr.status, "failed")
+
+    def test_graph_copy_still_fails_when_monitor_401_and_destination_missing(self):
+        class _GraphMonitor401NoDest:
+            def start_drive_item_copy(self, **kwargs):
+                return "https://graph.microsoft.com/v1.0/monitor/fake"
+
+            def wait_graph_async_operation(self, monitor, timeout_sec=600.0):
+                r = requests.Response()
+                r.status_code = 401
+                raise requests.HTTPError("401", response=r)
+
+            def get_drive_item_by_path(self, drive_id, relative_path):
+                return None
+
+        manifest = {
+            "manifest_version": 2,
+            "transfer_steps": [
+                {
+                    "index": 0,
+                    "operation": "copy",
+                    "is_source_folder": False,
+                    "source_name": "missing.txt",
+                    "destination_name": "missing.txt",
+                    "source_path": "",
+                    "destination_path": "Root/Personal/missing.txt",
+                    "source_drive_id": "src-drive",
+                    "source_item_id": "src-item",
+                    "destination_drive_id": "dst-drive",
+                    "destination_item_id": "parent-folder-id",
+                }
+            ],
+            "proposed_folder_steps": [],
+        }
+        r = run_manifest_local_filesystem(manifest, dry_run=False, graph_client=_GraphMonitor401NoDest())
+        tr = [x for x in r.records if x.phase == "transfer"][0]
+        self.assertEqual(tr.status, "failed")
 
     def test_pilot_max_graph_operations_caps_live_graph_steps(self):
         from unittest.mock import MagicMock
