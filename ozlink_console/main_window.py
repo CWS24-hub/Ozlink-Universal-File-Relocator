@@ -1063,6 +1063,7 @@ class MainWindow(QMainWindow):
         self._destination_restore_materialization_user_paused = False
         self._destination_preserved_children_by_worker = {}
         self._destination_real_tree_snapshot = []
+        self._destination_real_tree_snapshot_stale = True
         self._destination_full_tree_snapshot = []
         self._destination_full_tree_worker = None
         self._destination_full_tree_requested_drive_id = ""
@@ -6562,6 +6563,7 @@ class MainWindow(QMainWindow):
 
     def _reset_destination_full_tree_state(self):
         self._destination_full_tree_snapshot = []
+        self._mark_destination_real_tree_snapshot_stale()
         self._destination_full_tree_requested_drive_id = ""
         self._destination_full_tree_completed_drive_id = ""
         self._destination_full_tree_materialization_pending = False
@@ -6797,6 +6799,7 @@ class MainWindow(QMainWindow):
             self._retired_destination_full_tree_workers[self._active_destination_full_tree_worker_id] = self._destination_full_tree_worker
 
         self._destination_full_tree_snapshot = []
+        self._mark_destination_real_tree_snapshot_stale()
         self._destination_full_tree_requested_drive_id = drive_id
         self._destination_full_tree_completed_drive_id = ""
         self._destination_full_tree_sequence += 1
@@ -6833,6 +6836,7 @@ class MainWindow(QMainWindow):
 
         self._destination_full_tree_snapshot = snapshot_entries
         self._destination_full_tree_completed_drive_id = drive_id
+        self._mark_destination_real_tree_snapshot_stale()
         log_info("destination_full_tree_completed", drive_id=drive_id, total_count=len(snapshot_entries))
         if self._destination_expand_all_after_full_tree:
             self._destination_full_tree_materialization_pending = False
@@ -6865,6 +6869,7 @@ class MainWindow(QMainWindow):
             return
         self._destination_full_tree_snapshot = []
         self._destination_full_tree_completed_drive_id = ""
+        self._mark_destination_real_tree_snapshot_stale()
         self._destination_full_tree_materialization_pending = False
         self._destination_expand_all_after_full_tree = False
         self._expand_all_pending["destination"] = False
@@ -10458,6 +10463,7 @@ class MainWindow(QMainWindow):
     def _finalize_tree_snapshot_restore(self, panel_key, snapshots, status_message):
         if panel_key == "destination":
             self._destination_snapshot_chunked_restore_active = False
+            self._mark_destination_real_tree_snapshot_stale()
         tree, _status = self._get_tree_and_status(panel_key)
         if panel_key == "destination" and self._tree_snapshot_node_count_gt(snapshots, 1):
             self._destination_root_prime_pending = False
@@ -12608,6 +12614,7 @@ class MainWindow(QMainWindow):
                 self._set_tree_status_message(panel_key, "This library is empty.", loading=False)
                 model.set_empty_library_message("This library is empty.")
                 tree.setEnabled(False)
+                self._mark_destination_real_tree_snapshot_stale()
                 return
             sorted_items = sorted(items, key=lambda value: (not value.get("is_folder", False), value.get("name", "").lower()))
             payloads = []
@@ -12616,6 +12623,7 @@ class MainWindow(QMainWindow):
                 self._apply_tree_item_visual_state(None, pl)
                 payloads.append(pl)
             model.reset_root_payloads(payloads)
+            self._mark_destination_real_tree_snapshot_stale()
             self._set_tree_status_message(panel_key, f"{len(items)} root item(s) loaded.", loading=False)
         finally:
             tree.setUpdatesEnabled(True)
@@ -13315,7 +13323,7 @@ class MainWindow(QMainWindow):
             if not restored_runtime_snapshot:
                 self._start_source_restore_materialization()
         else:
-            self._refresh_destination_real_tree_snapshot()
+            self._refresh_destination_real_tree_snapshot(force=True)
             dest_tree = getattr(self, "destination_tree_widget", None)
             destination_top_level_count = self._planning_tree_top_level_count(dest_tree)
             root_row = None
@@ -15101,12 +15109,21 @@ class MainWindow(QMainWindow):
                 "children": [],
             })
 
-    def _refresh_destination_real_tree_snapshot(self):
+    def _mark_destination_real_tree_snapshot_stale(self) -> None:
+        """Real (non-overlay) destination rows changed; next overlay build must rescan the tree."""
+        self._destination_real_tree_snapshot_stale = True
+
+    def _refresh_destination_real_tree_snapshot(self, *, force: bool = False):
+        if not force and not getattr(self, "_destination_real_tree_snapshot_stale", True):
+            if is_dev_mode():
+                _perf_explorer_log("destination_real_tree_snapshot_refresh_skipped", reason="snapshot_still_fresh")
+            return
         current_drive_id = self._current_selected_destination_drive_id() or self.pending_root_drive_ids.get("destination", "")
         snapshot = []
         tree = getattr(self, "destination_tree_widget", None)
         if tree is None:
             self._destination_real_tree_snapshot = []
+            self._destination_real_tree_snapshot_stale = False
             return
         if self._destination_tree_uses_model_view():
             self._collect_real_destination_snapshot_entries_index(snapshot)
@@ -15120,6 +15137,7 @@ class MainWindow(QMainWindow):
         )
         if not full_snapshot_available:
             self._destination_real_tree_snapshot = snapshot
+            self._destination_real_tree_snapshot_stale = False
             return
 
         merged_by_path = {}
@@ -15135,6 +15153,7 @@ class MainWindow(QMainWindow):
         merged_snapshot = list(merged_by_path.values())
         merged_snapshot.sort(key=lambda value: ([segment.lower() for segment in self._path_segments(value.get("semantic_path", ""))],))
         self._destination_real_tree_snapshot = merged_snapshot
+        self._destination_real_tree_snapshot_stale = False
 
     def _ensure_visible_destination_root_children_in_model(self, model_nodes):
         if self._destination_tree_uses_model_view():
@@ -16185,7 +16204,7 @@ class MainWindow(QMainWindow):
         return snap_sig, prop_sig, moves_sig, full_fp
 
     def _current_destination_full_overlay_fingerprint(self) -> str:
-        self._refresh_destination_real_tree_snapshot()
+        self._refresh_destination_real_tree_snapshot(force=True)
         return self._destination_overlay_fingerprint_context(False)[3]
 
     def _store_destination_future_model_overlay_cache(
@@ -21969,6 +21988,7 @@ class MainWindow(QMainWindow):
                         p["load_failed"] = False
 
                     model.update_payload_for_index(parent_index, _mut_partial)
+                self._mark_destination_real_tree_snapshot_stale()
                 node_data = dict(parent_index.data(Qt.UserRole) or {})
                 trigger_path = node_data.get("item_path") or node_data.get("display_path") or ""
                 current_child_paths = self._capture_child_path_set_for_destination_model_index(parent_index)
@@ -22165,6 +22185,7 @@ class MainWindow(QMainWindow):
                     )
 
             if panel_key == "destination":
+                self._mark_destination_real_tree_snapshot_stale()
                 semantic_path = self._destination_semantic_path(node_data)
                 if semantic_path == "Root":
                     self._destination_root_prime_pending = False
