@@ -14603,14 +14603,8 @@ class MainWindow(QMainWindow):
             return 0
         source_root_path = self._canonical_source_projection_path(self._tree_item_path(source_root_data))
         descendants = self._collect_source_descendants_for_projection(source_root_data, move)
-        descendants = sorted(
-            descendants,
-            key=lambda data: (
-                len(self._path_segments(self._canonical_source_projection_path(self._tree_item_path(data)))),
-                0 if bool(data.get("is_folder", False)) else 1,
-                str(data.get("name", "")).lower(),
-            ),
-        )
+        descendants = self._sort_descendants_for_allocation_apply(descendants)
+        child_map_cache = {}
         added_count = 0
         for desc_index, descendant_data in enumerate(descendants):
             if desc_index > 0 and desc_index % 50 == 0:
@@ -14639,12 +14633,16 @@ class MainWindow(QMainWindow):
                     continue
             current_parent_ix = parent_ix
             current_parent_data = parent_data
+            visibility_refresh_parents = []
+            seen_vis = set()
             for index, segment in enumerate(relative_segments):
                 branch_path = self._canonical_destination_projection_path(
                     "\\".join([allocation_destination_path] + relative_segments[: index + 1])
                 )
                 is_leaf = index == len(relative_segments) - 1
-                existing_child = self._find_destination_child_by_path(current_parent_ix, branch_path)
+                existing_child = self._find_destination_child_by_path_index_cached(
+                    current_parent_ix, branch_path, child_map_cache
+                )
                 if existing_child is None:
                     self._remove_placeholder_children(current_parent_ix)
                     new_pl = self._build_projected_allocation_descendant_payload(
@@ -14655,11 +14653,17 @@ class MainWindow(QMainWindow):
                     model.append_child_payloads(current_parent_ix, [new_pl])
                     new_row = model.rowCount(current_parent_ix) - 1
                     existing_child = model.index(new_row, 0, current_parent_ix)
-                    self._refresh_destination_item_visibility_index(current_parent_ix, expand=True)
+                    pk = self._destination_child_map_cache_key_index(current_parent_ix)
+                    self._destination_apply_invalidate_child_map_cache_key(child_map_cache, pk)
+                    if pk not in seen_vis:
+                        seen_vis.add(pk)
+                        visibility_refresh_parents.append(current_parent_ix)
                     if is_leaf:
                         added_count += 1
                 current_parent_ix = existing_child
                 current_parent_data = current_parent_ix.data(Qt.UserRole) or {}
+            for rp in visibility_refresh_parents:
+                self._refresh_destination_item_visibility_index(rp, expand=True)
         return added_count
 
     def _allocation_projection_relative_source_segments(self, source_root_path, descendant_source_path):
@@ -14739,14 +14743,8 @@ class MainWindow(QMainWindow):
 
         source_root_path = self._canonical_source_projection_path(self._tree_item_path(source_root_data))
         descendants = self._collect_source_descendants_for_projection(source_root_data, move)
-        descendants = sorted(
-            descendants,
-            key=lambda data: (
-                len(self._path_segments(self._canonical_source_projection_path(self._tree_item_path(data)))),
-                0 if bool(data.get("is_folder", False)) else 1,
-                str(data.get("name", "")).lower(),
-            ),
-        )
+        descendants = self._sort_descendants_for_allocation_apply(descendants)
+        child_map_cache = {}
 
         added_count = 0
         for desc_index, descendant_data in enumerate(descendants):
@@ -14781,12 +14779,16 @@ class MainWindow(QMainWindow):
 
             current_parent_item = parent_item
             current_parent_data = parent_data
+            visibility_refresh_parents = []
+            seen_vis = set()
             for index, segment in enumerate(relative_segments):
                 branch_path = self._canonical_destination_projection_path(
                     "\\".join([allocation_destination_path] + relative_segments[: index + 1])
                 )
                 is_leaf = index == len(relative_segments) - 1
-                existing_child = self._find_destination_child_by_path(current_parent_item, branch_path)
+                existing_child = self._find_destination_child_by_path_widget_cached(
+                    current_parent_item, branch_path, child_map_cache
+                )
                 if existing_child is None:
                     self._remove_placeholder_children(current_parent_item)
                     new_child = self._build_projected_allocation_descendant_item(
@@ -14795,13 +14797,19 @@ class MainWindow(QMainWindow):
                         current_parent_data,
                     )
                     current_parent_item.addChild(new_child)
-                    self._refresh_destination_item_visibility(current_parent_item, expand=True)
                     existing_child = new_child
+                    pk = self._destination_child_map_cache_key_widget(current_parent_item)
+                    self._destination_apply_invalidate_child_map_cache_key(child_map_cache, pk)
+                    if pk not in seen_vis:
+                        seen_vis.add(pk)
+                        visibility_refresh_parents.append(current_parent_item)
                     if is_leaf:
                         added_count += 1
 
                 current_parent_item = existing_child
                 current_parent_data = current_parent_item.data(0, Qt.UserRole) or {}
+            for rp in visibility_refresh_parents:
+                self._refresh_destination_item_visibility(rp, expand=True)
 
         if len(descendants) > 0 and added_count == 0:
             sample = []
@@ -18854,6 +18862,75 @@ class MainWindow(QMainWindow):
             if sem:
                 out[sem] = child
         return out
+
+    def _sort_descendants_for_allocation_apply(self, descendants):
+        """Depth-first apply order; compute canonical paths once per descendant row."""
+        decorated = []
+        for data in descendants:
+            dsp = self._canonical_source_projection_path(self._tree_item_path(data))
+            key = (
+                len(self._path_segments(dsp)),
+                0 if bool(data.get("is_folder", False)) else 1,
+                str(data.get("name", "")).lower(),
+            )
+            decorated.append((key, data))
+        decorated.sort(key=lambda t: t[0])
+        return [d for _, d in decorated]
+
+    def _destination_child_map_cache_key_index(self, parent_ix: QModelIndex) -> int:
+        if not parent_ix.isValid():
+            return -1
+        ptr = parent_ix.internalPointer()
+        return id(ptr) if ptr is not None else -2
+
+    def _destination_child_map_cache_key_widget(self, parent_item) -> int:
+        return id(parent_item) if parent_item is not None else -1
+
+    def _destination_apply_invalidate_child_map_cache_key(self, cache: dict, cache_key: int) -> None:
+        cache.pop(cache_key, None)
+
+    def _find_destination_child_by_path_index_cached(self, parent_ix: QModelIndex, destination_path: str, cache: dict):
+        dm = getattr(self, "destination_planning_model", None)
+        normalized_target = self._canonical_destination_projection_path(destination_path) or self.normalize_memory_path(
+            destination_path
+        )
+        ck = self._destination_child_map_cache_key_index(parent_ix)
+        sub = cache.get(ck)
+        if sub is None:
+            sub = self._destination_children_semantic_map_index(parent_ix)
+            cache[ck] = sub
+        hit = sub.get(normalized_target) if normalized_target else None
+        if hit is not None:
+            try:
+                if hit.isValid() and dm is not None and hit.model() is dm:
+                    return hit
+            except RuntimeError:
+                pass
+        found = self._find_destination_child_by_path(parent_ix, destination_path)
+        if found is not None and normalized_target and isinstance(cache.get(ck), dict):
+            cache[ck][normalized_target] = found
+        return found
+
+    def _find_destination_child_by_path_widget_cached(self, parent_item, destination_path: str, cache: dict):
+        normalized_target = self._canonical_destination_projection_path(destination_path) or self.normalize_memory_path(
+            destination_path
+        )
+        ck = self._destination_child_map_cache_key_widget(parent_item)
+        sub = cache.get(ck)
+        if sub is None:
+            sub = self._destination_children_semantic_map_widget(parent_item)
+            cache[ck] = sub
+        hit = sub.get(normalized_target) if normalized_target else None
+        if hit is not None:
+            try:
+                if hit.parent() == parent_item:
+                    return hit
+            except RuntimeError:
+                pass
+        found = self._find_destination_child_by_path(parent_item, destination_path)
+        if found is not None and normalized_target and isinstance(cache.get(ck), dict):
+            cache[ck][normalized_target] = found
+        return found
 
     def _find_destination_child_by_path(self, parent_item, destination_path):
         if parent_item is None:
