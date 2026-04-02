@@ -14874,6 +14874,42 @@ class MainWindow(QMainWindow):
                 return True
         return False
 
+    def _destination_model_build_allocation_apply_pairs(self, dmodel, pm_lookup):
+        """Planned allocation folder rows with resolved moves: path-index first, then one tree walk for misses."""
+        pairs = []
+        seen = set()
+        alloc_by_path = pm_lookup.get("alloc_by_path") or {}
+        for ap, move in alloc_by_path.items():
+            if not ap:
+                continue
+            for ix in dmodel.find_indices_for_canonical_destination_path(ap):
+                if not ix.isValid():
+                    continue
+                nd = ix.data(Qt.UserRole) or {}
+                if not self.node_is_planned_allocation(nd) or not bool(nd.get("is_folder", False)):
+                    continue
+                ptr = ix.internalPointer()
+                sid = id(ptr) if ptr is not None else None
+                if sid is None or sid in seen:
+                    continue
+                seen.add(sid)
+                pairs.append((ix, move))
+        for ix in dmodel.iter_depth_first():
+            ptr = ix.internalPointer()
+            sid = id(ptr) if ptr is not None else None
+            if sid is not None and sid in seen:
+                continue
+            nd = ix.data(Qt.UserRole) or {}
+            if not self.node_is_planned_allocation(nd) or not bool(nd.get("is_folder", False)):
+                continue
+            move = self._find_planned_move_for_destination_node_indexed(nd, pm_lookup)
+            if move is None:
+                continue
+            if sid is not None:
+                seen.add(sid)
+            pairs.append((ix, move))
+        return pairs
+
     def _apply_visible_destination_allocation_descendants(self, *, destination_expanded_paths=None):
         tree = getattr(self, "destination_tree_widget", None)
         if tree is None:
@@ -14891,7 +14927,7 @@ class MainWindow(QMainWindow):
             allocation_pass = 0
             visited = 0
             pm_lookup = self._build_planned_move_destination_lookup()
-            for ix in dmodel.iter_depth_first():
+            for ix, move in self._destination_model_build_allocation_apply_pairs(dmodel, pm_lookup):
                 visited += 1
                 if visited % 40 == 0:
                     QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
@@ -14899,9 +14935,6 @@ class MainWindow(QMainWindow):
                 if not self.node_is_planned_allocation(node_data):
                     continue
                 if not bool(node_data.get("is_folder", False)):
-                    continue
-                move = self._find_planned_move_for_destination_node_indexed(node_data, pm_lookup)
-                if move is None:
                     continue
                 allocation_pass += 1
                 if dmodel.rowCount(ix) > 0 and self._destination_allocation_folder_shows_materialized_children_index(ix):
@@ -14939,6 +14972,7 @@ class MainWindow(QMainWindow):
         allocation_pass = 0
         visited = 0
         pm_lookup = self._build_planned_move_destination_lookup()
+        alloc_by_path = pm_lookup.get("alloc_by_path") or {}
         for index in range(tree.topLevelItemCount()):
             for item in self._iter_tree_items(tree.topLevelItem(index)):
                 visited += 1
@@ -14949,7 +14983,15 @@ class MainWindow(QMainWindow):
                     continue
                 if not bool(node_data.get("is_folder", False)):
                     continue
-                move = self._find_planned_move_for_destination_node_indexed(node_data, pm_lookup)
+                dest_key = self._canonical_destination_projection_path(
+                    node_data.get("destination_path", "")
+                    or node_data.get("item_path", "")
+                    or node_data.get("display_path", "")
+                    or self._tree_item_path(node_data)
+                )
+                move = alloc_by_path.get(dest_key) if dest_key else None
+                if move is None:
+                    move = self._find_planned_move_for_destination_node_indexed(node_data, pm_lookup)
                 if move is None:
                     continue
                 allocation_pass += 1
@@ -16964,6 +17006,37 @@ class MainWindow(QMainWindow):
         """ QModelIndex / QTreeWidgetItem rows to append per collect_flat timer slice. """
         return 240
 
+    def _destination_chunked_bind_maybe_record_allocation_pair(self, st, item, node_data, *, is_model_index: bool):
+        """During collect_flat, attach (item, move) for planned allocation folders (deduped by item identity)."""
+        pm = st.get("pm_lookup")
+        if pm is None or node_data is None:
+            return
+        if not self.node_is_planned_allocation(node_data) or not bool(node_data.get("is_folder", False)):
+            return
+        dest = self._canonical_destination_projection_path(
+            node_data.get("destination_path", "")
+            or node_data.get("item_path", "")
+            or node_data.get("display_path", "")
+            or self._tree_item_path(node_data)
+        )
+        move = (pm.get("alloc_by_path") or {}).get(dest) if dest else None
+        if move is None:
+            move = self._find_planned_move_for_destination_node_indexed(node_data, pm)
+        if move is None:
+            return
+        if is_model_index:
+            ptr = item.internalPointer() if isinstance(item, QModelIndex) and item.isValid() else None
+            sid = id(ptr) if ptr is not None else None
+        else:
+            sid = id(item)
+        if sid is None:
+            return
+        seen = st.setdefault("allocation_pair_seen", set())
+        if sid in seen:
+            return
+        seen.add(sid)
+        st.setdefault("allocation_pairs", []).append((item, move))
+
     def _destination_chunked_bind_collect_model_indices_slice(self, st, dm, budget: int) -> bool:
         """Depth-first pre-order walk matching ``DestinationPlanningTreeModel.iter_depth_first``; returns True if more remain."""
         flat_items = st.setdefault("flat_items", [])
@@ -16980,6 +17053,11 @@ class MainWindow(QMainWindow):
             ix = dm.index(r, 0, parent)
             stack[-1] = (parent, r + 1)
             flat_items.append(ix)
+            try:
+                nd = ix.data(Qt.UserRole) or {}
+            except Exception:
+                nd = {}
+            self._destination_chunked_bind_maybe_record_allocation_pair(st, ix, nd, is_model_index=True)
             budget -= 1
             if dm.rowCount(ix) > 0:
                 stack.append((ix, 0))
@@ -17003,6 +17081,11 @@ class MainWindow(QMainWindow):
                 it = tree.topLevelItem(i)
                 stack[-1] = ("top", i + 1)
                 flat_items.append(it)
+                try:
+                    wnd = it.data(0, Qt.UserRole) or {}
+                except Exception:
+                    wnd = {}
+                self._destination_chunked_bind_maybe_record_allocation_pair(st, it, wnd, is_model_index=False)
                 budget -= 1
                 try:
                     cc = it.childCount() if it is not None else 0
@@ -17027,6 +17110,11 @@ class MainWindow(QMainWindow):
                     continue
                 stack[-1] = (item, j + 1)
                 flat_items.append(ch)
+                try:
+                    wnd = ch.data(0, Qt.UserRole) or {}
+                except Exception:
+                    wnd = {}
+                self._destination_chunked_bind_maybe_record_allocation_pair(st, ch, wnd, is_model_index=False)
                 budget -= 1
                 try:
                     ccc = ch.childCount() if ch is not None else 0
@@ -17364,6 +17452,9 @@ class MainWindow(QMainWindow):
                 st["normalized_targets"] = normalized_targets
                 st["destination_projection_eager_all"] = self._destination_projection_eager_expand_all_destination()
                 st["allocation_descendants_deferred"] = 0
+                st["pm_lookup"] = self._build_planned_move_destination_lookup()
+                st["allocation_pairs"] = []
+                st["allocation_pair_seen"] = set()
                 st["phase"] = "collect_flat"
                 self._set_tree_status_message("destination", "Merging destination structure…", loading=True)
             except Exception as exc:
@@ -17415,17 +17506,33 @@ class MainWindow(QMainWindow):
 
         if phase == "allocation":
             budget = 72
-            flat_items = st.get("flat_items") or []
             pm_lookup = st.get("pm_lookup")
             if pm_lookup is None:
                 pm_lookup = self._build_planned_move_destination_lookup()
                 st["pm_lookup"] = pm_lookup
+            pairs = st.get("allocation_pairs") if isinstance(st.get("allocation_pairs"), list) else []
+            alloc_by_path = pm_lookup.get("alloc_by_path") or {}
+            may_need_allocation_scan = bool(alloc_by_path) or bool(getattr(self, "planned_moves", None) or [])
+            if pairs:
+                workload = pairs
+                use_pairs = True
+            elif may_need_allocation_scan:
+                workload = st.get("flat_items") or []
+                use_pairs = False
+            else:
+                workload = []
+                use_pairs = False
             i = int(st.get("alloc_i", 0) or 0)
-            end = min(i + budget, len(flat_items))
+            end = min(i + budget, len(workload))
             try:
                 while i < end:
-                    item = flat_items[i]
+                    entry = workload[i]
                     i += 1
+                    if use_pairs:
+                        item, move = entry
+                    else:
+                        item = entry
+                        move = None
                     if isinstance(item, (QModelIndex, QPersistentModelIndex)):
                         if not item.isValid():
                             continue
@@ -17445,7 +17552,8 @@ class MainWindow(QMainWindow):
                         continue
                     if not bool(node_data.get("is_folder", False)):
                         continue
-                    move = self._find_planned_move_for_destination_node_indexed(node_data, pm_lookup)
+                    if move is None:
+                        move = self._find_planned_move_for_destination_node_indexed(node_data, pm_lookup)
                     if move is None:
                         continue
                     st["allocation_pass"] = int(st.get("allocation_pass", 0) or 0) + 1
@@ -17497,7 +17605,7 @@ class MainWindow(QMainWindow):
                 _fail(exc, phase_name="chunked_destination_bind.allocation")
                 return
             st["alloc_i"] = i
-            if i < len(flat_items):
+            if i < len(workload):
                 QTimer.singleShot(0, self._run_destination_chunked_bind_tick)
                 return
             if int(st.get("descendant_applied", 0) or 0) and tree is not None:
