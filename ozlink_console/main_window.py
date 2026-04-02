@@ -320,13 +320,14 @@ class DestinationPlanningTreeWidget(QTreeWidget):
         vp = self.viewport()
         drop_pos = vp.mapFromGlobal(event.globalPosition().toPoint())
         target_item = self.itemAt(drop_pos)
-        log_info(
-            "debug_pass_destination_drop",
-            tree="QTreeWidget",
-            has_source=source_item is not None,
-            has_target=target_item is not None,
-            drop_pos=(drop_pos.x(), drop_pos.y()),
-        )
+        if is_dev_mode():
+            log_info(
+                "debug_pass_destination_drop",
+                tree="QTreeWidget",
+                has_source=source_item is not None,
+                has_target=target_item is not None,
+                drop_pos=(drop_pos.x(), drop_pos.y()),
+            )
         if source_item is None or target_item is None or source_item is target_item:
             event.ignore()
             return
@@ -357,13 +358,14 @@ class DestinationPlanningTreeView(QTreeView):
         vp = self.viewport()
         drop_pos = vp.mapFromGlobal(event.globalPosition().toPoint())
         target_ix = self.indexAt(drop_pos)
-        log_info(
-            "debug_pass_destination_drop",
-            tree="QTreeView",
-            has_source=source_ix is not None and source_ix.isValid(),
-            has_target=target_ix.isValid(),
-            drop_pos=(drop_pos.x(), drop_pos.y()),
-        )
+        if is_dev_mode():
+            log_info(
+                "debug_pass_destination_drop",
+                tree="QTreeView",
+                has_source=source_ix is not None and source_ix.isValid(),
+                has_target=target_ix.isValid(),
+                drop_pos=(drop_pos.x(), drop_pos.y()),
+            )
         if (
             source_ix is None
             or not source_ix.isValid()
@@ -22996,9 +22998,9 @@ class MainWindow(QMainWindow):
             rename_planned_action.setEnabled(is_planned_allocation or is_projected_descendant)
             rename_planned_action.triggered.connect(lambda: self.handle_rename_planned_item(node_data))
 
-            remove_planned_action = menu.addAction("Remove Planned Allocation")
-            remove_planned_action.setEnabled(is_planned_allocation)
-            remove_planned_action.triggered.connect(lambda: self.handle_remove_planned_allocation(node_data))
+            unassign_destination_action = menu.addAction("Unassign")
+            unassign_destination_action.setEnabled(is_planned_allocation)
+            unassign_destination_action.triggered.connect(lambda: self.handle_remove_planned_allocation(node_data))
 
             menu.addSeparator()
 
@@ -23564,13 +23566,14 @@ class MainWindow(QMainWindow):
     def handle_destination_draft_move(self, source_item, target_item):
         source_node = self.get_tree_item_node_data(source_item)
         target_node = self.get_tree_item_node_data(target_item)
-        log_info(
-            "debug_pass_destination_draft_move",
-            has_source=bool(source_node),
-            has_target=bool(target_node),
-            source_path_excerpt=str((source_node or {}).get("display_path", "") or "")[:160],
-            target_path_excerpt=str((target_node or {}).get("display_path", "") or "")[:160],
-        )
+        if is_dev_mode():
+            log_info(
+                "debug_pass_destination_draft_move",
+                has_source=bool(source_node),
+                has_target=bool(target_node),
+                source_path_excerpt=str((source_node or {}).get("display_path", "") or "")[:160],
+                target_path_excerpt=str((target_node or {}).get("display_path", "") or "")[:160],
+            )
         if not source_node or not target_node:
             return
         if not target_node.get("is_folder"):
@@ -23693,10 +23696,11 @@ class MainWindow(QMainWindow):
         if payload is None:
             self.destination_tree_status.setText("This destination item cannot be moved.")
             return
-        log_info(
-            "debug_pass_cut_destination",
-            path_excerpt=str(payload.get("path") or payload.get("display_path") or "")[:200],
-        )
+        if is_dev_mode():
+            log_info(
+                "debug_pass_cut_destination",
+                path_excerpt=str(payload.get("path") or payload.get("display_path") or "")[:200],
+            )
         self._destination_cut_buffer = payload
         self.destination_tree_status.setText(f"Cut '{payload.get('label', 'item')}'. Use Paste Here on the target folder.")
 
@@ -23705,7 +23709,8 @@ class MainWindow(QMainWindow):
         if not payload:
             self.destination_tree_status.setText("Nothing is waiting to be pasted.")
             return
-        log_info("debug_pass_paste_destination", phase="start")
+        if is_dev_mode():
+            log_info("debug_pass_paste_destination", phase="start")
         target_path = target_node.get("display_path") or target_node.get("item_path") or ""
         target_item = self._destination_tree_index_if_current_matches_path(target_path)
         if target_item is None:
@@ -23985,28 +23990,29 @@ class MainWindow(QMainWindow):
         self._persist_planning_change("planned_item_renamed")
 
     def handle_remove_planned_allocation(self, node_data):
-        log_info(
-            "debug_pass_remove_planned_allocation",
-            node_id_excerpt=str((node_data or {}).get("id", "") or "")[:120],
-            path_excerpt=str(
-                (node_data or {}).get("display_path")
-                or (node_data or {}).get("item_path")
-                or ""
-            )[:200],
-        )
+        if is_dev_mode():
+            log_info(
+                "debug_pass_remove_planned_allocation",
+                node_id_excerpt=str((node_data or {}).get("id", "") or "")[:120],
+                path_excerpt=str(
+                    (node_data or {}).get("display_path")
+                    or (node_data or {}).get("item_path")
+                    or ""
+                )[:200],
+            )
         move_index = self.find_planned_move_index_by_destination(node_data)
         if move_index is None:
             QMessageBox.information(
                 self,
-                "Remove Planned Allocation",
-                "No planned allocation exists for the selected destination item.",
+                "Unassign",
+                "No planned move exists for the selected destination item.",
             )
             return
 
         move = self.planned_moves[move_index]
         if self._is_move_submitted(move):
             self._show_submitted_item_locked_message(
-                "Remove Planned Allocation",
+                "Unassign",
                 f"'{move.get('source_name', 'This item')}'",
                 self._submitted_batch_id_for_move(move),
             )
@@ -24016,7 +24022,7 @@ class MainWindow(QMainWindow):
         self.planned_moves.pop(move_index)
         self._reset_unresolved_allocation_queue()
         self.refresh_planned_moves_table()
-        self.planned_moves_status.setText("Planned allocation removed.")
+        self.planned_moves_status.setText("Planned move removed.")
         if not removed_visually:
             self._schedule_deferred_destination_materialization("remove_allocation_tree_reconcile", delay_ms=220)
         self._persist_planning_change(
@@ -30164,11 +30170,12 @@ class MainWindow(QMainWindow):
         else:
             new_move["allocation_method"] = "Manual"
         self.planned_moves.append(new_move)
-        log_info(
-            "debug_pass_assign",
-            source_path_excerpt=str(source_node.get("display_path", "") or "")[:200],
-            dest_path_excerpt=str(destination_node.get("display_path", "") or "")[:200],
-        )
+        if is_dev_mode():
+            log_info(
+                "debug_pass_assign",
+                source_path_excerpt=str(source_node.get("display_path", "") or "")[:200],
+                dest_path_excerpt=str(destination_node.get("display_path", "") or "")[:200],
+            )
         self.refresh_planned_moves_table()
         self.planned_moves_status.setText("Planned move added.")
         self._defer_destination_projection_if_quick_apply_failed(
@@ -30190,11 +30197,12 @@ class MainWindow(QMainWindow):
             move_index = self.find_planned_move_index_by_source(source_node)
             if move_index is not None:
                 existing_move = self.planned_moves[move_index]
-                log_info(
-                    "debug_pass_unassign",
-                    via="source_tree",
-                    source_path_excerpt=str(source_node.get("display_path", "") or "")[:200],
-                )
+                if is_dev_mode():
+                    log_info(
+                        "debug_pass_unassign",
+                        via="source_tree",
+                        source_path_excerpt=str(source_node.get("display_path", "") or "")[:200],
+                    )
                 if self._is_move_submitted(existing_move):
                     self._show_submitted_item_locked_message(
                         "Unassign",
@@ -30220,7 +30228,8 @@ class MainWindow(QMainWindow):
             row_index = selected_ranges[0].topRow()
             if 0 <= row_index < len(self.planned_moves):
                 target_move = self.planned_moves[row_index]
-                log_info("debug_pass_unassign", via="planned_moves_table", row_index=row_index)
+                if is_dev_mode():
+                    log_info("debug_pass_unassign", via="planned_moves_table", row_index=row_index)
                 if self._is_move_submitted(target_move):
                     self._show_submitted_item_locked_message(
                         "Unassign",
