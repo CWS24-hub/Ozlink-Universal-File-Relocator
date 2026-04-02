@@ -380,6 +380,11 @@ class DestinationPlanningTreeView(QTreeView):
         self._dragged_index = None
 
 
+# Planning tree toolbar: expand/collapse-all glyphs (must match _set_expand_all_button_label).
+_EXPAND_ALL_TREE_GLYPH_EXPAND = "⤢"
+_EXPAND_ALL_TREE_GLYPH_COLLAPSE = "⤡"
+
+
 class FullCountWorker(QThread):
     success = Signal(dict)
     error = Signal(dict)
@@ -1457,114 +1462,114 @@ class MainWindow(QMainWindow):
     def _apply_theme(self):
         self.setStyleSheet("""
             QWidget#Root {
-                background-color: #0B0D10;
-                color: #E8EAED;
+                background-color: #09090B;
+                color: #ECEEF2;
             }
 
             QWidget {
                 background-color: transparent;
-                color: #E8EAED;
+                color: #ECEEF2;
                 font-family: "Segoe UI", "Segoe UI Variable", sans-serif;
                 font-size: 10pt;
             }
 
             QFrame#TopBar {
-                background-color: #0F1218;
-                border-bottom: 1px solid rgba(255, 255, 255, 0.055);
+                background-color: #0C0C0F;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.05);
             }
 
             QFrame#LeftNav {
-                background-color: #10141C;
-                border-right: 1px solid rgba(255, 255, 255, 0.045);
+                background-color: #0E0E12;
+                border-right: 1px solid rgba(255, 255, 255, 0.04);
             }
 
             QFrame#ContentArea {
-                background-color: #0B0D10;
+                background-color: #09090B;
             }
 
             QFrame#BottomStatusBar {
-                background-color: #0F1218;
-                border-top: 1px solid rgba(255, 255, 255, 0.055);
+                background-color: #0C0C0F;
+                border-top: 1px solid rgba(255, 255, 255, 0.05);
             }
 
             QFrame#PageCard {
-                background-color: #12151C;
+                background-color: #121218;
                 border: none;
             }
 
             QFrame#InfoBanner {
-                background-color: #052E1A;
+                background-color: #052A1C;
                 border: none;
             }
 
             QFrame#SectionBox {
-                background-color: #151922;
+                background-color: #14141A;
                 border: none;
                 border-radius: 12px;
             }
 
             QFrame#HeroCard {
-                background-color: #1A1F2A;
+                background-color: #18181F;
                 border: none;
                 border-radius: 12px;
             }
 
             QFrame#InsightCard {
-                background-color: #161B24;
+                background-color: #14141A;
                 border: none;
                 border-radius: 12px;
             }
 
             QFrame#TopMetaCard {
-                background-color: #1C2230;
+                background-color: #1A1A22;
                 border: none;
                 border-radius: 12px;
             }
 
             QFrame#MetricCard {
-                background-color: #181E28;
+                background-color: #16161E;
                 border: none;
                 border-radius: 12px;
             }
 
             QFrame#SoftBanner {
-                background-color: #1E2430;
+                background-color: #1C1C26;
                 border: none;
                 border-radius: 12px;
             }
 
             QFrame#TreeSurface {
-                background-color: #0E1118;
+                background-color: #0A0A10;
                 border: none;
                 border-radius: 10px;
             }
 
             QFrame#TabSurface {
-                background-color: #161B24;
+                background-color: #14141A;
                 border: none;
                 border-radius: 10px;
             }
 
             QFrame#StatRibbon {
-                background-color: #181E28;
+                background-color: #16161E;
                 border: none;
                 border-radius: 12px;
             }
 
             QFrame#PlanningContextBar {
-                background-color: #1A1F2A;
+                background-color: #18181F;
                 border: none;
                 border-radius: 12px;
             }
 
             QFrame#SurfaceCard {
-                background-color: #161B24;
+                background-color: #14141A;
                 border: none;
                 border-radius: 12px;
             }
 
             QFrame#BadgeChip {
-                background-color: #141A24;
+                background-color: #12121A;
                 border: none;
                 border-radius: 10px;
             }
@@ -1578,8 +1583,13 @@ class MainWindow(QMainWindow):
 
             QLabel#AppSubtitle {
                 font-size: 9.5pt;
-                color: #5ECAD0;
+                color: #38BDF8;
                 font-weight: 600;
+            }
+
+            QLabel#AuditEmptyGlyph {
+                color: #64748B;
+                font-size: 42pt;
             }
 
             QLabel#NavHeader {
@@ -1610,12 +1620,6 @@ class MainWindow(QMainWindow):
             QLabel#CardBody {
                 font-size: 11pt;
                 color: #A8B4C8;
-            }
-
-            QLabel#PlanningFlowHint {
-                font-size: 10pt;
-                color: #7DD3E8;
-                font-weight: 500;
             }
 
             QLabel#HeaderEyebrow {
@@ -1724,20 +1728,20 @@ class MainWindow(QMainWindow):
                 height: 18px;
                 border-radius: 4px;
                 border: 1px solid #3D4A5C;
-                background-color: #121722;
+                background-color: #12121A;
             }
 
             QCheckBox::indicator:hover {
-                border: 1px solid #2DD4BF;
+                border: 1px solid #22D3EE;
             }
 
             QCheckBox::indicator:checked {
-                background-color: #0D9488;
-                border: 1px solid #2DD4BF;
+                background-color: #0891B2;
+                border: 1px solid #38BDF8;
             }
 
             QPushButton {
-                background-color: #161B24;
+                background-color: #16161E;
                 border: none;
                 color: #E8EDF7;
                 padding: 8px 14px;
@@ -1746,27 +1750,33 @@ class MainWindow(QMainWindow):
             }
 
             QPushButton:hover {
-                background-color: #1E2530;
+                background-color: #1E1E28;
             }
 
             QPushButton:pressed {
-                background-color: #222A36;
+                background-color: #252530;
             }
 
             QPushButton#PrimaryButton {
-                background-color: #0D9488;
+                background-color: #0891B2;
                 border: none;
-                color: #F0FDFA;
+                color: #F8FAFC;
                 font-weight: 700;
                 min-height: 30px;
             }
 
             QPushButton#PrimaryButton:hover {
-                background-color: #14B8A6;
+                background-color: #22D3EE;
+                color: #0C1220;
+            }
+
+            QPushButton#PrimaryButton:pressed {
+                background-color: #0E7490;
+                color: #F8FAFC;
             }
 
             QPushButton#SecondaryButton {
-                background-color: #161B24;
+                background-color: #16161E;
                 border: none;
                 color: #E8EDF7;
                 padding: 8px 14px;
@@ -1776,7 +1786,7 @@ class MainWindow(QMainWindow):
             }
 
             QPushButton#SecondaryButton:hover {
-                background-color: #1E2530;
+                background-color: #1E1E28;
             }
 
             QPushButton#TertiaryButton {
@@ -1790,12 +1800,12 @@ class MainWindow(QMainWindow):
             }
 
             QPushButton#TertiaryButton:hover {
-                background-color: #161B24;
+                background-color: #16161E;
                 color: #E8EDF7;
             }
 
             QToolButton#OverflowMenuButton {
-                background-color: #161B24;
+                background-color: #16161E;
                 border: none;
                 color: #C5D0E0;
                 border-radius: 8px;
@@ -1809,14 +1819,14 @@ class MainWindow(QMainWindow):
             }
 
             QToolButton#OverflowMenuButton:hover {
-                background-color: #1E2530;
-                color: #5EEAD4;
+                background-color: #1E1E28;
+                color: #38BDF8;
             }
 
             QPushButton#IconToolButton {
                 background-color: transparent;
                 border: none;
-                color: #9CA8BC;
+                color: #94A3B8;
                 min-width: 36px;
                 max-width: 36px;
                 min-height: 36px;
@@ -1828,8 +1838,13 @@ class MainWindow(QMainWindow):
             }
 
             QPushButton#IconToolButton:hover {
-                background-color: #161B24;
-                color: #5EEAD4;
+                background-color: #1A1A24;
+                color: #38BDF8;
+            }
+
+            QPushButton#IconToolButton:pressed {
+                background-color: #22222E;
+                color: #E0F2FE;
             }
 
             QPushButton#NavButton {
@@ -1842,21 +1857,21 @@ class MainWindow(QMainWindow):
             }
 
             QPushButton#NavButton:hover {
-                background-color: #121722;
+                background-color: #14141C;
             }
 
             QPushButton#NavButtonActive {
                 text-align: left;
                 padding: 9px 12px;
                 font-size: 11pt;
-                color: #ECFEFF;
-                background-color: #134E4A;
+                color: #F0F9FF;
+                background-color: #155E75;
                 border: none;
                 border-radius: 6px;
             }
 
             QToolButton {
-                color: #94A8BF;
+                color: #94A3B8;
                 background-color: transparent;
                 border: none;
                 font-weight: 600;
@@ -1864,11 +1879,11 @@ class MainWindow(QMainWindow):
             }
 
             QToolButton:hover {
-                color: #5EEAD4;
+                color: #38BDF8;
             }
 
             QLineEdit {
-                background-color: #0E1118;
+                background-color: #0E0E14;
                 border: none;
                 color: #EAF0FF;
                 padding: 8px 10px;
@@ -1877,30 +1892,30 @@ class MainWindow(QMainWindow):
             }
 
             QLineEdit:focus {
-                border: 1px solid #2DD4BF;
+                border: 1px solid #38BDF8;
             }
 
             QComboBox {
-                background-color: #0E1118;
+                background-color: #0E0E14;
                 border: none;
                 color: #F3F7FF;
                 padding: 6px 36px 6px 10px;
                 min-height: 22px;
                 border-radius: 8px;
-                selection-background-color: #0F766E;
+                selection-background-color: #155E75;
                 selection-color: #F8FBFF;
             }
 
             QComboBox:focus {
-                border: 1px solid #2DD4BF;
+                border: 1px solid #38BDF8;
             }
 
             QComboBox::drop-down {
                 subcontrol-origin: padding;
                 subcontrol-position: top right;
-                border-left: 1px solid #2A3444;
+                border-left: 1px solid #2A2A36;
                 width: 28px;
-                background-color: #121722;
+                background-color: #12121A;
             }
 
             QComboBox::down-arrow {
@@ -1910,17 +1925,17 @@ class MainWindow(QMainWindow):
             }
 
             QComboBox QAbstractItemView {
-                background-color: #121722;
+                background-color: #12121A;
                 border: none;
                 color: #F3F7FF;
-                selection-background-color: #0F766E;
+                selection-background-color: #155E75;
                 selection-color: #FFFFFF;
                 outline: 0;
                 padding: 4px;
             }
 
             QMenu {
-                background-color: #121722;
+                background-color: #12121A;
                 color: #E8EDF7;
                 border: none;
                 padding: 8px 4px;
@@ -1936,8 +1951,8 @@ class MainWindow(QMainWindow):
             }
 
             QMenu::item:selected {
-                background-color: #1E3A3A;
-                color: #F0FDFA;
+                background-color: #1E3A4A;
+                color: #F0F9FF;
             }
 
             QMenu::item:disabled {
@@ -1952,27 +1967,27 @@ class MainWindow(QMainWindow):
             }
 
             QMenu#PlanningOverflowMenu {
-                background-color: #151922;
-                padding: 10px 6px;
-                border-radius: 10px;
+                background-color: #14141C;
+                padding: 12px 8px;
+                border-radius: 12px;
             }
 
             QMenu#PlanningOverflowMenu::item {
-                padding: 11px 32px 11px 18px;
-                margin: 2px 8px;
-                min-height: 20px;
+                padding: 12px 36px 12px 20px;
+                margin: 3px 10px;
+                min-height: 22px;
             }
 
             QMenu#PlanningOverflowMenu::item:selected {
-                background-color: #134E4A;
-                color: #CCFBF1;
+                background-color: #164E63;
+                color: #E0F2FE;
             }
 
             QTreeWidget, QTreeView {
-                background-color: #121722;
+                background-color: #0F0F16;
                 border: none;
                 color: #E8EDF7;
-                padding: 4px;
+                padding: 6px;
             }
 
             QScrollBar:horizontal {
@@ -1984,18 +1999,18 @@ class MainWindow(QMainWindow):
             }
 
             QScrollBar::handle:horizontal {
-                background-color: #2A9D8F;
+                background-color: #0891B2;
                 min-width: 40px;
                 border-radius: 4px;
                 border: none;
             }
 
             QScrollBar::handle:horizontal:hover {
-                background-color: #3ECFB8;
+                background-color: #22D3EE;
             }
 
             QScrollBar::handle:horizontal:pressed {
-                background-color: #0D9488;
+                background-color: #0E7490;
             }
 
             QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
@@ -2018,18 +2033,18 @@ class MainWindow(QMainWindow):
             }
 
             QScrollBar::handle:vertical {
-                background-color: #2A9D8F;
+                background-color: #0891B2;
                 min-height: 48px;
                 border-radius: 4px;
                 border: none;
             }
 
             QScrollBar::handle:vertical:hover {
-                background-color: #3ECFB8;
+                background-color: #22D3EE;
             }
 
             QScrollBar::handle:vertical:pressed {
-                background-color: #0D9488;
+                background-color: #0E7490;
             }
 
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
@@ -2048,23 +2063,27 @@ class MainWindow(QMainWindow):
             }
 
             QTreeWidget::item:selected, QTreeView::item:selected {
-                background-color: #134E4A;
-                color: #F0FDFA;
+                background-color: #164E63;
+                color: #F0F9FF;
             }
 
             QTreeWidget::item:hover, QTreeView::item:hover {
-                background-color: #1A222E;
+                background-color: #1C1C28;
             }
 
             QTableWidget {
-                background-color: #121722;
+                background-color: #0F0F16;
                 border: none;
                 color: #E8EDF7;
                 gridline-color: rgba(255, 255, 255, 0.05);
             }
 
+            QTableWidget::item:hover {
+                background-color: #1C1C28;
+            }
+
             QHeaderView::section {
-                background-color: #0E1118;
+                background-color: #0C0C12;
                 color: #F3F7FF;
                 padding: 8px 6px;
                 border: none;
@@ -2078,12 +2097,12 @@ class MainWindow(QMainWindow):
             }
 
             QTableWidget::item:selected {
-                background-color: #134E4A;
+                background-color: #164E63;
                 color: #FFFFFF;
             }
 
             QTextEdit#DetailsNotes {
-                background-color: #121722;
+                background-color: #0F0F16;
                 border: none;
                 color: #E8EDF7;
                 padding: 10px;
@@ -2092,7 +2111,7 @@ class MainWindow(QMainWindow):
 
             QTabWidget::pane {
                 border: none;
-                background-color: #161B24;
+                background-color: #14141A;
                 top: 0px;
                 border-radius: 0 0 10px 10px;
             }
@@ -2108,12 +2127,12 @@ class MainWindow(QMainWindow):
             }
 
             QTabBar::tab:selected {
-                background-color: #161B24;
-                color: #CCFBF1;
+                background-color: #14141A;
+                color: #E0F2FE;
             }
 
             QTabBar::tab:hover:!selected {
-                color: #5EEAD4;
+                color: #38BDF8;
             }
 
             QSplitter::handle {
@@ -2121,7 +2140,7 @@ class MainWindow(QMainWindow):
             }
 
             QSplitter::handle:hover {
-                background-color: rgba(45, 212, 191, 0.35);
+                background-color: rgba(56, 189, 248, 0.35);
             }
         """)
 
@@ -2140,7 +2159,7 @@ class MainWindow(QMainWindow):
         self.logo_block = QFrame()
         self.logo_block.setFixedSize(28, 28)
         self.logo_block.setStyleSheet(
-            "background-color:#0D9488; border:none; border-radius:8px;"
+            "background-color:#0891B2; border:none; border-radius:8px;"
         )
 
         brand_text_layout = QVBoxLayout()
@@ -2230,7 +2249,7 @@ class MainWindow(QMainWindow):
 
         divider = QFrame()
         divider.setFixedHeight(1)
-        divider.setStyleSheet("background-color:#1E2A3F; border:none;")
+        divider.setStyleSheet("background-color: rgba(255, 255, 255, 0.06); border: none;")
         nav_layout.addWidget(divider)
 
         buttons = [
@@ -2254,7 +2273,7 @@ class MainWindow(QMainWindow):
 
         bottom_divider = QFrame()
         bottom_divider.setFixedHeight(1)
-        bottom_divider.setStyleSheet("background-color:#1E2A3F; border:none;")
+        bottom_divider.setStyleSheet("background-color: rgba(255, 255, 255, 0.06); border: none;")
         nav_layout.addWidget(bottom_divider)
 
         self.mode_label = QLabel("Client planning mode")
@@ -2891,7 +2910,7 @@ class MainWindow(QMainWindow):
         self._planning_draft_overflow_btn.setCursor(Qt.PointingHandCursor)
         _draft_menu = QMenu(self._planning_draft_overflow_btn)
         _draft_menu.setObjectName("PlanningOverflowMenu")
-        _draft_menu.setMinimumWidth(200)
+        _draft_menu.setMinimumWidth(228)
         _act_imp = _draft_menu.addAction("Import Draft")
         _act_imp.triggered.connect(self._handle_import_draft)
         _act_exp = _draft_menu.addAction("Export Draft")
@@ -2904,14 +2923,6 @@ class MainWindow(QMainWindow):
         self.action_buttons["Submit Request to Ozlink IT"].setMinimumWidth(198)
         submit_row.addWidget(self.action_buttons["Submit Request to Ozlink IT"], 0, Qt.AlignRight)
         header_action_wrap.addLayout(submit_row)
-
-        self._planning_map_hint = QLabel(
-            "Select items in the trees, then right-click a source or destination row to assign, "
-            "unassign, or add a proposed folder."
-        )
-        self._planning_map_hint.setObjectName("PlanningFlowHint")
-        self._planning_map_hint.setWordWrap(True)
-        header_action_wrap.addWidget(self._planning_map_hint)
         header_action_wrap.addStretch()
 
         selectors_row = QGridLayout()
@@ -3106,7 +3117,7 @@ class MainWindow(QMainWindow):
         card.setObjectName("MetricCard")
 
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(4)
 
         label = QLabel(label_text)
@@ -3160,13 +3171,13 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
+        layout.setSpacing(14)
 
         hero = QFrame()
         hero.setObjectName("HeroCard")
         hero_layout = QVBoxLayout(hero)
-        hero_layout.setContentsMargins(16, 14, 16, 14)
-        hero_layout.setSpacing(8)
+        hero_layout.setContentsMargins(18, 16, 18, 16)
+        hero_layout.setSpacing(10)
 
         title = QLabel("Requests")
         title.setObjectName("PageTitle")
@@ -3180,7 +3191,7 @@ class MainWindow(QMainWindow):
         summary_strip = QFrame()
         summary_strip.setObjectName("StatRibbon")
         summary_layout = QHBoxLayout(summary_strip)
-        summary_layout.setContentsMargins(12, 10, 12, 10)
+        summary_layout.setContentsMargins(14, 12, 14, 12)
         summary_layout.setSpacing(10)
         self.requests_live_count = QLabel("0")
         self.requests_live_count.setObjectName("MetricValue")
@@ -3196,7 +3207,7 @@ class MainWindow(QMainWindow):
             chip = QFrame()
             chip.setObjectName("MetricCard")
             chip_layout = QVBoxLayout(chip)
-            chip_layout.setContentsMargins(14, 10, 14, 10)
+            chip_layout.setContentsMargins(16, 12, 16, 12)
             chip_layout.setSpacing(2)
             chip_layout.addWidget(label)
             chip_label = QLabel(caption)
@@ -3208,8 +3219,8 @@ class MainWindow(QMainWindow):
         actions_bar = QFrame()
         actions_bar.setObjectName("SurfaceCard")
         actions_outer = QVBoxLayout(actions_bar)
-        actions_outer.setContentsMargins(14, 12, 14, 12)
-        actions_outer.setSpacing(8)
+        actions_outer.setContentsMargins(18, 16, 18, 16)
+        actions_outer.setSpacing(10)
         actions_caption = QLabel("Actions")
         actions_caption.setObjectName("SectionTitle")
         actions_row = QHBoxLayout()
@@ -3606,7 +3617,7 @@ class MainWindow(QMainWindow):
         box = QFrame()
         box.setObjectName("SectionBox")
         layout = QVBoxLayout(box)
-        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(12)
 
         title = QLabel(title_text)
@@ -3617,7 +3628,7 @@ class MainWindow(QMainWindow):
         refresh_cache_button.clicked.connect(
             lambda _=False, panel_key=panel_key: self.handle_refresh_cache_for_panel(panel_key)
         )
-        expand_button = QPushButton("⤢")
+        expand_button = QPushButton(_EXPAND_ALL_TREE_GLYPH_EXPAND)
         expand_button.setObjectName("IconToolButton")
         expand_button.setToolTip("Expand all folders in this tree (may load in the background)")
         expand_button.clicked.connect(lambda _=False, panel_key=panel_key: self.handle_expand_all(panel_key))
@@ -4299,8 +4310,14 @@ class MainWindow(QMainWindow):
 
     def _set_expand_all_button_label(self, panel_key, expanded):
         button = self._expand_all_button_for_panel(panel_key)
-        if button is not None:
-            button.setText("Collapse All" if expanded else "Expand All")
+        if button is None:
+            return
+        if expanded:
+            button.setText(_EXPAND_ALL_TREE_GLYPH_COLLAPSE)
+            button.setToolTip("Collapse all expanded folders in this tree")
+        else:
+            button.setText(_EXPAND_ALL_TREE_GLYPH_EXPAND)
+            button.setToolTip("Expand all folders in this tree (may load in the background)")
 
     def _panel_loaded_branch_state_planning_model(self, tree):
         model = getattr(self, "destination_planning_model", None)
@@ -7572,9 +7589,8 @@ class MainWindow(QMainWindow):
         card_layout.setAlignment(Qt.AlignCenter)
 
         glyph = QLabel("◆")
-        glyph.setObjectName("MetricValue")
+        glyph.setObjectName("AuditEmptyGlyph")
         glyph.setAlignment(Qt.AlignCenter)
-        glyph.setStyleSheet("color: #475569; font-size: 42pt;")
 
         title = QLabel("Audit")
         title.setObjectName("CardTitle")
@@ -7600,7 +7616,7 @@ class MainWindow(QMainWindow):
         page = QWidget()
         outer = QVBoxLayout(page)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(10)
+        outer.setSpacing(14)
 
         page_title = QLabel("Execution")
         page_title.setObjectName("PageTitle")
@@ -7617,7 +7633,7 @@ class MainWindow(QMainWindow):
         plan_card = QFrame()
         plan_card.setObjectName("SurfaceCard")
         plan_layout = QVBoxLayout(plan_card)
-        plan_layout.setContentsMargins(16, 14, 16, 14)
+        plan_layout.setContentsMargins(18, 16, 18, 16)
         plan_layout.setSpacing(10)
         plan_title = QLabel("Plan & manifest")
         plan_title.setObjectName("SectionTitle")
@@ -7656,7 +7672,7 @@ class MainWindow(QMainWindow):
         run_card = QFrame()
         run_card.setObjectName("SurfaceCard")
         run_layout = QVBoxLayout(run_card)
-        run_layout.setContentsMargins(16, 14, 16, 14)
+        run_layout.setContentsMargins(18, 16, 18, 16)
         run_layout.setSpacing(10)
         run_title = QLabel("Run")
         run_title.setObjectName("SectionTitle")
@@ -7686,7 +7702,7 @@ class MainWindow(QMainWindow):
         scope_card = QFrame()
         scope_card.setObjectName("SurfaceCard")
         scope_layout = QVBoxLayout(scope_card)
-        scope_layout.setContentsMargins(16, 14, 16, 14)
+        scope_layout.setContentsMargins(18, 16, 18, 16)
         scope_layout.setSpacing(8)
         scope_title = QLabel("Scope & recursive options")
         scope_title.setObjectName("SectionTitle")
@@ -7779,12 +7795,12 @@ class MainWindow(QMainWindow):
         page = QWidget()
         outer = QVBoxLayout(page)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(10)
+        outer.setSpacing(14)
 
         card = QFrame()
         card.setObjectName("SectionBox")
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(16, 14, 16, 14)
+        card_layout.setContentsMargins(18, 16, 18, 16)
         card_layout.setSpacing(14)
 
         title = QLabel("Microsoft Graph cache")
@@ -7845,7 +7861,7 @@ class MainWindow(QMainWindow):
         self._settings_admin_submissions_card = QFrame()
         self._settings_admin_submissions_card.setObjectName("SectionBox")
         admin_card_layout = QVBoxLayout(self._settings_admin_submissions_card)
-        admin_card_layout.setContentsMargins(16, 14, 16, 14)
+        admin_card_layout.setContentsMargins(18, 16, 18, 16)
         admin_card_layout.setSpacing(12)
 
         admin_title = QLabel("Planning & submissions (administrator)")
@@ -7877,7 +7893,7 @@ class MainWindow(QMainWindow):
         ui_card = QFrame()
         ui_card.setObjectName("SectionBox")
         ui_card_layout = QVBoxLayout(ui_card)
-        ui_card_layout.setContentsMargins(16, 14, 16, 14)
+        ui_card_layout.setContentsMargins(18, 16, 18, 16)
         ui_card_layout.setSpacing(14)
 
         ui_title = QLabel("Planning workspace — faster source and destination trees (optional)")
@@ -29409,7 +29425,7 @@ class MainWindow(QMainWindow):
             if tree is None:
                 return
             expand_button = self._expand_all_button_for_panel(panel_key)
-            if expand_button is not None and expand_button.text() == "Collapse All":
+            if expand_button is not None and expand_button.text() == _EXPAND_ALL_TREE_GLYPH_COLLAPSE:
                 tree.collapseAll()
                 self._set_expand_all_button_label(panel_key, False)
                 self._set_tree_status_message(panel_key, "Local tree collapsed.", loading=False)
@@ -29431,7 +29447,7 @@ class MainWindow(QMainWindow):
                 )
                 return
             expand_button = self._expand_all_button_for_panel("source")
-            if expand_button is not None and expand_button.text() == "Collapse All":
+            if expand_button is not None and expand_button.text() == _EXPAND_ALL_TREE_GLYPH_COLLAPSE:
                 self._collapse_loaded_branches_for_panel("source", status_message="Loaded branches collapsed.")
                 return
             if self._can_fast_bulk_expand("source"):
@@ -29447,7 +29463,7 @@ class MainWindow(QMainWindow):
                 )
                 return
             expand_button = self._expand_all_button_for_panel("destination")
-            if expand_button is not None and expand_button.text() == "Collapse All":
+            if expand_button is not None and expand_button.text() == _EXPAND_ALL_TREE_GLYPH_COLLAPSE:
                 self._collapse_loaded_branches_for_panel("destination", status_message="Loaded branches collapsed.")
                 return
             if getattr(self, "_destination_root_prime_pending", False):
@@ -29494,7 +29510,7 @@ class MainWindow(QMainWindow):
             return
 
         expand_button = self._expand_all_button_for_panel(panel_key)
-        if expand_button is not None and expand_button.text() == "Collapse All":
+        if expand_button is not None and expand_button.text() == _EXPAND_ALL_TREE_GLYPH_COLLAPSE:
             self._collapse_loaded_branches_for_panel(panel_key, status_message="Loaded branches collapsed.")
             return
 
