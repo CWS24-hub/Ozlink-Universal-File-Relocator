@@ -9,7 +9,7 @@ import time
 import bisect
 import copy
 from functools import partial
-from collections import Counter, deque
+from collections import Counter, deque, OrderedDict
 import ctypes
 import traceback
 import re
@@ -1150,6 +1150,8 @@ class MainWindow(QMainWindow):
         self.current_profile = None
         self.discovered_sites = []
         self.planned_moves = []
+        self._source_projection_descendants_cache = OrderedDict()
+        self._source_projection_descendants_cache_limit = 96
         self._destination_indicator_dirty_semantic_paths = set()
         self._destination_future_model_overlay_cache = None
         self._destination_last_materialized_overlay_fp = ""
@@ -4704,6 +4706,7 @@ class MainWindow(QMainWindow):
         self._restore_payload_source = ""
         self._restore_selected_candidate_path = ""
         self.planned_moves = []
+        self._clear_source_projection_descendants_cache()
         self.proposed_folders = []
         self._memory_restore_complete = False
         self._restore_destination_overlay_pending = False
@@ -5454,6 +5457,7 @@ class MainWindow(QMainWindow):
         self._draft_shell_raw = dict(session_raw or {})
         self.active_draft_session_id = session_state.DraftId or self.active_draft_session_id
         self.planned_moves = [self._build_restored_planned_move_record(row) for row in allocations]
+        self._clear_source_projection_descendants_cache()
         self.proposed_folders = list(proposed)
         self._reset_unresolved_proposed_queue()
         self._reset_unresolved_allocation_queue()
@@ -8940,6 +8944,7 @@ class MainWindow(QMainWindow):
             self._login_in_progress = False
             self.discovered_sites = []
             self.planned_moves = []
+            self._clear_source_projection_descendants_cache()
             self.proposed_folders = []
             self._reset_full_count_state()
             self._reset_destination_full_tree_state()
@@ -15589,6 +15594,51 @@ class MainWindow(QMainWindow):
                 src["item_path"] = out["item_path"]
         return out
 
+    def _clear_source_projection_descendants_cache(self):
+        od = getattr(self, "_source_projection_descendants_cache", None)
+        if isinstance(od, OrderedDict):
+            od.clear()
+
+    def _projection_descendants_planned_signature_digest(self) -> str:
+        pm = getattr(self, "planned_moves", None) or []
+        h = hashlib.sha256()
+        for m in pm:
+            h.update(str(m.get("request_id", "")).encode("utf-8", errors="replace"))
+            h.update(b"\x1f")
+            h.update(str(m.get("source_path", "")).encode("utf-8", errors="replace"))
+            h.update(b"\x1e")
+        return h.hexdigest()
+
+    def _source_projection_descendants_cache_key_for_root(self, source_root_data) -> tuple:
+        sp = self._canonical_source_projection_path(self._tree_item_path(source_root_data))
+        return (
+            self._projection_descendants_planned_signature_digest(),
+            str(source_root_data.get("drive_id") or ""),
+            str(source_root_data.get("id") or ""),
+            sp,
+        )
+
+    def _source_projection_descendants_cache_get(self, key):
+        od = getattr(self, "_source_projection_descendants_cache", None)
+        if not isinstance(od, OrderedDict) or not key:
+            return None
+        if key not in od:
+            return None
+        od.move_to_end(key)
+        return copy.deepcopy(od[key])
+
+    def _source_projection_descendants_cache_put(self, key, descendants):
+        if not key:
+            return
+        od = getattr(self, "_source_projection_descendants_cache", None)
+        if not isinstance(od, OrderedDict):
+            return
+        od[key] = copy.deepcopy(descendants)
+        od.move_to_end(key)
+        lim = int(getattr(self, "_source_projection_descendants_cache_limit", 96) or 96)
+        while len(od) > lim:
+            od.popitem(last=False)
+
     def _collect_source_descendants_for_projection(self, source_root_data, move=None):
         """
         Prefer walking the in-memory source tree when the allocation root is visible and fully loaded.
@@ -15604,6 +15654,17 @@ class MainWindow(QMainWindow):
         base_diag = self._destination_projection_diag_payload(source_root_data, move, source_item)
 
         if source_item is not None and self._source_subtree_fully_loaded_in_tree(source_item):
+            cache_key = self._source_projection_descendants_cache_key_for_root(source_root_data)
+            cached = self._source_projection_descendants_cache_get(cache_key)
+            if cached is not None:
+                self._log_destination_projection_collect_result(
+                    cached,
+                    branch="tree_fully_loaded_cache",
+                    graph_attempted=False,
+                    graph_error=None,
+                    **base_diag,
+                )
+                return cached
             descendants = []
             for descendant_item in self._iter_source_tree_subtree_rows(source_item):
                 if descendant_item == source_item:
@@ -15612,6 +15673,7 @@ class MainWindow(QMainWindow):
                 if descendant_data.get("placeholder"):
                     continue
                 descendants.append(dict(descendant_data))
+            self._source_projection_descendants_cache_put(cache_key, descendants)
             self._log_destination_projection_collect_result(
                 descendants,
                 branch="tree_fully_loaded",
