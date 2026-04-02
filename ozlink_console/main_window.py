@@ -900,6 +900,35 @@ def _m365_sign_in_error_dialog(message: str) -> tuple[str, str]:
 _JSON_PERSIST_OMIT = object()
 
 
+def _perf_explorer_log(phase: str, **kwargs: Any) -> None:
+    """Dev-only structured timing/diagnostic events for explorer responsiveness work."""
+    if not is_dev_mode():
+        return
+    log_info("perf_explorer", phase=phase, **kwargs)
+
+
+class _PerfExplorerTimer:
+    """Context manager: logs perf_explorer with elapsed_ms on exit (dev-only)."""
+
+    __slots__ = ("phase", "extra", "_timer")
+
+    def __init__(self, phase: str, **extra: Any):
+        self.phase = phase
+        self.extra = extra
+        self._timer: QElapsedTimer | None = None
+
+    def __enter__(self):
+        if is_dev_mode():
+            self._timer = QElapsedTimer()
+            self._timer.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if is_dev_mode() and self._timer is not None:
+            _perf_explorer_log(self.phase, elapsed_ms=self._timer.elapsed(), **self.extra)
+        return False
+
+
 class MainWindow(QMainWindow):
     @staticmethod
     def _source_tree_model_view_effective() -> bool:
@@ -3691,6 +3720,7 @@ class MainWindow(QMainWindow):
         tree.setRootIsDecorated(True)
         tree.setItemsExpandable(True)
         tree.setExpandsOnDoubleClick(True)
+        tree.setAnimated(False)
         tree.setAlternatingRowColors(False)
         tree.setUniformRowHeights(True)
         # Source: Ctrl+click multi-select for "Assign individually…"; destination stays single-select.
@@ -3722,6 +3752,7 @@ class MainWindow(QMainWindow):
         local_tree.setRootIsDecorated(True)
         local_tree.setItemsExpandable(True)
         local_tree.setExpandsOnDoubleClick(True)
+        local_tree.setAnimated(False)
         local_tree.setAlternatingRowColors(False)
         local_tree.setUniformRowHeights(True)
         local_tree.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -4173,7 +4204,11 @@ class MainWindow(QMainWindow):
             )
             if not any(message_text.startswith(prefix) for prefix in allowed_prefixes):
                 return
-        label = self.source_tree_status if panel_key == "source" else self.destination_tree_status
+        label = (
+            getattr(self, "source_tree_status", None)
+            if panel_key == "source"
+            else getattr(self, "destination_tree_status", None)
+        )
         if label is not None:
             label.setText(message)
             self._apply_loading_visual_state(label, loading=loading, kind="tree")
@@ -4254,30 +4289,36 @@ class MainWindow(QMainWindow):
             for r in reasons
         )
 
-        try:
-            if getattr(self, "destination_tree_widget", None) is not None:
-                if skip_full_destination_future_model:
-                    log_info(
-                        "Planning deferred refresh skipped full destination rebuild (incremental planning).",
-                        reasons=combined_reason,
+        with _PerfExplorerTimer(
+            "run_deferred_planning_refresh",
+            combined_reason=combined_reason,
+            skip_full_destination_future_model=skip_full_destination_future_model,
+            source_projection_path_count=len(source_projection_paths),
+        ):
+            try:
+                if getattr(self, "destination_tree_widget", None) is not None:
+                    if skip_full_destination_future_model:
+                        log_info(
+                            "Planning deferred refresh skipped full destination rebuild (incremental planning).",
+                            reasons=combined_reason,
+                        )
+                    else:
+                        self._materialize_destination_future_model(f"deferred_{combined_reason}")
+            except Exception as exc:
+                self._log_restore_exception("deferred_planning_refresh.destination", exc)
+
+            try:
+                if getattr(self, "source_tree_widget", None) is not None and source_projection_paths:
+                    self._schedule_source_projection_refresh_for_paths(
+                        source_projection_paths,
+                        f"source_projection_deferred_{combined_reason}",
+                        delay_ms=50,
                     )
-                else:
-                    self._materialize_destination_future_model(f"deferred_{combined_reason}")
-        except Exception as exc:
-            self._log_restore_exception("deferred_planning_refresh.destination", exc)
+            except Exception as exc:
+                self._log_restore_exception("deferred_planning_refresh.source", exc)
 
-        try:
-            if getattr(self, "source_tree_widget", None) is not None and source_projection_paths:
-                self._schedule_source_projection_refresh_for_paths(
-                    source_projection_paths,
-                    f"source_projection_deferred_{combined_reason}",
-                    delay_ms=50,
-                )
-        except Exception as exc:
-            self._log_restore_exception("deferred_planning_refresh.source", exc)
-
-        self.update_progress_summaries()
-        self._set_window_title_status()
+            self.update_progress_summaries()
+            self._set_window_title_status()
 
     def _flush_deferred_planning_refresh(self):
         timer = getattr(self, "_deferred_planning_refresh_timer", None)
@@ -4314,10 +4355,12 @@ class MainWindow(QMainWindow):
             return
         if expanded:
             button.setText(_EXPAND_ALL_TREE_GLYPH_COLLAPSE)
-            button.setToolTip("Collapse all expanded folders in this tree")
+            tip = "Collapse all expanded folders in this tree"
         else:
             button.setText(_EXPAND_ALL_TREE_GLYPH_EXPAND)
-            button.setToolTip("Expand all folders in this tree (may load in the background)")
+            tip = "Expand all folders in this tree (may load in the background)"
+        if hasattr(button, "setToolTip"):
+            button.setToolTip(tip)
 
     def _panel_loaded_branch_state_planning_model(self, tree):
         model = getattr(self, "destination_planning_model", None)
@@ -7092,7 +7135,7 @@ class MainWindow(QMainWindow):
             toggle_button.setText("▴")
             toggle_button.setToolTip("Collapse planning header")
         header_frame.updateGeometry()
-        header_frame.repaint()
+        header_frame.update()
 
     def toggle_planning_header_collapsed(self):
         self._apply_planning_header_collapsed_state(not getattr(self, "_planning_header_collapsed", False))
@@ -7125,7 +7168,7 @@ class MainWindow(QMainWindow):
             self.workspace_tabs_toggle_button.setToolTip("Collapse bottom panel")
             self.workspace_tabs.setDocumentMode(False)
         self.workspace_tabs.updateGeometry()
-        self.workspace_tabs.repaint()
+        self.workspace_tabs.update()
 
     def toggle_workspace_tabs_collapsed(self):
         self._apply_workspace_tabs_collapsed_state(not getattr(self, "_workspace_tabs_collapsed", False))
@@ -11441,8 +11484,8 @@ class MainWindow(QMainWindow):
 
     def _get_tree_and_status(self, panel_key):
         if panel_key == "source":
-            return self.source_tree_widget, self.source_tree_status
-        return self.destination_tree_widget, self.destination_tree_status
+            return getattr(self, "source_tree_widget", None), getattr(self, "source_tree_status", None)
+        return getattr(self, "destination_tree_widget", None), getattr(self, "destination_tree_status", None)
 
     def _log_root_success_step(self, step_name, **data):
         tree_visible = False
@@ -11677,35 +11720,46 @@ class MainWindow(QMainWindow):
         self._rebuild_submission_visual_cache()
         refreshed_paths = set()
         refreshed_count = 0
-        process_event_every = 300
+        process_event_every = 120
         source_model = getattr(self, "source_sharepoint_model", None)
-        for source_path in sorted(normalized_paths, key=len):
-            item = self._find_visible_source_item_by_path(source_path)
-            if item is None:
-                continue
-            for subtree_row in self._iter_source_tree_subtree_rows(item):
-                subtree_data = dict(self._source_tree_row_payload(subtree_row))
-                if subtree_data.get("placeholder"):
+        updates_were_enabled = tree.updatesEnabled()
+        if updates_were_enabled:
+            tree.setUpdatesEnabled(False)
+        perf = QElapsedTimer()
+        dev = is_dev_mode()
+        if dev:
+            perf.start()
+        try:
+            for source_path in sorted(normalized_paths, key=len):
+                item = self._find_visible_source_item_by_path(source_path)
+                if item is None:
                     continue
-                subtree_path = self._canonical_source_projection_path(self._tree_item_path(subtree_data))
-                if subtree_path and subtree_path in refreshed_paths:
-                    continue
-                if isinstance(subtree_row, QModelIndex):
-                    self._apply_tree_item_visual_state(None, subtree_data)
-                    if source_model is not None:
+                for subtree_row in self._iter_source_tree_subtree_rows(item):
+                    subtree_data = dict(self._source_tree_row_payload(subtree_row))
+                    if subtree_data.get("placeholder"):
+                        continue
+                    subtree_path = self._canonical_source_projection_path(self._tree_item_path(subtree_data))
+                    if subtree_path and subtree_path in refreshed_paths:
+                        continue
+                    if isinstance(subtree_row, QModelIndex):
+                        self._apply_tree_item_visual_state(None, subtree_data)
+                        if source_model is not None:
 
-                        def _mut(p, repl=subtree_data):
-                            p.clear()
-                            p.update(repl)
+                            def _mut(p, repl=subtree_data):
+                                p.clear()
+                                p.update(repl)
 
-                        source_model.update_payload_for_index(subtree_row, _mut)
-                else:
-                    self._apply_tree_item_visual_state(subtree_row, subtree_data)
-                if subtree_path:
-                    refreshed_paths.add(subtree_path)
-                refreshed_count += 1
-                if refreshed_count % process_event_every == 0:
-                    QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+                            source_model.update_payload_for_index(subtree_row, _mut)
+                    else:
+                        self._apply_tree_item_visual_state(subtree_row, subtree_data)
+                    if subtree_path:
+                        refreshed_paths.add(subtree_path)
+                    refreshed_count += 1
+                    if refreshed_count % process_event_every == 0:
+                        QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        finally:
+            if updates_were_enabled:
+                tree.setUpdatesEnabled(True)
 
         tree.viewport().update()
         self._log_restore_phase(
@@ -11714,6 +11768,14 @@ class MainWindow(QMainWindow):
             refreshed_item_count=refreshed_count,
             refreshed_path_count=len(normalized_paths),
         )
+        if dev:
+            _perf_explorer_log(
+                "refresh_source_projection_for_paths",
+                elapsed_ms=perf.elapsed(),
+                refreshed_item_count=refreshed_count,
+                root_path_count=len(normalized_paths),
+                phase_name=str(phase_name or ""),
+            )
 
     def _schedule_source_projection_refresh_for_paths(self, paths, phase_name, trigger_path="", delay_ms=250):
         for path in paths or []:
@@ -11781,21 +11843,22 @@ class MainWindow(QMainWindow):
             )
             return
 
-        self._refresh_tree_visual_states("source")
-        self.source_tree_widget.viewport().update()
-        verbose_flag = os.environ.get("OZLINK_RESTORE_VERBOSE_LOG", "").strip().lower()
-        if verbose_flag in ("1", "true", "yes"):
-            counts = self._collect_source_projection_counts()
-        else:
-            counts = {
-                "counts_skipped": True,
-                "planned_moves_count": len(self.planned_moves),
-            }
-        self._log_restore_phase(
-            phase_name,
-            trigger_path=self.normalize_memory_path(trigger_path),
-            **counts,
-        )
+        with _PerfExplorerTimer("refresh_source_projection_full", phase_name=str(phase_name or "")):
+            self._refresh_tree_visual_states("source")
+            self.source_tree_widget.viewport().update()
+            verbose_flag = os.environ.get("OZLINK_RESTORE_VERBOSE_LOG", "").strip().lower()
+            if verbose_flag in ("1", "true", "yes"):
+                counts = self._collect_source_projection_counts()
+            else:
+                counts = {
+                    "counts_skipped": True,
+                    "planned_moves_count": len(self.planned_moves),
+                }
+            self._log_restore_phase(
+                phase_name,
+                trigger_path=self.normalize_memory_path(trigger_path),
+                **counts,
+            )
 
     def _source_branch_depth(self, source_path):
         return len(self._path_segments(source_path))
@@ -13835,8 +13898,9 @@ class MainWindow(QMainWindow):
             return 0
 
     def _register_and_project_planned_move(self, move, *, reason="planned_move"):
-        self._queue_unresolved_allocation(move, reason)
-        return self._quick_apply_allocated_node_under_parent(move)
+        with _PerfExplorerTimer("register_and_project_planned_move", subreason=str(reason or "")):
+            self._queue_unresolved_allocation(move, reason)
+            return self._quick_apply_allocated_node_under_parent(move)
 
     def _defer_destination_projection_if_quick_apply_failed(self, applied, *, reconcile_reason, delay_ms=120):
         if applied and int(applied) > 0:
@@ -17499,6 +17563,25 @@ class MainWindow(QMainWindow):
     def _materialize_destination_future_model(
         self, reason, *, allow_defer=True, prefer_chunked_projection=False
     ):
+        perf = QElapsedTimer()
+        dev = is_dev_mode()
+        if dev:
+            perf.start()
+        try:
+            return self._materialize_destination_future_model_body(
+                reason, allow_defer=allow_defer, prefer_chunked_projection=prefer_chunked_projection
+            )
+        finally:
+            if dev:
+                _perf_explorer_log(
+                    "materialize_destination_future_model",
+                    reason=str(reason or ""),
+                    elapsed_ms=perf.elapsed(),
+                )
+
+    def _materialize_destination_future_model_body(
+        self, reason, *, allow_defer=True, prefer_chunked_projection=False
+    ):
         self._destination_future_model_last_blocked_source_restore = False
 
         # Each destination folder_worker_success used to call this path and the cancel below
@@ -18933,8 +19016,15 @@ class MainWindow(QMainWindow):
         return ix if match_details.get("exact_match") else None
 
     def _find_visible_destination_item_by_path(self, destination_path):
+        perf = QElapsedTimer()
+        dev = is_dev_mode()
+        if dev:
+            perf.start()
+
         tree = getattr(self, "destination_tree_widget", None)
         if tree is None:
+            if dev:
+                _perf_explorer_log("find_visible_destination_item_by_path", elapsed_ms=perf.elapsed(), match="no_tree")
             return None
         normalized_target = self._canonical_destination_projection_path(destination_path) or self.normalize_memory_path(
             destination_path
@@ -18955,6 +19045,13 @@ class MainWindow(QMainWindow):
                     if visible_path:
                         match_details = self._destination_parent_match_details(destination_path, visible_path)
                         if match_details["exact_match"]:
+                            if dev:
+                                _perf_explorer_log(
+                                    "find_visible_destination_item_by_path",
+                                    elapsed_ms=perf.elapsed(),
+                                    match="cache_persistent",
+                                    scanned_nodes=0,
+                                )
                             return ix
             elif not self._tree_item_is_alive(cached):
                 del dest_cache[normalized_target]
@@ -18964,14 +19061,39 @@ class MainWindow(QMainWindow):
                 if visible_path:
                     match_details = self._destination_parent_match_details(destination_path, visible_path)
                     if match_details["exact_match"]:
+                        if dev:
+                            _perf_explorer_log(
+                                "find_visible_destination_item_by_path",
+                                elapsed_ms=perf.elapsed(),
+                                match="cache_item",
+                                scanned_nodes=0,
+                            )
                         return cached
+
+        path_probe = normalized_target or destination_path or ""
         if self._destination_tree_uses_model_view():
+            quick_ix = self._destination_tree_index_if_current_matches_path(path_probe)
+            if quick_ix is not None:
+                if normalized_target:
+                    dest_cache[normalized_target] = QPersistentModelIndex(quick_ix)
+                if dev:
+                    _perf_explorer_log(
+                        "find_visible_destination_item_by_path",
+                        elapsed_ms=perf.elapsed(),
+                        match="current_index",
+                        scanned_nodes=0,
+                    )
+                return quick_ix
             model = getattr(self, "destination_planning_model", None)
             if model is None:
+                if dev:
+                    _perf_explorer_log("find_visible_destination_item_by_path", elapsed_ms=perf.elapsed(), match="no_model")
                 return None
             emit_restore_match_logs = bool(getattr(self, "_verbose_destination_match_logging", False))
             matches = []
+            scanned_nodes = 0
             for ix in model.iter_depth_first():
+                scanned_nodes += 1
                 node_data = ix.data(Qt.UserRole) or {}
                 if node_data.get("placeholder"):
                     continue
@@ -18987,7 +19109,34 @@ class MainWindow(QMainWindow):
             selected = self._select_canonical_destination_item(matches)
             if selected is not None and normalized_target:
                 dest_cache[normalized_target] = QPersistentModelIndex(selected)
+            if dev:
+                _perf_explorer_log(
+                    "find_visible_destination_item_by_path",
+                    elapsed_ms=perf.elapsed(),
+                    match="depth_first",
+                    scanned_nodes=scanned_nodes,
+                    candidate_matches=len(matches),
+                )
             return selected
+
+        cur = tree.currentItem()
+        if cur is not None:
+            cur_data = cur.data(0, Qt.UserRole) or {}
+            if not cur_data.get("placeholder"):
+                cur_path = self._tree_item_path(cur_data)
+                if cur_path:
+                    cur_match = self._destination_parent_match_details(destination_path, cur_path)
+                    if cur_match["exact_match"]:
+                        if normalized_target:
+                            dest_cache[normalized_target] = cur
+                        if dev:
+                            _perf_explorer_log(
+                                "find_visible_destination_item_by_path",
+                                elapsed_ms=perf.elapsed(),
+                                match="current_item",
+                                scanned_nodes=0,
+                            )
+                        return cur
 
         emit_restore_match_logs = bool(getattr(self, "_verbose_destination_match_logging", False))
         if emit_restore_match_logs:
@@ -18997,8 +19146,10 @@ class MainWindow(QMainWindow):
                 normalized_parent_path=normalized_target,
             )
         matches = []
+        scanned_nodes = 0
         for index in range(tree.topLevelItemCount()):
             for item in self._iter_tree_items(tree.topLevelItem(index)):
+                scanned_nodes += 1
                 node_data = item.data(0, Qt.UserRole) or {}
                 if node_data.get("placeholder"):
                     continue
@@ -19047,6 +19198,14 @@ class MainWindow(QMainWindow):
         selected = self._select_canonical_destination_item(matches)
         if selected is not None and normalized_target:
             dest_cache[normalized_target] = selected
+        if dev:
+            _perf_explorer_log(
+                "find_visible_destination_item_by_path",
+                elapsed_ms=perf.elapsed(),
+                match="full_walk",
+                scanned_nodes=scanned_nodes,
+                candidate_matches=len(matches),
+            )
         return selected
 
     def _build_destination_materialization_paths(self):
@@ -23580,172 +23739,199 @@ class MainWindow(QMainWindow):
         return True
 
     def handle_destination_draft_move(self, source_item, target_item):
-        source_node = self.get_tree_item_node_data(source_item)
-        target_node = self.get_tree_item_node_data(target_item)
-        if is_dev_mode():
-            log_info(
-                "debug_pass_destination_draft_move",
-                has_source=bool(source_node),
-                has_target=bool(target_node),
-                source_path_excerpt=str((source_node or {}).get("display_path", "") or "")[:160],
-                target_path_excerpt=str((target_node or {}).get("display_path", "") or "")[:160],
-            )
-        if not source_node or not target_node:
-            return
-        if not target_node.get("is_folder"):
-            self.destination_tree_status.setText("Drop onto a destination folder.")
-            return
-        if self.node_is_planned_allocation(target_node):
-            self.destination_tree_status.setText("Cannot move items under a planned allocation node.")
-            return
-
-        if self.node_is_proposed(source_node):
-            source_path = self._canonical_destination_projection_path(
-                source_node.get("display_path") or source_node.get("item_path") or ""
-            ) or self.normalize_memory_path(source_node.get("display_path") or source_node.get("item_path") or "")
-            target_path = self._canonical_destination_projection_path(
-                target_node.get("display_path") or target_node.get("item_path") or ""
-            ) or self.normalize_memory_path(target_node.get("display_path") or target_node.get("item_path") or "")
-            if not source_path or not target_path:
-                self.destination_tree_status.setText("Could not resolve the proposed branch move.")
-                return
-            if target_path == source_path or target_path.startswith(source_path + "\\"):
-                QMessageBox.information(self, "Move Proposed Folder", "A proposed folder cannot be moved inside itself.")
-                return
-            if self._proposed_branch_contains_submitted_items(source_path):
-                self._show_submitted_item_locked_message(
-                    "Move Proposed Folder",
-                    f"'{source_node.get('name', 'This proposed folder')}'",
+        _perf_t = QElapsedTimer()
+        _perf_d = is_dev_mode()
+        if _perf_d:
+            _perf_t.start()
+        try:
+            source_node = self.get_tree_item_node_data(source_item)
+            target_node = self.get_tree_item_node_data(target_item)
+            if is_dev_mode():
+                log_info(
+                    "debug_pass_destination_draft_move",
+                    has_source=bool(source_node),
+                    has_target=bool(target_node),
+                    source_path_excerpt=str((source_node or {}).get("display_path", "") or "")[:160],
+                    target_path_excerpt=str((target_node or {}).get("display_path", "") or "")[:160],
                 )
+            if not source_node or not target_node:
                 return
-            if self.node_is_proposed(target_node):
-                target_proposed = self._find_proposed_folder_record_by_path(target_path)
-                if target_proposed is not None and self._is_proposed_folder_submitted(target_proposed):
+            if not target_node.get("is_folder"):
+                self.destination_tree_status.setText("Drop onto a destination folder.")
+                return
+            if self.node_is_planned_allocation(target_node):
+                self.destination_tree_status.setText("Cannot move items under a planned allocation node.")
+                return
+
+            if self.node_is_proposed(source_node):
+                source_path = self._canonical_destination_projection_path(
+                    source_node.get("display_path") or source_node.get("item_path") or ""
+                ) or self.normalize_memory_path(source_node.get("display_path") or source_node.get("item_path") or "")
+                target_path = self._canonical_destination_projection_path(
+                    target_node.get("display_path") or target_node.get("item_path") or ""
+                ) or self.normalize_memory_path(target_node.get("display_path") or target_node.get("item_path") or "")
+                if not source_path or not target_path:
+                    self.destination_tree_status.setText("Could not resolve the proposed branch move.")
+                    return
+                if target_path == source_path or target_path.startswith(source_path + "\\"):
+                    QMessageBox.information(self, "Move Proposed Folder", "A proposed folder cannot be moved inside itself.")
+                    return
+                if self._proposed_branch_contains_submitted_items(source_path):
                     self._show_submitted_item_locked_message(
                         "Move Proposed Folder",
-                        f"'{target_node.get('name', 'This proposed folder')}'",
-                        self._submitted_batch_id_for_proposed_folder(target_proposed),
+                        f"'{source_node.get('name', 'This proposed folder')}'",
+                    )
+                    return
+                if self.node_is_proposed(target_node):
+                    target_proposed = self._find_proposed_folder_record_by_path(target_path)
+                    if target_proposed is not None and self._is_proposed_folder_submitted(target_proposed):
+                        self._show_submitted_item_locked_message(
+                            "Move Proposed Folder",
+                            f"'{target_node.get('name', 'This proposed folder')}'",
+                            self._submitted_batch_id_for_proposed_folder(target_proposed),
+                        )
+                        return
+
+                new_path = self.normalize_memory_path("\\".join(part for part in [target_path, source_node.get("name", "")] if part))
+                if not new_path or self._destination_paths_match_exact(new_path, source_path):
+                    return
+                if self._destination_path_exists_under_parent(target_item, new_path, ignore_item=source_item):
+                    QMessageBox.information(
+                        self,
+                        "Move Proposed Folder",
+                        "A folder with that name already exists in the destination branch.",
                     )
                     return
 
-            new_path = self.normalize_memory_path("\\".join(part for part in [target_path, source_node.get("name", "")] if part))
-            if not new_path or self._destination_paths_match_exact(new_path, source_path):
-                return
-            if self._destination_path_exists_under_parent(target_item, new_path, ignore_item=source_item):
-                QMessageBox.information(
-                    self,
-                    "Move Proposed Folder",
-                    "A folder with that name already exists in the destination branch.",
-                )
-                return
+                if self._destination_tree_uses_model_view():
+                    if not isinstance(source_item, QModelIndex) or not isinstance(target_item, QModelIndex):
+                        self.destination_tree_status.setText("Could not move proposed folder in the current tree view.")
+                        return
+                    if not source_item.isValid() or not target_item.isValid():
+                        return
+                    model = getattr(self, "destination_planning_model", None)
+                    tree = getattr(self, "destination_tree_widget", None)
+                    if model is None or tree is None:
+                        return
+                    original_parent = source_item.parent()
+                    source_was_expanded = tree.isExpanded(source_item)
+                    self._rewrite_proposed_branch_runtime_paths(source_path, new_path)
+                    nested = model.remove_node_at(source_item)
+                    if nested is None:
+                        self.destination_tree_status.setText("Could not remove the proposed folder from its current location.")
+                        return
+                    new_child_ix = model.append_nested_child(target_item, nested)
+                    tree.expand(target_item)
+                    if new_child_ix.isValid():
+                        self._rename_visible_destination_subtree_index(new_child_ix, source_path, new_path)
+                    if original_parent.isValid():
+                        self._refresh_destination_item_visibility_index(original_parent)
+                    self._refresh_destination_item_visibility_index(target_item, expand=True)
+                    if new_child_ix.isValid() and source_was_expanded:
+                        tree.expand(new_child_ix)
+                    if new_child_ix.isValid():
+                        sm = tree.selectionModel()
+                        if sm is not None:
+                            sm.select(
+                                new_child_ix,
+                                QItemSelectionModel.SelectionFlag.ClearAndSelect
+                                | QItemSelectionModel.SelectionFlag.Rows,
+                            )
+                        tree.setCurrentIndex(new_child_ix)
+                    self.destination_tree_status.setText("Proposed folder moved.")
+                    self._persist_planning_change_lightweight()
+                    self.on_tree_selection_changed("destination")
+                    return
 
-            if self._destination_tree_uses_model_view():
-                if not isinstance(source_item, QModelIndex) or not isinstance(target_item, QModelIndex):
-                    self.destination_tree_status.setText("Could not move proposed folder in the current tree view.")
-                    return
-                if not source_item.isValid() or not target_item.isValid():
-                    return
-                model = getattr(self, "destination_planning_model", None)
-                tree = getattr(self, "destination_tree_widget", None)
-                if model is None or tree is None:
-                    return
                 original_parent = source_item.parent()
-                source_was_expanded = tree.isExpanded(source_item)
+                source_was_expanded = source_item.isExpanded()
+
                 self._rewrite_proposed_branch_runtime_paths(source_path, new_path)
-                nested = model.remove_node_at(source_item)
-                if nested is None:
-                    self.destination_tree_status.setText("Could not remove the proposed folder from its current location.")
-                    return
-                new_child_ix = model.append_nested_child(target_item, nested)
-                tree.expand(target_item)
-                if new_child_ix.isValid():
-                    self._rename_visible_destination_subtree_index(new_child_ix, source_path, new_path)
-                if original_parent.isValid():
-                    self._refresh_destination_item_visibility_index(original_parent)
-                self._refresh_destination_item_visibility_index(target_item, expand=True)
-                if new_child_ix.isValid() and source_was_expanded:
-                    tree.expand(new_child_ix)
-                if new_child_ix.isValid():
-                    sm = tree.selectionModel()
-                    if sm is not None:
-                        sm.select(
-                            new_child_ix,
-                            QItemSelectionModel.SelectionFlag.ClearAndSelect
-                            | QItemSelectionModel.SelectionFlag.Rows,
-                        )
-                    tree.setCurrentIndex(new_child_ix)
+                if original_parent is not None:
+                    original_parent.removeChild(source_item)
+                    self._refresh_destination_item_visibility(original_parent)
+                else:
+                    index = self.destination_tree_widget.indexOfTopLevelItem(source_item)
+                    if index >= 0:
+                        self.destination_tree_widget.takeTopLevelItem(index)
+
+                target_item.addChild(source_item)
+                target_item.setExpanded(True)
+                self._refresh_destination_item_visibility(target_item, expand=True)
+                self._rename_visible_destination_subtree(source_item, source_path, new_path)
+                source_item.setExpanded(source_was_expanded)
+                self.destination_tree_widget.setCurrentItem(source_item)
+                source_item.setSelected(True)
                 self.destination_tree_status.setText("Proposed folder moved.")
                 self._persist_planning_change_lightweight()
                 self.on_tree_selection_changed("destination")
                 return
 
-            original_parent = source_item.parent()
-            source_was_expanded = source_item.isExpanded()
+            moved = self._move_planned_destination_node(source_node, target_node)
+            if moved:
+                self.clear_selection_details()
 
-            self._rewrite_proposed_branch_runtime_paths(source_path, new_path)
-            if original_parent is not None:
-                original_parent.removeChild(source_item)
-                self._refresh_destination_item_visibility(original_parent)
-            else:
-                index = self.destination_tree_widget.indexOfTopLevelItem(source_item)
-                if index >= 0:
-                    self.destination_tree_widget.takeTopLevelItem(index)
-
-            target_item.addChild(source_item)
-            target_item.setExpanded(True)
-            self._refresh_destination_item_visibility(target_item, expand=True)
-            self._rename_visible_destination_subtree(source_item, source_path, new_path)
-            source_item.setExpanded(source_was_expanded)
-            self.destination_tree_widget.setCurrentItem(source_item)
-            source_item.setSelected(True)
-            self.destination_tree_status.setText("Proposed folder moved.")
-            self._persist_planning_change_lightweight()
-            self.on_tree_selection_changed("destination")
-            return
-
-        moved = self._move_planned_destination_node(source_node, target_node)
-        if moved:
-            self.clear_selection_details()
+        finally:
+            if _perf_d:
+                _perf_explorer_log("handle_destination_draft_move", elapsed_ms=_perf_t.elapsed())
 
     def handle_cut_destination_item(self, node_data):
-        payload = self._build_destination_move_payload(node_data)
-        if payload is None:
-            self.destination_tree_status.setText("This destination item cannot be moved.")
-            return
-        if is_dev_mode():
-            log_info(
-                "debug_pass_cut_destination",
-                path_excerpt=str(payload.get("path") or payload.get("display_path") or "")[:200],
-            )
-        self._destination_cut_buffer = payload
-        self.destination_tree_status.setText(f"Cut '{payload.get('label', 'item')}'. Use Paste Here on the target folder.")
+        _perf_t = QElapsedTimer()
+        _perf_d = is_dev_mode()
+        if _perf_d:
+            _perf_t.start()
+        try:
+            payload = self._build_destination_move_payload(node_data)
+            if payload is None:
+                self.destination_tree_status.setText("This destination item cannot be moved.")
+                return
+            if is_dev_mode():
+                log_info(
+                    "debug_pass_cut_destination",
+                    path_excerpt=str(payload.get("path") or payload.get("display_path") or "")[:200],
+                )
+            self._destination_cut_buffer = payload
+            self.destination_tree_status.setText(f"Cut '{payload.get('label', 'item')}'. Use Paste Here on the target folder.")
+
+        finally:
+            if _perf_d:
+                _perf_explorer_log("handle_cut_destination_item", elapsed_ms=_perf_t.elapsed())
 
     def handle_paste_destination_item(self, target_node):
-        payload = getattr(self, "_destination_cut_buffer", None)
-        if not payload:
-            self.destination_tree_status.setText("Nothing is waiting to be pasted.")
-            return
-        if is_dev_mode():
-            log_info("debug_pass_paste_destination", phase="start")
-        target_path = target_node.get("display_path") or target_node.get("item_path") or ""
-        target_item = self._destination_tree_index_if_current_matches_path(target_path)
-        if target_item is None:
-            target_item = self._find_visible_destination_item_by_path(target_path)
-        if target_item is None:
-            self.destination_tree_status.setText("The destination folder is not visible yet.")
-            return
+        _perf_t = QElapsedTimer()
+        _perf_d = is_dev_mode()
+        if _perf_d:
+            _perf_t.start()
+        try:
+            payload = getattr(self, "_destination_cut_buffer", None)
+            if not payload:
+                self.destination_tree_status.setText("Nothing is waiting to be pasted.")
+                return
+            if is_dev_mode():
+                log_info("debug_pass_paste_destination", phase="start")
+            target_path = target_node.get("display_path") or target_node.get("item_path") or ""
+            target_item = self._destination_tree_index_if_current_matches_path(target_path)
+            if target_item is None:
+                target_item = self._find_visible_destination_item_by_path(target_path)
+            if target_item is None:
+                self.destination_tree_status.setText("The destination folder is not visible yet.")
+                return
 
-        source_path = payload.get("path") or payload.get("display_path") or ""
-        source_item = self._destination_tree_index_if_current_matches_path(source_path)
-        if source_item is None:
-            source_item = self._find_visible_destination_item_by_path(source_path)
-        if source_item is None:
-            self.destination_tree_status.setText("The cut item is no longer visible. Cut it again and retry.")
+            source_path = payload.get("path") or payload.get("display_path") or ""
+            source_item = self._destination_tree_index_if_current_matches_path(source_path)
+            if source_item is None:
+                source_item = self._find_visible_destination_item_by_path(source_path)
+            if source_item is None:
+                self.destination_tree_status.setText("The cut item is no longer visible. Cut it again and retry.")
+                self._destination_cut_buffer = None
+                return
+
+            self.handle_destination_draft_move(source_item, target_item)
             self._destination_cut_buffer = None
-            return
 
-        self.handle_destination_draft_move(source_item, target_item)
-        self._destination_cut_buffer = None
+        finally:
+            if _perf_d:
+                _perf_explorer_log("handle_paste_destination_item", elapsed_ms=_perf_t.elapsed())
 
     def on_destination_tree_item_changed(self, item, column):
         if column != 0:
@@ -29566,26 +29752,31 @@ class MainWindow(QMainWindow):
                 restore_abort_reason=str(getattr(self, "_restore_abort_reason", "") or ""),
             )
             return
-        self._invalidate_projection_lookup_caches(bump_generation=True)
-        try:
-            spaths = (
-                self._collect_current_source_projection_paths()
-                if source_projection_paths is None
-                else set(source_projection_paths)
-            )
-            self._queue_deferred_planning_refresh(
-                reason,
-                source_projection_paths=spaths,
-                delay_ms=120,
-                notify_saved=notify_saved,
-            )
-            if getattr(self, "source_tree_widget", None) is not None:
-                self.source_tree_widget.viewport().update()
-            if getattr(self, "destination_tree_widget", None) is not None:
-                self.destination_tree_widget.viewport().update()
-            self.update_progress_summaries()
-        except Exception as exc:
-            self._log_restore_exception("persist_planning_change.deferred_queue", exc)
+        with _PerfExplorerTimer(
+            "persist_planning_change",
+            reason=str(reason or ""),
+            narrow_paths=source_projection_paths is not None,
+        ):
+            self._invalidate_projection_lookup_caches(bump_generation=True)
+            try:
+                spaths = (
+                    self._collect_current_source_projection_paths()
+                    if source_projection_paths is None
+                    else set(source_projection_paths)
+                )
+                self._queue_deferred_planning_refresh(
+                    reason,
+                    source_projection_paths=spaths,
+                    delay_ms=120,
+                    notify_saved=notify_saved,
+                )
+                if getattr(self, "source_tree_widget", None) is not None:
+                    self.source_tree_widget.viewport().update()
+                if getattr(self, "destination_tree_widget", None) is not None:
+                    self.destination_tree_widget.viewport().update()
+                self.update_progress_summaries()
+            except Exception as exc:
+                self._log_restore_exception("persist_planning_change.deferred_queue", exc)
 
         def _deferred_save():
             try:
@@ -30073,200 +30264,218 @@ class MainWindow(QMainWindow):
         )
 
     def handle_assign(self):
-        source_node = self.get_selected_tree_node_data("source")
-        destination_node = self.get_selected_tree_node_data("destination")
+        _perf_t = QElapsedTimer()
+        _perf_d = is_dev_mode()
+        if _perf_d:
+            _perf_t.start()
+        try:
+            source_node = self.get_selected_tree_node_data("source")
+            destination_node = self.get_selected_tree_node_data("destination")
 
-        if source_node is None:
-            QMessageBox.information(self, "Assign", "Select one source item before assigning.")
-            return
-
-        if destination_node is None:
-            QMessageBox.information(self, "Assign", "Select one destination item before assigning.")
-            return
-
-        if not self.node_is_valid_destination_target(destination_node):
-            QMessageBox.information(self, "Assign", "Select a valid destination folder before assigning.")
-            return
-
-        submitted_move = self._find_submitted_move_by_source_node(source_node)
-        if submitted_move is not None:
-            self._show_submitted_item_locked_message(
-                "Assign",
-                f"'{source_node.get('name', 'This item')}'",
-                self._submitted_batch_id_for_move(submitted_move),
-            )
-            return
-
-        planning_state = self._resolve_selection_planning_state("source", source_node)
-        existing_index = self.find_planned_move_index_by_source(source_node)
-        if existing_index is not None:
-            existing_move = self.planned_moves[existing_index]
-            existing_destination = existing_move.get("destination", {})
-            current_destination_path = self._move_destination_target_path(existing_move)
-            new_destination_path = self._destination_target_path_for_node(destination_node)
-
-            same_destination = bool(
-                current_destination_path
-                and new_destination_path
-                and current_destination_path.lower() == new_destination_path.lower()
-            )
-            if not same_destination:
-                same_destination = self.node_keys_match(existing_destination, destination_node, "destination")
-
-            if same_destination:
-                QMessageBox.information(self, "Assign", "This source item is already assigned to that destination.")
+            if source_node is None:
+                QMessageBox.information(self, "Assign", "Select one source item before assigning.")
                 return
 
-            source_name = source_node.get("name", "This item")
-            if not self._confirm_assignment_override(source_name, current_destination_path, new_destination_path):
+            if destination_node is None:
+                QMessageBox.information(self, "Assign", "Select one destination item before assigning.")
                 return
 
-            self._mark_allocation_resolved(existing_move)
-            replacement_move = self.build_planned_move_record(source_node, destination_node)
-            replacement_move["allocation_method"] = "Manual - Override"
-            self.planned_moves[existing_index] = replacement_move
-            self.refresh_planned_moves_table()
-            self.planned_moves_status.setText("Planned move override applied.")
-            self._defer_destination_projection_if_quick_apply_failed(
-                self._register_and_project_planned_move(replacement_move, reason="planned_move_override"),
-                reconcile_reason="assign_override_tree_reconcile",
-            )
-            self._persist_planning_change(
-                "planned_move_override_added",
-                notify_saved=False,
-                source_projection_paths=self._narrow_source_projection_paths_for_move(replacement_move),
-            )
-            return
+            if not self.node_is_valid_destination_target(destination_node):
+                QMessageBox.information(self, "Assign", "Select a valid destination folder before assigning.")
+                return
 
-        inherited_move = planning_state.get("move") if planning_state.get("mode") == "inherited" else None
-        if inherited_move is not None:
-            inherited_destination_path = self._move_destination_target_path(inherited_move)
-            new_destination_path = self._destination_target_path_for_node(destination_node)
-            same_destination = bool(
-                inherited_destination_path
-                and new_destination_path
-                and inherited_destination_path.lower() == new_destination_path.lower()
-            )
-            if same_destination:
-                QMessageBox.information(
-                    self,
+            submitted_move = self._find_submitted_move_by_source_node(source_node)
+            if submitted_move is not None:
+                self._show_submitted_item_locked_message(
                     "Assign",
-                    "This source item already inherits its assignment to that destination.",
+                    f"'{source_node.get('name', 'This item')}'",
+                    self._submitted_batch_id_for_move(submitted_move),
                 )
                 return
 
-            source_name = source_node.get("name", "This item")
-            if not self._confirm_assignment_override(
-                source_name,
-                inherited_destination_path,
-                new_destination_path,
-                inherited_from=inherited_move.get("source_name", ""),
-            ):
+            planning_state = self._resolve_selection_planning_state("source", source_node)
+            existing_index = self.find_planned_move_index_by_source(source_node)
+            if existing_index is not None:
+                existing_move = self.planned_moves[existing_index]
+                existing_destination = existing_move.get("destination", {})
+                current_destination_path = self._move_destination_target_path(existing_move)
+                new_destination_path = self._destination_target_path_for_node(destination_node)
+
+                same_destination = bool(
+                    current_destination_path
+                    and new_destination_path
+                    and current_destination_path.lower() == new_destination_path.lower()
+                )
+                if not same_destination:
+                    same_destination = self.node_keys_match(existing_destination, destination_node, "destination")
+
+                if same_destination:
+                    QMessageBox.information(self, "Assign", "This source item is already assigned to that destination.")
+                    return
+
+                source_name = source_node.get("name", "This item")
+                if not self._confirm_assignment_override(source_name, current_destination_path, new_destination_path):
+                    return
+
+                self._mark_allocation_resolved(existing_move)
+                replacement_move = self.build_planned_move_record(source_node, destination_node)
+                replacement_move["allocation_method"] = "Manual - Override"
+                self.planned_moves[existing_index] = replacement_move
+                self.refresh_planned_moves_table()
+                self.planned_moves_status.setText("Planned move override applied.")
+                self._defer_destination_projection_if_quick_apply_failed(
+                    self._register_and_project_planned_move(replacement_move, reason="planned_move_override"),
+                    reconcile_reason="assign_override_tree_reconcile",
+                )
+                self._persist_planning_change(
+                    "planned_move_override_added",
+                    notify_saved=False,
+                    source_projection_paths=self._narrow_source_projection_paths_for_move(replacement_move),
+                )
                 return
 
-            override_move = self.build_planned_move_record(source_node, destination_node)
-            override_move["allocation_method"] = "Manual - Override"
-            self.planned_moves.append(override_move)
+            inherited_move = planning_state.get("move") if planning_state.get("mode") == "inherited" else None
+            if inherited_move is not None:
+                inherited_destination_path = self._move_destination_target_path(inherited_move)
+                new_destination_path = self._destination_target_path_for_node(destination_node)
+                same_destination = bool(
+                    inherited_destination_path
+                    and new_destination_path
+                    and inherited_destination_path.lower() == new_destination_path.lower()
+                )
+                if same_destination:
+                    QMessageBox.information(
+                        self,
+                        "Assign",
+                        "This source item already inherits its assignment to that destination.",
+                    )
+                    return
+
+                source_name = source_node.get("name", "This item")
+                if not self._confirm_assignment_override(
+                    source_name,
+                    inherited_destination_path,
+                    new_destination_path,
+                    inherited_from=inherited_move.get("source_name", ""),
+                ):
+                    return
+
+                override_move = self.build_planned_move_record(source_node, destination_node)
+                override_move["allocation_method"] = "Manual - Override"
+                self.planned_moves.append(override_move)
+                self.refresh_planned_moves_table()
+                self.planned_moves_status.setText("Planned move override applied.")
+                self._defer_destination_projection_if_quick_apply_failed(
+                    self._register_and_project_planned_move(override_move, reason="planned_move_override"),
+                    reconcile_reason="assign_override_tree_reconcile",
+                )
+                self._persist_planning_change(
+                    "planned_move_override_added",
+                    notify_saved=False,
+                    source_projection_paths=self._narrow_source_projection_paths_for_move(override_move),
+                )
+                return
+
+            new_move = self.build_planned_move_record(source_node, destination_node)
+            if source_node.get("is_folder"):
+                new_move["allocation_method"] = "Manual - Recursive"
+            else:
+                new_move["allocation_method"] = "Manual"
+            self.planned_moves.append(new_move)
+            if is_dev_mode():
+                log_info(
+                    "debug_pass_assign",
+                    source_path_excerpt=str(source_node.get("display_path", "") or "")[:200],
+                    dest_path_excerpt=str(destination_node.get("display_path", "") or "")[:200],
+                )
             self.refresh_planned_moves_table()
-            self.planned_moves_status.setText("Planned move override applied.")
+            self.planned_moves_status.setText("Planned move added.")
             self._defer_destination_projection_if_quick_apply_failed(
-                self._register_and_project_planned_move(override_move, reason="planned_move_override"),
-                reconcile_reason="assign_override_tree_reconcile",
+                self._register_and_project_planned_move(new_move, reason="planned_move_added"),
+                reconcile_reason="assign_tree_reconcile",
             )
             self._persist_planning_change(
-                "planned_move_override_added",
+                "planned_move_added",
                 notify_saved=False,
-                source_projection_paths=self._narrow_source_projection_paths_for_move(override_move),
+                source_projection_paths=self._narrow_source_projection_paths_for_move(new_move),
             )
-            return
 
-        new_move = self.build_planned_move_record(source_node, destination_node)
-        if source_node.get("is_folder"):
-            new_move["allocation_method"] = "Manual - Recursive"
-        else:
-            new_move["allocation_method"] = "Manual"
-        self.planned_moves.append(new_move)
-        if is_dev_mode():
-            log_info(
-                "debug_pass_assign",
-                source_path_excerpt=str(source_node.get("display_path", "") or "")[:200],
-                dest_path_excerpt=str(destination_node.get("display_path", "") or "")[:200],
-            )
-        self.refresh_planned_moves_table()
-        self.planned_moves_status.setText("Planned move added.")
-        self._defer_destination_projection_if_quick_apply_failed(
-            self._register_and_project_planned_move(new_move, reason="planned_move_added"),
-            reconcile_reason="assign_tree_reconcile",
-        )
-        self._persist_planning_change(
-            "planned_move_added",
-            notify_saved=False,
-            source_projection_paths=self._narrow_source_projection_paths_for_move(new_move),
-        )
+        finally:
+            if _perf_d:
+                _perf_explorer_log("handle_assign", elapsed_ms=_perf_t.elapsed())
 
     def handle_unassign(self):
-        # Prefer the current source tree selection when it has a planned move. The planned-moves
-        # table can retain a stale selection while the user uses the source context menu, which
-        # previously caused Unassign to target the wrong row or appear to do nothing.
-        source_node = self.get_selected_tree_node_data("source")
-        if source_node is not None:
-            move_index = self.find_planned_move_index_by_source(source_node)
-            if move_index is not None:
-                existing_move = self.planned_moves[move_index]
-                if is_dev_mode():
-                    log_info(
-                        "debug_pass_unassign",
-                        via="source_tree",
-                        source_path_excerpt=str(source_node.get("display_path", "") or "")[:200],
-                    )
-                if self._is_move_submitted(existing_move):
-                    self._show_submitted_item_locked_message(
-                        "Unassign",
-                        f"'{existing_move.get('source_name', 'This item')}'",
-                        self._submitted_batch_id_for_move(existing_move),
-                    )
-                    return
-                removed_visually = self._quick_remove_planned_move_from_destination_tree(existing_move) > 0
-                self.planned_moves.pop(move_index)
-                self._reset_unresolved_allocation_queue()
-                self.refresh_planned_moves_table()
-                self.planned_moves_status.setText("Planned move removed.")
-                if not removed_visually:
-                    self._schedule_deferred_destination_materialization("unassign_tree_reconcile", delay_ms=220)
-                self._persist_planning_change(
-                    "planned_move_removed",
-                    source_projection_paths=self._narrow_source_projection_paths_for_move(existing_move),
-                )
-                return
-
-        selected_ranges = self.planned_moves_table.selectedRanges()
-        if selected_ranges:
-            row_index = selected_ranges[0].topRow()
-            if 0 <= row_index < len(self.planned_moves):
-                target_move = self.planned_moves[row_index]
-                if is_dev_mode():
-                    log_info("debug_pass_unassign", via="planned_moves_table", row_index=row_index)
-                if self._is_move_submitted(target_move):
-                    self._show_submitted_item_locked_message(
-                        "Unassign",
-                        f"'{target_move.get('source_name', 'This item')}'",
-                        self._submitted_batch_id_for_move(target_move),
+        _perf_t = QElapsedTimer()
+        _perf_d = is_dev_mode()
+        if _perf_d:
+            _perf_t.start()
+        try:
+            # Prefer the current source tree selection when it has a planned move. The planned-moves
+            # table can retain a stale selection while the user uses the source context menu, which
+            # previously caused Unassign to target the wrong row or appear to do nothing.
+            source_node = self.get_selected_tree_node_data("source")
+            if source_node is not None:
+                move_index = self.find_planned_move_index_by_source(source_node)
+                if move_index is not None:
+                    existing_move = self.planned_moves[move_index]
+                    if is_dev_mode():
+                        log_info(
+                            "debug_pass_unassign",
+                            via="source_tree",
+                            source_path_excerpt=str(source_node.get("display_path", "") or "")[:200],
+                        )
+                    if self._is_move_submitted(existing_move):
+                        self._show_submitted_item_locked_message(
+                            "Unassign",
+                            f"'{existing_move.get('source_name', 'This item')}'",
+                            self._submitted_batch_id_for_move(existing_move),
+                        )
+                        return
+                    removed_visually = self._quick_remove_planned_move_from_destination_tree(existing_move) > 0
+                    self.planned_moves.pop(move_index)
+                    self._reset_unresolved_allocation_queue()
+                    self.refresh_planned_moves_table()
+                    self.planned_moves_status.setText("Planned move removed.")
+                    if not removed_visually:
+                        self._schedule_deferred_destination_materialization("unassign_tree_reconcile", delay_ms=220)
+                    self._persist_planning_change(
+                        "planned_move_removed",
+                        source_projection_paths=self._narrow_source_projection_paths_for_move(existing_move),
                     )
                     return
-                removed_visually = self._quick_remove_planned_move_from_destination_tree(target_move) > 0
-                self.planned_moves.pop(row_index)
-                self._reset_unresolved_allocation_queue()
-                self.refresh_planned_moves_table()
-                self.planned_moves_status.setText("Planned move removed.")
-                if not removed_visually:
-                    self._schedule_deferred_destination_materialization("unassign_tree_reconcile", delay_ms=220)
-                self._persist_planning_change(
-                    "planned_move_removed",
-                    source_projection_paths=self._narrow_source_projection_paths_for_move(target_move),
-                )
-                return
 
-        QMessageBox.information(self, "Unassign", "Select a planned move or select a source item with a planned move.")
+            selected_ranges = self.planned_moves_table.selectedRanges()
+            if selected_ranges:
+                row_index = selected_ranges[0].topRow()
+                if 0 <= row_index < len(self.planned_moves):
+                    target_move = self.planned_moves[row_index]
+                    if is_dev_mode():
+                        log_info("debug_pass_unassign", via="planned_moves_table", row_index=row_index)
+                    if self._is_move_submitted(target_move):
+                        self._show_submitted_item_locked_message(
+                            "Unassign",
+                            f"'{target_move.get('source_name', 'This item')}'",
+                            self._submitted_batch_id_for_move(target_move),
+                        )
+                        return
+                    removed_visually = self._quick_remove_planned_move_from_destination_tree(target_move) > 0
+                    self.planned_moves.pop(row_index)
+                    self._reset_unresolved_allocation_queue()
+                    self.refresh_planned_moves_table()
+                    self.planned_moves_status.setText("Planned move removed.")
+                    if not removed_visually:
+                        self._schedule_deferred_destination_materialization("unassign_tree_reconcile", delay_ms=220)
+                    self._persist_planning_change(
+                        "planned_move_removed",
+                        source_projection_paths=self._narrow_source_projection_paths_for_move(target_move),
+                    )
+                    return
+
+            QMessageBox.information(self, "Unassign", "Select a planned move or select a source item with a planned move.")
+
+        finally:
+            if _perf_d:
+                _perf_explorer_log("handle_unassign", elapsed_ms=_perf_t.elapsed())
 
     def try_restore_main_window(self):
         preserve_maximized = self._was_maximized_before_login or self.isMaximized()

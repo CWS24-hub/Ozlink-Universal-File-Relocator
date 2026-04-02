@@ -73,6 +73,13 @@ class _MaterializeSkipHost:
     def _cancel_destination_future_async_projection(self, reason=""):
         self.cancel_projection_calls.append(str(reason or ""))
 
+    def _materialize_destination_future_model_body(
+        self, reason, *, allow_defer=True, prefer_chunked_projection=False
+    ):
+        return MainWindow._materialize_destination_future_model_body(
+            self, reason, allow_defer=allow_defer, prefer_chunked_projection=prefer_chunked_projection
+        )
+
 
 def test_materialize_skips_folder_worker_success_while_projection_merge_in_progress():
     host = _MaterializeSkipHost()
