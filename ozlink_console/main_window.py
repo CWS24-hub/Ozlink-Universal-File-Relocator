@@ -10534,7 +10534,12 @@ class MainWindow(QMainWindow):
                         model.set_empty_library_message("This library is empty.")
                         tree.setEnabled(False)
                     else:
-                        model.reset_root_payloads(root_payloads)
+                        with _PerfExplorerTimer(
+                            "tree_snapshot_reset_root_payloads",
+                            panel_key="source",
+                            root_count=len(root_payloads),
+                        ):
+                            model.reset_root_payloads(root_payloads)
                         self._set_tree_status_message(
                             panel_key,
                             f"Loading tree snapshot… ({len(root_payloads)}/{len(snapshots)})",
@@ -10573,7 +10578,12 @@ class MainWindow(QMainWindow):
                         model.set_empty_library_message("This library is empty.")
                         tree.setEnabled(False)
                     else:
-                        model.reset_root_payloads(root_payloads)
+                        with _PerfExplorerTimer(
+                            "tree_snapshot_reset_root_payloads",
+                            panel_key="destination",
+                            root_count=len(root_payloads),
+                        ):
+                            model.reset_root_payloads(root_payloads)
                         self._set_tree_status_message(
                             panel_key,
                             f"Loading tree snapshot… ({len(root_payloads)}/{len(snapshots)})",
@@ -11945,37 +11955,118 @@ class MainWindow(QMainWindow):
             cache[normalized_target] = row
 
     def _find_visible_source_item_by_path(self, source_path):
+        perf = QElapsedTimer()
+        dev = is_dev_mode()
+        if dev:
+            perf.start()
         tree = getattr(self, "source_tree_widget", None)
         if tree is None:
+            if dev:
+                _perf_explorer_log("find_visible_source_item_by_path", elapsed_ms=perf.elapsed(), match="no_tree")
             return None
         normalized_target = self._canonical_source_projection_path(source_path)
         if not normalized_target:
+            if dev:
+                _perf_explorer_log("find_visible_source_item_by_path", elapsed_ms=perf.elapsed(), match="no_normalized_path")
             return None
         cached = self._source_lookup_cache_get(normalized_target)
         if cached is not None:
+            if dev:
+                _perf_explorer_log(
+                    "find_visible_source_item_by_path",
+                    elapsed_ms=perf.elapsed(),
+                    match="cache",
+                    scanned_nodes=0,
+                )
             return cached
         if self._source_tree_uses_model_view():
+            ix = tree.currentIndex()
+            if ix.isValid() and ix.column() != 0:
+                ix = ix.siblingAtColumn(0)
+            if ix.isValid():
+                node_data = self.get_tree_item_node_data(ix)
+                if node_data:
+                    visible_path = self._canonical_source_projection_path(self._tree_item_path(node_data))
+                    if visible_path and visible_path == normalized_target:
+                        self._source_lookup_cache_put(normalized_target, ix)
+                        if dev:
+                            _perf_explorer_log(
+                                "find_visible_source_item_by_path",
+                                elapsed_ms=perf.elapsed(),
+                                match="current_index",
+                                scanned_nodes=0,
+                            )
+                        return ix
             model = getattr(self, "source_sharepoint_model", None)
             if model is None:
+                if dev:
+                    _perf_explorer_log("find_visible_source_item_by_path", elapsed_ms=perf.elapsed(), match="no_model")
                 return None
+            scanned_nodes = 0
             for ix in model.iter_depth_first():
+                scanned_nodes += 1
                 node_data = self.get_tree_item_node_data(ix) or {}
                 if node_data.get("placeholder"):
                     continue
                 visible_path = self._canonical_source_projection_path(self._tree_item_path(node_data))
                 if visible_path and visible_path == normalized_target:
                     self._source_lookup_cache_put(normalized_target, ix)
+                    if dev:
+                        _perf_explorer_log(
+                            "find_visible_source_item_by_path",
+                            elapsed_ms=perf.elapsed(),
+                            match="depth_first",
+                            scanned_nodes=scanned_nodes,
+                        )
                     return ix
+            if dev:
+                _perf_explorer_log(
+                    "find_visible_source_item_by_path",
+                    elapsed_ms=perf.elapsed(),
+                    match="depth_first_miss",
+                    scanned_nodes=scanned_nodes,
+                )
             return None
+        cur = tree.currentItem()
+        if cur is not None:
+            node_data = cur.data(0, Qt.UserRole) or {}
+            if not node_data.get("placeholder"):
+                visible_path = self._canonical_source_projection_path(self._tree_item_path(node_data))
+                if visible_path and visible_path == normalized_target:
+                    self._source_lookup_cache_put(normalized_target, cur)
+                    if dev:
+                        _perf_explorer_log(
+                            "find_visible_source_item_by_path",
+                            elapsed_ms=perf.elapsed(),
+                            match="current_item",
+                            scanned_nodes=0,
+                        )
+                    return cur
+        scanned_nodes = 0
         for index in range(tree.topLevelItemCount()):
             for item in self._iter_tree_items(tree.topLevelItem(index)):
+                scanned_nodes += 1
                 node_data = item.data(0, Qt.UserRole) or {}
                 if node_data.get("placeholder"):
                     continue
                 visible_path = self._canonical_source_projection_path(self._tree_item_path(node_data))
                 if visible_path and visible_path == normalized_target:
                     self._source_lookup_cache_put(normalized_target, item)
+                    if dev:
+                        _perf_explorer_log(
+                            "find_visible_source_item_by_path",
+                            elapsed_ms=perf.elapsed(),
+                            match="widget_walk",
+                            scanned_nodes=scanned_nodes,
+                        )
                     return item
+        if dev:
+            _perf_explorer_log(
+                "find_visible_source_item_by_path",
+                elapsed_ms=perf.elapsed(),
+                match="widget_walk_miss",
+                scanned_nodes=scanned_nodes,
+            )
         return None
 
     def _find_source_item_for_planned_move(self, move):
@@ -13889,10 +13980,13 @@ class MainWindow(QMainWindow):
         if not parent_path:
             return 0
         try:
-            parent_item = self._ensure_destination_projection_path(parent_path)
+            parent_item = None
+            with _PerfExplorerTimer("quick_apply_allocated_node", step="ensure_parent"):
+                parent_item = self._ensure_destination_projection_path(parent_path)
             if parent_item is None:
                 return 0
-            return self._apply_allocation_children_to_item(parent_item)
+            with _PerfExplorerTimer("quick_apply_allocated_node", step="apply_children"):
+                return self._apply_allocation_children_to_item(parent_item)
         except Exception as exc:
             self._log_restore_exception("quick_apply_allocated_node_under_parent", exc)
             return 0
@@ -13991,46 +14085,47 @@ class MainWindow(QMainWindow):
 
     def _quick_remove_planned_move_from_destination_tree(self, move):
         """Remove or unmark the visible destination projection for one planned move (no full tree bind)."""
-        if not isinstance(move, dict):
-            return 0
-        self._mark_allocation_resolved(move)
-        parent_path = self._allocation_parent_path(move)
-        child = None
-        parent_item = self._find_visible_destination_item_by_path(parent_path) if parent_path else None
-        if parent_item is not None:
-            child = self._find_destination_child_by_allocation_equivalence(parent_item, move)
-        if child is None:
-            proj = self._allocation_projection_path(move)
-            if proj:
-                child = self._find_visible_destination_item_by_path(proj)
-        if child is None:
-            child = self._find_destination_tree_item_for_planned_move(move)
-        if child is None:
-            return 0
-        if not self._destination_tree_item_matches_move(child, move):
-            node_data_probe = child.data(0, Qt.UserRole) or {}
-            alloc = self._canonical_destination_projection_path(self._allocation_projection_path(move))
-            ip = self._canonical_destination_projection_path(self._tree_item_path(node_data_probe))
-            if not (
-                alloc
-                and ip
-                and ip == alloc
-                and (
-                    self.node_is_planned_allocation(node_data_probe)
-                    or bool(node_data_probe.get("planned_allocation"))
-                )
-            ):
+        with _PerfExplorerTimer("quick_remove_planned_move_from_destination_tree"):
+            if not isinstance(move, dict):
                 return 0
-        node_data = child.data(0, Qt.UserRole) or {}
-        cid = str(node_data.get("id", "") or "")
-        if cid.startswith("allocated::"):
-            self._take_destination_tree_item(child)
-            return 1
-        if self.node_is_planned_allocation(node_data):
-            self._remove_planned_allocation_projection_children(child)
-            self._strip_planned_allocation_overlay_for_move(child, move)
-            return 1
-        return 0
+            self._mark_allocation_resolved(move)
+            parent_path = self._allocation_parent_path(move)
+            child = None
+            parent_item = self._find_visible_destination_item_by_path(parent_path) if parent_path else None
+            if parent_item is not None:
+                child = self._find_destination_child_by_allocation_equivalence(parent_item, move)
+            if child is None:
+                proj = self._allocation_projection_path(move)
+                if proj:
+                    child = self._find_visible_destination_item_by_path(proj)
+            if child is None:
+                child = self._find_destination_tree_item_for_planned_move(move)
+            if child is None:
+                return 0
+            if not self._destination_tree_item_matches_move(child, move):
+                node_data_probe = child.data(0, Qt.UserRole) or {}
+                alloc = self._canonical_destination_projection_path(self._allocation_projection_path(move))
+                ip = self._canonical_destination_projection_path(self._tree_item_path(node_data_probe))
+                if not (
+                    alloc
+                    and ip
+                    and ip == alloc
+                    and (
+                        self.node_is_planned_allocation(node_data_probe)
+                        or bool(node_data_probe.get("planned_allocation"))
+                    )
+                ):
+                    return 0
+            node_data = child.data(0, Qt.UserRole) or {}
+            cid = str(node_data.get("id", "") or "")
+            if cid.startswith("allocated::"):
+                self._take_destination_tree_item(child)
+                return 1
+            if self.node_is_planned_allocation(node_data):
+                self._remove_planned_allocation_projection_children(child)
+                self._strip_planned_allocation_overlay_for_move(child, move)
+                return 1
+            return 0
 
     def _mark_proposed_folder_resolved(self, proposed_folder):
         parent_path = self._proposed_parent_path(proposed_folder)
@@ -30263,6 +30358,13 @@ class MainWindow(QMainWindow):
             skipped_other=skipped_other,
         )
 
+    def _acknowledge_planning_mutation_ui(self, message: str = "Updating plan…") -> None:
+        """Immediate status + event pump so assign/unassign feels responsive before heavier UI work."""
+        status = getattr(self, "planned_moves_status", None)
+        if status is not None:
+            status.setText(message)
+        QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+
     def handle_assign(self):
         _perf_t = QElapsedTimer()
         _perf_d = is_dev_mode()
@@ -30321,6 +30423,7 @@ class MainWindow(QMainWindow):
                 replacement_move = self.build_planned_move_record(source_node, destination_node)
                 replacement_move["allocation_method"] = "Manual - Override"
                 self.planned_moves[existing_index] = replacement_move
+                self._acknowledge_planning_mutation_ui("Applying assignment…")
                 self.refresh_planned_moves_table()
                 self.planned_moves_status.setText("Planned move override applied.")
                 self._defer_destination_projection_if_quick_apply_failed(
@@ -30363,6 +30466,7 @@ class MainWindow(QMainWindow):
                 override_move = self.build_planned_move_record(source_node, destination_node)
                 override_move["allocation_method"] = "Manual - Override"
                 self.planned_moves.append(override_move)
+                self._acknowledge_planning_mutation_ui("Applying assignment…")
                 self.refresh_planned_moves_table()
                 self.planned_moves_status.setText("Planned move override applied.")
                 self._defer_destination_projection_if_quick_apply_failed(
@@ -30388,6 +30492,7 @@ class MainWindow(QMainWindow):
                     source_path_excerpt=str(source_node.get("display_path", "") or "")[:200],
                     dest_path_excerpt=str(destination_node.get("display_path", "") or "")[:200],
                 )
+            self._acknowledge_planning_mutation_ui("Applying assignment…")
             self.refresh_planned_moves_table()
             self.planned_moves_status.setText("Planned move added.")
             self._defer_destination_projection_if_quick_apply_failed(
@@ -30431,6 +30536,7 @@ class MainWindow(QMainWindow):
                             self._submitted_batch_id_for_move(existing_move),
                         )
                         return
+                    self._acknowledge_planning_mutation_ui("Removing assignment…")
                     removed_visually = self._quick_remove_planned_move_from_destination_tree(existing_move) > 0
                     self.planned_moves.pop(move_index)
                     self._reset_unresolved_allocation_queue()
@@ -30458,6 +30564,7 @@ class MainWindow(QMainWindow):
                             self._submitted_batch_id_for_move(target_move),
                         )
                         return
+                    self._acknowledge_planning_mutation_ui("Removing assignment…")
                     removed_visually = self._quick_remove_planned_move_from_destination_tree(target_move) > 0
                     self.planned_moves.pop(row_index)
                     self._reset_unresolved_allocation_queue()
