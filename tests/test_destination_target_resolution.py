@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from PySide6.QtCore import QModelIndex, Qt
+from PySide6.QtCore import QByteArray, QModelIndex, QMimeData, Qt
 from PySide6.QtGui import QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import QAbstractItemView, QApplication
 
-from ozlink_console.main_window import MainWindow
+from ozlink_console.main_window import MainWindow, OZLINK_DESTINATION_PLANNING_DRAG_MIME
 from ozlink_console.tree_models.destination_planning_model import DestinationPlanningTreeModel
 
 
@@ -246,6 +246,10 @@ def test_handle_destination_draft_move_accepts_allocated_folder_only_for_paste_k
     moved.clear()
     mw.handle_destination_draft_move(src_ix, tgt_ix)
     assert moved == []
+
+    moved.clear()
+    mw.handle_destination_draft_move(src_ix, tgt_ix, _manual_planning_drag=True)
+    assert moved == [True]
 
 
 def test_normalize_paste_destination_row_ref_column_zero():
@@ -733,7 +737,7 @@ def test_manual_drop_resolver_does_not_reset_model():
     assert len(resets) == 0
 
 
-def test_manual_drop_rejects_allocated_folder_target():
+def test_manual_drop_allows_allocated_folder_container():
     _qapp()
     model = DestinationPlanningTreeModel(destination_index_key_fn=_dest_key)
     model.reset_root_payloads(
@@ -755,7 +759,89 @@ def test_manual_drop_rejects_allocated_folder_target():
     commit_ix, meta = mw._resolve_destination_manual_drop_folder_index(
         alloc_ix, QAbstractItemView.DropIndicatorPosition.OnItem
     )
+    assert commit_ix == alloc_ix
+    assert meta["drop_rejected_reason"] == ""
+    assert meta["drag_acceptance_reason"] == "valid_visible_folder_container"
+    assert meta["resolved_target_path"]
+
+
+def test_manual_drop_rejects_projected_allocation_descendant_folder_row():
+    _qapp()
+    model = DestinationPlanningTreeModel(destination_index_key_fn=_dest_key)
+    model.reset_root_payloads(
+        [
+            {
+                "base_display_label": "Proj",
+                "name": "Proj",
+                "is_folder": True,
+                "item_path": r"Root\Proj",
+                "display_path": r"Root\Proj",
+                "tree_role": "destination",
+                "node_origin": "projectedallocationdescendant",
+            }
+        ]
+    )
+    ix = model.index(0, 0, QModelIndex())
+    mw = MainWindow.__new__(MainWindow)
+    commit_ix, meta = mw._resolve_destination_manual_drop_folder_index(
+        ix, QAbstractItemView.DropIndicatorPosition.OnItem
+    )
     assert commit_ix is None
     assert meta["drop_rejected_reason"] == "target_not_eligible"
-    assert not meta.get("resolved_target_path")
+
+
+def test_manual_planning_drag_mime_is_registered_on_mimedata():
+    md = QMimeData()
+    md.setData(OZLINK_DESTINATION_PLANNING_DRAG_MIME, QByteArray(b"v1"))
+    assert md.hasFormat(OZLINK_DESTINATION_PLANNING_DRAG_MIME)
+
+
+def test_manual_drop_resolved_path_matches_commit_semantics():
+    _qapp()
+    model = DestinationPlanningTreeModel(destination_index_key_fn=_dest_key)
+    model.reset_root_payloads(
+        [
+            {
+                "base_display_label": "D",
+                "name": "D",
+                "is_folder": True,
+                "item_path": r"Root\D",
+                "display_path": r"Root\D",
+                "tree_role": "destination",
+                "node_origin": "Real",
+            }
+        ]
+    )
+    folder_ix = model.index(0, 0, QModelIndex())
+    mw = MainWindow.__new__(MainWindow)
+    commit_ix, meta = mw._resolve_destination_manual_drop_folder_index(
+        folder_ix, QAbstractItemView.DropIndicatorPosition.OnItem
+    )
+    commit_node = commit_ix.data(Qt.UserRole) or {}
+    sem = mw._destination_row_semantic_path(commit_node)
+    assert meta["resolved_target_path"] == str(sem or "")[:240]
+
+
+def test_destination_tree_drag_enter_accepts_move_action():
+    """View accepts our MIME with explicit Move (regression: forbidden cursor if proposed action mismatches)."""
+    _qapp()
+    from PySide6.QtCore import QPoint
+    from PySide6.QtGui import QDragEnterEvent
+
+    from ozlink_console.main_window import DestinationPlanningTreeView
+
+    tree = DestinationPlanningTreeView()
+    md = QMimeData()
+    md.setData(OZLINK_DESTINATION_PLANNING_DRAG_MIME, QByteArray(b"v1"))
+    pos = QPoint(4, 4)
+    ev = QDragEnterEvent(
+        pos,
+        Qt.DropAction.MoveAction,
+        md,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    tree.dragEnterEvent(ev)
+    assert ev.isAccepted()
+    assert ev.dropAction() == Qt.DropAction.MoveAction
 
