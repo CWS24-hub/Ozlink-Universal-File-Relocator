@@ -6383,6 +6383,7 @@ class MainWindow(QMainWindow):
             "phase2_post_login_restore_timer",
             "phase4_destination_overlay_timer",
             "phase4_destination_overlay_immediate",
+            "phase4_destination_overlay_after_destination_ui",
             "login.restore_workspace",
             "login_worker.success",
             "discovery_worker.success",
@@ -10744,6 +10745,19 @@ class MainWindow(QMainWindow):
             self._safe_invoke("phase4_destination_overlay_immediate", self._post_login_restore_phase4)
             self._log_restore_phase("phase2_post_login_restore_exit")
 
+    def _schedule_post_login_restore_phase4_if_pending(self) -> None:
+        """Re-run phase-4 when the first invoke ran before the destination tree was ready."""
+        if not getattr(self, "_memory_restore_in_progress", False):
+            return
+        if not getattr(self, "_restore_destination_overlay_pending", False):
+            return
+        if self._restore_abort_active():
+            return
+        self._safe_invoke(
+            "phase4_destination_overlay_after_destination_ui",
+            self._post_login_restore_phase4,
+        )
+
     def _post_login_restore_phase4(self):
         if self._restore_abort_active():
             self._log_restore_phase(
@@ -10751,6 +10765,7 @@ class MainWindow(QMainWindow):
                 reason="restore_abort_mode",
                 restore_abort_reason=str(getattr(self, "_restore_abort_reason", "") or ""),
             )
+            self._finalize_memory_restore_if_ready("phase4_skipped_restore_abort")
             return
         if not self._restore_destination_overlay_pending:
             self._log_restore_phase("phase4_destination_overlay skipped", reason="no proposed folders pending")
@@ -14910,6 +14925,8 @@ class MainWindow(QMainWindow):
                 )
                 self._schedule_progress_summary_refresh()
                 self._log_root_success_step("step_11_ui_refresh_exit", panel_key=panel_key)
+                if panel_key == "destination":
+                    self._schedule_post_login_restore_phase4_if_pending()
                 return
             root_present = root_row is not None and (
                 not isinstance(root_row, QModelIndex) or root_row.isValid()
@@ -14934,6 +14951,8 @@ class MainWindow(QMainWindow):
                 )
                 self._schedule_progress_summary_refresh()
                 self._log_root_success_step("step_11_ui_refresh_exit", panel_key=panel_key)
+                if panel_key == "destination":
+                    self._schedule_post_login_restore_phase4_if_pending()
                 return
             if getattr(self, "_sharepoint_lazy_mode", False):
                 applied_count = 0
@@ -14950,6 +14969,8 @@ class MainWindow(QMainWindow):
                 )
                 self._schedule_progress_summary_refresh()
                 self._log_root_success_step("step_11_ui_refresh_exit", panel_key=panel_key)
+                if panel_key == "destination":
+                    self._schedule_post_login_restore_phase4_if_pending()
                 return
             applied_count = self._apply_proposed_overlay_after_root_bind(panel_key)
             self._start_destination_restore_materialization()
@@ -14973,6 +14994,8 @@ class MainWindow(QMainWindow):
                 visible_proposed_count=self._count_visible_destination_proposed_nodes(),
                 deferred=self._restore_destination_overlay_pending,
             )
+            if panel_key == "destination":
+                self._schedule_post_login_restore_phase4_if_pending()
         self._schedule_progress_summary_refresh()
         self._log_root_success_step("step_11_ui_refresh_exit", panel_key=panel_key)
 

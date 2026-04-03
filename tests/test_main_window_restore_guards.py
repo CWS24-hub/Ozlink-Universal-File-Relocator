@@ -107,6 +107,66 @@ def test_materialize_skips_folder_worker_success_while_chunked_bind_in_progress(
     )
 
 
+def test_schedule_post_login_phase4_skips_when_restore_not_in_progress():
+    class Host:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            self._memory_restore_in_progress = False
+            self._restore_destination_overlay_pending = True
+            self._restore_abort_mode = False
+
+        def _restore_abort_active(self) -> bool:
+            return bool(self._restore_abort_mode)
+
+        def _safe_invoke(self, name, fn) -> None:
+            self.calls.append(str(name))
+
+    host = Host()
+    MainWindow._schedule_post_login_restore_phase4_if_pending(host)
+    assert host.calls == []
+
+
+def test_schedule_post_login_phase4_skips_when_abort_active():
+    class Host:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            self._memory_restore_in_progress = True
+            self._restore_destination_overlay_pending = True
+            self._restore_abort_mode = True
+
+        def _restore_abort_active(self) -> bool:
+            return bool(self._restore_abort_mode)
+
+        def _safe_invoke(self, name, fn) -> None:
+            self.calls.append(str(name))
+
+    host = Host()
+    MainWindow._schedule_post_login_restore_phase4_if_pending(host)
+    assert host.calls == []
+
+
+def test_schedule_post_login_phase4_invokes_safe_invoke_when_pending():
+    class Host:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            self._memory_restore_in_progress = True
+            self._restore_destination_overlay_pending = True
+            self._restore_abort_mode = False
+
+        def _restore_abort_active(self) -> bool:
+            return bool(self._restore_abort_mode)
+
+        def _post_login_restore_phase4(self) -> None:
+            pass
+
+        def _safe_invoke(self, name, fn) -> None:
+            self.calls.append(str(name))
+
+    host = Host()
+    MainWindow._schedule_post_login_restore_phase4_if_pending(host)
+    assert host.calls == ["phase4_destination_overlay_after_destination_ui"]
+
+
 def test_materialize_skips_folder_worker_success_while_bind_sync_active():
     host = _MaterializeSkipHost()
     host._destination_future_bind_sync_active = True
