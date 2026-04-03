@@ -13778,9 +13778,9 @@ class MainWindow(QMainWindow):
             if isinstance(destination_library, dict):
                 library_name = destination_library.get("name", "")
 
-        if not site_name and isinstance(self._draft_shell_state, SessionState):
+        if not site_name and hasattr(self, "_draft_shell_state") and isinstance(self._draft_shell_state, SessionState):
             site_name = self._draft_shell_state.SelectedDestinationSite or ""
-        if not library_name and isinstance(self._draft_shell_state, SessionState):
+        if not library_name and hasattr(self, "_draft_shell_state") and isinstance(self._draft_shell_state, SessionState):
             library_name = self._draft_shell_state.SelectedDestinationLibrary or ""
 
         return [segment for segment in (site_name, library_name) if segment]
@@ -13798,9 +13798,9 @@ class MainWindow(QMainWindow):
             if isinstance(source_library, dict):
                 library_name = source_library.get("name", "")
 
-        if not site_name and isinstance(self._draft_shell_state, SessionState):
+        if not site_name and hasattr(self, "_draft_shell_state") and isinstance(self._draft_shell_state, SessionState):
             site_name = self._draft_shell_state.SelectedSourceSite or ""
-        if not library_name and isinstance(self._draft_shell_state, SessionState):
+        if not library_name and hasattr(self, "_draft_shell_state") and isinstance(self._draft_shell_state, SessionState):
             library_name = self._draft_shell_state.SelectedSourceLibrary or ""
 
         return [segment for segment in (site_name, library_name) if segment]
@@ -14111,7 +14111,10 @@ class MainWindow(QMainWindow):
     def _destination_tree_item_matches_move(self, item, move):
         if item is None or not isinstance(move, dict):
             return False
-        d = item.data(0, Qt.UserRole) or {}
+        if isinstance(item, QModelIndex):
+            d = item.data(Qt.UserRole) or {}
+        else:
+            d = item.data(0, Qt.UserRole) or {}
         ms = self._canonical_source_projection_path(move.get("source_path", ""))
         ns = self._canonical_source_projection_path(d.get("source_path", ""))
         if ms and ns and ms.casefold() == ns.casefold():
@@ -14155,6 +14158,33 @@ class MainWindow(QMainWindow):
         self._apply_tree_item_visual_state(item, node_data)
         self._refresh_destination_item_visibility(item)
 
+    def _strip_planned_allocation_overlay_model_index(self, ix, move):
+        if ix is None or not isinstance(ix, QModelIndex) or not ix.isValid() or not isinstance(move, dict):
+            return
+        model = getattr(self, "destination_planning_model", None)
+        if model is None:
+            return
+        node_data = dict(ix.data(Qt.UserRole) or {})
+        dest = move.get("destination") if isinstance(move.get("destination"), dict) else {}
+        for key in ("display_path", "item_path", "destination_path"):
+            v = dest.get(key)
+            if v:
+                node_data[key] = v
+        node_data.pop("planned_allocation", None)
+        node_data["node_origin"] = "Real"
+        node_data.pop("overlay_state", None)
+        name = str(node_data.get("real_name") or node_data.get("name", "") or "").strip() or "Item"
+        base_label = self._tree_name_column_label(name)
+        node_data["base_display_label"] = base_label
+
+        def _m(p):
+            p.clear()
+            p.update(node_data)
+
+        model.update_payload_for_index(ix, _m)
+        self._apply_tree_item_visual_state(None, node_data)
+        self._refresh_destination_item_visibility_index(ix)
+
     def _find_destination_tree_item_for_planned_move(self, move):
         """Locate the tree row for a planned move when parent/child equivalence lookup misses."""
         if not isinstance(move, dict):
@@ -14197,7 +14227,7 @@ class MainWindow(QMainWindow):
             if child is None:
                 return 0
             if not self._destination_tree_item_matches_move(child, move):
-                node_data_probe = child.data(0, Qt.UserRole) or {}
+                node_data_probe = self.get_tree_item_node_data(child) or {}
                 alloc = self._canonical_destination_projection_path(self._allocation_projection_path(move))
                 ip = self._canonical_destination_projection_path(self._tree_item_path(node_data_probe))
                 if not (
@@ -14210,8 +14240,25 @@ class MainWindow(QMainWindow):
                     )
                 ):
                     return 0
-            node_data = child.data(0, Qt.UserRole) or {}
+            node_data = self.get_tree_item_node_data(child) or {}
             cid = str(node_data.get("id", "") or "")
+            if isinstance(child, QModelIndex):
+                model = getattr(self, "destination_planning_model", None)
+                if cid.startswith("allocated::"):
+                    if model is not None:
+                        model.remove_node_at(child)
+                        return 1
+                    return 0
+                if self.node_is_planned_allocation(node_data):
+                    if bool(node_data.get("is_folder")) and model is not None:
+                        while model.rowCount(child) > 0:
+                            ch = model.index(0, 0, child)
+                            if not ch.isValid():
+                                break
+                            model.remove_node_at(ch)
+                    self._strip_planned_allocation_overlay_model_index(child, move)
+                    return 1
+                return 0
             if cid.startswith("allocated::"):
                 self._take_destination_tree_item(child)
                 return 1
@@ -24574,7 +24621,7 @@ class MainWindow(QMainWindow):
             "label": str(node_data.get("name", "") or self._move_target_name(move or inherited_move) or "This planned item"),
         }
 
-    def _move_planned_destination_node(self, source_node, target_node):
+    def _move_planned_destination_node(self, source_node, target_node, *, from_paste_here=False):
         move_index, move, inherited_move = self._resolve_planned_move_for_destination_node(source_node)
         if move is None and inherited_move is None:
             self.destination_tree_status.setText("No planned allocation exists for the selected destination item.")
@@ -24629,6 +24676,8 @@ class MainWindow(QMainWindow):
                 target_projection_path=target_projection_path,
             )
 
+        old_snap = copy.deepcopy(move) if from_paste_here and move is not None else None
+
         destination_node = self._destination_target_snapshot(target_node, target_path)
         if move is None and inherited_move is not None:
             source_item = self._find_visible_source_item_by_path(source_node.get("source_path", ""))
@@ -24648,14 +24697,49 @@ class MainWindow(QMainWindow):
             override_move["allocation_method"] = "Manual - Override"
             override_move["target_name"] = target_name
             self.planned_moves.append(override_move)
-        else:
-            move["destination_path"] = target_path
-            move["destination_id"] = destination_node.get("id", "")
-            move["destination_name"] = destination_node.get("name", "")
-            move["destination"] = dict(destination_node)
-            move["target_name"] = target_name
+            self.planned_moves_status.setText("Planned item moved.")
+            self.refresh_planned_moves_table()
+            self._schedule_deferred_destination_materialization("planned_item_moved", delay_ms=220)
+            self._persist_planning_change("planned_item_moved")
+            return True
+
+        move["destination_path"] = target_path
+        move["destination_id"] = destination_node.get("id", "")
+        move["destination_name"] = destination_node.get("name", "")
+        move["destination"] = dict(destination_node)
+        move["target_name"] = target_name
 
         self.planned_moves_status.setText("Planned item moved.")
+
+        if from_paste_here and move is not None:
+            scrubbed = self._quick_remove_planned_move_from_destination_tree(old_snap) if old_snap else 0
+            self._reset_unresolved_allocation_queue()
+            applied = self._register_and_project_planned_move(move, reason="planned_item_moved_paste")
+            old_p = self._allocation_parent_path(old_snap) if old_snap else ""
+            new_p = self._allocation_parent_path(move)
+            reapplied_old = 0
+            if old_p and new_p and not self._paths_equivalent(old_p, new_p, "destination"):
+                p_ix = self._find_visible_destination_item_by_path(old_p)
+                if p_ix is not None:
+                    reapplied_old = self._apply_allocation_children_to_item(p_ix)
+            if is_dev_mode():
+                log_info(
+                    "paste_post_move_refresh",
+                    refresh_mode="quick" if applied > 0 else "finalize_fallback",
+                    quick_apply_children=applied,
+                    scrubbed_projection_nodes=scrubbed,
+                    reapplied_old_parent_overlays=reapplied_old,
+                    target_folder_path=str(target_path)[:240],
+                    old_alloc_parent=str(old_p)[:240],
+                    new_alloc_parent=str(new_p)[:240],
+                    finalize_reason="" if applied > 0 else "quick_apply_returned_zero",
+                    allocation_badge_note="reapplied_sibling_overlays" if reapplied_old else "none",
+                )
+            if applied > 0:
+                self.refresh_planned_moves_table()
+                self._persist_planning_change_lightweight()
+                return True
+
         self.refresh_planned_moves_table()
         self._schedule_deferred_destination_materialization("planned_item_moved", delay_ms=220)
         self._persist_planning_change("planned_item_moved")
@@ -24799,7 +24883,9 @@ class MainWindow(QMainWindow):
                 self.on_tree_selection_changed("destination")
                 return
 
-            moved = self._move_planned_destination_node(source_node, target_node)
+            moved = self._move_planned_destination_node(
+                source_node, target_node, from_paste_here=_paste_here_target
+            )
             if moved:
                 self.clear_selection_details()
 

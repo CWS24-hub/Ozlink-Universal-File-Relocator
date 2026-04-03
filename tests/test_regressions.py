@@ -1422,6 +1422,8 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._is_move_submitted = lambda current_move: False
         window._find_visible_destination_item_by_path = lambda path: None
         window._persist_planning_change = lambda reason: setattr(window, "_persist_reason", reason)
+        window.refresh_planned_moves_table = lambda: None
+        window._schedule_deferred_destination_materialization = lambda *args, **kwargs: None
 
         moved = window._move_planned_destination_node(
             {"name": "Salary Increases.xlsx", "display_path": "Root\\Sales\\Follow Up\\Salary Increases.xlsx"},

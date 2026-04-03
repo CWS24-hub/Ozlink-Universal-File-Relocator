@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import QApplication
 
@@ -225,7 +226,7 @@ def test_handle_destination_draft_move_accepts_allocated_folder_only_for_paste_k
     mw.node_is_proposed = lambda n: False
     moved = []
 
-    def do_move(s, t):
+    def do_move(s, t, **kwargs):
         moved.append(True)
         return True
 
@@ -261,6 +262,117 @@ def test_normalize_paste_destination_row_ref_column_zero():
     out = mw._normalize_paste_destination_row_ref(ix_col1)
     assert out.column() == 0
     assert out.row() == ix_col1.row()
+
+
+def test_move_planned_from_paste_uses_lightweight_persist_when_quick_apply_succeeds():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    move = {
+        "source_name": "Doc.xlsx",
+        "target_name": "Doc.xlsx",
+        "source_path": "Src\\Doc.xlsx",
+        "destination_path": "Root\\OldParent",
+        "destination_id": "d1",
+        "destination_name": "OldParent",
+        "destination": {
+            "id": "d1",
+            "name": "OldParent",
+            "display_path": "Root\\OldParent",
+            "item_path": "Root\\OldParent",
+        },
+        "source": {"name": "Doc.xlsx"},
+        "status": "Draft",
+    }
+    mw.planned_moves = [move]
+    mw._resolve_planned_move_for_destination_node = lambda node: (0, move, None)
+    mw._is_move_submitted = lambda m: False
+    mw._destination_row_semantic_path = lambda n: str(n.get("display_path") or n.get("item_path") or "")
+    mw._find_visible_destination_item_by_path = lambda path: None
+    mw._quick_remove_planned_move_from_destination_tree = lambda old: 0
+    mw._reset_unresolved_allocation_queue = lambda: None
+    mw._register_and_project_planned_move = lambda m, reason="": 1
+    mw._apply_allocation_children_to_item = lambda ix: 0
+    mw._paths_equivalent = lambda a, b, role: str(a).replace("/", "\\") == str(b).replace("/", "\\")
+    scheduled = []
+    mw._schedule_deferred_destination_materialization = lambda r, delay_ms=180: scheduled.append((r, delay_ms))
+    lightweight = []
+    mw._persist_planning_change_lightweight = lambda: lightweight.append(True)
+
+    def heavy_persist(r):
+        raise AssertionError("heavy persist should not run when quick apply succeeds")
+
+    mw._persist_planning_change = heavy_persist
+    mw.refresh_planned_moves_table = lambda: None
+    mw.planned_moves_status = MagicMock()
+    mw.destination_tree_status = MagicMock()
+
+    src = {"name": "Doc.xlsx", "display_path": "Root\\OldParent\\Doc.xlsx", "item_path": "Root\\OldParent\\Doc.xlsx"}
+    tgt = {"name": "NewParent", "display_path": "Root\\NewParent", "item_path": "Root\\NewParent", "is_folder": True}
+
+    assert mw._move_planned_destination_node(src, tgt, from_paste_here=True) is True
+    assert not scheduled
+    assert lightweight == [True]
+    assert move["destination_path"] == "Root\\NewParent"
+
+
+def test_move_planned_from_paste_falls_back_finalize_when_quick_apply_zero():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    move = {
+        "source_name": "Doc.xlsx",
+        "target_name": "Doc.xlsx",
+        "source_path": "Src\\Doc.xlsx",
+        "destination_path": "Root\\OldParent",
+        "destination_id": "d1",
+        "destination_name": "OldParent",
+        "destination": {
+            "id": "d1",
+            "name": "OldParent",
+            "display_path": "Root\\OldParent",
+            "item_path": "Root\\OldParent",
+        },
+        "source": {"name": "Doc.xlsx"},
+        "status": "Draft",
+    }
+    mw.planned_moves = [move]
+    mw._resolve_planned_move_for_destination_node = lambda node: (0, move, None)
+    mw._is_move_submitted = lambda m: False
+    mw._destination_row_semantic_path = lambda n: str(n.get("display_path") or n.get("item_path") or "")
+    mw._find_visible_destination_item_by_path = lambda path: None
+    mw._quick_remove_planned_move_from_destination_tree = lambda old: 0
+    mw._reset_unresolved_allocation_queue = lambda: None
+    mw._register_and_project_planned_move = lambda m, reason="": 0
+    mw._apply_allocation_children_to_item = lambda ix: 0
+    mw._paths_equivalent = lambda a, b, role: False
+    scheduled = []
+    mw._schedule_deferred_destination_materialization = lambda r, delay_ms=180: scheduled.append((r, delay_ms))
+    mw._persist_planning_change_lightweight = lambda: (_ for _ in ()).throw(
+        AssertionError("lightweight should not run when quick apply fails")
+    )
+    heavy = []
+    mw._persist_planning_change = lambda r: heavy.append(r)
+    mw.refresh_planned_moves_table = lambda: None
+    mw.planned_moves_status = MagicMock()
+    mw.destination_tree_status = MagicMock()
+
+    src = {"name": "Doc.xlsx", "display_path": "Root\\OldParent\\Doc.xlsx", "item_path": "Root\\OldParent\\Doc.xlsx"}
+    tgt = {"name": "NewParent", "display_path": "Root\\NewParent", "item_path": "Root\\NewParent", "is_folder": True}
+
+    assert mw._move_planned_destination_node(src, tgt, from_paste_here=True) is True
+    assert scheduled
+    assert heavy == ["planned_item_moved"]
+
+
+def test_destination_tree_item_matches_move_accepts_qmodelindex():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    model = QStandardItemModel()
+    it = QStandardItem("n")
+    it.setData({"source_path": "S\\X"}, Qt.UserRole)
+    model.appendRow(it)
+    ix = model.index(0, 0)
+    move = {"source_path": "S\\X"}
+    assert mw._destination_tree_item_matches_move(ix, move) is True
 
 
 def test_select_canonical_destination_item_prefers_current_index_when_in_candidates():
