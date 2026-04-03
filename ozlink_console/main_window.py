@@ -20658,8 +20658,8 @@ class MainWindow(QMainWindow):
         tree = getattr(self, "destination_tree_widget", None)
         if model is None or tree is None or not index.isValid():
             return
-        node_data = dict(index.data(Qt.UserRole) or {})
-        if node_data.get("placeholder"):
+        node_data = self._destination_model_index_user_role_dict(index)
+        if not node_data or node_data.get("placeholder"):
             return
         self._apply_tree_item_visual_state(None, node_data)
         rc = model.rowCount(index)
@@ -20667,7 +20667,7 @@ class MainWindow(QMainWindow):
         has_placeholder_children = False
         for r in range(rc):
             ix = model.index(r, 0, index)
-            cd = ix.data(Qt.UserRole) or {}
+            cd = self._destination_model_index_user_role_dict(ix)
             if cd.get("placeholder"):
                 has_placeholder_children = True
             else:
@@ -21324,7 +21324,7 @@ class MainWindow(QMainWindow):
                 return None
             for r in range(model.rowCount(parent_item)):
                 ix = model.index(r, 0, parent_item)
-                child_data = ix.data(Qt.UserRole) or {}
+                child_data = self._destination_model_index_user_role_dict(ix)
                 if child_data.get("placeholder"):
                     continue
                 child_path = self._tree_item_path(child_data)
@@ -21447,6 +21447,29 @@ class MainWindow(QMainWindow):
         self._apply_tree_item_visual_state(node, node_data)
         return node
 
+    def _destination_model_index_user_role_dict(self, ix: QModelIndex) -> dict:
+        """Read ``Qt.UserRole`` from a destination planning index without crashing on stale indices.
+
+        ``QModelIndex`` snapshots can become dangling after nested model updates or event-loop
+        re-entry (see :meth:`_refresh_destination_tree_indicators`); dereferencing them can raise
+        ``RuntimeError`` or cause native access violations.
+        """
+        if ix is None or not isinstance(ix, QModelIndex) or not ix.isValid():
+            return {}
+        dm = getattr(self, "destination_planning_model", None)
+        if dm is None:
+            return {}
+        try:
+            m = ix.model()
+            if m is not None and m is not dm:
+                return {}
+        except RuntimeError:
+            return {}
+        try:
+            return dict(ix.data(Qt.UserRole) or {})
+        except RuntimeError:
+            return {}
+
     def _ensure_destination_projection_path_model(self, destination_path, normalized_target):
         model = getattr(self, "destination_planning_model", None)
         tree = getattr(self, "destination_tree_widget", None)
@@ -21470,7 +21493,7 @@ class MainWindow(QMainWindow):
             if _ix_ok(existing):
                 anchor_ix = existing
                 anchor_index = index
-                anchor_data = dict(existing.data(Qt.UserRole) or {})
+                anchor_data = self._destination_model_index_user_role_dict(existing)
                 anchor_state = self._destination_node_state(anchor_data)
                 if index == len(prefixes) - 1:
                     self._log_restore_phase(
@@ -21503,14 +21526,14 @@ class MainWindow(QMainWindow):
         current_ix = anchor_ix
         current_parent_data = {}
         if _ix_ok(current_ix):
-            current_parent_data = dict(current_ix.data(Qt.UserRole) or {})
+            current_parent_data = self._destination_model_index_user_role_dict(current_ix)
 
         start_index = anchor_index + 1
         if not _ix_ok(current_ix) and prefixes:
             visible_root = self._find_visible_destination_item_by_path("Root")
             if _ix_ok(visible_root):
                 current_ix = visible_root
-                current_parent_data = dict(current_ix.data(Qt.UserRole) or {})
+                current_parent_data = self._destination_model_index_user_role_dict(current_ix)
                 start_index = 1
                 self._log_restore_phase(
                     "destination_parent_resolution_reused_real",
@@ -21525,7 +21548,7 @@ class MainWindow(QMainWindow):
                 base_data = {}
                 if self._planning_tree_top_level_count(tree) > 0:
                     top_ix = model.index(0, 0, QModelIndex())
-                    base_data = dict(top_ix.data(Qt.UserRole) or {})
+                    base_data = self._destination_model_index_user_role_dict(top_ix)
                 branch_path = prefixes[0]
                 folder_name = self._path_segments(branch_path)[-1]
                 pl = self._build_projected_destination_folder_payload(folder_name, branch_path, base_data)
@@ -21533,7 +21556,9 @@ class MainWindow(QMainWindow):
                 row_before = model.rowCount(root_parent)
                 model.append_child_payloads(root_parent, [pl])
                 current_ix = model.index(row_before, 0, root_parent)
-                current_parent_data = dict(current_ix.data(Qt.UserRole) or {})
+                current_parent_data = self._destination_model_index_user_role_dict(current_ix)
+                if not current_parent_data:
+                    current_parent_data = dict(pl)
                 start_index = 1
                 self._log_restore_phase(
                     "destination_parent_resolution_created_projected",
@@ -21551,7 +21576,7 @@ class MainWindow(QMainWindow):
             existing_child = self._find_destination_child_by_path(parent_for_find, branch_path)
             if existing_child is not None:
                 current_ix = existing_child
-                current_parent_data = dict(current_ix.data(Qt.UserRole) or {})
+                current_parent_data = self._destination_model_index_user_role_dict(current_ix)
                 self._log_restore_phase(
                     "destination_parent_resolution_duplicate_detected",
                     requested_parent_path=destination_path,
@@ -21567,16 +21592,29 @@ class MainWindow(QMainWindow):
             pl = self._build_projected_destination_folder_payload(folder_name, branch_path, current_parent_data)
             if _ix_ok(current_ix):
                 row_before = model.rowCount(current_ix)
-                model.append_child_payloads(current_ix, [pl])
                 parent_refresh = current_ix
+                model.append_child_payloads(parent_refresh, [pl])
                 current_ix = model.index(row_before, 0, parent_refresh)
+                current_parent_data = self._destination_model_index_user_role_dict(current_ix)
+                if not current_parent_data:
+                    current_parent_data = dict(pl)
+                # Refresh parent after reading the new row: refresh can pump events and invalidate
+                # QModelIndex snapshots (native access violation if we .data() the child after).
                 self._refresh_destination_item_visibility_index(parent_refresh, expand=True)
+                fresh_ix = model.index(row_before, 0, parent_refresh)
+                if fresh_ix.isValid():
+                    current_ix = fresh_ix
+                    reread = self._destination_model_index_user_role_dict(current_ix)
+                    if reread:
+                        current_parent_data = reread
             else:
                 root_parent = QModelIndex()
                 row_before = model.rowCount(root_parent)
                 model.append_child_payloads(root_parent, [pl])
                 current_ix = model.index(row_before, 0, root_parent)
-            current_parent_data = dict(current_ix.data(Qt.UserRole) or {})
+                current_parent_data = self._destination_model_index_user_role_dict(current_ix)
+                if not current_parent_data:
+                    current_parent_data = dict(pl)
             self._log_restore_phase(
                 "destination_parent_resolution_created_projected",
                 requested_parent_path=destination_path,
