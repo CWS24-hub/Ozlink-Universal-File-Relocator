@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QModelIndex, Qt
 from PySide6.QtGui import QStandardItem, QStandardItemModel
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QAbstractItemView, QApplication
 
 from ozlink_console.main_window import MainWindow
+from ozlink_console.tree_models.destination_planning_model import DestinationPlanningTreeModel
 
 
 def _qapp():
@@ -594,4 +595,167 @@ def test_upsert_allocated_merges_over_real_folder_for_reset_nested_payload():
     pl, _kids = nested
     assert "[Allocated]" in str(pl.get("base_display_label", ""))
     assert pl.get("planned_allocation") is True
+
+
+def _dest_key(payload: dict) -> str:
+    return str(payload.get("item_path") or payload.get("display_path") or "").strip().replace("/", "\\")
+
+
+def test_manual_drop_on_folder_row_commits_that_folder():
+    _qapp()
+    model = DestinationPlanningTreeModel(destination_index_key_fn=_dest_key)
+    model.reset_root_payloads(
+        [
+            {
+                "base_display_label": "D",
+                "name": "D",
+                "is_folder": True,
+                "item_path": r"Root\D",
+                "display_path": r"Root\D",
+                "tree_role": "destination",
+                "node_origin": "Real",
+            }
+        ]
+    )
+    folder_ix = model.index(0, 0, QModelIndex())
+    mw = MainWindow.__new__(MainWindow)
+    commit_ix, meta = mw._resolve_destination_manual_drop_folder_index(
+        folder_ix, QAbstractItemView.DropIndicatorPosition.OnItem
+    )
+    assert commit_ix == folder_ix
+    assert meta["exact_hovered_row_committed"] is True
+    assert meta["indicator_mode"] == "on_folder"
+    assert meta["resolved_target_path"]
+
+
+def test_manual_drop_between_nested_rows_resolves_parent_folder():
+    _qapp()
+    model = DestinationPlanningTreeModel(destination_index_key_fn=_dest_key)
+    model.reset_root_payloads(
+        [
+            {
+                "base_display_label": "D",
+                "name": "D",
+                "is_folder": True,
+                "item_path": r"Root\D",
+                "display_path": r"Root\D",
+                "tree_role": "destination",
+                "node_origin": "Real",
+            }
+        ]
+    )
+    folder_ix = model.index(0, 0, QModelIndex())
+    model.replace_all_children(
+        folder_ix,
+        [
+            {
+                "base_display_label": "f",
+                "name": "f.txt",
+                "is_folder": False,
+                "item_path": r"Root\D\f.txt",
+                "display_path": r"Root\D\f.txt",
+                "tree_role": "destination",
+                "node_origin": "Real",
+            }
+        ],
+    )
+    file_ix = model.index(0, 0, folder_ix)
+    mw = MainWindow.__new__(MainWindow)
+    for dip in (
+        QAbstractItemView.DropIndicatorPosition.AboveItem,
+        QAbstractItemView.DropIndicatorPosition.BelowItem,
+    ):
+        commit_ix, meta = mw._resolve_destination_manual_drop_folder_index(file_ix, dip)
+        assert commit_ix == folder_ix
+        assert meta["insertion_context"] is True
+        assert meta["indicator_mode"] == "between_rows"
+        assert meta["drop_rejected_reason"] == ""
+
+
+def test_manual_drop_between_top_level_rows_rejected_without_path_fallback():
+    _qapp()
+    model = DestinationPlanningTreeModel(destination_index_key_fn=_dest_key)
+    model.reset_root_payloads(
+        [
+            {
+                "base_display_label": "A",
+                "name": "A",
+                "is_folder": True,
+                "item_path": r"Root\A",
+                "display_path": r"Root\A",
+                "tree_role": "destination",
+                "node_origin": "Real",
+            },
+            {
+                "base_display_label": "B",
+                "name": "B",
+                "is_folder": True,
+                "item_path": r"Root\B",
+                "display_path": r"Root\B",
+                "tree_role": "destination",
+                "node_origin": "Real",
+            },
+        ]
+    )
+    b_ix = model.index(1, 0, QModelIndex())
+    mw = MainWindow.__new__(MainWindow)
+    commit_ix, meta = mw._resolve_destination_manual_drop_folder_index(
+        b_ix, QAbstractItemView.DropIndicatorPosition.AboveItem
+    )
+    assert commit_ix is None
+    assert meta["drop_rejected_reason"] == "between_rows_top_level"
+
+
+def test_manual_drop_resolver_does_not_reset_model():
+    _qapp()
+    model = DestinationPlanningTreeModel(destination_index_key_fn=_dest_key)
+    model.reset_root_payloads(
+        [
+            {
+                "base_display_label": "D",
+                "name": "D",
+                "is_folder": True,
+                "item_path": r"Root\D",
+                "display_path": r"Root\D",
+                "tree_role": "destination",
+                "node_origin": "Real",
+            }
+        ]
+    )
+    folder_ix = model.index(0, 0, QModelIndex())
+    resets = []
+    model.modelAboutToBeReset.connect(lambda: resets.append(1))
+    mw = MainWindow.__new__(MainWindow)
+    mw._resolve_destination_manual_drop_folder_index(
+        folder_ix, QAbstractItemView.DropIndicatorPosition.OnItem
+    )
+    assert model.rowCount(QModelIndex()) == 1
+    assert len(resets) == 0
+
+
+def test_manual_drop_rejects_allocated_folder_target():
+    _qapp()
+    model = DestinationPlanningTreeModel(destination_index_key_fn=_dest_key)
+    model.reset_root_payloads(
+        [
+            {
+                "base_display_label": "Alloc",
+                "name": "Alloc",
+                "is_folder": True,
+                "item_path": r"Root\Alloc",
+                "display_path": r"Root\Alloc",
+                "tree_role": "destination",
+                "planned_allocation": True,
+                "node_origin": "PlannedAllocation",
+            }
+        ]
+    )
+    alloc_ix = model.index(0, 0, QModelIndex())
+    mw = MainWindow.__new__(MainWindow)
+    commit_ix, meta = mw._resolve_destination_manual_drop_folder_index(
+        alloc_ix, QAbstractItemView.DropIndicatorPosition.OnItem
+    )
+    assert commit_ix is None
+    assert meta["drop_rejected_reason"] == "target_not_eligible"
+    assert not meta.get("resolved_target_path")
 
