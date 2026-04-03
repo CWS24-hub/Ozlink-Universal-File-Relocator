@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import (
     Qt,
     QDir,
+    QObject,
     QThread,
     Signal,
     QTimer,
@@ -329,6 +330,217 @@ class FolderLoadWorker(QThread):
 
 OZLINK_DESTINATION_PLANNING_DRAG_MIME = "application/x-ozlink-destination-planning-drag"
 
+_DRAGTRACE_MSG = "DRAGTRACE"
+
+
+def _dragtrace_global_pos_str(event) -> str:
+    try:
+        gp = event.globalPosition()
+        p = gp.toPoint()
+        return f"{p.x()},{p.y()}"
+    except Exception:
+        pass
+    try:
+        pos = event.position()
+        p = pos.toPoint()
+        return f"local:{p.x()},{p.y()}"
+    except Exception:
+        return "?"
+
+
+def _dragtrace_mime_ok(event) -> bool:
+    md = event.mimeData()
+    return bool(md and md.hasFormat(OZLINK_DESTINATION_PLANNING_DRAG_MIME))
+
+
+def _dragtrace_drop_action_int(event):
+    try:
+        da = event.dropAction()
+        if hasattr(da, "value"):
+            return int(da.value)
+        return int(da)
+    except Exception:
+        return None
+
+
+def _dragtrace_proposed_int(event):
+    try:
+        pa = event.proposedAction()
+        if hasattr(pa, "value"):
+            return int(pa.value)
+        return int(pa)
+    except Exception:
+        return None
+
+
+class _DestinationDragTraceEventFilter(QObject):
+    """Temporary: log drag-related events on tree and children; never consumes events."""
+
+    def __init__(self, tree_label: str, parent: QObject | None = None):
+        super().__init__(parent)
+        self._tree_label = tree_label
+
+    def eventFilter(self, watched, event):
+        et = event.type()
+        if et not in (
+            QEvent.Type.DragEnter,
+            QEvent.Type.DragMove,
+            QEvent.Type.Drop,
+            QEvent.Type.DragLeave,
+        ):
+            return False
+        try:
+            acc_before = event.isAccepted()
+        except Exception:
+            acc_before = False
+        try:
+            c = QCursor.pos()
+            gpos = f"{c.x()},{c.y()}"
+        except Exception:
+            gpos = "?"
+        log_info(
+            _DRAGTRACE_MSG,
+            stage="filter",
+            tree=self._tree_label,
+            watched=watched.__class__.__name__,
+            ev=int(et),
+            acc_before=acc_before,
+            proposed=_dragtrace_proposed_int(event),
+            drop=_dragtrace_drop_action_int(event),
+            gpos=gpos,
+        )
+        return False
+
+
+def _install_destination_drag_trace_filters(tree_self, tree_label: str) -> None:
+    f = _DestinationDragTraceEventFilter(tree_label, tree_self)
+    tree_self._drag_trace_filter_obj = f
+    tree_self.installEventFilter(f)
+    tree_self.viewport().installEventFilter(f)
+    tree_self.header().installEventFilter(f)
+    tree_self.verticalScrollBar().installEventFilter(f)
+    tree_self.horizontalScrollBar().installEventFilter(f)
+
+
+def _dragtrace_enter_line(cls_name: str, event) -> None:
+    log_info(
+        _DRAGTRACE_MSG,
+        stage="enter",
+        cls=cls_name,
+        mime_ok=_dragtrace_mime_ok(event),
+        pos=_dragtrace_global_pos_str(event),
+        row_ok="n/a",
+        res_ok="n/a",
+        rej="",
+        acc=event.isAccepted(),
+        drop=_dragtrace_drop_action_int(event),
+    )
+
+
+def _dragtrace_leave_line(cls_name: str, event) -> None:
+    log_info(
+        _DRAGTRACE_MSG,
+        stage="leave",
+        cls=cls_name,
+        mime_ok=_dragtrace_mime_ok(event),
+        pos=_dragtrace_global_pos_str(event),
+        row_ok="n/a",
+        res_ok="n/a",
+        rej="",
+        acc=event.isAccepted(),
+        drop=_dragtrace_drop_action_int(event),
+    )
+
+
+def _dragtrace_widget_move_or_drop_line(stage: str, tree_self, cls_name: str, event) -> None:
+    mime_ok = _dragtrace_mime_ok(event)
+    pos_s = _dragtrace_global_pos_str(event)
+    try:
+        acc_b = event.isAccepted()
+    except Exception:
+        acc_b = False
+    da = _dragtrace_drop_action_int(event)
+    row_ok = "n/a"
+    res_ok = "n/a"
+    rej = ""
+    if mime_ok:
+        try:
+            g = event.globalPosition().toPoint()
+            p = tree_self.viewport().mapFromGlobal(g)
+            ref, dip_int = tree_self._drop_band_at_pos_widget(p)
+            row_ok = str(ref is not None)
+            mw = getattr(tree_self, "_ozlink_main_window", None)
+            if ref is not None and mw is not None:
+                dip = QAbstractItemView.DropIndicatorPosition(dip_int)
+                commit, meta = mw._resolve_destination_manual_drop_folder_item(ref, dip)
+                res_ok = str(commit is not None)
+                rej = str(meta.get("drop_rejected_reason", ""))[:120]
+            elif ref is not None:
+                res_ok = "no_mw"
+            else:
+                res_ok = "n/a"
+        except Exception as ex:
+            row_ok = "err"
+            res_ok = "err"
+            rej = str(ex)[:120]
+    log_info(
+        _DRAGTRACE_MSG,
+        stage=stage,
+        cls=cls_name,
+        mime_ok=mime_ok,
+        pos=pos_s,
+        row_ok=row_ok,
+        res_ok=res_ok,
+        rej=rej,
+        acc=acc_b,
+        drop=da,
+    )
+
+
+def _dragtrace_view_move_or_drop_line(stage: str, tree_self, cls_name: str, event) -> None:
+    mime_ok = _dragtrace_mime_ok(event)
+    pos_s = _dragtrace_global_pos_str(event)
+    try:
+        acc_b = event.isAccepted()
+    except Exception:
+        acc_b = False
+    da = _dragtrace_drop_action_int(event)
+    row_ok = "n/a"
+    res_ok = "n/a"
+    rej = ""
+    if mime_ok:
+        try:
+            g = event.globalPosition().toPoint()
+            p = tree_self.viewport().mapFromGlobal(g)
+            ref_ix, dip_int = tree_self._drop_band_at_pos_view(p)
+            row_ok = str(ref_ix.isValid())
+            mw = getattr(tree_self, "_ozlink_main_window", None)
+            if ref_ix.isValid() and mw is not None:
+                dip = QAbstractItemView.DropIndicatorPosition(dip_int)
+                commit_ix, meta = mw._resolve_destination_manual_drop_folder_index(ref_ix, dip)
+                res_ok = str(commit_ix.isValid())
+                rej = str(meta.get("drop_rejected_reason", ""))[:120]
+            elif ref_ix.isValid():
+                res_ok = "no_mw"
+            else:
+                res_ok = "n/a"
+        except Exception as ex:
+            row_ok = "err"
+            res_ok = "err"
+            rej = str(ex)[:120]
+    log_info(
+        _DRAGTRACE_MSG,
+        stage=stage,
+        cls=cls_name,
+        mime_ok=mime_ok,
+        pos=pos_s,
+        row_ok=row_ok,
+        res_ok=res_ok,
+        rej=rej,
+        acc=acc_b,
+        drop=da,
+    )
+
 
 def _destination_drop_band_margin_px(row_height: int) -> int:
     """Narrow top/bottom band so most pointer positions classify as OnItem (was up to 8px)."""
@@ -362,8 +574,23 @@ def _destination_manual_drag_viewport_event_filter(tree_self, tree_label: str, w
         tree_self.dropEvent(event)
     elif et == QEvent.Type.DragLeave:
         tree_self.dragLeaveEvent(event)
+    da_int = _dragtrace_drop_action_int(event)
+    try:
+        c = QCursor.pos()
+        gpos = f"{c.x()},{c.y()}"
+    except Exception:
+        gpos = "?"
+    log_info(
+        _DRAGTRACE_MSG,
+        stage="filter_done",
+        tree=tree_label,
+        watched=watched.__class__.__name__,
+        ev=int(et),
+        acc_after=event.isAccepted(),
+        drop=da_int,
+        gpos=gpos,
+    )
     if is_dev_mode():
-        da = event.dropAction() if hasattr(event, "dropAction") else None
         log_info(
             "debug_pass_destination_manual_drag",
             phase="event_filter",
@@ -371,7 +598,7 @@ def _destination_manual_drag_viewport_event_filter(tree_self, tree_label: str, w
             watched_class=watched.__class__.__name__,
             event_type=int(et),
             event_accepted=event.isAccepted(),
-            drop_action=int(da) if da is not None else None,
+            drop_action=da_int,
         )
     return True
 
@@ -408,6 +635,7 @@ class DestinationPlanningTreeWidget(QTreeWidget):
         for sb in (self.verticalScrollBar(), self.horizontalScrollBar()):
             sb.setAcceptDrops(False)
             sb.installEventFilter(self)
+        _install_destination_drag_trace_filters(self, "QTreeWidget")
 
     def eventFilter(self, watched, event):
         r = _destination_manual_drag_viewport_event_filter(self, "QTreeWidget", watched, event)
@@ -540,15 +768,31 @@ class DestinationPlanningTreeWidget(QTreeWidget):
         mime.setData(OZLINK_DESTINATION_PLANNING_DRAG_MIME, QByteArray(b"v1"))
         drag = QDrag(self)
         drag.setMimeData(mime)
+        log_info(
+            _DRAGTRACE_MSG,
+            stage="start",
+            cls="QTreeWidget",
+            path=start_path[:200],
+            mime_present=True,
+        )
         self._manual_drag_source_item = source_item
         self._dd_drag_active = True
-        drag.exec(Qt.DropAction.MoveAction)
+        exec_result = drag.exec(Qt.DropAction.MoveAction)
+        log_info(
+            _DRAGTRACE_MSG,
+            stage="end",
+            cls="QTreeWidget",
+            path=start_path[:200],
+            mime_present=True,
+            exec_return=int(exec_result),
+        )
         self._dd_drag_active = False
         self._manual_drag_source_item = None
         self._hide_destination_drop_overlay()
         self.viewport().update()
 
     def dragEnterEvent(self, event):
+        _dragtrace_enter_line("QTreeWidget", event)
         if event.mimeData() and event.mimeData().hasFormat(OZLINK_DESTINATION_PLANNING_DRAG_MIME):
             if is_dev_mode():
                 log_info(
@@ -566,6 +810,7 @@ class DestinationPlanningTreeWidget(QTreeWidget):
         super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event):
+        _dragtrace_widget_move_or_drop_line("move", self, "QTreeWidget", event)
         md = event.mimeData()
         if md is None or not md.hasFormat(OZLINK_DESTINATION_PLANNING_DRAG_MIME):
             super().dragMoveEvent(event)
@@ -686,10 +931,12 @@ class DestinationPlanningTreeWidget(QTreeWidget):
             )
 
     def dragLeaveEvent(self, event):
+        _dragtrace_leave_line("QTreeWidget", event)
         self._hide_destination_drop_overlay()
         super().dragLeaveEvent(event)
 
     def dropEvent(self, event):
+        _dragtrace_widget_move_or_drop_line("drop", self, "QTreeWidget", event)
         md = event.mimeData()
         if md is None or not md.hasFormat(OZLINK_DESTINATION_PLANNING_DRAG_MIME):
             super().dropEvent(event)
@@ -770,6 +1017,7 @@ class DestinationPlanningTreeView(QTreeView):
         for sb in (self.verticalScrollBar(), self.horizontalScrollBar()):
             sb.setAcceptDrops(False)
             sb.installEventFilter(self)
+        _install_destination_drag_trace_filters(self, "QTreeView")
 
     def eventFilter(self, watched, event):
         r = _destination_manual_drag_viewport_event_filter(self, "QTreeView", watched, event)
@@ -905,15 +1153,31 @@ class DestinationPlanningTreeView(QTreeView):
         mime.setData(OZLINK_DESTINATION_PLANNING_DRAG_MIME, QByteArray(b"v1"))
         drag = QDrag(self)
         drag.setMimeData(mime)
+        log_info(
+            _DRAGTRACE_MSG,
+            stage="start",
+            cls="QTreeView",
+            path=start_path[:200],
+            mime_present=True,
+        )
         self._manual_drag_source_persistent = QPersistentModelIndex(source_index)
         self._dd_drag_active = True
-        drag.exec(Qt.DropAction.MoveAction)
+        exec_result = drag.exec(Qt.DropAction.MoveAction)
+        log_info(
+            _DRAGTRACE_MSG,
+            stage="end",
+            cls="QTreeView",
+            path=start_path[:200],
+            mime_present=True,
+            exec_return=int(exec_result),
+        )
         self._dd_drag_active = False
         self._manual_drag_source_persistent = QPersistentModelIndex()
         self._hide_destination_drop_overlay()
         self.viewport().update()
 
     def dragEnterEvent(self, event):
+        _dragtrace_enter_line("QTreeView", event)
         if event.mimeData() and event.mimeData().hasFormat(OZLINK_DESTINATION_PLANNING_DRAG_MIME):
             if is_dev_mode():
                 log_info(
@@ -930,6 +1194,7 @@ class DestinationPlanningTreeView(QTreeView):
         super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event):
+        _dragtrace_view_move_or_drop_line("move", self, "QTreeView", event)
         md = event.mimeData()
         if md is None or not md.hasFormat(OZLINK_DESTINATION_PLANNING_DRAG_MIME):
             super().dragMoveEvent(event)
@@ -1050,10 +1315,12 @@ class DestinationPlanningTreeView(QTreeView):
             )
 
     def dragLeaveEvent(self, event):
+        _dragtrace_leave_line("QTreeView", event)
         self._hide_destination_drop_overlay()
         super().dragLeaveEvent(event)
 
     def dropEvent(self, event):
+        _dragtrace_view_move_or_drop_line("drop", self, "QTreeView", event)
         md = event.mimeData()
         if md is None or not md.hasFormat(OZLINK_DESTINATION_PLANNING_DRAG_MIME):
             super().dropEvent(event)
