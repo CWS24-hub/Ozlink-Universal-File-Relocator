@@ -18191,11 +18191,25 @@ class MainWindow(QMainWindow):
         )
 
     def _dev_log_watch_folder_badge_owners(self, context: str) -> None:
-        """Dev-only: sample rows whose path contains known folder container names from manual QA."""
+        """Dev-only: sample rows whose path contains known folder container names from manual QA.
+
+        Supports QTreeWidget and model-backed :class:`DestinationPlanningTreeView`. Never raises.
+        """
         if not is_dev_mode():
             return
+        try:
+            self._dev_log_watch_folder_badge_owners_impl(context)
+        except Exception as exc:
+            log_warn(
+                "destination_allocation_folder_lifecycle",
+                phase="final_watch_folder_badge_probe_error",
+                context=context,
+                error=str(exc),
+            )
+
+    def _dev_log_watch_folder_badge_owners_impl(self, context: str) -> None:
         tree = getattr(self, "destination_tree_widget", None)
-        if tree is None or tree.topLevelItemCount() <= 0:
+        if tree is None:
             log_info(
                 "destination_allocation_folder_lifecycle",
                 phase="final_watch_folder_badge_probe",
@@ -18203,18 +18217,37 @@ class MainWindow(QMainWindow):
                 rows=[],
             )
             return
+
         watches = ("100GOPRO", "Employee Hours")
-        rows = []
-        for ti in range(tree.topLevelItemCount()):
-            root = tree.topLevelItem(ti)
-            for item in self._iter_tree_items(root):
-                nd = item.data(0, Qt.UserRole) or {}
+        rows: list[dict] = []
+
+        if self._destination_tree_uses_model_view():
+            if self._planning_tree_top_level_count(tree) <= 0:
+                log_info(
+                    "destination_allocation_folder_lifecycle",
+                    phase="final_watch_folder_badge_probe",
+                    context=context,
+                    rows=[],
+                )
+                return
+            model = getattr(self, "destination_planning_model", None)
+            if model is None or not hasattr(model, "iter_depth_first"):
+                log_info(
+                    "destination_allocation_folder_lifecycle",
+                    phase="final_watch_folder_badge_probe",
+                    context=context,
+                    note="model_view_missing_iter_depth_first",
+                    rows=[],
+                )
+                return
+            for ix in model.iter_depth_first():
+                nd = self.get_tree_item_node_data(ix) or {}
                 if not isinstance(nd, dict):
                     continue
                 sp = self._destination_row_semantic_path(nd) or ""
                 if not sp or not any(w in sp for w in watches):
                     continue
-                label = str(nd.get("base_display_label", "") or item.text(0) or "")[:120]
+                label = str(nd.get("base_display_label", "") or nd.get("name", "") or "")[:120]
                 rows.append(
                     {
                         "path": sp[:200],
@@ -18222,6 +18255,43 @@ class MainWindow(QMainWindow):
                         "planned_allocation": bool(nd.get("planned_allocation")),
                     }
                 )
+        elif hasattr(tree, "topLevelItemCount") and hasattr(tree, "topLevelItem"):
+            if tree.topLevelItemCount() <= 0:
+                log_info(
+                    "destination_allocation_folder_lifecycle",
+                    phase="final_watch_folder_badge_probe",
+                    context=context,
+                    rows=[],
+                )
+                return
+            for ti in range(tree.topLevelItemCount()):
+                root = tree.topLevelItem(ti)
+                for item in self._iter_tree_items(root):
+                    nd = item.data(0, Qt.UserRole) or {}
+                    if not isinstance(nd, dict):
+                        continue
+                    sp = self._destination_row_semantic_path(nd) or ""
+                    if not sp or not any(w in sp for w in watches):
+                        continue
+                    label = str(nd.get("base_display_label", "") or item.text(0) or "")[:120]
+                    rows.append(
+                        {
+                            "path": sp[:200],
+                            "has_allocated_tag": "[Allocated]" in label,
+                            "planned_allocation": bool(nd.get("planned_allocation")),
+                        }
+                    )
+        else:
+            log_info(
+                "destination_allocation_folder_lifecycle",
+                phase="final_watch_folder_badge_probe",
+                context=context,
+                note="unsupported_destination_tree_type",
+                tree_class=tree.__class__.__name__,
+                rows=[],
+            )
+            return
+
         log_info(
             "destination_allocation_folder_lifecycle",
             phase="final_watch_folder_badge_probe",
