@@ -15371,6 +15371,10 @@ class MainWindow(QMainWindow):
         return 3
 
     def _destination_model_state_priority(self, node_state):
+        # Higher wins on merge. Planned allocation at a path must replace a snapshot "real" row
+        # at the same semantic path so reset_nested receives [Allocated] chrome in the payload.
+        if node_state == "allocated":
+            return 4
         if node_state == "real":
             return 3
         if node_state == "proposed":
@@ -15613,6 +15617,40 @@ class MainWindow(QMainWindow):
             "children": [],
         }
 
+    def _merge_real_destination_row_with_allocation_node_data(self, real_data, allocation_data):
+        """Apply planned-allocation fields onto a graph snapshot row (same contract as overlay on real items)."""
+        out = dict(real_data or {})
+        ad = dict(allocation_data or {})
+        source_name = str(ad.get("name") or out.get("name") or "Allocated Item").strip() or "Allocated Item"
+        out["planned_allocation"] = True
+        out["node_origin"] = "PlannedAllocation"
+        out["overlay_state"] = "PlannedAllocation"
+        out["source_path"] = str(ad.get("source_path", "") or "")
+        for key in ("display_path", "item_path", "destination_path"):
+            if ad.get(key):
+                out[key] = ad[key]
+        out["real_name"] = str(ad.get("real_name", source_name) or source_name)
+        out["name"] = source_name
+        out["base_display_label"] = self._tree_name_column_label(source_name, tag="[Allocated]")
+        out["tree_role"] = "destination"
+        if ad.get("drive_id"):
+            out["drive_id"] = ad["drive_id"]
+        for k in ("site_id", "site_name", "library_id", "library_name", "web_url"):
+            if ad.get(k):
+                out[k] = ad[k]
+        if "is_folder" in ad:
+            out["is_folder"] = bool(ad["is_folder"])
+        is_folder = bool(out.get("is_folder"))
+        if is_folder:
+            if bool(real_data.get("children_loaded")):
+                out["children_loaded"] = True
+            else:
+                out.setdefault("children_loaded", bool(ad.get("children_loaded", False)))
+        else:
+            out["children_loaded"] = True
+        out["load_failed"] = bool(real_data.get("load_failed", False))
+        return out
+
     def _coerce_destination_model_node_state(self, semantic_path, node_state, data):
         normalized_path = self.normalize_memory_path(semantic_path)
         effective_state = node_state
@@ -15634,9 +15672,24 @@ class MainWindow(QMainWindow):
             node = self._make_destination_model_node(semantic_path, name, node_state, data, parent_semantic_path=parent_semantic_path)
             model_nodes[semantic_path] = node
         else:
-            if self._destination_model_state_priority(node_state) > self._destination_model_state_priority(node["node_state"]):
-                node["node_state"] = node_state
-                node["data"] = dict(data)
+            old_state = node["node_state"]
+            new_pri = self._destination_model_state_priority(node_state)
+            old_pri = self._destination_model_state_priority(old_state)
+            if new_pri > old_pri:
+                if node_state == "allocated" and old_state == "real":
+                    merged = self._merge_real_destination_row_with_allocation_node_data(node["data"], data)
+                    node["node_state"] = node_state
+                    node["data"] = merged
+                    if is_dev_mode() and bool(merged.get("is_folder")):
+                        log_info(
+                            "destination_nested_model_allocated_folder",
+                            phase="real_row_upgraded_to_allocated_in_model",
+                            semantic_path=str(semantic_path)[:200],
+                            has_allocated_label="[Allocated]" in str(merged.get("base_display_label", "")),
+                        )
+                else:
+                    node["node_state"] = node_state
+                    node["data"] = dict(data)
             node["name"] = name or node["name"]
             if parent_semantic_path:
                 node["parent_semantic_path"] = parent_semantic_path
@@ -15704,6 +15757,7 @@ class MainWindow(QMainWindow):
         source_name = self._move_target_name(move) or source_node.get("name", "Allocated Item")
         destination_path = self._canonical_destination_projection_path(self._allocation_projection_path(move))
         is_folder = bool(source_node.get("is_folder", True))
+        base_label = self._tree_name_column_label(source_name, tag="[Allocated]")
         return {
             "id": f"allocated::{destination_path}",
             "name": source_name,
@@ -15725,6 +15779,7 @@ class MainWindow(QMainWindow):
             "overlay_state": "PlannedAllocation",
             "planned_allocation": True,
             "web_url": parent_data.get("web_url", ""),
+            "base_display_label": base_label,
         }
 
     def _build_destination_allocation_descendant_node_data(self, source_node_data, destination_semantic_path, parent_data):
@@ -17502,6 +17557,13 @@ class MainWindow(QMainWindow):
         data.setdefault("destination_path", semantic_path)
         data.setdefault("base_display_label", label)
         self._apply_tree_item_visual_state(None, data)
+        if is_dev_mode() and node_state == "allocated" and is_folder:
+            log_info(
+                "destination_nested_model_allocated_folder",
+                phase="nested_spec_emitted",
+                semantic_path=str(semantic_path)[:200],
+                base_excerpt=str(data.get("base_display_label", ""))[:80],
+            )
 
         child_paths = sorted(node["children"], key=lambda child_path: self._destination_model_sort_key(model_nodes, child_path))
         child_nested: List[NestedSpec] = [

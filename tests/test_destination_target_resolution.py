@@ -531,3 +531,67 @@ def test_deferred_planning_refresh_skips_destination_for_paste_quick_reason():
     mw._run_deferred_planning_refresh()
     assert not materialized
 
+
+def test_destination_model_priority_allocated_wins_over_real():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    assert mw._destination_model_state_priority("allocated") > mw._destination_model_state_priority("real")
+
+
+def test_upsert_allocated_merges_over_real_folder_for_reset_nested_payload():
+    """Real snapshot row at allocation path must become allocated in model_nodes (same path)."""
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    mw.proposed_folders = []
+    mw.planned_moves = []
+    mw._destination_full_tree_ready = lambda: False
+    path = r"Root\Media\100GOPRO"
+    parent = r"Root\Media"
+    model_nodes = {}
+    mw._upsert_destination_model_node(
+        model_nodes,
+        path,
+        name="100GOPRO",
+        node_state="real",
+        data={
+            "name": "100GOPRO",
+            "is_folder": True,
+            "children_loaded": True,
+            "id": "graph-folder-id",
+            "item_path": path,
+            "display_path": path,
+            "destination_path": path,
+            "tree_role": "destination",
+        },
+        parent_semantic_path=parent,
+    )
+    move = {
+        "source_path": r"S\100GOPRO",
+        "destination_path": parent,
+        "target_name": "100GOPRO",
+        "source": {"name": "100GOPRO", "is_folder": True},
+    }
+    parent_data = model_nodes.get(parent, {}).get("data", {})
+    alloc_data = mw._build_destination_allocation_node_data(move, parent_data)
+    mw._upsert_destination_model_node(
+        model_nodes,
+        path,
+        name="100GOPRO",
+        node_state="allocated",
+        data=alloc_data,
+        parent_semantic_path=parent,
+    )
+    node = model_nodes[path]
+    assert node["node_state"] == "allocated"
+    d = node["data"]
+    assert d.get("planned_allocation") is True
+    assert d.get("node_origin") == "PlannedAllocation"
+    assert "[Allocated]" in str(d.get("base_display_label", ""))
+    assert d.get("id") == "graph-folder-id"
+    assert d.get("children_loaded") is True
+
+    nested = mw._build_destination_future_nested(model_nodes, path)
+    pl, _kids = nested
+    assert "[Allocated]" in str(pl.get("base_display_label", ""))
+    assert pl.get("planned_allocation") is True
+
