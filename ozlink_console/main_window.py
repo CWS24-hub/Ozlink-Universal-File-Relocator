@@ -385,6 +385,12 @@ def _qt_drop_action_to_int(action) -> int | None:
         return None
 
 
+def _destination_planning_qdrag_source_object(tree_self):
+    """QDrag(QObject) source must not be the destination tree: Win/Qt may not deliver DragMove/Drop to that widget's viewport, so hover never accepts (exec returns Ignore)."""
+    w = tree_self.window()
+    return w if w is not None else tree_self
+
+
 class _DestinationDragTraceEventFilter(QObject):
     """Temporary: log drag-related events on tree and children; never consumes events."""
 
@@ -778,7 +784,7 @@ class DestinationPlanningTreeWidget(QTreeWidget):
             )
         mime = QMimeData()
         mime.setData(OZLINK_DESTINATION_PLANNING_DRAG_MIME, QByteArray(b"v1"))
-        drag = QDrag(self)
+        drag = QDrag(_destination_planning_qdrag_source_object(self))
         drag.setMimeData(mime)
         log_info(
             _DRAGTRACE_MSG,
@@ -1163,7 +1169,7 @@ class DestinationPlanningTreeView(QTreeView):
             )
         mime = QMimeData()
         mime.setData(OZLINK_DESTINATION_PLANNING_DRAG_MIME, QByteArray(b"v1"))
-        drag = QDrag(self)
+        drag = QDrag(_destination_planning_qdrag_source_object(self))
         drag.setMimeData(mime)
         log_info(
             _DRAGTRACE_MSG,
