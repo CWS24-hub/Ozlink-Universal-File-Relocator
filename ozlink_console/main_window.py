@@ -62,7 +62,6 @@ from PySide6.QtGui import (
     QColor,
     QCursor,
     QDesktopServices,
-    QDrag,
     QFont,
     QGuiApplication,
     QKeySequence,
@@ -498,179 +497,11 @@ def _qt_drop_action_to_int(action) -> int | None:
         return None
 
 
-def _destination_planning_qdrag_source_object(tree_self):
-    """QDrag(QObject) source must not be the destination tree: Win/Qt may not deliver DragMove/Drop to that widget's viewport, so hover never accepts (exec returns Ignore)."""
-    w = tree_self.window()
-    return w if w is not None else tree_self
+_MANUALDRAG_MSG = "MANUALDRAG"
 
 
-class _DestinationDragTraceEventFilter(QObject):
-    """Temporary: log drag-related events on tree and children; never consumes events."""
-
-    def __init__(self, tree_label: str, parent: QObject | None = None):
-        super().__init__(parent)
-        self._tree_label = tree_label
-
-    def eventFilter(self, watched, event):
-        et = event.type()
-        if et not in (
-            QEvent.Type.DragEnter,
-            QEvent.Type.DragMove,
-            QEvent.Type.Drop,
-            QEvent.Type.DragLeave,
-        ):
-            return False
-        try:
-            acc_before = event.isAccepted()
-        except Exception:
-            acc_before = False
-        try:
-            c = QCursor.pos()
-            gpos = f"{c.x()},{c.y()}"
-        except Exception:
-            gpos = "?"
-        log_info(
-            _DRAGTRACE_MSG,
-            stage="filter",
-            tree=self._tree_label,
-            watched=watched.__class__.__name__,
-            ev=int(et),
-            acc_before=acc_before,
-            proposed=_dragtrace_proposed_int(event),
-            drop=_dragtrace_drop_action_int(event),
-            gpos=gpos,
-        )
-        return False
-
-
-def _install_destination_drag_trace_filters(tree_self, tree_label: str) -> None:
-    f = _DestinationDragTraceEventFilter(tree_label, tree_self)
-    tree_self._drag_trace_filter_obj = f
-    tree_self.installEventFilter(f)
-    tree_self.viewport().installEventFilter(f)
-    tree_self.header().installEventFilter(f)
-    tree_self.verticalScrollBar().installEventFilter(f)
-    tree_self.horizontalScrollBar().installEventFilter(f)
-
-
-def _dragtrace_enter_line(cls_name: str, event) -> None:
-    log_info(
-        _DRAGTRACE_MSG,
-        stage="enter",
-        cls=cls_name,
-        mime_ok=_dragtrace_mime_ok(event),
-        pos=_dragtrace_global_pos_str(event),
-        row_ok="n/a",
-        res_ok="n/a",
-        rej="",
-        acc=event.isAccepted(),
-        drop=_dragtrace_drop_action_int(event),
-    )
-
-
-def _dragtrace_leave_line(cls_name: str, event) -> None:
-    log_info(
-        _DRAGTRACE_MSG,
-        stage="leave",
-        cls=cls_name,
-        mime_ok=_dragtrace_mime_ok(event),
-        pos=_dragtrace_global_pos_str(event),
-        row_ok="n/a",
-        res_ok="n/a",
-        rej="",
-        acc=event.isAccepted(),
-        drop=_dragtrace_drop_action_int(event),
-    )
-
-
-def _dragtrace_widget_move_or_drop_line(stage: str, tree_self, cls_name: str, event) -> None:
-    mime_ok = _dragtrace_mime_ok(event)
-    pos_s = _dragtrace_global_pos_str(event)
-    try:
-        acc_b = event.isAccepted()
-    except Exception:
-        acc_b = False
-    da = _dragtrace_drop_action_int(event)
-    row_ok = "n/a"
-    res_ok = "n/a"
-    rej = ""
-    if mime_ok:
-        try:
-            g = event.globalPosition().toPoint()
-            p = tree_self.viewport().mapFromGlobal(g)
-            ref, dip_int = tree_self._drop_band_at_pos_widget(p)
-            row_ok = str(ref is not None)
-            mw = getattr(tree_self, "_ozlink_main_window", None)
-            if ref is not None and mw is not None:
-                dip = QAbstractItemView.DropIndicatorPosition(dip_int)
-                commit, meta = mw._resolve_destination_manual_drop_folder_item(ref, dip)
-                res_ok = str(commit is not None)
-                rej = str(meta.get("drop_rejected_reason", ""))[:120]
-            elif ref is not None:
-                res_ok = "no_mw"
-            else:
-                res_ok = "n/a"
-        except Exception as ex:
-            row_ok = "err"
-            res_ok = "err"
-            rej = str(ex)[:120]
-    log_info(
-        _DRAGTRACE_MSG,
-        stage=stage,
-        cls=cls_name,
-        mime_ok=mime_ok,
-        pos=pos_s,
-        row_ok=row_ok,
-        res_ok=res_ok,
-        rej=rej,
-        acc=acc_b,
-        drop=da,
-    )
-
-
-def _dragtrace_view_move_or_drop_line(stage: str, tree_self, cls_name: str, event) -> None:
-    mime_ok = _dragtrace_mime_ok(event)
-    pos_s = _dragtrace_global_pos_str(event)
-    try:
-        acc_b = event.isAccepted()
-    except Exception:
-        acc_b = False
-    da = _dragtrace_drop_action_int(event)
-    row_ok = "n/a"
-    res_ok = "n/a"
-    rej = ""
-    if mime_ok:
-        try:
-            g = event.globalPosition().toPoint()
-            p = tree_self.viewport().mapFromGlobal(g)
-            ref_ix, dip_int = tree_self._drop_band_at_pos_view(p)
-            row_ok = str(ref_ix.isValid())
-            mw = getattr(tree_self, "_ozlink_main_window", None)
-            if ref_ix.isValid() and mw is not None:
-                dip = QAbstractItemView.DropIndicatorPosition(dip_int)
-                commit_ix, meta = mw._resolve_destination_manual_drop_folder_index(ref_ix, dip)
-                res_ok = str(commit_ix.isValid())
-                rej = str(meta.get("drop_rejected_reason", ""))[:120]
-            elif ref_ix.isValid():
-                res_ok = "no_mw"
-            else:
-                res_ok = "n/a"
-        except Exception as ex:
-            row_ok = "err"
-            res_ok = "err"
-            rej = str(ex)[:120]
-    log_info(
-        _DRAGTRACE_MSG,
-        stage=stage,
-        cls=cls_name,
-        mime_ok=mime_ok,
-        pos=pos_s,
-        row_ok=row_ok,
-        res_ok=res_ok,
-        rej=rej,
-        acc=acc_b,
-        drop=da,
-    )
+def _manualdrag_log(phase: str, *, tree_class: str, **data) -> None:
+    log_info(_MANUALDRAG_MSG, phase=phase, tree_class=tree_class, **data)
 
 
 def _destination_drop_band_margin_px(row_height: int) -> int:
@@ -679,59 +510,6 @@ def _destination_drop_band_margin_px(row_height: int) -> int:
     if h <= 0:
         return 1
     return max(1, min(2, h // 8))
-
-
-def _destination_manual_drag_viewport_event_filter(tree_self, tree_label: str, watched, event) -> bool | None:
-    """Return True/False if handled; None if this filter should not intercept (delegate to super().eventFilter)."""
-    et = event.type()
-    drag_types = (
-        QEvent.Type.DragEnter,
-        QEvent.Type.DragMove,
-        QEvent.Type.Drop,
-        QEvent.Type.DragLeave,
-    )
-    if et not in drag_types:
-        return None
-    vp = tree_self.viewport()
-    hdr = tree_self.header()
-    bars = (tree_self.verticalScrollBar(), tree_self.horizontalScrollBar())
-    if watched is not vp and watched is not hdr and watched not in bars:
-        return None
-    if et == QEvent.Type.DragEnter:
-        tree_self.dragEnterEvent(event)
-    elif et == QEvent.Type.DragMove:
-        tree_self.dragMoveEvent(event)
-    elif et == QEvent.Type.Drop:
-        tree_self.dropEvent(event)
-    elif et == QEvent.Type.DragLeave:
-        tree_self.dragLeaveEvent(event)
-    da_int = _dragtrace_drop_action_int(event)
-    try:
-        c = QCursor.pos()
-        gpos = f"{c.x()},{c.y()}"
-    except Exception:
-        gpos = "?"
-    log_info(
-        _DRAGTRACE_MSG,
-        stage="filter_done",
-        tree=tree_label,
-        watched=watched.__class__.__name__,
-        ev=int(et),
-        acc_after=event.isAccepted(),
-        drop=da_int,
-        gpos=gpos,
-    )
-    if is_dev_mode():
-        log_info(
-            "debug_pass_destination_manual_drag",
-            phase="event_filter",
-            tree=tree_label,
-            watched_class=watched.__class__.__name__,
-            event_type=int(et),
-            event_accepted=event.isAccepted(),
-            drop_action=da_int,
-        )
-    return True
 
 
 class DestinationPlanningTreeWidget(QTreeWidget):
@@ -745,7 +523,8 @@ class DestinationPlanningTreeWidget(QTreeWidget):
         self._dd_press_item = None
         self._manual_drag_source_item = None
         self._dd_drag_active = False
-        self._dd_last_cursor_global = QPoint()
+        self._manualdrag_hover_sig = None
+        self._manual_override_cursor = False
         self._dd_overlay_ref_item = None
         self._dd_overlay_commit_item = None
         self._dd_overlay_dip = QAbstractItemView.DropIndicatorPosition.OnItem
@@ -754,25 +533,6 @@ class DestinationPlanningTreeWidget(QTreeWidget):
         self._init_destination_drag_overlay_widgets()
         self.verticalScrollBar().valueChanged.connect(self._destination_drag_on_scroll)
         self.horizontalScrollBar().valueChanged.connect(self._destination_drag_on_scroll)
-        self._install_destination_manual_drag_child_drop_targets()
-
-    def _install_destination_manual_drag_child_drop_targets(self):
-        vp = self.viewport()
-        vp.setAcceptDrops(True)
-        vp.installEventFilter(self)
-        hdr = self.header()
-        hdr.setAcceptDrops(False)
-        hdr.installEventFilter(self)
-        for sb in (self.verticalScrollBar(), self.horizontalScrollBar()):
-            sb.setAcceptDrops(False)
-            sb.installEventFilter(self)
-        _install_destination_drag_trace_filters(self, "QTreeWidget")
-
-    def eventFilter(self, watched, event):
-        r = _destination_manual_drag_viewport_event_filter(self, "QTreeWidget", watched, event)
-        if r is not None:
-            return r
-        return super().eventFilter(watched, event)
 
     def _init_destination_drag_overlay_widgets(self):
         vp = self.viewport()
@@ -853,41 +613,53 @@ class DestinationPlanningTreeWidget(QTreeWidget):
             dip = QAbstractItemView.DropIndicatorPosition.OnItem
         return item, dip.value
 
-    def mousePressEvent(self, event):
-        super().mousePressEvent(event)
-        if event.button() != Qt.MouseButton.LeftButton:
-            self._dd_press_item = None
+    def _planning_manual_source_path_widget(self) -> str:
+        mw = getattr(self, "_ozlink_main_window", None)
+        if mw is None or self._manual_drag_source_item is None:
+            return ""
+        node = mw.get_tree_item_node_data(self._manual_drag_source_item) or {}
+        return str(mw._destination_row_semantic_path(node) or "")[:240]
+
+    def _planning_manual_cleanup_widget(self) -> None:
+        try:
+            self.viewport().releaseMouse()
+        except Exception:
+            pass
+        if self._manual_override_cursor:
+            self._manual_override_cursor = False
+            QApplication.restoreOverrideCursor()
+        self._dd_drag_active = False
+        self._manual_drag_source_item = None
+        self._manualdrag_hover_sig = None
+        self._hide_destination_drop_overlay()
+        self.viewport().update()
+
+    def _planning_manual_cancel_widget(self, reason: str) -> None:
+        if not self._dd_drag_active:
             return
-        self._dd_press_pos = event.position().toPoint()
-        self._dd_press_item = self.itemAt(self._dd_press_pos)
+        _manualdrag_log(
+            "cancel",
+            tree_class="QTreeWidget",
+            source_path=self._planning_manual_source_path_widget()[:200],
+            reject_reason=reason,
+        )
+        self._planning_manual_cleanup_widget()
 
-    def mouseMoveEvent(self, event):
-        if (
-            self._dd_press_item is not None
-            and (event.buttons() & Qt.MouseButton.LeftButton)
-            and (event.position().toPoint() - self._dd_press_pos).manhattanLength()
-            >= QApplication.startDragDistance()
-        ):
-            mw = getattr(self, "_ozlink_main_window", None)
-            if mw is not None and mw.destination_planning_row_allows_manual_drag_item(self._dd_press_item):
-                src = self._dd_press_item
-                self._dd_press_item = None
-                self._run_manual_planning_drag_widget(src)
-                return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._dd_press_item = None
-        super().mouseReleaseEvent(event)
-
-    def _run_manual_planning_drag_widget(self, source_item: QTreeWidgetItem):
+    def _planning_manual_begin_widget(self, source_item: QTreeWidgetItem) -> None:
         mw = getattr(self, "_ozlink_main_window", None)
         if mw is None or source_item is None:
             return
-        ix = source_item
-        node = mw.get_tree_item_node_data(ix) or {}
+        node = mw.get_tree_item_node_data(source_item) or {}
         start_path = str(mw._destination_row_semantic_path(node) or "")[:240]
+        self._manual_drag_source_item = source_item
+        self._dd_drag_active = True
+        self._manualdrag_hover_sig = None
+        try:
+            self.viewport().grabMouse()
+        except Exception:
+            pass
+        QApplication.setOverrideCursor(Qt.CursorShape.ClosedHandCursor)
+        self._manual_override_cursor = True
         if is_dev_mode():
             log_info(
                 "debug_pass_destination_manual_drag",
@@ -895,228 +667,176 @@ class DestinationPlanningTreeWidget(QTreeWidget):
                 tree="QTreeWidget",
                 drag_start_path=start_path,
             )
-        mime = QMimeData()
-        mime.setData(OZLINK_DESTINATION_PLANNING_DRAG_MIME, QByteArray(b"v1"))
-        drag = QDrag(_destination_planning_qdrag_source_object(self))
-        drag.setMimeData(mime)
-        log_info(
-            _DRAGTRACE_MSG,
-            stage="start",
-            cls="QTreeWidget",
-            path=start_path[:200],
-            mime_present=True,
-            initiator_tree_id=id(self),
-            initiator_viewport_id=id(self.viewport()),
-            **_dragproof_dest_ids_for_main_window(mw),
-        )
-        self._manual_drag_source_item = source_item
-        self._dd_drag_active = True
-        exec_result = drag.exec(Qt.DropAction.MoveAction)
-        log_info(
-            _DRAGTRACE_MSG,
-            stage="end",
-            cls="QTreeWidget",
-            path=start_path[:200],
-            mime_present=True,
-            exec_return=_qt_drop_action_to_int(exec_result),
-        )
-        self._dd_drag_active = False
-        self._manual_drag_source_item = None
-        self._hide_destination_drop_overlay()
-        self.viewport().update()
+        _manualdrag_log("drag_begin", tree_class="QTreeWidget", source_path=start_path[:200])
+        try:
+            pos_vp = self.viewport().mapFromGlobal(QCursor.pos())
+        except Exception:
+            pos_vp = QPoint(0, 0)
+        self._planning_manual_update_hover_widget(pos_vp)
 
-    def dragEnterEvent(self, event):
-        _dragtrace_enter_line("QTreeWidget", event)
-        if event.mimeData() and event.mimeData().hasFormat(OZLINK_DESTINATION_PLANNING_DRAG_MIME):
-            if is_dev_mode():
-                log_info(
-                    "debug_pass_destination_manual_drag",
-                    phase="drag_enter",
-                    tree="QTreeWidget",
-                    drag_mime_seen=True,
-                    drag_acceptance_reason="mime_match",
-                    rejection_reason="",
-                )
-            # drag.exec(MoveAction) — force Move; acceptProposedAction() can disagree on some platforms → forbidden cursor
-            event.setDropAction(Qt.DropAction.MoveAction)
-            event.accept()
-            return
-        super().dragEnterEvent(event)
-
-    def dragMoveEvent(self, event):
-        _dragtrace_widget_move_or_drop_line("move", self, "QTreeWidget", event)
-        md = event.mimeData()
-        if md is None or not md.hasFormat(OZLINK_DESTINATION_PLANNING_DRAG_MIME):
-            super().dragMoveEvent(event)
-            return
-        self._dd_last_cursor_global = event.globalPosition().toPoint()
+    def _planning_manual_hover_signature_widget(self, mw, pos, ref_item, dip, commit_item, meta) -> tuple:
         vp = self.viewport()
-        pos = vp.mapFromGlobal(self._dd_last_cursor_global)
+        if mw is None:
+            return ("no_mw",)
+        if ref_item is None:
+            return ("provisional_viewport",) if vp.rect().contains(pos) else ("outside",)
+        mode = str((meta or {}).get("indicator_mode", ""))
+        htype = str((meta or {}).get("hover_row_type", ""))
+        hp = str((meta or {}).get("hovered_path", ""))[:200]
+        if commit_item is None:
+            return ("provisional_unresolved", hp, mode, str((meta or {}).get("drop_rejected_reason", "")))
+        resolved = str((meta or {}).get("resolved_target_path", ""))[:240]
+        return ("commit", resolved, mode, htype, dip.value)
+
+    def _planning_manual_update_hover_widget(self, pos: QPoint) -> None:
+        mw = getattr(self, "_ozlink_main_window", None)
         ref_item, dip_int = self._drop_band_at_pos_widget(pos)
         dip = QAbstractItemView.DropIndicatorPosition(dip_int)
-        initial_dip = dip.value
-        mw = getattr(self, "_ozlink_main_window", None)
+        meta: dict = {}
+        commit_item = None
         if mw is None:
             self._hide_destination_drop_overlay()
-            event.ignore()
-            if is_dev_mode():
-                log_info(
-                    "debug_pass_destination_manual_drag",
-                    phase="drag_move",
-                    tree="QTreeWidget",
-                    drag_mime_seen=True,
-                    initial_hover_dip=initial_dip,
-                    drag_acceptance_reason="rejected",
-                    rejection_reason="no_main_window",
-                    provisional_accept=False,
-                    top_level_between_fallback=False,
-                    resolved_target_path="",
-                    accepted_drop_action="",
-                )
-            return
-        if ref_item is None:
+        elif ref_item is None:
             self._hide_destination_drop_overlay()
-            if vp.rect().contains(pos):
-                event.setDropAction(Qt.DropAction.MoveAction)
-                event.accept()
-                if is_dev_mode():
-                    log_info(
-                        "debug_pass_destination_manual_drag",
-                        phase="drag_move",
-                        tree="QTreeWidget",
-                        drag_mime_seen=True,
-                        initial_hover_dip=initial_dip,
-                        drag_acceptance_reason="provisional_no_row_viewport",
-                        rejection_reason="",
-                        provisional_accept=True,
-                        top_level_between_fallback=False,
-                        resolved_target_path="",
-                        accepted_drop_action="Move",
-                    )
+        else:
+            commit_item, meta = mw._resolve_destination_manual_drop_folder_item(ref_item, dip)
+            if commit_item is None:
+                self._hide_destination_drop_overlay()
             else:
-                event.ignore()
-                if is_dev_mode():
-                    log_info(
-                        "debug_pass_destination_manual_drag",
-                        phase="drag_move",
-                        tree="QTreeWidget",
-                        drag_mime_seen=True,
-                        initial_hover_dip=initial_dip,
-                        drag_acceptance_reason="rejected",
-                        rejection_reason="no_hover_row",
-                        provisional_accept=False,
-                        top_level_between_fallback=False,
-                        resolved_target_path="",
-                        accepted_drop_action="",
-                    )
-            return
-        commit_item, meta = mw._resolve_destination_manual_drop_folder_item(ref_item, dip)
+                self._dd_overlay_ref_item = ref_item
+                self._dd_overlay_commit_item = commit_item
+                self._dd_overlay_dip = dip
+                self._reposition_destination_drop_overlay_widgets()
+        sig = self._planning_manual_hover_signature_widget(mw, pos, ref_item, dip, commit_item, meta)
+        if sig != self._manualdrag_hover_sig:
+            self._manualdrag_hover_sig = sig
+            hover_path = str(meta.get("hovered_path", ""))[:200] if meta else ""
+            resolved = str(meta.get("resolved_target_path", ""))[:240] if meta else ""
+            _manualdrag_log(
+                "hover_update",
+                tree_class="QTreeWidget",
+                source_path=self._planning_manual_source_path_widget()[:200],
+                hover_path=hover_path,
+                resolved_target_path=resolved,
+                hover_mode=repr(sig),
+                drop_indicator=dip.value,
+                commit_preview=commit_item is not None,
+                reject_reason=str(meta.get("drop_rejected_reason", ""))[:120] if meta else "",
+            )
+
+    def _planning_manual_finish_widget(self, pos: QPoint) -> None:
+        mw = getattr(self, "_ozlink_main_window", None)
+        source_item = self._manual_drag_source_item
+        ref_item, dip_int = self._drop_band_at_pos_widget(pos)
+        dip = QAbstractItemView.DropIndicatorPosition(dip_int)
+        meta: dict = {}
+        target_item = None
+        if mw is not None and ref_item is not None:
+            target_item, meta = mw._resolve_destination_manual_drop_folder_item(ref_item, dip)
+        committed_path = str(meta.get("resolved_target_path", ""))[:240]
         hover_path = str(meta.get("hovered_path", ""))[:200]
         mode = str(meta.get("indicator_mode", ""))
         htype = str(meta.get("hover_row_type", ""))
-        tlfb = bool(meta.get("top_level_between_fallback", False))
-        if commit_item is None:
-            self._hide_destination_drop_overlay()
-            event.setDropAction(Qt.DropAction.MoveAction)
-            event.accept()
-            if is_dev_mode():
-                log_info(
-                    "debug_pass_destination_manual_drag",
-                    phase="drag_move",
-                    tree="QTreeWidget",
-                    drag_mime_seen=True,
-                    initial_hover_dip=initial_dip,
-                    hover_row_path=hover_path,
-                    hover_row_type=htype,
-                    indicator_mode=mode,
-                    drop_indicator=initial_dip,
-                    drag_acceptance_reason="provisional_unresolved_target",
-                    rejection_reason=str(meta.get("drop_rejected_reason", "")),
-                    provisional_accept=True,
-                    top_level_between_fallback=tlfb,
-                    resolved_target_path="",
-                    accepted_drop_action="Move",
-                )
-            return
-        resolved = str(meta.get("resolved_target_path", ""))[:240]
-        self._dd_overlay_ref_item = ref_item
-        self._dd_overlay_commit_item = commit_item
-        self._dd_overlay_dip = dip
-        self._reposition_destination_drop_overlay_widgets()
-        event.setDropAction(Qt.DropAction.MoveAction)
-        event.accept()
-        if is_dev_mode():
-            log_info(
-                "debug_pass_destination_manual_drag",
-                phase="drag_move",
-                tree="QTreeWidget",
-                drag_mime_seen=True,
-                initial_hover_dip=initial_dip,
-                hover_row_path=hover_path,
-                hover_row_type=htype,
-                indicator_mode=mode,
-                drop_indicator=initial_dip,
-                drag_acceptance_reason=str(meta.get("drag_acceptance_reason", "")),
-                rejection_reason="",
-                provisional_accept=False,
-                top_level_between_fallback=tlfb,
-                resolved_target_path=resolved[:200],
-                accepted_drop_action="Move",
-            )
-
-    def dragLeaveEvent(self, event):
-        _dragtrace_leave_line("QTreeWidget", event)
-        self._hide_destination_drop_overlay()
-        super().dragLeaveEvent(event)
-
-    def dropEvent(self, event):
-        _dragtrace_widget_move_or_drop_line("drop", self, "QTreeWidget", event)
-        md = event.mimeData()
-        if md is None or not md.hasFormat(OZLINK_DESTINATION_PLANNING_DRAG_MIME):
-            super().dropEvent(event)
-            return
-        source_item = self._manual_drag_source_item
-        vp = self.viewport()
-        pos = vp.mapFromGlobal(event.globalPosition().toPoint())
-        ref_item, dip_int = self._drop_band_at_pos_widget(pos)
-        dip = QAbstractItemView.DropIndicatorPosition(dip_int)
-        mw = getattr(self, "_ozlink_main_window", None)
-        drop_rejected = ""
-        committed_path = ""
-        target_item = None
-        meta: dict = {}
-        if mw is not None and ref_item is not None:
-            target_item, meta = mw._resolve_destination_manual_drop_folder_item(ref_item, dip)
-            committed_path = str(meta.get("resolved_target_path", ""))[:240]
-            drop_rejected = str(meta.get("drop_rejected_reason", ""))
         if is_dev_mode():
             log_info(
                 "debug_pass_destination_manual_drag",
                 phase="drop",
                 tree="QTreeWidget",
-                drag_mime_seen=True,
-                hover_row_path=str(meta.get("hovered_path", ""))[:200],
-                hover_row_type=str(meta.get("hover_row_type", "")),
-                indicator_mode=str(meta.get("indicator_mode", "")),
+                drag_mime_seen=False,
+                hover_row_path=hover_path,
+                hover_row_type=htype,
+                indicator_mode=mode,
                 drop_indicator=dip.value,
                 resolved_target_path=str(meta.get("resolved_target_path", ""))[:200],
                 drop_committed_path=committed_path[:200],
-                drop_rejected_reason=drop_rejected,
-                rejection_reason=drop_rejected,
+                drop_rejected_reason=str(meta.get("drop_rejected_reason", "")),
+                rejection_reason=str(meta.get("drop_rejected_reason", "")),
                 accepted_drop_action="Move" if target_item is not None else "",
             )
-        self._hide_destination_drop_overlay()
-        self._dd_drag_active = False
-        if (
-            source_item is None
-            or target_item is None
-            or source_item is target_item
-        ):
-            event.ignore()
+        if source_item is None or target_item is None or source_item is target_item:
+            _manualdrag_log(
+                "release_reject",
+                tree_class="QTreeWidget",
+                source_path=self._planning_manual_source_path_widget()[:200],
+                hover_path=hover_path,
+                resolved_target_path=committed_path,
+                hover_mode=mode or htype,
+                commit="no",
+                reject_reason=str(meta.get("drop_rejected_reason", ""))[:160] if meta else "no_target",
+            )
+            self._planning_manual_cleanup_widget()
             return
+        _manualdrag_log(
+            "release_commit",
+            tree_class="QTreeWidget",
+            source_path=self._planning_manual_source_path_widget()[:200],
+            hover_path=hover_path,
+            resolved_target_path=committed_path,
+            hover_mode=mode or htype,
+            commit="yes",
+            reject_reason="",
+        )
         self.proposedBranchMoveRequested.emit(source_item, target_item)
-        event.setDropAction(Qt.DropAction.MoveAction)
-        event.accept()
+        self._planning_manual_cleanup_widget()
+
+    def mousePressEvent(self, event):
+        if self._dd_drag_active:
+            return
+        super().mousePressEvent(event)
+        if event.button() != Qt.MouseButton.LeftButton:
+            self._dd_press_item = None
+            return
+        self._dd_press_pos = self.viewport().mapFromGlobal(event.globalPosition().toPoint())
+        self._dd_press_item = self.itemAt(self._dd_press_pos)
+        mw = getattr(self, "_ozlink_main_window", None)
+        if mw is not None and self._dd_press_item and mw.destination_planning_row_allows_manual_drag_item(self._dd_press_item):
+            node = mw.get_tree_item_node_data(self._dd_press_item) or {}
+            sp = str(mw._destination_row_semantic_path(node) or "")[:200]
+            _manualdrag_log("press_candidate", tree_class="QTreeWidget", source_path=sp)
+
+    def mouseMoveEvent(self, event):
+        if self._dd_drag_active:
+            pos_vp = self.viewport().mapFromGlobal(event.globalPosition().toPoint())
+            self._planning_manual_update_hover_widget(pos_vp)
+            event.accept()
+            return
+        if (
+            self._dd_press_item is not None
+            and (event.buttons() & Qt.MouseButton.LeftButton)
+            and (
+                self.viewport().mapFromGlobal(event.globalPosition().toPoint()) - self._dd_press_pos
+            ).manhattanLength()
+            >= QApplication.startDragDistance()
+        ):
+            mw = getattr(self, "_ozlink_main_window", None)
+            if mw is not None and mw.destination_planning_row_allows_manual_drag_item(self._dd_press_item):
+                src = self._dd_press_item
+                self._dd_press_item = None
+                self._planning_manual_begin_widget(src)
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._dd_drag_active:
+            pos_vp = self.viewport().mapFromGlobal(event.globalPosition().toPoint())
+            self._planning_manual_finish_widget(pos_vp)
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dd_press_item = None
+        super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event):
+        if self._dd_drag_active:
+            self._planning_manual_cancel_widget("leave_widget")
+        super().leaveEvent(event)
+
+    def keyPressEvent(self, event):
+        if self._dd_drag_active and event.key() == Qt.Key.Key_Escape:
+            self._planning_manual_cancel_widget("escape")
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 class DestinationPlanningTreeView(QTreeView):
@@ -1130,7 +850,8 @@ class DestinationPlanningTreeView(QTreeView):
         self._dd_press_index = QModelIndex()
         self._manual_drag_source_persistent = QPersistentModelIndex()
         self._dd_drag_active = False
-        self._dd_last_cursor_global = QPoint()
+        self._manualdrag_hover_sig = None
+        self._manual_override_cursor = False
         self._dd_overlay_ref = QPersistentModelIndex()
         self._dd_overlay_commit = QPersistentModelIndex()
         self._dd_overlay_dip = QAbstractItemView.DropIndicatorPosition.OnItem
@@ -1139,25 +860,6 @@ class DestinationPlanningTreeView(QTreeView):
         self._init_destination_drag_overlay_widgets()
         self.verticalScrollBar().valueChanged.connect(self._destination_drag_on_scroll)
         self.horizontalScrollBar().valueChanged.connect(self._destination_drag_on_scroll)
-        self._install_destination_manual_drag_child_drop_targets()
-
-    def _install_destination_manual_drag_child_drop_targets(self):
-        vp = self.viewport()
-        vp.setAcceptDrops(True)
-        vp.installEventFilter(self)
-        hdr = self.header()
-        hdr.setAcceptDrops(False)
-        hdr.installEventFilter(self)
-        for sb in (self.verticalScrollBar(), self.horizontalScrollBar()):
-            sb.setAcceptDrops(False)
-            sb.installEventFilter(self)
-        _install_destination_drag_trace_filters(self, "QTreeView")
-
-    def eventFilter(self, watched, event):
-        r = _destination_manual_drag_viewport_event_filter(self, "QTreeView", watched, event)
-        if r is not None:
-            return r
-        return super().eventFilter(watched, event)
 
     def _init_destination_drag_overlay_widgets(self):
         vp = self.viewport()
@@ -1238,19 +940,209 @@ class DestinationPlanningTreeView(QTreeView):
             dip = QAbstractItemView.DropIndicatorPosition.OnItem
         return ix0, dip.value
 
+    def _planning_manual_source_path_view(self) -> str:
+        mw = getattr(self, "_ozlink_main_window", None)
+        six = QModelIndex(self._manual_drag_source_persistent)
+        if mw is None or not six.isValid():
+            return ""
+        node = mw.get_tree_item_node_data(six) or {}
+        return str(mw._destination_row_semantic_path(node) or "")[:240]
+
+    def _planning_manual_cleanup_view(self) -> None:
+        try:
+            self.viewport().releaseMouse()
+        except Exception:
+            pass
+        if self._manual_override_cursor:
+            self._manual_override_cursor = False
+            QApplication.restoreOverrideCursor()
+        self._dd_drag_active = False
+        self._manual_drag_source_persistent = QPersistentModelIndex()
+        self._manualdrag_hover_sig = None
+        self._hide_destination_drop_overlay()
+        self.viewport().update()
+
+    def _planning_manual_cancel_view(self, reason: str) -> None:
+        if not self._dd_drag_active:
+            return
+        _manualdrag_log(
+            "cancel",
+            tree_class="QTreeView",
+            source_path=self._planning_manual_source_path_view()[:200],
+            reject_reason=reason,
+        )
+        self._planning_manual_cleanup_view()
+
+    def _planning_manual_begin_view(self, source_index: QModelIndex) -> None:
+        mw = getattr(self, "_ozlink_main_window", None)
+        if mw is None or not source_index.isValid():
+            return
+        node = mw.get_tree_item_node_data(source_index) or {}
+        start_path = str(mw._destination_row_semantic_path(node) or "")[:240]
+        self._manual_drag_source_persistent = QPersistentModelIndex(source_index)
+        self._dd_drag_active = True
+        self._manualdrag_hover_sig = None
+        try:
+            self.viewport().grabMouse()
+        except Exception:
+            pass
+        QApplication.setOverrideCursor(Qt.CursorShape.ClosedHandCursor)
+        self._manual_override_cursor = True
+        if is_dev_mode():
+            log_info(
+                "debug_pass_destination_manual_drag",
+                phase="drag_start",
+                tree="QTreeView",
+                drag_start_path=start_path,
+            )
+        _manualdrag_log("drag_begin", tree_class="QTreeView", source_path=start_path[:200])
+        try:
+            pos_vp = self.viewport().mapFromGlobal(QCursor.pos())
+        except Exception:
+            pos_vp = QPoint(0, 0)
+        self._planning_manual_update_hover_view(pos_vp)
+
+    def _planning_manual_hover_signature_view(self, mw, pos, ref_ix, dip, commit_ix, meta) -> tuple:
+        vp = self.viewport()
+        if mw is None:
+            return ("no_mw",)
+        if not ref_ix.isValid():
+            return ("provisional_viewport",) if vp.rect().contains(pos) else ("outside",)
+        mode = str((meta or {}).get("indicator_mode", ""))
+        htype = str((meta or {}).get("hover_row_type", ""))
+        hp = str((meta or {}).get("hovered_path", ""))[:200]
+        if commit_ix is None or not commit_ix.isValid():
+            return ("provisional_unresolved", hp, mode, str((meta or {}).get("drop_rejected_reason", "")))
+        resolved = str((meta or {}).get("resolved_target_path", ""))[:240]
+        return ("commit", resolved, mode, htype, dip.value)
+
+    def _planning_manual_update_hover_view(self, pos: QPoint) -> None:
+        mw = getattr(self, "_ozlink_main_window", None)
+        ref_ix, dip_int = self._drop_band_at_pos_view(pos)
+        dip = QAbstractItemView.DropIndicatorPosition(dip_int)
+        meta: dict = {}
+        commit_ix = QModelIndex()
+        if mw is None:
+            self._hide_destination_drop_overlay()
+        elif not ref_ix.isValid():
+            self._hide_destination_drop_overlay()
+        else:
+            cand, meta = mw._resolve_destination_manual_drop_folder_index(ref_ix, dip)
+            if cand is None or not cand.isValid():
+                commit_ix = QModelIndex()
+                self._hide_destination_drop_overlay()
+            else:
+                commit_ix = cand
+                self._dd_overlay_ref = QPersistentModelIndex(ref_ix)
+                self._dd_overlay_commit = QPersistentModelIndex(commit_ix)
+                self._dd_overlay_dip = dip
+                self._reposition_destination_drop_overlay_widgets()
+        sig = self._planning_manual_hover_signature_view(mw, pos, ref_ix, dip, commit_ix, meta)
+        if sig != self._manualdrag_hover_sig:
+            self._manualdrag_hover_sig = sig
+            hover_path = str(meta.get("hovered_path", ""))[:200] if meta else ""
+            resolved = str(meta.get("resolved_target_path", ""))[:240] if meta else ""
+            _manualdrag_log(
+                "hover_update",
+                tree_class="QTreeView",
+                source_path=self._planning_manual_source_path_view()[:200],
+                hover_path=hover_path,
+                resolved_target_path=resolved,
+                hover_mode=repr(sig),
+                drop_indicator=dip.value,
+                commit_preview=commit_ix.isValid(),
+                reject_reason=str(meta.get("drop_rejected_reason", ""))[:120] if meta else "",
+            )
+
+    def _planning_manual_finish_view(self, pos: QPoint) -> None:
+        mw = getattr(self, "_ozlink_main_window", None)
+        source_ix = QModelIndex(self._manual_drag_source_persistent)
+        ref_ix, dip_int = self._drop_band_at_pos_view(pos)
+        dip = QAbstractItemView.DropIndicatorPosition(dip_int)
+        meta: dict = {}
+        target_ix = QModelIndex()
+        if mw is not None and ref_ix.isValid():
+            cand, meta = mw._resolve_destination_manual_drop_folder_index(ref_ix, dip)
+            if cand is not None and cand.isValid():
+                target_ix = cand
+        committed_path = str(meta.get("resolved_target_path", ""))[:240]
+        hover_path = str(meta.get("hovered_path", ""))[:200]
+        mode = str(meta.get("indicator_mode", ""))
+        htype = str(meta.get("hover_row_type", ""))
+        if is_dev_mode():
+            log_info(
+                "debug_pass_destination_manual_drag",
+                phase="drop",
+                tree="QTreeView",
+                drag_mime_seen=False,
+                hover_row_path=hover_path,
+                hover_row_type=htype,
+                indicator_mode=mode,
+                drop_indicator=dip.value,
+                resolved_target_path=str(meta.get("resolved_target_path", ""))[:200],
+                drop_committed_path=committed_path[:200],
+                drop_rejected_reason=str(meta.get("drop_rejected_reason", "")),
+                rejection_reason=str(meta.get("drop_rejected_reason", "")),
+                accepted_drop_action="Move" if target_ix.isValid() else "",
+            )
+        if not source_ix.isValid() or not target_ix.isValid() or source_ix == target_ix:
+            _manualdrag_log(
+                "release_reject",
+                tree_class="QTreeView",
+                source_path=self._planning_manual_source_path_view()[:200],
+                hover_path=hover_path,
+                resolved_target_path=committed_path,
+                hover_mode=mode or htype,
+                commit="no",
+                reject_reason=str(meta.get("drop_rejected_reason", ""))[:160] if meta else "no_target",
+            )
+            self._planning_manual_cleanup_view()
+            return
+        _manualdrag_log(
+            "release_commit",
+            tree_class="QTreeView",
+            source_path=self._planning_manual_source_path_view()[:200],
+            hover_path=hover_path,
+            resolved_target_path=committed_path,
+            hover_mode=mode or htype,
+            commit="yes",
+            reject_reason="",
+        )
+        self.proposedBranchMoveRequested.emit(source_ix, target_ix)
+        self._planning_manual_cleanup_view()
+
     def mousePressEvent(self, event):
+        if self._dd_drag_active:
+            return
         super().mousePressEvent(event)
         if event.button() != Qt.MouseButton.LeftButton:
             self._dd_press_index = QModelIndex()
             return
-        self._dd_press_pos = event.position().toPoint()
+        self._dd_press_pos = self.viewport().mapFromGlobal(event.globalPosition().toPoint())
         self._dd_press_index = self.indexAt(self._dd_press_pos)
+        ix = (
+            self._dd_press_index.siblingAtColumn(0)
+            if self._dd_press_index.column() != 0
+            else self._dd_press_index
+        )
+        mw = getattr(self, "_ozlink_main_window", None)
+        if mw is not None and ix.isValid() and mw.destination_planning_row_allows_manual_drag_index(ix):
+            node = mw.get_tree_item_node_data(ix) or {}
+            sp = str(mw._destination_row_semantic_path(node) or "")[:200]
+            _manualdrag_log("press_candidate", tree_class="QTreeView", source_path=sp)
 
     def mouseMoveEvent(self, event):
+        if self._dd_drag_active:
+            pos_vp = self.viewport().mapFromGlobal(event.globalPosition().toPoint())
+            self._planning_manual_update_hover_view(pos_vp)
+            event.accept()
+            return
         if (
             self._dd_press_index.isValid()
             and (event.buttons() & Qt.MouseButton.LeftButton)
-            and (event.position().toPoint() - self._dd_press_pos).manhattanLength()
+            and (
+                self.viewport().mapFromGlobal(event.globalPosition().toPoint()) - self._dd_press_pos
+            ).manhattanLength()
             >= QApplication.startDragDistance()
         ):
             ix = (
@@ -1261,249 +1153,31 @@ class DestinationPlanningTreeView(QTreeView):
             mw = getattr(self, "_ozlink_main_window", None)
             if mw is not None and mw.destination_planning_row_allows_manual_drag_index(ix):
                 self._dd_press_index = QModelIndex()
-                self._run_manual_planning_drag_view(ix)
+                self._planning_manual_begin_view(ix)
                 return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._dd_drag_active:
+            pos_vp = self.viewport().mapFromGlobal(event.globalPosition().toPoint())
+            self._planning_manual_finish_view(pos_vp)
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             self._dd_press_index = QModelIndex()
         super().mouseReleaseEvent(event)
 
-    def _run_manual_planning_drag_view(self, source_index: QModelIndex):
-        mw = getattr(self, "_ozlink_main_window", None)
-        if mw is None or not source_index.isValid():
-            return
-        node = mw.get_tree_item_node_data(source_index) or {}
-        start_path = str(mw._destination_row_semantic_path(node) or "")[:240]
-        if is_dev_mode():
-            log_info(
-                "debug_pass_destination_manual_drag",
-                phase="drag_start",
-                tree="QTreeView",
-                drag_start_path=start_path,
-            )
-        mime = QMimeData()
-        mime.setData(OZLINK_DESTINATION_PLANNING_DRAG_MIME, QByteArray(b"v1"))
-        drag = QDrag(_destination_planning_qdrag_source_object(self))
-        drag.setMimeData(mime)
-        log_info(
-            _DRAGTRACE_MSG,
-            stage="start",
-            cls="QTreeView",
-            path=start_path[:200],
-            mime_present=True,
-            initiator_tree_id=id(self),
-            initiator_viewport_id=id(self.viewport()),
-            **_dragproof_dest_ids_for_main_window(mw),
-        )
-        self._manual_drag_source_persistent = QPersistentModelIndex(source_index)
-        self._dd_drag_active = True
-        exec_result = drag.exec(Qt.DropAction.MoveAction)
-        log_info(
-            _DRAGTRACE_MSG,
-            stage="end",
-            cls="QTreeView",
-            path=start_path[:200],
-            mime_present=True,
-            exec_return=_qt_drop_action_to_int(exec_result),
-        )
-        self._dd_drag_active = False
-        self._manual_drag_source_persistent = QPersistentModelIndex()
-        self._hide_destination_drop_overlay()
-        self.viewport().update()
+    def leaveEvent(self, event):
+        if self._dd_drag_active:
+            self._planning_manual_cancel_view("leave_view")
+        super().leaveEvent(event)
 
-    def dragEnterEvent(self, event):
-        _dragtrace_enter_line("QTreeView", event)
-        if event.mimeData() and event.mimeData().hasFormat(OZLINK_DESTINATION_PLANNING_DRAG_MIME):
-            if is_dev_mode():
-                log_info(
-                    "debug_pass_destination_manual_drag",
-                    phase="drag_enter",
-                    tree="QTreeView",
-                    drag_mime_seen=True,
-                    drag_acceptance_reason="mime_match",
-                    rejection_reason="",
-                )
-            event.setDropAction(Qt.DropAction.MoveAction)
+    def keyPressEvent(self, event):
+        if self._dd_drag_active and event.key() == Qt.Key.Key_Escape:
+            self._planning_manual_cancel_view("escape")
             event.accept()
             return
-        super().dragEnterEvent(event)
-
-    def dragMoveEvent(self, event):
-        _dragtrace_view_move_or_drop_line("move", self, "QTreeView", event)
-        md = event.mimeData()
-        if md is None or not md.hasFormat(OZLINK_DESTINATION_PLANNING_DRAG_MIME):
-            super().dragMoveEvent(event)
-            return
-        self._dd_last_cursor_global = event.globalPosition().toPoint()
-        vp = self.viewport()
-        pos = vp.mapFromGlobal(self._dd_last_cursor_global)
-        ref_ix, dip_int = self._drop_band_at_pos_view(pos)
-        dip = QAbstractItemView.DropIndicatorPosition(dip_int)
-        initial_dip = dip.value
-        mw = getattr(self, "_ozlink_main_window", None)
-        if mw is None:
-            self._hide_destination_drop_overlay()
-            event.ignore()
-            if is_dev_mode():
-                log_info(
-                    "debug_pass_destination_manual_drag",
-                    phase="drag_move",
-                    tree="QTreeView",
-                    drag_mime_seen=True,
-                    initial_hover_dip=initial_dip,
-                    drag_acceptance_reason="rejected",
-                    rejection_reason="no_main_window",
-                    provisional_accept=False,
-                    top_level_between_fallback=False,
-                    resolved_target_path="",
-                    accepted_drop_action="",
-                )
-            return
-        if not ref_ix.isValid():
-            self._hide_destination_drop_overlay()
-            if vp.rect().contains(pos):
-                event.setDropAction(Qt.DropAction.MoveAction)
-                event.accept()
-                if is_dev_mode():
-                    log_info(
-                        "debug_pass_destination_manual_drag",
-                        phase="drag_move",
-                        tree="QTreeView",
-                        drag_mime_seen=True,
-                        initial_hover_dip=initial_dip,
-                        drag_acceptance_reason="provisional_no_row_viewport",
-                        rejection_reason="",
-                        provisional_accept=True,
-                        top_level_between_fallback=False,
-                        resolved_target_path="",
-                        accepted_drop_action="Move",
-                    )
-            else:
-                event.ignore()
-                if is_dev_mode():
-                    log_info(
-                        "debug_pass_destination_manual_drag",
-                        phase="drag_move",
-                        tree="QTreeView",
-                        drag_mime_seen=True,
-                        initial_hover_dip=initial_dip,
-                        drag_acceptance_reason="rejected",
-                        rejection_reason="no_hover_row",
-                        provisional_accept=False,
-                        top_level_between_fallback=False,
-                        resolved_target_path="",
-                        accepted_drop_action="",
-                    )
-            return
-        commit_ix, meta = mw._resolve_destination_manual_drop_folder_index(ref_ix, dip)
-        hover_path = str(meta.get("hovered_path", ""))[:200]
-        mode = str(meta.get("indicator_mode", ""))
-        htype = str(meta.get("hover_row_type", ""))
-        tlfb = bool(meta.get("top_level_between_fallback", False))
-        if commit_ix is None or not commit_ix.isValid():
-            self._hide_destination_drop_overlay()
-            event.setDropAction(Qt.DropAction.MoveAction)
-            event.accept()
-            if is_dev_mode():
-                log_info(
-                    "debug_pass_destination_manual_drag",
-                    phase="drag_move",
-                    tree="QTreeView",
-                    drag_mime_seen=True,
-                    initial_hover_dip=initial_dip,
-                    hover_row_path=hover_path,
-                    hover_row_type=htype,
-                    indicator_mode=mode,
-                    drop_indicator=initial_dip,
-                    drag_acceptance_reason="provisional_unresolved_target",
-                    rejection_reason=str(meta.get("drop_rejected_reason", "")),
-                    provisional_accept=True,
-                    top_level_between_fallback=tlfb,
-                    resolved_target_path="",
-                    accepted_drop_action="Move",
-                )
-            return
-        resolved = str(meta.get("resolved_target_path", ""))[:240]
-        self._dd_overlay_ref = QPersistentModelIndex(ref_ix)
-        self._dd_overlay_commit = QPersistentModelIndex(commit_ix)
-        self._dd_overlay_dip = dip
-        self._reposition_destination_drop_overlay_widgets()
-        event.setDropAction(Qt.DropAction.MoveAction)
-        event.accept()
-        if is_dev_mode():
-            log_info(
-                "debug_pass_destination_manual_drag",
-                phase="drag_move",
-                tree="QTreeView",
-                drag_mime_seen=True,
-                initial_hover_dip=initial_dip,
-                hover_row_path=hover_path,
-                hover_row_type=htype,
-                indicator_mode=mode,
-                drop_indicator=initial_dip,
-                drag_acceptance_reason=str(meta.get("drag_acceptance_reason", "")),
-                rejection_reason="",
-                provisional_accept=False,
-                top_level_between_fallback=tlfb,
-                resolved_target_path=resolved[:200],
-                accepted_drop_action="Move",
-            )
-
-    def dragLeaveEvent(self, event):
-        _dragtrace_leave_line("QTreeView", event)
-        self._hide_destination_drop_overlay()
-        super().dragLeaveEvent(event)
-
-    def dropEvent(self, event):
-        _dragtrace_view_move_or_drop_line("drop", self, "QTreeView", event)
-        md = event.mimeData()
-        if md is None or not md.hasFormat(OZLINK_DESTINATION_PLANNING_DRAG_MIME):
-            super().dropEvent(event)
-            return
-        meta = {}
-        source_ix = QModelIndex(self._manual_drag_source_persistent)
-        vp = self.viewport()
-        pos = vp.mapFromGlobal(event.globalPosition().toPoint())
-        ref_ix, dip_int = self._drop_band_at_pos_view(pos)
-        dip = QAbstractItemView.DropIndicatorPosition(dip_int)
-        mw = getattr(self, "_ozlink_main_window", None)
-        drop_rejected = ""
-        committed_path = ""
-        target_ix = QModelIndex()
-        if mw is not None and ref_ix.isValid():
-            target_ix, meta = mw._resolve_destination_manual_drop_folder_index(ref_ix, dip)
-            committed_path = str(meta.get("resolved_target_path", ""))[:240]
-            drop_rejected = str(meta.get("drop_rejected_reason", ""))
-        if is_dev_mode():
-            log_info(
-                "debug_pass_destination_manual_drag",
-                phase="drop",
-                tree="QTreeView",
-                drag_mime_seen=True,
-                hover_row_path=str(meta.get("hovered_path", ""))[:200],
-                hover_row_type=str(meta.get("hover_row_type", "")),
-                indicator_mode=str(meta.get("indicator_mode", "")),
-                drop_indicator=dip.value,
-                resolved_target_path=str(meta.get("resolved_target_path", ""))[:200],
-                drop_committed_path=committed_path[:200],
-                drop_rejected_reason=drop_rejected,
-                rejection_reason=drop_rejected,
-                accepted_drop_action="Move" if target_ix.isValid() else "",
-            )
-        self._hide_destination_drop_overlay()
-        self._dd_drag_active = False
-        if (
-            not source_ix.isValid()
-            or not target_ix.isValid()
-            or source_ix == target_ix
-        ):
-            event.ignore()
-            return
-        self.proposedBranchMoveRequested.emit(source_ix, target_ix)
-        event.setDropAction(Qt.DropAction.MoveAction)
-        event.accept()
+        super().keyPressEvent(event)
 
 
 # Planning tree toolbar: expand/collapse-all glyphs (must match _set_expand_all_button_label).
@@ -4885,9 +4559,9 @@ class MainWindow(QMainWindow):
         if panel_key == "destination":
             # Manual planning drag/drop on destination trees only (no Qt default model drag pipeline).
             tree.setDragEnabled(False)
-            tree.setAcceptDrops(True)
-            # Viewport is the real hit target for row drags; header/scrollbars forward via event filter.
-            tree.viewport().setAcceptDrops(True)
+            # Planning moves use internal mouse-driven drag only — no native Qt drop surface.
+            tree.setAcceptDrops(False)
+            tree.viewport().setAcceptDrops(False)
             tree.header().setAcceptDrops(False)
             tree.setDropIndicatorShown(False)
             tree.setDragDropMode(QAbstractItemView.NoDragDrop)

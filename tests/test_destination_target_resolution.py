@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
-from PySide6.QtCore import QByteArray, QEvent, QModelIndex, QMimeData, QPoint, Qt
-from PySide6.QtGui import QStandardItem, QStandardItemModel
+from PySide6.QtCore import QByteArray, QEvent, QModelIndex, QMimeData, QPoint, QPointF, Qt
+from PySide6.QtGui import QKeyEvent, QMouseEvent, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import QAbstractItemView, QApplication
 
-from ozlink_console.main_window import MainWindow, OZLINK_DESTINATION_PLANNING_DRAG_MIME, _destination_drop_band_margin_px
+from ozlink_console.main_window import (
+    DestinationPlanningTreeView,
+    DestinationPlanningTreeWidget,
+    MainWindow,
+    OZLINK_DESTINATION_PLANNING_DRAG_MIME,
+    _destination_drop_band_margin_px,
+)
 from ozlink_console.tree_models.destination_planning_model import DestinationPlanningTreeModel
 
 
@@ -898,159 +904,358 @@ def test_manual_drop_resolved_path_matches_commit_semantics():
     assert meta["resolved_target_path"] == str(sem or "")[:240]
 
 
-def test_destination_tree_drag_enter_accepts_move_action():
-    """View accepts our MIME with explicit Move (regression: forbidden cursor if proposed action mismatches)."""
-    _qapp()
-    from PySide6.QtCore import QPoint
-    from PySide6.QtGui import QDragEnterEvent
-
-    from ozlink_console.main_window import DestinationPlanningTreeView
-
-    tree = DestinationPlanningTreeView()
-    md = QMimeData()
-    md.setData(OZLINK_DESTINATION_PLANNING_DRAG_MIME, QByteArray(b"v1"))
-    pos = QPoint(4, 4)
-    ev = QDragEnterEvent(
-        pos,
-        Qt.DropAction.MoveAction,
-        md,
-        Qt.MouseButton.LeftButton,
+def _send_vp_mouse(
+    tree,
+    typ: QEvent.Type,
+    vp_pos: QPoint,
+    *,
+    button: Qt.MouseButton = Qt.MouseButton.LeftButton,
+    buttons: Qt.MouseButton = Qt.MouseButton.LeftButton,
+) -> None:
+    vp = tree.viewport()
+    g = vp.mapToGlobal(vp_pos)
+    ev = QMouseEvent(
+        typ,
+        QPointF(vp_pos),
+        QPointF(g),
+        button,
+        buttons,
         Qt.KeyboardModifier.NoModifier,
     )
-    tree.dragEnterEvent(ev)
-    assert ev.isAccepted()
-    assert ev.dropAction() == Qt.DropAction.MoveAction
+    QApplication.sendEvent(vp, ev)
 
 
-def test_destination_planning_tree_viewport_accepts_drops_widget_and_view():
-    """Child viewport must accept drops so Qt does not reject the drag before our handlers run."""
+def _planning_view_for_manual_drag(payloads: list) -> tuple:
     _qapp()
-    from ozlink_console.main_window import DestinationPlanningTreeView, DestinationPlanningTreeWidget
+    model = DestinationPlanningTreeModel(destination_index_key_fn=_dest_key)
+    model.reset_root_payloads(payloads)
+    tree = DestinationPlanningTreeView()
+    tree.setModel(model)
+    mw = MainWindow.__new__(MainWindow)
+    tree._ozlink_main_window = mw
+    tree.resize(720, 520)
+    tree.show()
+    QApplication.processEvents()
+    return tree, model, mw
 
+
+def _proposed_src_payload(**extra):
+    base = {
+        "base_display_label": "Src",
+        "name": "Src",
+        "is_folder": True,
+        "item_path": r"Root\Src",
+        "display_path": r"Root\Src",
+        "tree_role": "destination",
+        "node_origin": "Proposed",
+        "proposed": True,
+    }
+    base.update(extra)
+    return base
+
+
+def _real_folder_payload(label: str, path: str, **extra):
+    base = {
+        "base_display_label": label,
+        "name": label,
+        "is_folder": True,
+        "item_path": path,
+        "display_path": path,
+        "tree_role": "destination",
+        "node_origin": "Real",
+    }
+    base.update(extra)
+    return base
+
+
+def test_destination_planning_trees_viewport_native_drops_disabled():
+    """Manual planning drag does not use Qt's native drop surface on the destination tree."""
+    _qapp()
     w = DestinationPlanningTreeWidget()
-    assert w.viewport().acceptDrops() is True
+    assert w.acceptDrops() is False
+    assert w.viewport().acceptDrops() is False
     assert w.header().acceptDrops() is False
-
     v = DestinationPlanningTreeView()
-    assert v.viewport().acceptDrops() is True
+    assert v.acceptDrops() is False
+    assert v.viewport().acceptDrops() is False
     assert v.header().acceptDrops() is False
 
 
-def test_viewport_event_filter_drag_enter_accepts_valid_mime_qtreeview():
-    _qapp()
-    from PySide6.QtCore import QPoint
-    from PySide6.QtGui import QDragEnterEvent
-
-    from ozlink_console.main_window import DestinationPlanningTreeView
-
-    tree = DestinationPlanningTreeView()
-    md = QMimeData()
-    md.setData(OZLINK_DESTINATION_PLANNING_DRAG_MIME, QByteArray(b"v1"))
-    pos = QPoint(4, 4)
-    ev = QDragEnterEvent(
-        pos,
-        Qt.DropAction.MoveAction,
-        md,
-        Qt.MouseButton.LeftButton,
-        Qt.KeyboardModifier.NoModifier,
+def test_manual_planning_drag_move_threshold_starts_mode_qtreeview():
+    tree, model, _mw = _planning_view_for_manual_drag(
+        [
+            _proposed_src_payload(),
+            _real_folder_payload("Tgt", r"Root\Tgt"),
+        ]
     )
-    assert tree.eventFilter(tree.viewport(), ev) is True
-    assert ev.isAccepted()
-    assert ev.dropAction() == Qt.DropAction.MoveAction
-
-
-def test_viewport_event_filter_drag_enter_accepts_valid_mime_qtreewidget():
-    _qapp()
-    from PySide6.QtCore import QPoint
-    from PySide6.QtGui import QDragEnterEvent
-
-    from ozlink_console.main_window import DestinationPlanningTreeWidget
-
-    tree = DestinationPlanningTreeWidget()
-    md = QMimeData()
-    md.setData(OZLINK_DESTINATION_PLANNING_DRAG_MIME, QByteArray(b"v1"))
-    pos = QPoint(4, 4)
-    ev = QDragEnterEvent(
-        pos,
-        Qt.DropAction.MoveAction,
-        md,
-        Qt.MouseButton.LeftButton,
-        Qt.KeyboardModifier.NoModifier,
+    ix0 = model.index(0, 0, QModelIndex())
+    r0 = tree.visualRect(ix0)
+    assert r0.isValid() and r0.height() > 0
+    p0 = r0.center()
+    dist = QApplication.startDragDistance()
+    _send_vp_mouse(tree, QEvent.Type.MouseButtonPress, p0)
+    assert not tree._dd_drag_active
+    p_small = p0 + QPoint(max(1, dist // 4), 0)
+    if (p_small - p0).manhattanLength() >= dist:
+        p_small = p0 + QPoint(1, 0)
+    assert (p_small - p0).manhattanLength() < dist
+    _send_vp_mouse(
+        tree,
+        QEvent.Type.MouseMove,
+        p_small,
+        button=Qt.MouseButton.NoButton,
+        buttons=Qt.MouseButton.LeftButton,
     )
-    assert tree.eventFilter(tree.viewport(), ev) is True
-    assert ev.isAccepted()
-    assert ev.dropAction() == Qt.DropAction.MoveAction
-
-
-class _SyntheticDragMoveGlobalPos:
-    __slots__ = ("_pt",)
-
-    def __init__(self, pt: QPoint):
-        self._pt = pt
-
-    def toPoint(self) -> QPoint:
-        return self._pt
-
-
-class _SyntheticDragMoveEvent(QEvent):
-    """QDragMoveEvent from QtGui ctor may omit globalPosition() on some bindings; real drags provide it."""
-
-    def __init__(self, global_pt: QPoint, md: QMimeData):
-        super().__init__(QEvent.Type.DragMove)
-        self._md = md
-        self._global_pt = QPoint(global_pt)
-        self._accepted = False
-        self._drop_action = Qt.DropAction.IgnoreAction
-
-    def mimeData(self):
-        return self._md
-
-    def globalPosition(self):
-        return _SyntheticDragMoveGlobalPos(self._global_pt)
-
-    def setDropAction(self, action):
-        self._drop_action = action
-
-    def dropAction(self):
-        return self._drop_action
-
-    def accept(self):
-        self._accepted = True
-
-    def ignore(self):
-        self._accepted = False
-
-    def isAccepted(self):
-        return self._accepted
-
-
-def test_viewport_event_filter_drag_move_accepts_valid_mime_first_hover():
-    """First DragMove over empty viewport should provisionally accept (forbidden cursor regression)."""
-    _qapp()
-    from PySide6.QtGui import QDragEnterEvent
-
-    from ozlink_console.main_window import DestinationPlanningTreeView
-
-    tree = DestinationPlanningTreeView()
-    tree._ozlink_main_window = MagicMock()
-    tree.resize(400, 300)
-    tree.show()
-
-    md = QMimeData()
-    md.setData(OZLINK_DESTINATION_PLANNING_DRAG_MIME, QByteArray(b"v1"))
-    vp = tree.viewport()
-    local = QPoint(30, 40)
-    global_pt = vp.mapToGlobal(local)
-    enter = QDragEnterEvent(
-        local,
-        Qt.DropAction.MoveAction,
-        md,
-        Qt.MouseButton.LeftButton,
-        Qt.KeyboardModifier.NoModifier,
+    assert not tree._dd_drag_active
+    p_far = p0 + QPoint(dist + 48, 0)
+    _send_vp_mouse(
+        tree,
+        QEvent.Type.MouseMove,
+        p_far,
+        button=Qt.MouseButton.NoButton,
+        buttons=Qt.MouseButton.LeftButton,
     )
-    tree.eventFilter(vp, enter)
-    move = _SyntheticDragMoveEvent(global_pt, md)
-    assert tree.eventFilter(vp, move) is True
-    assert move.isAccepted()
-    assert move.dropAction() == Qt.DropAction.MoveAction
+    assert tree._dd_drag_active
+    _send_vp_mouse(
+        tree,
+        QEvent.Type.MouseButtonRelease,
+        p_far,
+        button=Qt.MouseButton.LeftButton,
+        buttons=Qt.MouseButton.NoButton,
+    )
+    assert not tree._dd_drag_active
+
+
+def test_manual_planning_drag_release_on_folder_commits_qtreeview():
+    tree, model, _mw = _planning_view_for_manual_drag(
+        [
+            _proposed_src_payload(),
+            _real_folder_payload("Tgt", r"Root\Tgt"),
+        ]
+    )
+    ix0 = model.index(0, 0, QModelIndex())
+    ix1 = model.index(1, 0, QModelIndex())
+    p0 = tree.visualRect(ix0).center()
+    p1 = tree.visualRect(ix1).center()
+    dist = QApplication.startDragDistance()
+    received = []
+    tree.proposedBranchMoveRequested.connect(lambda s, t: received.append((s, t)))
+
+    _send_vp_mouse(tree, QEvent.Type.MouseButtonPress, p0)
+    _send_vp_mouse(
+        tree,
+        QEvent.Type.MouseMove,
+        p0 + QPoint(dist + 40, 0),
+        button=Qt.MouseButton.NoButton,
+        buttons=Qt.MouseButton.LeftButton,
+    )
+    assert tree._dd_drag_active
+    _send_vp_mouse(
+        tree,
+        QEvent.Type.MouseButtonRelease,
+        p1,
+        button=Qt.MouseButton.LeftButton,
+        buttons=Qt.MouseButton.NoButton,
+    )
+    assert len(received) == 1
+    s_ix, t_ix = received[0]
+    assert s_ix.siblingAtColumn(0) == ix0
+    assert t_ix.siblingAtColumn(0) == ix1
+    assert not tree._dd_drag_active
+
+
+def test_manual_planning_drag_release_on_allocated_folder_commits_qtreeview():
+    tree, model, _mw = _planning_view_for_manual_drag(
+        [
+            _proposed_src_payload(),
+            {
+                "base_display_label": "Alloc",
+                "name": "Alloc",
+                "is_folder": True,
+                "item_path": r"Root\Alloc",
+                "display_path": r"Root\Alloc",
+                "tree_role": "destination",
+                "planned_allocation": True,
+                "node_origin": "PlannedAllocation",
+            },
+        ]
+    )
+    ix0 = model.index(0, 0, QModelIndex())
+    ix_alloc = model.index(1, 0, QModelIndex())
+    p0 = tree.visualRect(ix0).center()
+    p1 = tree.visualRect(ix_alloc).center()
+    dist = QApplication.startDragDistance()
+    received = []
+    tree.proposedBranchMoveRequested.connect(lambda s, t: received.append((t,)))
+
+    _send_vp_mouse(tree, QEvent.Type.MouseButtonPress, p0)
+    _send_vp_mouse(
+        tree,
+        QEvent.Type.MouseMove,
+        p0 + QPoint(dist + 40, 0),
+        button=Qt.MouseButton.NoButton,
+        buttons=Qt.MouseButton.LeftButton,
+    )
+    _send_vp_mouse(
+        tree,
+        QEvent.Type.MouseButtonRelease,
+        p1,
+        button=Qt.MouseButton.LeftButton,
+        buttons=Qt.MouseButton.NoButton,
+    )
+    assert len(received) == 1
+    assert received[0][0].siblingAtColumn(0) == ix_alloc
+
+
+def test_manual_planning_drag_invalid_target_rejects_qtreeview():
+    tree, model, _mw = _planning_view_for_manual_drag(
+        [
+            _proposed_src_payload(),
+            {
+                "base_display_label": "Proj",
+                "name": "Proj",
+                "is_folder": True,
+                "item_path": r"Root\Proj",
+                "display_path": r"Root\Proj",
+                "tree_role": "destination",
+                "node_origin": "projectedallocationdescendant",
+            },
+        ]
+    )
+    ix0 = model.index(0, 0, QModelIndex())
+    ix_bad = model.index(1, 0, QModelIndex())
+    p0 = tree.visualRect(ix0).center()
+    p1 = tree.visualRect(ix_bad).center()
+    dist = QApplication.startDragDistance()
+    received = []
+    tree.proposedBranchMoveRequested.connect(lambda s, t: received.append(1))
+
+    _send_vp_mouse(tree, QEvent.Type.MouseButtonPress, p0)
+    _send_vp_mouse(
+        tree,
+        QEvent.Type.MouseMove,
+        p0 + QPoint(dist + 40, 0),
+        button=Qt.MouseButton.NoButton,
+        buttons=Qt.MouseButton.LeftButton,
+    )
+    _send_vp_mouse(
+        tree,
+        QEvent.Type.MouseButtonRelease,
+        p1,
+        button=Qt.MouseButton.LeftButton,
+        buttons=Qt.MouseButton.NoButton,
+    )
+    assert received == []
+    assert not tree._dd_drag_active
+
+
+def test_manual_planning_drag_hover_overlay_matches_commit_index_qtreeview():
+    tree, model, _mw = _planning_view_for_manual_drag(
+        [
+            _proposed_src_payload(),
+            _real_folder_payload("Tgt", r"Root\Tgt"),
+        ]
+    )
+    ix0 = model.index(0, 0, QModelIndex())
+    ix1 = model.index(1, 0, QModelIndex())
+    p0 = tree.visualRect(ix0).center()
+    p1 = tree.visualRect(ix1).center()
+    dist = QApplication.startDragDistance()
+    received = []
+    tree.proposedBranchMoveRequested.connect(lambda s, t: received.append(t))
+
+    _send_vp_mouse(tree, QEvent.Type.MouseButtonPress, p0)
+    _send_vp_mouse(
+        tree,
+        QEvent.Type.MouseMove,
+        p0 + QPoint(dist + 40, 0),
+        button=Qt.MouseButton.NoButton,
+        buttons=Qt.MouseButton.LeftButton,
+    )
+    tree._planning_manual_update_hover_view(p1)
+    expected = QModelIndex(tree._dd_overlay_commit)
+    assert expected.isValid()
+    _send_vp_mouse(
+        tree,
+        QEvent.Type.MouseButtonRelease,
+        p1,
+        button=Qt.MouseButton.LeftButton,
+        buttons=Qt.MouseButton.NoButton,
+    )
+    assert len(received) == 1
+    assert received[0].siblingAtColumn(0) == expected.siblingAtColumn(0)
+
+
+def test_manual_planning_drag_cancel_clears_state_qtreeview():
+    tree, model, _mw = _planning_view_for_manual_drag(
+        [
+            _proposed_src_payload(),
+            _real_folder_payload("Tgt", r"Root\Tgt"),
+        ]
+    )
+    ix0 = model.index(0, 0, QModelIndex())
+    p0 = tree.visualRect(ix0).center()
+    dist = QApplication.startDragDistance()
+    _send_vp_mouse(tree, QEvent.Type.MouseButtonPress, p0)
+    _send_vp_mouse(
+        tree,
+        QEvent.Type.MouseMove,
+        p0 + QPoint(dist + 40, 0),
+        button=Qt.MouseButton.NoButton,
+        buttons=Qt.MouseButton.LeftButton,
+    )
+    assert tree._dd_drag_active
+    tree.setFocus()
+    QApplication.processEvents()
+    esc = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier)
+    QApplication.sendEvent(tree, esc)
+    assert not tree._dd_drag_active
+
+
+def test_manual_planning_drag_does_not_use_qdrag_exec():
+    """Planning drag path must remain internal (no QDrag.exec)."""
+    _qapp()
+    from PySide6 import QtGui
+
+    tree, model, _mw = _planning_view_for_manual_drag(
+        [
+            _proposed_src_payload(),
+            _real_folder_payload("Tgt", r"Root\Tgt"),
+        ]
+    )
+    ix0 = model.index(0, 0, QModelIndex())
+    ix1 = model.index(1, 0, QModelIndex())
+    p0 = tree.visualRect(ix0).center()
+    p1 = tree.visualRect(ix1).center()
+    dist = QApplication.startDragDistance()
+    exec_called = []
+
+    class _SpyDrag:
+        def __init__(self, *a, **k):
+            pass
+
+        def setMimeData(self, *a, **k):
+            pass
+
+        def exec(self, *a, **k):
+            exec_called.append(True)
+            return Qt.DropAction.IgnoreAction
+
+    with patch.object(QtGui, "QDrag", _SpyDrag):
+        _send_vp_mouse(tree, QEvent.Type.MouseButtonPress, p0)
+        _send_vp_mouse(
+            tree,
+            QEvent.Type.MouseMove,
+            p0 + QPoint(dist + 40, 0),
+            button=Qt.MouseButton.NoButton,
+            buttons=Qt.MouseButton.LeftButton,
+        )
+        _send_vp_mouse(
+            tree,
+            QEvent.Type.MouseButtonRelease,
+            p1,
+            button=Qt.MouseButton.LeftButton,
+            buttons=Qt.MouseButton.NoButton,
+        )
+    assert exec_called == []
 
