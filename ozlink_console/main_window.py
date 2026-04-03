@@ -10833,6 +10833,7 @@ class MainWindow(QMainWindow):
                 nd["children_loaded"] = False
                 nd.pop("allocation_projection_destination_path_saved", None)
                 nd.pop("allocation_projection_children_signature", None)
+                nd.pop("allocation_descendants_applied", None)
                 item.setData(0, Qt.UserRole, nd)
                 return item.data(0, Qt.UserRole) or {}
         sig = str(node_data.get("allocation_projection_children_signature") or "").strip()
@@ -10843,6 +10844,7 @@ class MainWindow(QMainWindow):
                 nd["children_loaded"] = False
                 nd.pop("allocation_projection_destination_path_saved", None)
                 nd.pop("allocation_projection_children_signature", None)
+                nd.pop("allocation_descendants_applied", None)
                 item.setData(0, Qt.UserRole, nd)
                 return item.data(0, Qt.UserRole) or {}
         return node_data
@@ -10877,6 +10879,7 @@ class MainWindow(QMainWindow):
                 nd["children_loaded"] = False
                 nd.pop("allocation_projection_destination_path_saved", None)
                 nd.pop("allocation_projection_children_signature", None)
+                nd.pop("allocation_descendants_applied", None)
                 return nd
         sig = str(nd.get("allocation_projection_children_signature") or "").strip()
         if sig and self._destination_allocation_folder_shows_materialized_children_index(index):
@@ -10885,6 +10888,7 @@ class MainWindow(QMainWindow):
                 nd["children_loaded"] = False
                 nd.pop("allocation_projection_destination_path_saved", None)
                 nd.pop("allocation_projection_children_signature", None)
+                nd.pop("allocation_descendants_applied", None)
                 return nd
         return nd
 
@@ -12743,6 +12747,7 @@ class MainWindow(QMainWindow):
                 p["children_loaded"] = False
                 p["load_failed"] = False
                 p["projection_unresolved_terminal"] = False
+                p.pop("allocation_descendants_applied", None)
 
             model.update_payload_for_index(index, _mut_clear)
             node_data = index.data(Qt.UserRole) or {}
@@ -12759,7 +12764,7 @@ class MainWindow(QMainWindow):
         if (
             self.node_is_planned_allocation(node_data)
             and bool(node_data.get("is_folder", True))
-            and self._destination_allocation_folder_shows_materialized_children_index(index)
+            and bool(node_data.get("allocation_descendants_applied"))
             and not bool(node_data.get("children_loaded"))
         ):
 
@@ -12851,6 +12856,11 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _destination_allocation_folder_shows_materialized_children_index(self, index: QModelIndex) -> bool:
+        """True when the row has any non-placeholder child (e.g. explicit file allocations).
+
+        Do not use this alone to decide whether descendant projection has run; use
+        ``allocation_descendants_applied`` on the allocation folder payload.
+        """
         model = getattr(self, "destination_planning_model", None)
         if model is None or not index.isValid():
             return False
@@ -12865,6 +12875,31 @@ class MainWindow(QMainWindow):
             if role in ("projection_pending", "lazy_unloaded", "loading_in_progress"):
                 return False
         return False
+
+    def _mark_allocation_descendants_applied_on_allocation_folder_model_index(self, parent_ix: QModelIndex, move) -> None:
+        """Record that projected descendants were merged for this planned-allocation folder row.
+
+        Distinct from `_destination_allocation_folder_shows_materialized_children_index`, which only
+        detects non-placeholder children (explicit moves can satisfy that without a full descendant pass).
+        """
+        model = getattr(self, "destination_planning_model", None)
+        if model is None or not parent_ix.isValid():
+            return
+        col0 = parent_ix.siblingAtColumn(0) if parent_ix.column() != 0 else parent_ix
+        if not col0.isValid():
+            return
+
+        def _mut(p):
+            p["allocation_descendants_applied"] = True
+
+        model.update_payload_for_index(col0, _mut)
+
+    def _mark_allocation_descendants_applied_on_allocation_folder_widget(self, parent_item, move) -> None:
+        if parent_item is None:
+            return
+        nd = dict(parent_item.data(0, Qt.UserRole) or {})
+        nd["allocation_descendants_applied"] = True
+        parent_item.setData(0, Qt.UserRole, nd)
 
     def _source_payload_from_graph_item(self, item):
         prefix = "Folder" if item.get("is_folder") else "File"
@@ -14674,6 +14709,8 @@ class MainWindow(QMainWindow):
         self._allocation_apply_flush_all_pending_model(model, child_map_cache, pending_leaf_batches)
         for rp in visibility_targets.values():
             self._refresh_destination_item_visibility_index(rp, expand=True)
+        if added_count > 0 or not descendants:
+            self._mark_allocation_descendants_applied_on_allocation_folder_model_index(parent_ix, move)
         return added_count
 
     def _allocation_projection_relative_source_segments(self, source_root_path, descendant_source_path):
@@ -14854,6 +14891,8 @@ class MainWindow(QMainWindow):
                 added_count=added_count,
                 descendant_count=len(descendants),
             )
+        if added_count > 0 or not descendants:
+            self._mark_allocation_descendants_applied_on_allocation_folder_widget(parent_item, move)
         return added_count
 
     def _destination_bind_normalized_expanded_targets(self, destination_expanded_paths):
@@ -14961,7 +15000,7 @@ class MainWindow(QMainWindow):
                 if not bool(node_data.get("is_folder", False)):
                     continue
                 allocation_pass += 1
-                if dmodel.rowCount(ix) > 0 and self._destination_allocation_folder_shows_materialized_children_index(ix):
+                if bool(node_data.get("allocation_descendants_applied")):
                     nd = dict(node_data)
                     if not bool(nd.get("children_loaded")):
                         nd["children_loaded"] = True
@@ -15019,9 +15058,7 @@ class MainWindow(QMainWindow):
                 if move is None:
                     continue
                 allocation_pass += 1
-                # Future-state bind already attached projected / real children for many allocations.
-                # Re-running Graph + path matching here duplicates work and freezes the UI for minutes.
-                if item.childCount() > 0 and self._destination_allocation_folder_shows_materialized_children(item):
+                if bool(node_data.get("allocation_descendants_applied")):
                     nd = dict(node_data)
                     if not bool(nd.get("children_loaded")):
                         nd["children_loaded"] = True
@@ -16852,7 +16889,7 @@ class MainWindow(QMainWindow):
             nd = ix.data(Qt.UserRole) or {}
             if not self.node_is_planned_allocation(nd) or not bool(nd.get("is_folder", True)):
                 continue
-            if bool(nd.get("children_loaded")):
+            if bool(nd.get("children_loaded")) and bool(nd.get("allocation_descendants_applied")):
                 continue
             self._load_destination_projected_descendants_index(ix)
 
@@ -16877,7 +16914,7 @@ class MainWindow(QMainWindow):
             nd = item.data(0, Qt.UserRole) or {}
             if not self.node_is_planned_allocation(nd) or not bool(nd.get("is_folder", True)):
                 continue
-            if bool(nd.get("children_loaded")):
+            if bool(nd.get("children_loaded")) and bool(nd.get("allocation_descendants_applied")):
                 continue
             self._load_destination_projected_descendants(item)
 
@@ -16908,7 +16945,7 @@ class MainWindow(QMainWindow):
                 nd = ix.data(Qt.UserRole) or {}
                 if not self.node_is_planned_allocation(nd) or not bool(nd.get("is_folder", True)):
                     continue
-                if bool(nd.get("children_loaded")):
+                if bool(nd.get("children_loaded")) and bool(nd.get("allocation_descendants_applied")):
                     continue
                 self._load_destination_projected_descendants_index(ix)
             if si % 3 == 2:
@@ -16931,10 +16968,9 @@ class MainWindow(QMainWindow):
             nd = item.data(0, Qt.UserRole) or {}
             if not self.node_is_planned_allocation(nd) or not bool(nd.get("is_folder", True)):
                 continue
-            if bool(nd.get("children_loaded")):
+            if bool(nd.get("children_loaded")) and bool(nd.get("allocation_descendants_applied")):
                 continue
-            if not self._destination_allocation_folder_shows_materialized_children(item):
-                self._load_destination_projected_descendants(item)
+            self._load_destination_projected_descendants(item)
             if si % 3 == 2:
                 QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
 
@@ -17760,8 +17796,7 @@ class MainWindow(QMainWindow):
                     st["allocation_pass"] = int(st.get("allocation_pass", 0) or 0) + 1
                     dm = getattr(self, "destination_planning_model", None)
                     if isinstance(item, (QModelIndex, QPersistentModelIndex)) and dm is not None and item.isValid():
-                        has_kids = dm.rowCount(item) > 0
-                        if has_kids and self._destination_allocation_folder_shows_materialized_children_index(item):
+                        if bool(node_data.get("allocation_descendants_applied")):
                             nd = dict(node_data)
                             if not bool(nd.get("children_loaded")):
 
@@ -17774,7 +17809,7 @@ class MainWindow(QMainWindow):
                             st["allocation_descendants_deferred"] = int(
                                 st.get("allocation_descendants_deferred", 0) or 0
                             ) + 1
-                    elif item.childCount() > 0 and self._destination_allocation_folder_shows_materialized_children(item):
+                    elif bool(node_data.get("allocation_descendants_applied")):
                         nd = dict(node_data)
                         if not bool(nd.get("children_loaded")):
                             nd["children_loaded"] = True
@@ -21734,6 +21769,7 @@ class MainWindow(QMainWindow):
             node_data["children_loaded"] = False
             node_data["load_failed"] = False
             node_data["projection_unresolved_terminal"] = False
+            node_data.pop("allocation_descendants_applied", None)
             item.setData(0, Qt.UserRole, node_data)
             node_data = item.data(0, Qt.UserRole) or {}
         if panel_key == "destination" and self.node_is_planned_allocation(node_data):
@@ -21744,7 +21780,7 @@ class MainWindow(QMainWindow):
             panel_key == "destination"
             and self.node_is_planned_allocation(node_data)
             and bool(node_data.get("is_folder", True))
-            and self._destination_allocation_folder_shows_materialized_children(item)
+            and bool(node_data.get("allocation_descendants_applied"))
             and not bool(node_data.get("children_loaded"))
         ):
             node_data["children_loaded"] = True
@@ -22006,7 +22042,7 @@ class MainWindow(QMainWindow):
 
                 dmodel.update_payload_for_index(ix, _mut_inv)
                 node_data = dict(ix.data(Qt.UserRole) or {})
-        if self.node_is_planned_allocation(node_data) and self._destination_allocation_folder_shows_materialized_children_index(ix):
+        if self.node_is_planned_allocation(node_data) and bool(node_data.get("allocation_descendants_applied")):
             if not bool(node_data.get("children_loaded")):
 
                 def _mut_loaded(p):
@@ -22034,7 +22070,12 @@ class MainWindow(QMainWindow):
             self._refresh_destination_item_visibility_index(ix)
             return
         if node_data.get("children_loaded"):
-            return
+            if self.node_is_planned_allocation(node_data) and bool(node_data.get("is_folder", True)) and not node_data.get(
+                "allocation_descendants_applied"
+            ):
+                pass
+            else:
+                return
         move = move_for_row if move_for_row is not None else self._find_planned_move_for_destination_node(node_data)
         if move is None:
             if self.node_is_planned_allocation(node_data):
@@ -22073,6 +22114,7 @@ class MainWindow(QMainWindow):
                 p["projection_unresolved_terminal"] = False
                 p.pop("allocation_projection_destination_path_saved", None)
                 p.pop("allocation_projection_children_signature", None)
+                p.pop("allocation_descendants_applied", None)
 
             dmodel.update_payload_for_index(ix, _mut_retry)
             if dmodel.rowCount(ix) == 0:
@@ -22123,7 +22165,7 @@ class MainWindow(QMainWindow):
             move_for_row = self._find_planned_move_for_destination_node(node_data)
             node_data = self._invalidate_stale_destination_allocation_projection(item, node_data, move_for_row)
             node_data = item.data(0, Qt.UserRole) or {}
-        if self.node_is_planned_allocation(node_data) and self._destination_allocation_folder_shows_materialized_children(item):
+        if self.node_is_planned_allocation(node_data) and bool(node_data.get("allocation_descendants_applied")):
             if not bool(node_data.get("children_loaded")):
                 updated = dict(node_data)
                 updated["children_loaded"] = True
@@ -22139,7 +22181,7 @@ class MainWindow(QMainWindow):
                     self._log_destination_projection_ui(
                         "destination_projection_ui_load_outcome",
                         item=item,
-                        outcome="skipped_already_materialized_under_allocation",
+                        outcome="skipped_descendants_already_applied_under_allocation",
                     )
             else:
                 if move_for_row is not None and not (node_data.get("allocation_projection_destination_path_saved") or "").strip():
@@ -22162,17 +22204,22 @@ class MainWindow(QMainWindow):
             )
             return
         if node_data.get("children_loaded"):
-            if self.node_is_planned_allocation(node_data):
-                move_skip = move_for_row or self._find_planned_move_for_destination_node(node_data)
-                if move_skip is not None and not (node_data.get("allocation_projection_destination_path_saved") or "").strip():
-                    node_data = self._stamp_allocation_projection_cache_metadata(item, dict(node_data), move_skip)
-            if self._projection_diag_verbose_enabled():
-                self._log_destination_projection_ui(
-                    "destination_projection_ui_load_outcome",
-                    item=item,
-                    outcome="skipped_children_already_marked_loaded",
-                )
-            return
+            if self.node_is_planned_allocation(node_data) and bool(node_data.get("is_folder", True)) and not node_data.get(
+                "allocation_descendants_applied"
+            ):
+                pass
+            else:
+                if self.node_is_planned_allocation(node_data):
+                    move_skip = move_for_row or self._find_planned_move_for_destination_node(node_data)
+                    if move_skip is not None and not (node_data.get("allocation_projection_destination_path_saved") or "").strip():
+                        node_data = self._stamp_allocation_projection_cache_metadata(item, dict(node_data), move_skip)
+                if self._projection_diag_verbose_enabled():
+                    self._log_destination_projection_ui(
+                        "destination_projection_ui_load_outcome",
+                        item=item,
+                        outcome="skipped_children_already_marked_loaded",
+                    )
+                return
         move = move_for_row if move_for_row is not None else self._find_planned_move_for_destination_node(node_data)
         if move is None:
             # Keep allocation folders lazy-loadable when the move cannot be resolved yet;
@@ -22237,6 +22284,7 @@ class MainWindow(QMainWindow):
             updated_node_data["projection_unresolved_terminal"] = False
             updated_node_data.pop("allocation_projection_destination_path_saved", None)
             updated_node_data.pop("allocation_projection_children_signature", None)
+            updated_node_data.pop("allocation_descendants_applied", None)
             item.setData(0, Qt.UserRole, updated_node_data)
             if item.childCount() == 0:
                 item.addChild(
