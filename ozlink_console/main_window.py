@@ -504,6 +504,24 @@ def _manualdrag_log(phase: str, *, tree_class: str, **data) -> None:
     log_info(_MANUALDRAG_MSG, phase=phase, tree_class=tree_class, **data)
 
 
+def _manualdrag_commit_target_fields(mw, target_node: dict | None) -> dict[str, str]:
+    """MANUALDRAG extras for resolved commit target (allocated folder diagnostics)."""
+    if mw is None or not isinstance(target_node, dict) or not target_node:
+        return {"target_row_type": "", "allocated_flag": "no"}
+    if target_node.get("is_folder") is False:
+        row_kind = "file"
+    elif bool(target_node.get("is_folder")):
+        row_kind = "folder"
+    elif mw.node_is_planned_allocation(target_node):
+        row_kind = "folder"
+    else:
+        row_kind = "folder" if target_node.get("is_folder", True) else "file"
+    return {
+        "target_row_type": row_kind,
+        "allocated_flag": "yes" if mw.node_is_planned_allocation(target_node) else "no",
+    }
+
+
 def _destination_drop_band_margin_px(row_height: int) -> int:
     """Narrow top/bottom band so most pointer positions classify as OnItem (was up to 8px)."""
     h = int(row_height)
@@ -712,6 +730,8 @@ class DestinationPlanningTreeWidget(QTreeWidget):
             self._manualdrag_hover_sig = sig
             hover_path = str(meta.get("hovered_path", ""))[:200] if meta else ""
             resolved = str(meta.get("resolved_target_path", ""))[:240] if meta else ""
+            cnode = mw.get_tree_item_node_data(commit_item) if mw is not None and commit_item is not None else None
+            tgt_fields = _manualdrag_commit_target_fields(mw, cnode)
             _manualdrag_log(
                 "hover_update",
                 tree_class="QTreeWidget",
@@ -722,6 +742,8 @@ class DestinationPlanningTreeWidget(QTreeWidget):
                 drop_indicator=dip.value,
                 commit_preview=commit_item is not None,
                 reject_reason=str(meta.get("drop_rejected_reason", ""))[:120] if meta else "",
+                target_row_type=tgt_fields["target_row_type"],
+                allocated_flag=tgt_fields["allocated_flag"],
             )
 
     def _planning_manual_finish_widget(self, pos: QPoint) -> None:
@@ -754,6 +776,8 @@ class DestinationPlanningTreeWidget(QTreeWidget):
                 accepted_drop_action="Move" if target_item is not None else "",
             )
         if source_item is None or target_item is None or source_item is target_item:
+            tnode_r = mw.get_tree_item_node_data(target_item) if mw is not None and target_item is not None else None
+            tf_r = _manualdrag_commit_target_fields(mw, tnode_r)
             _manualdrag_log(
                 "release_reject",
                 tree_class="QTreeWidget",
@@ -762,10 +786,15 @@ class DestinationPlanningTreeWidget(QTreeWidget):
                 resolved_target_path=committed_path,
                 hover_mode=mode or htype,
                 commit="no",
+                commit_allowed="no",
                 reject_reason=str(meta.get("drop_rejected_reason", ""))[:160] if meta else "no_target",
+                target_row_type=tf_r["target_row_type"],
+                allocated_flag=tf_r["allocated_flag"],
             )
             self._planning_manual_cleanup_widget()
             return
+        tnode_ok = mw.get_tree_item_node_data(target_item) if mw is not None else None
+        tf_ok = _manualdrag_commit_target_fields(mw, tnode_ok)
         _manualdrag_log(
             "release_commit",
             tree_class="QTreeWidget",
@@ -774,7 +803,10 @@ class DestinationPlanningTreeWidget(QTreeWidget):
             resolved_target_path=committed_path,
             hover_mode=mode or htype,
             commit="yes",
+            commit_allowed="yes",
             reject_reason="",
+            target_row_type=tf_ok["target_row_type"],
+            allocated_flag=tf_ok["allocated_flag"],
         )
         self.proposedBranchMoveRequested.emit(source_item, target_item)
         self._planning_manual_cleanup_widget()
@@ -1042,6 +1074,8 @@ class DestinationPlanningTreeView(QTreeView):
             self._manualdrag_hover_sig = sig
             hover_path = str(meta.get("hovered_path", ""))[:200] if meta else ""
             resolved = str(meta.get("resolved_target_path", ""))[:240] if meta else ""
+            cnode = mw.get_tree_item_node_data(commit_ix) if mw is not None and commit_ix.isValid() else None
+            tgt_fields = _manualdrag_commit_target_fields(mw, cnode)
             _manualdrag_log(
                 "hover_update",
                 tree_class="QTreeView",
@@ -1052,6 +1086,8 @@ class DestinationPlanningTreeView(QTreeView):
                 drop_indicator=dip.value,
                 commit_preview=commit_ix.isValid(),
                 reject_reason=str(meta.get("drop_rejected_reason", ""))[:120] if meta else "",
+                target_row_type=tgt_fields["target_row_type"],
+                allocated_flag=tgt_fields["allocated_flag"],
             )
 
     def _planning_manual_finish_view(self, pos: QPoint) -> None:
@@ -1086,6 +1122,8 @@ class DestinationPlanningTreeView(QTreeView):
                 accepted_drop_action="Move" if target_ix.isValid() else "",
             )
         if not source_ix.isValid() or not target_ix.isValid() or source_ix == target_ix:
+            tnode_r = mw.get_tree_item_node_data(target_ix) if mw is not None and target_ix.isValid() else None
+            tf_r = _manualdrag_commit_target_fields(mw, tnode_r)
             _manualdrag_log(
                 "release_reject",
                 tree_class="QTreeView",
@@ -1094,10 +1132,15 @@ class DestinationPlanningTreeView(QTreeView):
                 resolved_target_path=committed_path,
                 hover_mode=mode or htype,
                 commit="no",
+                commit_allowed="no",
                 reject_reason=str(meta.get("drop_rejected_reason", ""))[:160] if meta else "no_target",
+                target_row_type=tf_r["target_row_type"],
+                allocated_flag=tf_r["allocated_flag"],
             )
             self._planning_manual_cleanup_view()
             return
+        tnode_ok = mw.get_tree_item_node_data(target_ix) if mw is not None else None
+        tf_ok = _manualdrag_commit_target_fields(mw, tnode_ok)
         _manualdrag_log(
             "release_commit",
             tree_class="QTreeView",
@@ -1106,7 +1149,10 @@ class DestinationPlanningTreeView(QTreeView):
             resolved_target_path=committed_path,
             hover_mode=mode or htype,
             commit="yes",
+            commit_allowed="yes",
             reject_reason="",
+            target_row_type=tf_ok["target_row_type"],
+            allocated_flag=tf_ok["allocated_flag"],
         )
         self.proposedBranchMoveRequested.emit(source_ix, target_ix)
         self._planning_manual_cleanup_view()
@@ -25133,17 +25179,40 @@ class MainWindow(QMainWindow):
         )
 
     def node_is_manual_drag_destination_folder(self, node_data):
-        """Folder rows that may receive Explorer-style manual planning drags (includes [Allocated] containers)."""
+        """Folder rows that may receive Explorer-style manual planning drags (includes [Allocated] containers).
+
+        [Allocated] visible containers count as folder targets even when the payload omits ``is_folder``;
+        only an explicit ``is_folder: False`` disqualifies. Local / projected-allocation-descendant rows
+        are never organization targets.
+        """
         if not isinstance(node_data, dict) or not node_data:
             return False
         if node_data.get("placeholder"):
             return False
-        if not bool(node_data.get("is_folder")):
-            return False
         origin = str(node_data.get("node_origin", "")).lower()
         if origin == "projectedallocationdescendant":
             return False
-        return True
+        if origin == "localfilesystem":
+            return False
+        if node_data.get("is_folder") is False:
+            return False
+        if bool(node_data.get("is_folder")):
+            return True
+        if self.node_is_planned_allocation(node_data):
+            return True
+        return False
+
+    def _destination_drop_ref_is_folder_row(self, ref_node: dict) -> bool:
+        """Whether the hovered row is treated as a folder for drop-band resolution (matches commit eligibility)."""
+        if not isinstance(ref_node, dict) or not ref_node:
+            return False
+        if ref_node.get("is_folder") is False:
+            return False
+        if bool(ref_node.get("is_folder")):
+            return True
+        if self.node_is_planned_allocation(ref_node):
+            return True
+        return False
 
     def show_source_context_menu(self, position):
         tw = self._active_source_tree_widget()
@@ -25969,7 +26038,7 @@ class MainWindow(QMainWindow):
 
         ref_node = ref_col0.data(Qt.UserRole) or {}
         meta["hovered_path"] = str(self._destination_row_semantic_path(ref_node) or "")[:240]
-        meta["hover_row_type"] = "folder" if ref_node.get("is_folder") else "file"
+        meta["hover_row_type"] = "folder" if self._destination_drop_ref_is_folder_row(ref_node) else "file"
 
         if dip == on_viewport:
             meta["drop_rejected_reason"] = "on_viewport"
@@ -25982,7 +26051,7 @@ class MainWindow(QMainWindow):
             meta["indicator_mode"] = "between_rows"
             parent_ix = ref_col0.parent()
             if not parent_ix.isValid():
-                if ref_node.get("is_folder"):
+                if self._destination_drop_ref_is_folder_row(ref_node):
                     meta["top_level_between_fallback"] = True
                     meta["indicator_mode"] = "between_rows_top_level_fallback_on_item"
                     meta["insertion_context"] = False
@@ -25994,7 +26063,7 @@ class MainWindow(QMainWindow):
             else:
                 commit_ix = parent_ix.siblingAtColumn(0) if parent_ix.column() != 0 else parent_ix
         elif dip == on_item:
-            if ref_node.get("is_folder"):
+            if self._destination_drop_ref_is_folder_row(ref_node):
                 meta["indicator_mode"] = "on_folder"
                 meta["exact_hovered_row_committed"] = True
                 commit_ix = ref_col0
@@ -26043,7 +26112,7 @@ class MainWindow(QMainWindow):
 
         ref_node = ref_item.data(0, Qt.UserRole) or {}
         meta["hovered_path"] = str(self._destination_row_semantic_path(ref_node) or "")[:240]
-        meta["hover_row_type"] = "folder" if ref_node.get("is_folder") else "file"
+        meta["hover_row_type"] = "folder" if self._destination_drop_ref_is_folder_row(ref_node) else "file"
 
         if dip == on_viewport:
             meta["drop_rejected_reason"] = "on_viewport"
@@ -26056,7 +26125,7 @@ class MainWindow(QMainWindow):
             meta["indicator_mode"] = "between_rows"
             parent_item = ref_item.parent()
             if parent_item is None:
-                if ref_node.get("is_folder"):
+                if self._destination_drop_ref_is_folder_row(ref_node):
                     meta["top_level_between_fallback"] = True
                     meta["indicator_mode"] = "between_rows_top_level_fallback_on_item"
                     meta["insertion_context"] = False
@@ -26068,7 +26137,7 @@ class MainWindow(QMainWindow):
             else:
                 commit_item = parent_item
         elif dip == on_item:
-            if ref_node.get("is_folder"):
+            if self._destination_drop_ref_is_folder_row(ref_node):
                 meta["indicator_mode"] = "on_folder"
                 meta["exact_hovered_row_committed"] = True
                 commit_item = ref_item
@@ -26122,13 +26191,8 @@ class MainWindow(QMainWindow):
                 )
             if not source_node or not target_node:
                 return
-            if not target_node.get("is_folder"):
+            if not self.node_is_manual_drag_destination_folder(target_node):
                 self.destination_tree_status.setText("Drop onto a destination folder.")
-                return
-            if self.node_is_planned_allocation(target_node) and not (
-                (_paste_here_target or _manual_planning_drag) and bool(target_node.get("is_folder"))
-            ):
-                self.destination_tree_status.setText("Cannot move items under a planned allocation node.")
                 return
 
             if self.node_is_proposed(source_node):
@@ -26282,7 +26346,7 @@ class MainWindow(QMainWindow):
         return ref
 
     def _paste_here_row_eligibility(self, pl: dict) -> tuple[bool, str]:
-        """Paste Here target eligibility and reason code (paste-only; used for logging)."""
+        """Paste Here target eligibility (same folder-container rule as manual planning drag)."""
         if not isinstance(pl, dict) or not pl:
             return False, "denied_empty_payload"
         if self._planning_browse_mode("destination") == "local":
@@ -26290,10 +26354,10 @@ class MainWindow(QMainWindow):
         origin = str(pl.get("node_origin", "")).lower()
         if origin == "localfilesystem":
             return False, "denied_local_fs_row"
-        if not bool(pl.get("is_folder")):
-            return False, "denied_not_folder"
         if origin == "projectedallocationdescendant":
             return False, "denied_projected_descendant"
+        if not self.node_is_manual_drag_destination_folder(pl):
+            return False, "denied_not_folder"
         if self.node_is_planned_allocation(pl):
             return True, "allowed_allocated_folder_container"
         return True, "allowed_normal_folder"

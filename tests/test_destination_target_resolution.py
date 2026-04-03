@@ -208,7 +208,8 @@ def test_paste_here_row_eligibility_denies_projected_descendant():
     assert "projected" in reason
 
 
-def test_handle_destination_draft_move_accepts_allocated_folder_only_for_paste_kwarg():
+def test_handle_destination_draft_move_accepts_allocated_folder_for_organization():
+    """Allocated folder containers are valid draft-move targets (paste, manual drag, or plain draft)."""
     _qapp()
     mw = MainWindow.__new__(MainWindow)
     src_ix = MagicMock()
@@ -251,11 +252,80 @@ def test_handle_destination_draft_move_accepts_allocated_folder_only_for_paste_k
 
     moved.clear()
     mw.handle_destination_draft_move(src_ix, tgt_ix)
-    assert moved == []
+    assert moved == [True]
 
     moved.clear()
     mw.handle_destination_draft_move(src_ix, tgt_ix, _manual_planning_drag=True)
     assert moved == [True]
+
+
+def test_handle_destination_draft_move_accepts_allocated_folder_without_is_folder_key():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    src_ix = MagicMock()
+    tgt_ix = MagicMock()
+    alloc_folder = {
+        "planned_allocation": True,
+        "node_origin": "PlannedAllocation",
+        "display_path": "Root\\A\\B",
+        "item_path": "Root\\A\\B",
+    }
+    source_node = {"name": "Item", "display_path": "Root\\S\\Item", "item_path": "Root\\S\\Item"}
+
+    def gdata(ix):
+        if ix is src_ix:
+            return source_node
+        if ix is tgt_ix:
+            return alloc_folder
+        return None
+
+    mw.get_tree_item_node_data = gdata
+    mw.node_is_proposed = lambda n: False
+    moved = []
+
+    def do_move(s, t, **kwargs):
+        moved.append(True)
+        return True
+
+    mw._move_planned_destination_node = do_move
+    mw.refresh_planned_moves_table = lambda: None
+    mw._schedule_deferred_destination_materialization = lambda *a, **k: None
+    mw._persist_planning_change = lambda *a, **k: None
+    mw.planned_moves_status = MagicMock()
+    mw.destination_tree_status = MagicMock()
+    mw.clear_selection_details = lambda: None
+    mw._perf_explorer_log = lambda *a, **k: None
+
+    mw.handle_destination_draft_move(src_ix, tgt_ix, _manual_planning_drag=True)
+    assert moved == [True]
+
+
+def test_node_is_manual_drag_destination_folder_allocated_without_is_folder_key():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    node = {
+        "planned_allocation": True,
+        "node_origin": "PlannedAllocation",
+        "display_path": r"Root\Alloc",
+        "item_path": r"Root\Alloc",
+        "tree_role": "destination",
+    }
+    assert mw.node_is_manual_drag_destination_folder(node) is True
+
+
+def test_paste_here_allows_allocated_folder_when_is_folder_key_omitted():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    pl = {
+        "planned_allocation": True,
+        "node_origin": "PlannedAllocation",
+        "display_path": r"Root\Finance\Employee Hours",
+        "item_path": r"Root\Finance\Employee Hours",
+        "tree_role": "destination",
+    }
+    ok, reason = mw._paste_here_row_eligibility(pl)
+    assert ok
+    assert reason == "allowed_allocated_folder_container"
 
 
 def test_normalize_paste_destination_row_ref_column_zero():
@@ -1105,6 +1175,84 @@ def test_manual_planning_drag_release_on_allocated_folder_commits_qtreeview():
     )
     assert len(received) == 1
     assert received[0][0].siblingAtColumn(0) == ix_alloc
+
+
+def test_manual_planning_drag_allocated_folder_commits_when_is_folder_key_omitted():
+    """Resolver + draft path treat [Allocated] as folder even if payload omits is_folder."""
+    tree, model, mw = _planning_view_for_manual_drag(
+        [
+            _proposed_src_payload(),
+            {
+                "base_display_label": "Alloc",
+                "name": "Alloc",
+                "item_path": r"Root\Alloc",
+                "display_path": r"Root\Alloc",
+                "tree_role": "destination",
+                "planned_allocation": True,
+                "node_origin": "PlannedAllocation",
+            },
+        ]
+    )
+    ix0 = model.index(0, 0, QModelIndex())
+    ix_alloc = model.index(1, 0, QModelIndex())
+    p0 = tree.visualRect(ix0).center()
+    p1 = tree.visualRect(ix_alloc).center()
+    dist = QApplication.startDragDistance()
+    received = []
+    tree.proposedBranchMoveRequested.connect(lambda s, t: received.append((s, t)))
+
+    _send_vp_mouse(tree, QEvent.Type.MouseButtonPress, p0)
+    _send_vp_mouse(
+        tree,
+        QEvent.Type.MouseMove,
+        p0 + QPoint(dist + 40, 0),
+        button=Qt.MouseButton.NoButton,
+        buttons=Qt.MouseButton.LeftButton,
+    )
+    _send_vp_mouse(
+        tree,
+        QEvent.Type.MouseButtonRelease,
+        p1,
+        button=Qt.MouseButton.LeftButton,
+        buttons=Qt.MouseButton.NoButton,
+    )
+    assert len(received) == 1
+    _src_ix, t_ix = received[0]
+    assert t_ix.siblingAtColumn(0) == ix_alloc
+
+
+def test_manual_planning_drag_hover_overlay_matches_allocated_folder_omit_is_folder():
+    tree, model, _mw = _planning_view_for_manual_drag(
+        [
+            _proposed_src_payload(),
+            {
+                "base_display_label": "Alloc",
+                "name": "Alloc",
+                "item_path": r"Root\Alloc",
+                "display_path": r"Root\Alloc",
+                "tree_role": "destination",
+                "planned_allocation": True,
+                "node_origin": "PlannedAllocation",
+            },
+        ]
+    )
+    ix0 = model.index(0, 0, QModelIndex())
+    ix_alloc = model.index(1, 0, QModelIndex())
+    p0 = tree.visualRect(ix0).center()
+    p1 = tree.visualRect(ix_alloc).center()
+    dist = QApplication.startDragDistance()
+    _send_vp_mouse(tree, QEvent.Type.MouseButtonPress, p0)
+    _send_vp_mouse(
+        tree,
+        QEvent.Type.MouseMove,
+        p0 + QPoint(dist + 40, 0),
+        button=Qt.MouseButton.NoButton,
+        buttons=Qt.MouseButton.LeftButton,
+    )
+    tree._planning_manual_update_hover_view(p1)
+    expected = QModelIndex(tree._dd_overlay_commit)
+    assert expected.isValid()
+    assert expected.siblingAtColumn(0) == ix_alloc
 
 
 def test_manual_planning_drag_invalid_target_rejects_qtreeview():
