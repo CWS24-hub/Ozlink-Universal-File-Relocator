@@ -297,6 +297,8 @@ def test_move_planned_from_paste_uses_lightweight_persist_when_quick_apply_succe
     mw._schedule_deferred_destination_materialization = lambda r, delay_ms=180: scheduled.append((r, delay_ms))
     lightweight = []
     mw._persist_planning_change_lightweight = lambda **kw: lightweight.append(kw)
+    overlay_bumps = []
+    mw._bump_destination_materialized_overlay_fingerprint = lambda **kw: overlay_bumps.append(kw)
 
     def heavy_persist(r):
         raise AssertionError("heavy persist should not run when quick apply succeeds")
@@ -312,6 +314,8 @@ def test_move_planned_from_paste_uses_lightweight_persist_when_quick_apply_succe
     assert mw._move_planned_destination_node(src, tgt, from_paste_here=True) is True
     assert not scheduled
     assert len(lightweight) == 1
+    assert len(overlay_bumps) == 1
+    assert overlay_bumps[0].get("phase") == "paste_touch_reapply"
     assert lightweight[0].get("planning_refresh_reason") == "planned_item_moved_paste_quick"
     assert move["destination_path"] == "Root\\NewParent"
 
@@ -426,6 +430,59 @@ def test_reapply_paste_touch_paths_calls_ensure_projection_and_apply_children():
     assert per.get("Root\\New") == 1
     assert ("ensure", "Root\\New") in calls
     assert ("apply", "stub-item") in calls
+
+
+def test_try_skip_redundant_destination_materialize_when_fp_matches_and_async_benign():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    mw.destination_tree_widget = MagicMock()
+    mw._planning_tree_top_level_count = lambda _t: 1
+    mw._destination_last_materialized_overlay_fp = "samefp"
+    mw._current_destination_full_overlay_fingerprint = lambda: "samefp"
+    mw._destination_future_projection_async_state = {"move_index": 0}
+    mw._count_visible_destination_future_state_nodes = lambda: 3
+    mw._log_restore_phase = lambda *a, **kwargs: None
+    mw._set_tree_status_message = lambda *a, **k: None
+    out = mw._try_skip_redundant_destination_future_model_materialize("source_folder_load_success")
+    assert out == 3
+
+
+def test_try_skip_redundant_destination_materialize_none_when_async_and_non_benign_reason():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    mw.destination_tree_widget = MagicMock()
+    mw._planning_tree_top_level_count = lambda _t: 1
+    mw._destination_last_materialized_overlay_fp = "samefp"
+    mw._current_destination_full_overlay_fingerprint = lambda: "samefp"
+    mw._destination_future_projection_async_state = {"move_index": 0}
+    out = mw._try_skip_redundant_destination_future_model_materialize("planned_item_moved")
+    assert out is None
+
+
+def test_try_skip_redundant_destination_materialize_none_when_fp_mismatch():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    mw.destination_tree_widget = MagicMock()
+    mw._planning_tree_top_level_count = lambda _t: 1
+    mw._destination_last_materialized_overlay_fp = "a"
+    mw._current_destination_full_overlay_fingerprint = lambda: "b"
+    mw._destination_future_projection_async_state = None
+    out = mw._try_skip_redundant_destination_future_model_materialize("source_folder_load_success")
+    assert out is None
+
+
+def test_try_skip_redundant_allows_deferred_prefix_during_async():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    mw.destination_tree_widget = MagicMock()
+    mw._planning_tree_top_level_count = lambda _t: 1
+    mw._destination_last_materialized_overlay_fp = "x"
+    mw._current_destination_full_overlay_fingerprint = lambda: "x"
+    mw._destination_future_projection_async_state = {"move_index": 0}
+    mw._count_visible_destination_future_state_nodes = lambda: 1
+    mw._log_restore_phase = lambda *a, **kwargs: None
+    mw._set_tree_status_message = lambda *a, **k: None
+    assert mw._try_skip_redundant_destination_future_model_materialize("deferred_planning_change_lightweight") == 1
 
 
 def test_deferred_planning_refresh_skips_destination_for_paste_quick_reason():

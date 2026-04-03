@@ -128,6 +128,16 @@ _INCREMENTAL_DEFERRED_PLANNING_REFRESH_REASONS = frozenset(
         "planned_item_moved_paste_quick",
     }
 )
+
+# Second-pass destination materialize calls that may run while allocation-descendant async
+# projection is still ticking; if overlay fingerprint already matches, skip without cancelling async.
+_DESTINATION_MATERIALIZE_BENIGN_SECOND_PASS_REASONS = frozenset(
+    {
+        "source_folder_load_success",
+        "destination_full_tree_idle_success",
+        "idle_destination_materialize",
+    }
+)
 from ozlink_console.transfer_job_runner import (
     is_absolute_local_path,
     load_manifest_json,
@@ -6711,6 +6721,14 @@ class MainWindow(QMainWindow):
 
     def _schedule_deferred_destination_materialization(self, reason, delay_ms=180):
         self._destination_idle_materialize_pending_reason = str(reason or "idle_destination_materialize")
+        if is_dev_mode():
+            log_info(
+                "destination_double_render_guard",
+                phase="second_pass_scheduled",
+                scheduling_path="_schedule_deferred_destination_materialization",
+                reason=str(reason or ""),
+                delay_ms=int(delay_ms),
+            )
         timer = getattr(self, "_destination_idle_materialize_timer", None)
         if timer is None:
             self._run_deferred_destination_materialization()
@@ -16228,6 +16246,13 @@ class MainWindow(QMainWindow):
 
     def _cancel_destination_future_async_projection(self, reason=""):
         had = getattr(self, "_destination_future_projection_async_state", None) is not None
+        if is_dev_mode() and had:
+            log_info(
+                "destination_double_render_guard",
+                phase="async_projection_cancelled",
+                scheduling_path="_cancel_destination_future_async_projection",
+                incoming_reason=str(reason or ""),
+            )
         self._destination_future_projection_async_state = None
         timer = getattr(self, "_destination_future_projection_timer", None)
         if timer is not None:
@@ -16303,6 +16328,13 @@ class MainWindow(QMainWindow):
             self._destination_last_materialized_overlay_fp = self._current_destination_full_overlay_fingerprint()
         except Exception:
             self._destination_last_materialized_overlay_fp = ""
+        if is_dev_mode():
+            log_info(
+                "destination_double_render_guard",
+                phase="background_incremental_merge_complete",
+                last_render_path="_finish_destination_future_async_projection",
+                visible_future_branch_count=visible_future_branch_count,
+            )
 
     def _run_destination_future_projection_chunk(self):
         state = self._destination_future_projection_async_state
@@ -16543,6 +16575,68 @@ class MainWindow(QMainWindow):
     def _current_destination_full_overlay_fingerprint(self) -> str:
         self._refresh_destination_real_tree_snapshot(force=True)
         return self._destination_overlay_fingerprint_context(False)[3]
+
+    def _destination_materialize_reason_may_skip_without_interrupting_async(self, reason: str) -> bool:
+        r = str(reason or "")
+        if r in _DESTINATION_MATERIALIZE_BENIGN_SECOND_PASS_REASONS:
+            return True
+        if r.startswith("deferred_"):
+            return True
+        if r.startswith("source_restore_flush_"):
+            return True
+        return False
+
+    def _bump_destination_materialized_overlay_fingerprint(self, *, phase: str, first_render_path: str = "") -> None:
+        """Record that the visible destination tree matches current planning overlay (anti double-bind)."""
+        try:
+            self._destination_last_materialized_overlay_fp = self._current_destination_full_overlay_fingerprint()
+        except Exception:
+            self._destination_last_materialized_overlay_fp = ""
+        if is_dev_mode():
+            fp = str(getattr(self, "_destination_last_materialized_overlay_fp", "") or "")
+            log_info(
+                "destination_double_render_guard",
+                phase=phase,
+                first_render_path=first_render_path or phase,
+                overlay_fp_bumped=True,
+                overlay_fp_prefix=fp[:16] if fp else "",
+            )
+
+    def _try_skip_redundant_destination_future_model_materialize(self, reason) -> int | None:
+        """If overlay fingerprint matches last materialization, skip a redundant bind (preserve async projection)."""
+        tree = getattr(self, "destination_tree_widget", None)
+        if tree is None or self._planning_tree_top_level_count(tree) <= 0:
+            return None
+        try:
+            current_full_fp = self._current_destination_full_overlay_fingerprint()
+        except Exception:
+            current_full_fp = ""
+        last_fp = str(getattr(self, "_destination_last_materialized_overlay_fp", "") or "")
+        if not current_full_fp or not last_fp or current_full_fp != last_fp:
+            return None
+        async_on = getattr(self, "_destination_future_projection_async_state", None) is not None
+        if async_on and not self._destination_materialize_reason_may_skip_without_interrupting_async(str(reason or "")):
+            return None
+        visible_future_branch_count = self._count_visible_destination_future_state_nodes()
+        if is_dev_mode():
+            log_info(
+                "destination_double_render_guard",
+                phase="redundant_materialize_skipped",
+                first_render_path="visible_tree_matches_overlay_fp",
+                second_scheduled_reason=str(reason or ""),
+                async_projection_preserved=async_on,
+                skipped=True,
+                visible_future_branch_count=visible_future_branch_count,
+            )
+        self._log_restore_phase(
+            "destination_future_model_materialize_skipped",
+            reason=reason,
+            skip_reason="already_materialized_same_overlay",
+            visible_future_branch_count=visible_future_branch_count,
+            async_projection_preserved=async_on,
+        )
+        self._set_tree_status_message("destination", "Destination structure ready.", loading=False)
+        return visible_future_branch_count
 
     def _store_destination_future_model_overlay_cache(
         self, payload, snap_sig, prop_sig, skip_allocation_descendants: bool
@@ -18366,7 +18460,19 @@ class MainWindow(QMainWindow):
                 )
                 return 0
 
+        # Before cancelling in-flight descendant projection: if the visible tree already matches
+        # the last overlay fingerprint, a second bind would be redundant and would drop correct
+        # first-pass folder allocation chrome.
+        had_async_projection = getattr(self, "_destination_future_projection_async_state", None) is not None
+        _redundant_skip = self._try_skip_redundant_destination_future_model_materialize(reason)
+        if _redundant_skip is not None:
+            return _redundant_skip
+
         self._cancel_destination_future_async_projection(reason or "materialize")
+        if had_async_projection:
+            _late_redundant = self._try_skip_redundant_destination_future_model_materialize(reason)
+            if _late_redundant is not None:
+                return _late_redundant
         if getattr(self, "_destination_root_prime_pending", False) and reason not in {
             "folder_worker_success",
             "destination_expand_all_complete",
@@ -18393,36 +18499,6 @@ class MainWindow(QMainWindow):
                 completed_drive_id=self._destination_full_tree_completed_drive_id,
             )
             return 0
-        tree = getattr(self, "destination_tree_widget", None)
-        if (
-            tree is not None
-            and self._planning_tree_top_level_count(tree) > 0
-            and getattr(self, "_destination_future_projection_async_state", None) is None
-        ):
-            # Startup fast-path: if destination preview is already materialized for the
-            # current overlay fingerprint, do not block on source restore queues.
-            try:
-                current_full_fp = self._current_destination_full_overlay_fingerprint()
-            except Exception:
-                current_full_fp = ""
-            if (
-                current_full_fp
-                and current_full_fp
-                == str(getattr(self, "_destination_last_materialized_overlay_fp", "") or "")
-            ):
-                visible_future_branch_count = self._count_visible_destination_future_state_nodes()
-                self._log_restore_phase(
-                    "destination_future_model_materialize_skipped",
-                    reason=reason,
-                    skip_reason="already_materialized_same_overlay",
-                    visible_future_branch_count=visible_future_branch_count,
-                )
-                self._set_tree_status_message(
-                    "destination",
-                    "Destination structure ready.",
-                    loading=False,
-                )
-                return visible_future_branch_count
         if self._destination_future_model_blocked_by_source_restore(reason):
             self._destination_future_model_pending_after_source_restore = True
             self._destination_future_model_last_blocked_source_restore = True
@@ -18534,6 +18610,10 @@ class MainWindow(QMainWindow):
                     loading=True,
                 )
                 self._destination_future_projection_timer.start(0)
+                self._bump_destination_materialized_overlay_fingerprint(
+                    phase="fast_first_paint_async_started",
+                    first_render_path="_complete_fast_first_paint_bind",
+                )
 
             bind_out = self._bind_destination_tree_from_future_state_model(
                 model_fast,
@@ -18582,6 +18662,13 @@ class MainWindow(QMainWindow):
                 )
             except Exception:
                 self._destination_last_materialized_overlay_fp = ""
+            if is_dev_mode():
+                log_info(
+                    "destination_double_render_guard",
+                    phase="full_sync_bind_complete",
+                    last_render_path="_complete_full_destination_bind",
+                    visible_future_branch_count=applied_count,
+                )
 
         bind_out = self._bind_destination_tree_from_future_state_model(
             model,
@@ -24840,6 +24927,10 @@ class MainWindow(QMainWindow):
                 )
             if quick_path_ok:
                 self.refresh_planned_moves_table()
+                self._bump_destination_materialized_overlay_fingerprint(
+                    phase="paste_touch_reapply",
+                    first_render_path="_reapply_allocation_overlays_for_paste_touch_paths",
+                )
                 self._persist_planning_change_lightweight(planning_refresh_reason="planned_item_moved_paste_quick")
                 return True
 
