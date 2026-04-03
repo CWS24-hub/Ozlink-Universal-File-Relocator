@@ -252,7 +252,7 @@ def test_handle_destination_draft_move_accepts_allocated_folder_for_organization
     moved = []
 
     def do_move(s, t, **kwargs):
-        moved.append(True)
+        moved.append(kwargs)
         return True
 
     mw._move_planned_destination_node = do_move
@@ -265,15 +265,15 @@ def test_handle_destination_draft_move_accepts_allocated_folder_for_organization
     mw._perf_explorer_log = lambda *a, **k: None
 
     mw.handle_destination_draft_move(src_ix, tgt_ix, _paste_here_target=True)
-    assert moved == [True]
+    assert moved == [{"from_paste_here": True, "from_manual_planning_drag": False}]
 
     moved.clear()
     mw.handle_destination_draft_move(src_ix, tgt_ix)
-    assert moved == [True]
+    assert moved == [{"from_paste_here": False, "from_manual_planning_drag": False}]
 
     moved.clear()
     mw.handle_destination_draft_move(src_ix, tgt_ix, _manual_planning_drag=True)
-    assert moved == [True]
+    assert moved == [{"from_paste_here": False, "from_manual_planning_drag": True}]
 
 
 def test_handle_destination_draft_move_accepts_allocated_folder_without_is_folder_key():
@@ -301,7 +301,7 @@ def test_handle_destination_draft_move_accepts_allocated_folder_without_is_folde
     moved = []
 
     def do_move(s, t, **kwargs):
-        moved.append(True)
+        moved.append(kwargs)
         return True
 
     mw._move_planned_destination_node = do_move
@@ -314,7 +314,7 @@ def test_handle_destination_draft_move_accepts_allocated_folder_without_is_folde
     mw._perf_explorer_log = lambda *a, **k: None
 
     mw.handle_destination_draft_move(src_ix, tgt_ix, _manual_planning_drag=True)
-    assert moved == [True]
+    assert moved == [{"from_paste_here": False, "from_manual_planning_drag": True}]
 
 
 def test_node_is_manual_drag_destination_folder_allocated_without_is_folder_key():
@@ -464,6 +464,166 @@ def test_move_planned_from_paste_falls_back_finalize_when_quick_apply_zero():
     assert mw._move_planned_destination_node(src, tgt, from_paste_here=True) is True
     assert scheduled
     assert heavy == ["planned_item_moved"]
+
+
+def test_move_planned_from_manual_drag_uses_lightweight_persist_when_quick_apply_succeeds():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    move = {
+        "source_name": "Doc.xlsx",
+        "target_name": "Doc.xlsx",
+        "source_path": "Src\\Doc.xlsx",
+        "destination_path": "Root\\OldParent",
+        "destination_id": "d1",
+        "destination_name": "OldParent",
+        "destination": {
+            "id": "d1",
+            "name": "OldParent",
+            "display_path": "Root\\OldParent",
+            "item_path": "Root\\OldParent",
+        },
+        "source": {"name": "Doc.xlsx"},
+        "status": "Draft",
+    }
+    mw.planned_moves = [move]
+    mw._resolve_planned_move_for_destination_node = lambda node: (0, move, None)
+    mw._is_move_submitted = lambda m: False
+    mw._destination_row_semantic_path = lambda n: str(n.get("display_path") or n.get("item_path") or "")
+    mw._find_visible_destination_item_by_path = lambda path: None
+    mw._quick_remove_planned_move_from_destination_tree = lambda old: 0
+    mw._reset_unresolved_allocation_queue = lambda: None
+    mw._allocation_parent_candidates_for_touch_paths = lambda _t: {"Root\\NewParent"}
+    mw._reapply_allocation_overlays_for_paste_touch_paths = lambda o, n, t: (1, {"Root\\NewParent": 1})
+    mw._paths_equivalent = lambda a, b, role: str(a).replace("/", "\\") == str(b).replace("/", "\\")
+    scheduled = []
+    mw._schedule_deferred_destination_materialization = lambda r, delay_ms=180: scheduled.append((r, delay_ms))
+    lightweight = []
+    mw._persist_planning_change_lightweight = lambda **kw: lightweight.append(kw)
+    overlay_bumps = []
+    mw._bump_destination_materialized_overlay_fingerprint = lambda **kw: overlay_bumps.append(kw)
+
+    def heavy_persist(r):
+        raise AssertionError("heavy persist should not run when quick apply succeeds")
+
+    mw._persist_planning_change = heavy_persist
+    mw.refresh_planned_moves_table = lambda: None
+    mw.planned_moves_status = MagicMock()
+    mw.destination_tree_status = MagicMock()
+
+    src = {"name": "Doc.xlsx", "display_path": "Root\\OldParent\\Doc.xlsx", "item_path": "Root\\OldParent\\Doc.xlsx"}
+    tgt = {"name": "NewParent", "display_path": "Root\\NewParent", "item_path": "Root\\NewParent", "is_folder": True}
+
+    assert mw._move_planned_destination_node(src, tgt, from_manual_planning_drag=True) is True
+    assert not scheduled
+    assert len(lightweight) == 1
+    assert lightweight[0].get("planning_refresh_reason") == "planned_item_moved_manual_drag"
+    assert move["destination_path"] == "Root\\NewParent"
+
+
+def test_move_planned_from_manual_drag_falls_back_finalize_when_quick_apply_zero():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    move = {
+        "source_name": "Doc.xlsx",
+        "target_name": "Doc.xlsx",
+        "source_path": "Src\\Doc.xlsx",
+        "destination_path": "Root\\OldParent",
+        "destination_id": "d1",
+        "destination_name": "OldParent",
+        "destination": {
+            "id": "d1",
+            "name": "OldParent",
+            "display_path": "Root\\OldParent",
+            "item_path": "Root\\OldParent",
+        },
+        "source": {"name": "Doc.xlsx"},
+        "status": "Draft",
+    }
+    mw.planned_moves = [move]
+    mw._resolve_planned_move_for_destination_node = lambda node: (0, move, None)
+    mw._is_move_submitted = lambda m: False
+    mw._destination_row_semantic_path = lambda n: str(n.get("display_path") or n.get("item_path") or "")
+    mw._find_visible_destination_item_by_path = lambda path: None
+    mw._quick_remove_planned_move_from_destination_tree = lambda old: 0
+    mw._reset_unresolved_allocation_queue = lambda: None
+    mw._allocation_parent_candidates_for_touch_paths = lambda _t: set()
+    mw._reapply_allocation_overlays_for_paste_touch_paths = lambda o, n, t: (0, {})
+    mw._paths_equivalent = lambda a, b, role: False
+    scheduled = []
+    mw._schedule_deferred_destination_materialization = lambda r, delay_ms=180: scheduled.append((r, delay_ms))
+    mw._persist_planning_change_lightweight = lambda **kw: (_ for _ in ()).throw(
+        AssertionError("lightweight should not run when quick apply fails")
+    )
+    heavy = []
+    mw._persist_planning_change = lambda r: heavy.append(r)
+    mw.refresh_planned_moves_table = lambda: None
+    mw.planned_moves_status = MagicMock()
+    mw.destination_tree_status = MagicMock()
+
+    src = {"name": "Doc.xlsx", "display_path": "Root\\OldParent\\Doc.xlsx", "item_path": "Root\\OldParent\\Doc.xlsx"}
+    tgt = {"name": "NewParent", "display_path": "Root\\NewParent", "item_path": "Root\\NewParent", "is_folder": True}
+
+    assert mw._move_planned_destination_node(src, tgt, from_manual_planning_drag=True) is True
+    assert scheduled
+    assert heavy == ["planned_item_moved"]
+
+
+def test_move_planned_manual_drag_second_move_still_lightweight_when_quick_succeeds():
+    """Chained manual drags should keep using incremental overlay refresh, not full finalize."""
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    move = {
+        "source_name": "Doc.xlsx",
+        "target_name": "Doc.xlsx",
+        "source_path": "Src\\Doc.xlsx",
+        "destination_path": "Root\\A",
+        "destination_id": "d1",
+        "destination_name": "A",
+        "destination": {
+            "id": "d1",
+            "name": "A",
+            "display_path": "Root\\A",
+            "item_path": "Root\\A",
+        },
+        "source": {"name": "Doc.xlsx"},
+        "status": "Draft",
+    }
+    mw.planned_moves = [move]
+    mw._resolve_planned_move_for_destination_node = lambda node: (0, move, None)
+    mw._is_move_submitted = lambda m: False
+    mw._destination_row_semantic_path = lambda n: str(n.get("display_path") or n.get("item_path") or "")
+    mw._find_visible_destination_item_by_path = lambda path: None
+    mw._quick_remove_planned_move_from_destination_tree = lambda old: 0
+    mw._reset_unresolved_allocation_queue = lambda: None
+    mw._allocation_parent_candidates_for_touch_paths = lambda _t: {"Root\\B", "Root\\C"}
+    mw._reapply_allocation_overlays_for_paste_touch_paths = lambda o, n, t: (1, {"x": 1})
+    mw._paths_equivalent = lambda a, b, role: str(a).replace("/", "\\") == str(b).replace("/", "\\")
+    scheduled = []
+    mw._schedule_deferred_destination_materialization = lambda r, delay_ms=180: scheduled.append((r, delay_ms))
+    lightweight = []
+    mw._persist_planning_change_lightweight = lambda **kw: lightweight.append(kw)
+    mw._bump_destination_materialized_overlay_fingerprint = lambda **kw: None
+
+    def heavy_persist(r):
+        raise AssertionError("heavy persist should not run")
+
+    mw._persist_planning_change = heavy_persist
+    mw.refresh_planned_moves_table = lambda: None
+    mw.planned_moves_status = MagicMock()
+    mw.destination_tree_status = MagicMock()
+
+    src1 = {"name": "Doc.xlsx", "display_path": "Root\\A\\Doc.xlsx", "item_path": "Root\\A\\Doc.xlsx"}
+    tgt_b = {"name": "B", "display_path": "Root\\B", "item_path": "Root\\B", "is_folder": True}
+    assert mw._move_planned_destination_node(src1, tgt_b, from_manual_planning_drag=True) is True
+
+    src2 = {"name": "Doc.xlsx", "display_path": "Root\\B\\Doc.xlsx", "item_path": "Root\\B\\Doc.xlsx"}
+    tgt_c = {"name": "C", "display_path": "Root\\C", "item_path": "Root\\C", "is_folder": True}
+    assert mw._move_planned_destination_node(src2, tgt_c, from_manual_planning_drag=True) is True
+
+    assert not scheduled
+    assert len(lightweight) == 2
+    assert all(x.get("planning_refresh_reason") == "planned_item_moved_manual_drag" for x in lightweight)
+    assert move["destination_path"] == "Root\\C"
 
 
 def test_destination_tree_item_matches_move_accepts_qmodelindex():
@@ -619,6 +779,26 @@ def test_deferred_planning_refresh_skips_destination_for_paste_quick_reason():
     mw.source_tree_widget = stub
     mw._deferred_planning_refresh_pending = True
     mw._deferred_planning_refresh_reasons = ["planned_item_moved_paste_quick"]
+    mw._deferred_source_projection_paths = set()
+    materialized = []
+    mw._materialize_destination_future_model = lambda reason: materialized.append(reason)
+    mw._schedule_source_projection_refresh_for_paths = lambda *a, **k: None
+    mw.update_progress_summaries = lambda: None
+    mw._set_window_title_status = lambda status_text="": None
+    mw._log_restore_exception = lambda *a, **k: None
+    mw._run_deferred_planning_refresh()
+    assert not materialized
+
+
+def test_deferred_planning_refresh_skips_destination_for_manual_drag_reason():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    stub = MagicMock()
+    stub.viewport.return_value.update = lambda: None
+    mw.destination_tree_widget = stub
+    mw.source_tree_widget = stub
+    mw._deferred_planning_refresh_pending = True
+    mw._deferred_planning_refresh_reasons = ["planned_item_moved_manual_drag"]
     mw._deferred_source_projection_paths = set()
     materialized = []
     mw._materialize_destination_future_model = lambda reason: materialized.append(reason)

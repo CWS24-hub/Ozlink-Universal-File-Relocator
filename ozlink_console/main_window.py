@@ -130,6 +130,7 @@ _INCREMENTAL_DEFERRED_PLANNING_REFRESH_REASONS = frozenset(
         "planned_move_override_added",
         "planning_change_lightweight",
         "planned_item_moved_paste_quick",
+        "planned_item_moved_manual_drag",
     }
 )
 
@@ -25904,7 +25905,9 @@ class MainWindow(QMainWindow):
             "label": str(node_data.get("name", "") or self._move_target_name(move or inherited_move) or "This planned item"),
         }
 
-    def _move_planned_destination_node(self, source_node, target_node, *, from_paste_here=False):
+    def _move_planned_destination_node(
+        self, source_node, target_node, *, from_paste_here=False, from_manual_planning_drag=False
+    ):
         move_index, move, inherited_move = self._resolve_planned_move_for_destination_node(source_node)
         if move is None and inherited_move is None:
             self.destination_tree_status.setText("No planned allocation exists for the selected destination item.")
@@ -25959,7 +25962,11 @@ class MainWindow(QMainWindow):
                 target_projection_path=target_projection_path,
             )
 
-        old_snap = copy.deepcopy(move) if from_paste_here and move is not None else None
+        old_snap = (
+            copy.deepcopy(move)
+            if (from_paste_here or from_manual_planning_drag) and move is not None
+            else None
+        )
 
         destination_node = self._destination_target_snapshot(target_node, target_path)
         if move is None and inherited_move is not None:
@@ -25994,7 +26001,15 @@ class MainWindow(QMainWindow):
 
         self.planned_moves_status.setText("Planned item moved.")
 
-        if from_paste_here and move is not None:
+        incremental_kind = ""
+        if from_paste_here:
+            incremental_kind = "paste"
+        elif from_manual_planning_drag:
+            incremental_kind = "manual"
+
+        if incremental_kind and move is not None:
+            move_perf_timer = QElapsedTimer()
+            move_perf_timer.start()
             scrubbed = self._quick_remove_planned_move_from_destination_tree(old_snap) if old_snap else 0
             self._reset_unresolved_allocation_queue()
             old_p = self._allocation_parent_path(old_snap) if old_snap else ""
@@ -26014,6 +26029,7 @@ class MainWindow(QMainWindow):
                 }
                 log_info(
                     "paste_post_move_refresh",
+                    incremental_kind=incremental_kind,
                     quick_path_ok=quick_path_ok,
                     touch_reapply_total=touch_reapply_total,
                     touch_reapply_per_parent=touch_reapply_per_parent,
@@ -26031,12 +26047,49 @@ class MainWindow(QMainWindow):
                     phase="paste_touch_reapply",
                     first_render_path="_reapply_allocation_overlays_for_paste_touch_paths",
                 )
-                self._persist_planning_change_lightweight(planning_refresh_reason="planned_item_moved_paste_quick")
+                planning_refresh_reason = (
+                    "planned_item_moved_paste_quick"
+                    if incremental_kind == "paste"
+                    else "planned_item_moved_manual_drag"
+                )
+                self._persist_planning_change_lightweight(planning_refresh_reason=planning_refresh_reason)
+                if incremental_kind == "manual":
+                    old_parent_path = self._destination_parent_path(current_projection_path)
+                    src_canon = self._canonical_source_projection_path(move.get("source_path", ""))
+                    log_info(
+                        "MOVEPERF",
+                        commit_source_path=str(current_projection_path)[:400],
+                        source_path=str(src_canon or "")[:400],
+                        old_parent_path=str(old_parent_path or "")[:400],
+                        new_parent_path=str(target_path)[:400],
+                        local_update_used=True,
+                        refinalise_called=False,
+                        rebind_called=False,
+                        touch_reapply_total=touch_reapply_total,
+                        scrubbed_projection_nodes=scrubbed,
+                        elapsed_ms=move_perf_timer.elapsed(),
+                    )
                 return True
 
         self.refresh_planned_moves_table()
         self._schedule_deferred_destination_materialization("planned_item_moved", delay_ms=220)
         self._persist_planning_change("planned_item_moved")
+        if from_manual_planning_drag and move is not None:
+            old_parent_path = self._destination_parent_path(current_projection_path)
+            src_canon = self._canonical_source_projection_path(move.get("source_path", ""))
+            touch_failed = bool(incremental_kind)
+            log_info(
+                "MOVEPERF",
+                commit_source_path=str(current_projection_path)[:400],
+                source_path=str(src_canon or "")[:400],
+                old_parent_path=str(old_parent_path or "")[:400],
+                new_parent_path=str(target_path)[:400],
+                local_update_used=False,
+                refinalise_called=True,
+                rebind_called=True,
+                incremental_touch_failed=touch_failed,
+                elapsed_ms=move_perf_timer.elapsed(),
+            )
         return True
 
     def destination_planning_row_allows_manual_drag_index(self, index: QModelIndex) -> bool:
@@ -26349,7 +26402,10 @@ class MainWindow(QMainWindow):
                 return
 
             moved = self._move_planned_destination_node(
-                source_node, target_node, from_paste_here=_paste_here_target
+                source_node,
+                target_node,
+                from_paste_here=_paste_here_target,
+                from_manual_planning_drag=_manual_planning_drag,
             )
             if moved:
                 self.clear_selection_details()
