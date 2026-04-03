@@ -13050,7 +13050,103 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(max(0, int(delay_ms)), _run)
 
-    def _refresh_source_projection_for_paths(self, paths, phase_name, trigger_path=""):
+    def _map_visible_source_items_by_canonical_paths(self, normalized_paths: set[str]) -> tuple[dict[str, Any], dict[str, int]]:
+        """Resolve many canonical source paths with at most one full tree walk (per view mode).
+
+        When several targets miss the model path index (for example right after a projection cache
+        invalidation), this avoids repeating a depth-first scan once per path.
+        """
+        out: dict[str, Any] = {}
+        stats = {
+            "total_lookup_calls": len(normalized_paths),
+            "unique_path_count": len(normalized_paths),
+            "cache_hit_count": 0,
+            "model_index_hit_count": 0,
+            "bulk_walk_used": 0,
+            "bulk_scan_nodes": 0,
+            "resolved_after_bulk_count": 0,
+            "depth_first_miss_count": 0,
+        }
+        if not normalized_paths:
+            return out, stats
+        tree = getattr(self, "source_tree_widget", None)
+        if tree is None:
+            stats["depth_first_miss_count"] = len(normalized_paths)
+            return out, stats
+
+        remaining = set(normalized_paths)
+        for p in list(remaining):
+            cached = self._source_lookup_cache_get(p)
+            if cached is not None:
+                out[p] = cached
+                remaining.discard(p)
+                stats["cache_hit_count"] += 1
+        if not remaining:
+            return out, stats
+
+        if self._source_tree_uses_model_view():
+            model = getattr(self, "source_sharepoint_model", None)
+            if model is None:
+                stats["depth_first_miss_count"] = len(remaining)
+                return out, stats
+            for p in list(remaining):
+                path_ix = model.find_index_for_canonical_source_path(p)
+                if path_ix.isValid():
+                    self._source_lookup_cache_put(p, path_ix)
+                    out[p] = path_ix
+                    remaining.discard(p)
+                    stats["model_index_hit_count"] += 1
+            if not remaining:
+                return out, stats
+
+            stats["bulk_walk_used"] = 1
+            path_to_ix: dict[str, Any] = {}
+            bulk_nodes = 0
+            for ix in model.iter_depth_first():
+                bulk_nodes += 1
+                node_data = self.get_tree_item_node_data(ix) or {}
+                if node_data.get("placeholder"):
+                    continue
+                vp = self._canonical_source_projection_path(self._tree_item_path(node_data))
+                if vp and vp not in path_to_ix:
+                    path_to_ix[vp] = ix
+            stats["bulk_scan_nodes"] = bulk_nodes
+            for p in list(remaining):
+                ix = path_to_ix.get(p)
+                if ix is not None:
+                    self._source_lookup_cache_put(p, ix)
+                    out[p] = ix
+                    remaining.discard(p)
+                    stats["resolved_after_bulk_count"] += 1
+            stats["depth_first_miss_count"] = len(remaining)
+            return out, stats
+
+        stats["bulk_walk_used"] = 1
+        path_to_item: dict[str, Any] = {}
+        bulk_nodes = 0
+        for index in range(tree.topLevelItemCount()):
+            for item in self._iter_tree_items(tree.topLevelItem(index)):
+                bulk_nodes += 1
+                node_data = item.data(0, Qt.UserRole) or {}
+                if node_data.get("placeholder"):
+                    continue
+                vp = self._canonical_source_projection_path(self._tree_item_path(node_data))
+                if vp and vp not in path_to_item:
+                    path_to_item[vp] = item
+        stats["bulk_scan_nodes"] = bulk_nodes
+        for p in list(remaining):
+            item = path_to_item.get(p)
+            if item is not None:
+                self._source_lookup_cache_put(p, item)
+                out[p] = item
+                remaining.discard(p)
+                stats["resolved_after_bulk_count"] += 1
+        stats["depth_first_miss_count"] = len(remaining)
+        return out, stats
+
+    def _refresh_source_projection_for_paths(
+        self, paths, phase_name, trigger_path="", *, source_perf_move_origin=""
+    ):
         _expand_pending = getattr(self, "_expand_all_pending", None) or {}
         if _expand_pending.get("source"):
             self._source_projection_refresh_paths.update(paths or [])
@@ -13080,11 +13176,13 @@ class MainWindow(QMainWindow):
             )
             return
 
+        raw_paths = list(paths or [])
         normalized_paths = {
             self._canonical_source_projection_path(path)
-            for path in (paths or [])
+            for path in raw_paths
             if self._canonical_source_projection_path(path)
         }
+        duplicate_lookup_count = max(0, len(raw_paths) - len(normalized_paths))
         if not normalized_paths:
             self._log_restore_phase(
                 phase_name,
@@ -13106,9 +13204,11 @@ class MainWindow(QMainWindow):
         dev = is_dev_mode()
         if dev:
             perf.start()
+        lookup_stats: dict[str, int] = {}
         try:
+            item_map, lookup_stats = self._map_visible_source_items_by_canonical_paths(normalized_paths)
             for source_path in sorted(normalized_paths, key=len):
-                item = self._find_visible_source_item_by_path(source_path)
+                item = item_map.get(source_path)
                 if item is None:
                     continue
                 for subtree_row in self._iter_source_tree_subtree_rows(item):
@@ -13145,13 +13245,24 @@ class MainWindow(QMainWindow):
             refreshed_item_count=refreshed_count,
             refreshed_path_count=len(normalized_paths),
         )
+        elapsed = perf.elapsed() if dev else 0
         if dev:
             _perf_explorer_log(
                 "refresh_source_projection_for_paths",
-                elapsed_ms=perf.elapsed(),
+                elapsed_ms=elapsed,
                 refreshed_item_count=refreshed_count,
                 root_path_count=len(normalized_paths),
                 phase_name=str(phase_name or ""),
+            )
+            log_info(
+                "SOURCEPERF",
+                phase=str(phase_name or ""),
+                move_origin=str(source_perf_move_origin or ""),
+                affected_source_path_count=len(raw_paths),
+                deduped_source_path_count=len(normalized_paths),
+                duplicate_lookup_count=int(duplicate_lookup_count),
+                elapsed_ms=elapsed,
+                **{k: int(v) for k, v in lookup_stats.items()},
             )
 
     def _schedule_source_projection_refresh_for_paths(self, paths, phase_name, trigger_path="", delay_ms=250):
@@ -15405,11 +15516,15 @@ class MainWindow(QMainWindow):
         table_refreshed: bool,
         incremental_lightweight: bool,
         move_origin: str,
-    ) -> None:
+    ) -> tuple[frozenset[str], bool]:
         """Single post-move contract for all planned destination reparent paths (drag, paste, other).
 
         Invalidates projection lookup caches (no planning generation bump), synchronously refreshes affected
         source rows when the source tree exists, and emits MOVEAUDIT in dev mode for every origin.
+
+        Returns ``(normalized_source_paths, did_sync_refresh)``. When ``did_sync_refresh`` is True, callers
+        should queue an empty deferred source-projection path set so a follow-up persist does not re-scan the
+        entire visible relationship surface.
         """
         rewritten_related = rewritten_related or []
         self._invalidate_projection_lookup_caches(bump_generation=False)
@@ -15431,6 +15546,7 @@ class MainWindow(QMainWindow):
                 normalized_paths,
                 phase,
                 trigger_path=sorted(normalized_paths, key=len)[0],
+                source_perf_move_origin=str(move_origin or ""),
             )
             source_traceability_updated = True
         if tw is not None:
@@ -15454,6 +15570,9 @@ class MainWindow(QMainWindow):
                 descendant_count=int(len(rewritten_related)),
                 incremental_lightweight=bool(incremental_lightweight),
             )
+
+        did_sync_refresh = bool(normalized_paths and tw is not None)
+        return frozenset(normalized_paths), did_sync_refresh
 
     def _sync_planning_after_proposed_branch_destination_relocate(
         self, paths_to_refresh: set, *, old_path: str, new_path: str, table_refreshed: bool = False
@@ -26302,13 +26421,29 @@ class MainWindow(QMainWindow):
         return False
 
     def _persist_planning_change_lightweight(
-        self, *, planning_refresh_reason="planning_change_lightweight", notify_saved=True
+        self,
+        *,
+        planning_refresh_reason="planning_change_lightweight",
+        notify_saved=True,
+        deferred_source_projection_paths=None,
     ):
         self._save_draft_shell(force=True)
         self._rebuild_submission_visual_cache()
+        if deferred_source_projection_paths is None:
+            spd = set(self._collect_current_source_projection_paths())
+        else:
+            spd = set(deferred_source_projection_paths)
+        if is_dev_mode() and deferred_source_projection_paths is not None:
+            log_info(
+                "SOURCEPERF",
+                event="deferred_queue_paths",
+                narrowed_deferred_scope=True,
+                deferred_path_count=len(spd),
+                planning_refresh_reason=str(planning_refresh_reason or ""),
+            )
         self._queue_deferred_planning_refresh(
             planning_refresh_reason,
-            source_projection_paths=self._collect_current_source_projection_paths(),
+            source_projection_paths=spd,
             notify_saved=notify_saved,
         )
         self.update_progress_summaries()
@@ -26710,7 +26845,7 @@ class MainWindow(QMainWindow):
                 table_refreshed=True,
                 incremental_lightweight=False,
                 move_origin=move_origin,
-            )
+            )  # return ignored; full persist follows
             self._schedule_deferred_destination_materialization("planned_item_moved", delay_ms=220)
             self._persist_planning_change("planned_item_moved")
             return True
@@ -26783,7 +26918,7 @@ class MainWindow(QMainWindow):
                 )
             if quick_path_ok:
                 self.refresh_planned_moves_table()
-                self._finalize_destination_move_planning_consistency(
+                _norm_paths, _did_sync_source = self._finalize_destination_move_planning_consistency(
                     move,
                     rewritten_related=rewritten_related,
                     old_destination_projection=str(old_proj or "")[:500],
@@ -26801,7 +26936,15 @@ class MainWindow(QMainWindow):
                     if incremental_kind == "paste"
                     else "planned_item_moved_manual_drag"
                 )
-                self._persist_planning_change_lightweight(planning_refresh_reason=planning_refresh_reason)
+                _deferred_paths = None
+                if _did_sync_source:
+                    _deferred_paths = frozenset()
+                elif _norm_paths:
+                    _deferred_paths = frozenset(_norm_paths)
+                self._persist_planning_change_lightweight(
+                    planning_refresh_reason=planning_refresh_reason,
+                    deferred_source_projection_paths=_deferred_paths,
+                )
                 if incremental_kind == "manual":
                     old_parent_path = self._destination_parent_path(current_projection_path)
                     src_canon = self._canonical_source_projection_path(move.get("source_path", ""))
@@ -26829,7 +26972,7 @@ class MainWindow(QMainWindow):
             table_refreshed=True,
             incremental_lightweight=False,
             move_origin=move_origin,
-        )
+        )  # return ignored; heavy persist uses full deferred refresh elsewhere
         self._schedule_deferred_destination_materialization("planned_item_moved", delay_ms=220)
         self._persist_planning_change("planned_item_moved")
         if from_manual_planning_drag and move is not None:

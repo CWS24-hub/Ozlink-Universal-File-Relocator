@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+from PySide6.QtCore import QModelIndex
 from PySide6.QtWidgets import QApplication
 
 from ozlink_console.main_window import MainWindow
@@ -290,6 +291,7 @@ def test_move_planned_destination_node_passes_move_origin_paste_and_manual():
 
         def _capture_finalize(primary_move, **kw):
             calls.append({"primary_move": primary_move, **kw})
+            return frozenset(), True
 
         mw._finalize_destination_move_planning_consistency = _capture_finalize
         src = {"name": "Doc.xlsx", "display_path": "Root\\OldParent\\Doc.xlsx", "item_path": "Root\\OldParent\\Doc.xlsx"}
@@ -302,6 +304,110 @@ def test_move_planned_destination_node_passes_move_origin_paste_and_manual():
 
     _run(True, False, "paste_here")
     _run(False, True, "manual_drag")
+
+
+def test_finalize_returns_normalized_paths_and_did_sync_flag():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    move = {
+        "source_path": "S\\One",
+        "source": {"display_path": "S\\One", "item_path": "S\\One", "is_folder": False},
+        "destination_path": "D\\T",
+        "target_name": "One",
+    }
+    mw.planned_moves = [move]
+    mw._expand_source_projection_paths_for_move_network = MagicMock(return_value={"S\\One"})
+    mw._invalidate_projection_lookup_caches = MagicMock()
+    mw._refresh_source_projection_for_paths = MagicMock()
+    mw.source_tree_widget = MagicMock()
+    canon = mw._canonical_source_projection_path("S\\One")
+    with patch("ozlink_console.main_window.is_dev_mode", return_value=False):
+        paths, did_sync = mw._finalize_destination_move_planning_consistency(
+            move,
+            rewritten_related=[],
+            old_destination_projection="a",
+            new_destination_projection="b",
+            table_refreshed=True,
+            incremental_lightweight=True,
+            move_origin="manual_drag",
+        )
+    assert canon in paths
+    assert did_sync is True
+    mw.source_tree_widget = None
+    with patch("ozlink_console.main_window.is_dev_mode", return_value=False):
+        paths2, did_sync2 = mw._finalize_destination_move_planning_consistency(
+            move,
+            rewritten_related=[],
+            old_destination_projection="a",
+            new_destination_projection="b",
+            table_refreshed=True,
+            incremental_lightweight=True,
+            move_origin="manual_drag",
+        )
+    assert canon in paths2
+    assert did_sync2 is False
+
+
+def test_persist_lightweight_deferred_paths_override_skips_full_collect():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    mw.planned_moves = []
+    mw._save_draft_shell = lambda force=True: None
+    mw._rebuild_submission_visual_cache = lambda: None
+    mw.update_progress_summaries = lambda: None
+    mw._set_window_title_status = lambda *a, **k: None
+    collect = MagicMock(side_effect=AssertionError("collect should not run"))
+    mw._collect_current_source_projection_paths = collect
+    q = MagicMock()
+    mw._queue_deferred_planning_refresh = q
+    with patch("ozlink_console.main_window.is_dev_mode", return_value=False):
+        mw._persist_planning_change_lightweight(
+            planning_refresh_reason="planned_item_moved_manual_drag",
+            deferred_source_projection_paths=frozenset(["S\\Only"]),
+        )
+    collect.assert_not_called()
+    q.assert_called_once()
+    assert q.call_args.kwargs["source_projection_paths"] == {"S\\Only"}
+
+
+def test_map_visible_source_items_uses_single_bulk_walk_for_multiple_index_misses():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    payloads = [
+        {"display_path": "S\\a", "item_path": "S\\a", "tree_role": "source"},
+        {"display_path": "S\\b", "item_path": "S\\b", "tree_role": "source"},
+    ]
+    idxs = []
+    for i in range(len(payloads)):
+        m_ix = MagicMock()
+        m_ix.isValid.return_value = True
+        m_ix._row_i = i
+        idxs.append(m_ix)
+    walk_calls = {"n": 0}
+
+    def fake_iter_depth_first():
+        walk_calls["n"] += 1
+        yield from idxs
+
+    model = MagicMock()
+    model.find_index_for_canonical_source_path = MagicMock(return_value=QModelIndex())
+    model.iter_depth_first = fake_iter_depth_first
+
+    mw.source_tree_widget = MagicMock()
+    mw.source_sharepoint_model = model
+    mw._source_tree_uses_model_view = lambda: True
+    mw.get_tree_item_node_data = lambda ix: payloads[getattr(ix, "_row_i", 0)]
+    mw._canonical_source_projection_path = lambda p: str(p or "").replace("/", "\\") if p else ""
+    mw._tree_item_path = lambda d: d.get("item_path", "") or ""
+    mw._source_lookup_cache_get = lambda _p: None
+    mw._source_lookup_cache_put = lambda *_a, **_k: None
+
+    want = {mw._canonical_source_projection_path("S\\a"), mw._canonical_source_projection_path("S\\b")}
+    out, stats = mw._map_visible_source_items_by_canonical_paths(want)
+    assert walk_calls["n"] == 1
+    assert stats["bulk_walk_used"] == 1
+    assert stats["bulk_scan_nodes"] == 2
+    assert len(out) == 2
 
 
 def test_evaluate_source_relationship_direct_suffix_reflects_destination_name():
