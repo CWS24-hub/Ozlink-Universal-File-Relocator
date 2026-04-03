@@ -144,9 +144,10 @@ def test_apply_draft_reset_after_backup_clears_runtime_and_persists_empty():
     mw.clear_selection_details = MagicMock()
     mw.update_progress_summaries = MagicMock()
     mw.planned_moves_status = MagicMock()
-    mw.source_tree_widget = None
-    mw.destination_tree_widget = None
+    mw.source_tree_widget = MagicMock()
+    mw.destination_tree_widget = MagicMock()
     mw._refresh_source_projection = MagicMock()
+    mw._materialize_destination_future_model = MagicMock(return_value=2)
     mw._schedule_deferred_destination_materialization = MagicMock()
 
     mw._apply_draft_reset_after_backup()
@@ -159,6 +160,99 @@ def test_apply_draft_reset_after_backup_clears_runtime_and_persists_empty():
     mm.save_proposed.assert_called_once_with([], allow_empty=True)
     mm.save_session.assert_called_once()
     mm.refresh_manifest.assert_called_once()
+    mw._materialize_destination_future_model.assert_called_once()
+    call_kw = mw._materialize_destination_future_model.call_args.kwargs
+    assert call_kw.get("allow_defer") is False
+    mw._refresh_source_projection.assert_called_once()
+
+
+def test_refresh_source_projection_refreshes_visuals_when_no_planned_moves():
+    """Regression: empty planned_moves must still clear source relationship / via chrome (e.g. after reset)."""
+    from PySide6.QtWidgets import QApplication
+
+    from ozlink_console.main_window import MainWindow
+
+    _ = QApplication.instance() or QApplication([])
+
+    mw = MainWindow.__new__(MainWindow)
+    mw.planned_moves = []
+    mw._memory_restore_in_progress = False
+    mw.source_tree_widget = MagicMock()
+    refreshed = []
+
+    def _capture(panel):
+        refreshed.append(panel)
+
+    mw._refresh_tree_visual_states = _capture
+    mw._log_restore_phase = MagicMock()
+
+    MainWindow._refresh_source_projection(mw, "test_zero_baseline")
+
+    assert refreshed == ["source"]
+    mw.source_tree_widget.viewport().update.assert_called_once()
+
+
+def test_apply_draft_reset_stops_deferred_planning_timer_and_clears_queues():
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from ozlink_console.main_window import MainWindow
+
+    _ = QApplication.instance() or QApplication([])
+
+    mm = MagicMock()
+    mw = MainWindow.__new__(MainWindow)
+    mw.memory_manager = mm
+    mw.planned_moves = [{"source_path": "S\\a"}]
+    mw.proposed_folders = []
+    mw.active_draft_session_id = "OLD"
+    mw._draft_shell_state = SessionState(DraftId="OLD")
+    mw._draft_shell_raw = {}
+    mw.current_session_context = {
+        "operator_upn": "u@t.ex",
+        "tenant_domain": "t.ex",
+        "operator_display_name": "User",
+    }
+    mw._suppress_autosave = True
+    timer = MagicMock(spec=QTimer)
+    mw._deferred_planning_refresh_timer = timer
+    mw._deferred_planning_refresh_pending = True
+    mw._deferred_planning_refresh_reasons = ["x"]
+    mw._deferred_source_projection_paths = {"p"}
+    mw._source_projection_refresh_scheduled = True
+    mw._source_projection_refresh_paths = {"q"}
+
+    def _minimal_clear(*, refresh_ui=True):
+        mw.planned_moves = []
+        mw.proposed_folders = []
+
+    mw._clear_runtime_draft_state = _minimal_clear
+    mw._invalidate_projection_lookup_caches = MagicMock()
+    mw._create_new_draft_session_id = lambda: "NEW-ID"
+
+    def _fresh(**_kw):
+        return SessionState(DraftId="")
+
+    mw._build_current_draft_shell_state = _fresh
+    mw._rebuild_submission_visual_cache = MagicMock()
+    mw.refresh_planned_moves_table = MagicMock()
+    mw.clear_selection_details = MagicMock()
+    mw.update_progress_summaries = MagicMock()
+    mw.planned_moves_status = MagicMock()
+    mw.source_tree_widget = MagicMock()
+    mw.destination_tree_widget = MagicMock()
+    mw._refresh_source_projection = MagicMock()
+    mw._materialize_destination_future_model = MagicMock(return_value=0)
+    mw._schedule_deferred_destination_materialization = MagicMock()
+
+    mw._apply_draft_reset_after_backup()
+
+    timer.stop.assert_called_once()
+    assert mw._deferred_planning_refresh_pending is False
+    assert mw._deferred_planning_refresh_reasons == []
+    assert mw._deferred_source_projection_paths == set()
+    assert mw._source_projection_refresh_scheduled is False
+    assert mw._source_projection_refresh_paths == set()
 
 
 def test_build_draft_reset_backup_payload_includes_allocations_and_moves():

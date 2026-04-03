@@ -6858,7 +6858,23 @@ class MainWindow(QMainWindow):
 
     def _apply_draft_reset_after_backup(self) -> None:
         """Clear runtime draft/planning state, persist an empty draft, and refresh planning UI (roots preserved)."""
+        pre_pm = len(self.planned_moves)
+        pre_pf = len(self.proposed_folders)
+        log_info(
+            "DRAFTRESET",
+            event="apply_reset_pre_counts",
+            pre_reset_planned_moves_count=pre_pm,
+            pre_reset_proposed_folders_count=pre_pf,
+        )
         self._clear_runtime_draft_state(refresh_ui=False)
+        dpt = getattr(self, "_deferred_planning_refresh_timer", None)
+        if dpt is not None:
+            dpt.stop()
+        self._deferred_planning_refresh_pending = False
+        self._deferred_planning_refresh_reasons = []
+        self._deferred_source_projection_paths = set()
+        self._source_projection_refresh_scheduled = False
+        self._source_projection_refresh_paths = set()
         self._invalidate_projection_lookup_caches(bump_generation=True)
         fresh = self._build_current_draft_shell_state(include_workspace_ui=True)
         fresh.DraftId = self._create_new_draft_session_id()
@@ -6889,12 +6905,41 @@ class MainWindow(QMainWindow):
         self.update_progress_summaries()
         if getattr(self, "planned_moves_status", None) is not None:
             self.planned_moves_status.setText("Draft reset: clean baseline.")
+        source_traceability_cleared = False
         if getattr(self, "source_tree_widget", None) is not None:
             self._refresh_source_projection("draft_reset_source_reconcile")
             self.source_tree_widget.viewport().update()
+            source_traceability_cleared = True
+        dest_materialize_return = -1
+        destination_projection_cleared = False
+        try:
+            raw_ret = self._materialize_destination_future_model(
+                "draft_reset_immediate",
+                allow_defer=False,
+                prefer_chunked_projection=False,
+            )
+            dest_materialize_return = int(raw_ret or 0)
+            destination_projection_cleared = True
+        except Exception as exc:
+            log_warn(
+                "DRAFTRESET",
+                event="destination_immediate_materialize_failed",
+                error=str(exc),
+            )
         self._schedule_deferred_destination_materialization("draft_reset_destination_reconcile", delay_ms=220)
         if getattr(self, "destination_tree_widget", None) is not None:
             self.destination_tree_widget.viewport().update()
+        log_info(
+            "DRAFTRESET",
+            event="apply_reset_post_baseline",
+            post_reset_planned_moves_count=len(self.planned_moves),
+            post_reset_proposed_folders_count=len(self.proposed_folders),
+            source_traceability_cleared=source_traceability_cleared,
+            destination_projection_cleared=destination_projection_cleared,
+            destination_materialize_return=dest_materialize_return,
+            planned_moves_table_cleared=True,
+            cache_invalidation_done=True,
+        )
 
     def _handle_reset_draft(self) -> None:
         if self.memory_manager is None:
@@ -13313,21 +13358,26 @@ class MainWindow(QMainWindow):
             )
             return
 
-        if not self.planned_moves:
-            self._log_restore_phase(
-                phase_name,
-                trigger_path=self.normalize_memory_path(trigger_path),
-                skipped_source_projection_count=0,
-                reason="no_planned_moves",
-            )
-            return
-
         if getattr(self, "_memory_restore_in_progress", False):
             self._log_restore_phase(
                 f"{phase_name}_deferred",
                 trigger_path=self.normalize_memory_path(trigger_path),
                 planned_moves_count=len(self.planned_moves),
                 reason="restore_in_progress",
+            )
+            return
+
+        if not self.planned_moves:
+            # Zero-draft baseline: still re-apply visual state so "via …" / relationship chrome
+            # from the previous draft does not linger (e.g. after Reset Draft).
+            with _PerfExplorerTimer("refresh_source_projection_full", phase_name=str(phase_name or "")):
+                self._refresh_tree_visual_states("source")
+                self.source_tree_widget.viewport().update()
+            self._log_restore_phase(
+                phase_name,
+                trigger_path=self.normalize_memory_path(trigger_path),
+                reason="zero_draft_baseline_source_visuals",
+                planned_moves_count=0,
             )
             return
 
