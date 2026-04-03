@@ -357,6 +357,8 @@ class DestinationPlanningTreeView(QTreeView):
         vp = self.viewport()
         drop_pos = vp.mapFromGlobal(event.globalPosition().toPoint())
         target_ix = self.indexAt(drop_pos)
+        if target_ix.isValid() and target_ix.column() != 0:
+            target_ix = target_ix.siblingAtColumn(0)
         if is_dev_mode():
             log_info(
                 "debug_pass_destination_drop",
@@ -14256,6 +14258,29 @@ class MainWindow(QMainWindow):
             or ""
         )
 
+    def _destination_row_semantic_path(self, node_data):
+        """Canonical path for the visible destination row (matches tree columns / selection).
+
+        Uses the same field precedence as :meth:`_tree_item_path` so UI actions target the row
+        the user sees. Do not prefer ``destination_path`` first — it can point at a different
+        folder (e.g. assignment parent) and caused assign/paste to land on the wrong subtree.
+        """
+        if not isinstance(node_data, dict):
+            return ""
+        raw = self._tree_item_path(node_data)
+        return self._canonical_destination_projection_path(raw) or self.normalize_memory_path(raw)
+
+    def _log_destination_action_target(self, action: str, *, selected_semantic_path: str, resolved_target_path: str, **extra):
+        if not is_dev_mode():
+            return
+        log_info(
+            "destination_action_target",
+            action=action,
+            selected_semantic_path=selected_semantic_path or "",
+            resolved_target_path=resolved_target_path or "",
+            **extra,
+        )
+
     def _resolve_tree_item_drive_id(self, panel_key, node_data):
         """Drive id for Graph folder loads: prefer the row's drive/library id, then the panel root."""
         if not isinstance(node_data, dict):
@@ -15094,11 +15119,16 @@ class MainWindow(QMainWindow):
             return 2
         return 3
 
-    def _select_canonical_destination_item(self, items):
+    def _select_canonical_destination_item(self, items, prefer=None):
         if not items:
             return None
         first = items[0]
         if isinstance(first, QModelIndex):
+            if prefer is not None and prefer.isValid():
+                p = prefer.siblingAtColumn(0) if prefer.column() != 0 else prefer
+                for it in items:
+                    if isinstance(it, QModelIndex) and it.isValid() and it == p:
+                        return it
 
             def _key_ix(ix):
                 pl = ix.data(Qt.UserRole) or {}
@@ -15108,6 +15138,13 @@ class MainWindow(QMainWindow):
                 )
 
             return min(items, key=_key_ix)
+        if prefer is not None and not isinstance(first, QModelIndex):
+            try:
+                for it in items:
+                    if it is prefer:
+                        return it
+            except TypeError:
+                pass
         return min(
             items,
             key=lambda item: (
@@ -19807,6 +19844,12 @@ class MainWindow(QMainWindow):
 
         path_probe = normalized_target or destination_path or ""
         if self._destination_tree_uses_model_view():
+            prefer_ix = None
+            tree_pf = getattr(self, "destination_tree_widget", None)
+            if tree_pf is not None:
+                cur_pf = tree_pf.currentIndex()
+                if cur_pf.isValid():
+                    prefer_ix = cur_pf.siblingAtColumn(0) if cur_pf.column() != 0 else cur_pf
             quick_ix = self._destination_tree_index_if_current_matches_path(path_probe)
             if quick_ix is not None:
                 if normalized_target:
@@ -19826,7 +19869,7 @@ class MainWindow(QMainWindow):
                 return None
             candidate_ixs = model.find_indices_for_canonical_destination_path(normalized_target)
             if candidate_ixs:
-                selected = self._select_canonical_destination_item(candidate_ixs)
+                selected = self._select_canonical_destination_item(candidate_ixs, prefer=prefer_ix)
                 if selected is not None and selected.isValid():
                     node_data = selected.data(Qt.UserRole) or {}
                     visible_path = self._tree_item_path(node_data)
@@ -19861,7 +19904,7 @@ class MainWindow(QMainWindow):
                     continue
                 if match_details["prefix_only_match"]:
                     continue
-            selected = self._select_canonical_destination_item(matches)
+            selected = self._select_canonical_destination_item(matches, prefer=prefer_ix)
             if selected is not None and normalized_target:
                 dest_cache[normalized_target] = QPersistentModelIndex(selected)
             if dev:
@@ -23791,24 +23834,41 @@ class MainWindow(QMainWindow):
         if not isinstance(destination_node, dict):
             return None
 
+        dest_path = self._destination_row_semantic_path(destination_node)
+        if not dest_path:
+            dest_path = self._canonical_destination_projection_path(
+                destination_node.get("display_path")
+                or destination_node.get("item_path")
+                or destination_node.get("destination_path")
+                or ""
+            )
+        dest_key = dest_path.casefold() if dest_path else ""
+
+        if dest_key:
+            for index, existing_move in enumerate(self.planned_moves):
+                alloc_path = self._canonical_destination_projection_path(
+                    self._allocation_projection_path(existing_move)
+                )
+                if alloc_path and alloc_path.casefold() == dest_key:
+                    if is_dev_mode():
+                        log_info(
+                            "planned_move_match_by_destination",
+                            match_kind="allocation_path_exact",
+                            move_index=index,
+                            semantic_path=dest_path,
+                            allocation_path=alloc_path,
+                        )
+                    return index
+
         for index, existing_move in enumerate(self.planned_moves):
             if self.node_keys_match(existing_move.get("destination", {}), destination_node, "destination"):
-                return index
-
-        dest_path = self._canonical_destination_projection_path(
-            self._tree_item_path(destination_node)
-            or destination_node.get("display_path")
-            or destination_node.get("item_path")
-            or destination_node.get("destination_path")
-            or ""
-        )
-        if not dest_path:
-            return None
-        for index, existing_move in enumerate(self.planned_moves):
-            alloc_path = self._canonical_destination_projection_path(
-                self._allocation_projection_path(existing_move)
-            )
-            if alloc_path and alloc_path == dest_path:
+                if is_dev_mode():
+                    log_info(
+                        "planned_move_match_by_destination",
+                        match_kind="node_keys",
+                        move_index=index,
+                        semantic_path=dest_path,
+                    )
                 return index
 
         nid = str(destination_node.get("id") or "")
@@ -23816,13 +23876,24 @@ class MainWindow(QMainWindow):
             embedded = nid[len("allocated::") :]
             ep = self._canonical_destination_projection_path(embedded)
             if ep:
+                ep_key = ep.casefold()
                 for index, existing_move in enumerate(self.planned_moves):
                     ap = self._canonical_destination_projection_path(
                         self._allocation_projection_path(existing_move)
                     )
-                    if ap and ap == ep:
+                    if ap and ap.casefold() == ep_key:
+                        if is_dev_mode():
+                            log_info(
+                                "planned_move_match_by_destination",
+                                match_kind="allocated_id_embedded_path",
+                                move_index=index,
+                                semantic_path=dest_path,
+                                allocation_path=ap,
+                            )
                         return index
 
+        if is_dev_mode():
+            log_info("planned_move_match_by_destination", match_kind="none", semantic_path=dest_path or "")
         return None
 
     def is_proposed_destination_node(self, node_data):
@@ -24487,12 +24558,16 @@ class MainWindow(QMainWindow):
         if move is not None:
             source_path = self._canonical_source_projection_path(move.get("source_path", "")) or source_path
 
+        row_path = self._destination_row_semantic_path(node_data)
         return {
             "kind": "planned_item",
             "source_path": source_path,
-            "display_path": self._canonical_destination_projection_path(
+            "path": row_path,
+            "display_path": row_path
+            or self._canonical_destination_projection_path(
                 node_data.get("display_path") or node_data.get("item_path") or ""
-            ) or self.normalize_memory_path(node_data.get("display_path") or node_data.get("item_path") or ""),
+            )
+            or self.normalize_memory_path(node_data.get("display_path") or node_data.get("item_path") or ""),
             "label": str(node_data.get("name", "") or self._move_target_name(move or inherited_move) or "This planned item"),
         }
 
@@ -24516,9 +24591,7 @@ class MainWindow(QMainWindow):
             )
             return False
 
-        target_path = self._canonical_destination_projection_path(
-            target_node.get("display_path") or target_node.get("item_path") or ""
-        ) or self.normalize_memory_path(target_node.get("display_path") or target_node.get("item_path") or "")
+        target_path = self._destination_row_semantic_path(target_node)
         if not target_path:
             self.destination_tree_status.setText("Could not resolve the destination folder for the move.")
             return False
@@ -24529,9 +24602,7 @@ class MainWindow(QMainWindow):
             return False
 
         target_projection_path = self.normalize_memory_path(f"{target_path}\\{target_name}")
-        current_projection_path = self._canonical_destination_projection_path(
-            source_node.get("display_path") or source_node.get("item_path") or ""
-        ) or self.normalize_memory_path(source_node.get("display_path") or source_node.get("item_path") or "")
+        current_projection_path = self._destination_row_semantic_path(source_node)
         if target_projection_path == current_projection_path:
             return False
 
@@ -24543,6 +24614,17 @@ class MainWindow(QMainWindow):
                 "A destination item with that name already exists in the selected folder.",
             )
             return False
+
+        prev_dest = self._move_destination_target_path(move) if move is not None else ""
+        if is_dev_mode():
+            log_info(
+                "planned_destination_mutation",
+                action="move_planned_item",
+                move_index=move_index if move is not None else None,
+                before_destination_path=prev_dest,
+                after_destination_path=target_path,
+                target_projection_path=target_projection_path,
+            )
 
         destination_node = self._destination_target_snapshot(target_node, target_path)
         if move is None and inherited_move is not None:
@@ -24591,6 +24673,8 @@ class MainWindow(QMainWindow):
                     has_target=bool(target_node),
                     source_path_excerpt=str((source_node or {}).get("display_path", "") or "")[:160],
                     target_path_excerpt=str((target_node or {}).get("display_path", "") or "")[:160],
+                    source_semantic=str(self._destination_row_semantic_path(source_node or {}) or "")[:240],
+                    target_semantic=str(self._destination_row_semantic_path(target_node or {}) or "")[:240],
                 )
             if not source_node or not target_node:
                 return
@@ -24605,9 +24689,13 @@ class MainWindow(QMainWindow):
                 source_path = self._canonical_destination_projection_path(
                     source_node.get("display_path") or source_node.get("item_path") or ""
                 ) or self.normalize_memory_path(source_node.get("display_path") or source_node.get("item_path") or "")
-                target_path = self._canonical_destination_projection_path(
-                    target_node.get("display_path") or target_node.get("item_path") or ""
-                ) or self.normalize_memory_path(target_node.get("display_path") or target_node.get("item_path") or "")
+                target_path = self._destination_row_semantic_path(target_node)
+                if not target_path:
+                    target_path = self._canonical_destination_projection_path(
+                        target_node.get("display_path") or target_node.get("item_path") or ""
+                    ) or self.normalize_memory_path(
+                        target_node.get("display_path") or target_node.get("item_path") or ""
+                    )
                 if not source_path or not target_path:
                     self.destination_tree_status.setText("Could not resolve the proposed branch move.")
                     return
@@ -24747,10 +24835,17 @@ class MainWindow(QMainWindow):
                 return
             if is_dev_mode():
                 log_info("debug_pass_paste_destination", phase="start")
-            target_raw = target_node.get("display_path") or target_node.get("item_path") or ""
-            target_path = self._canonical_destination_projection_path(target_raw) or self.normalize_memory_path(
-                target_raw
-            )
+            target_path = self._destination_row_semantic_path(target_node)
+            if not target_path:
+                self.destination_tree_status.setText("Could not resolve the destination folder for paste.")
+                return
+            if is_dev_mode():
+                self._log_destination_action_target(
+                    "paste",
+                    selected_semantic_path=target_path,
+                    resolved_target_path=target_path,
+                    cut_buffer_path=str(payload.get("path") or payload.get("display_path") or ""),
+                )
             target_item = self._destination_tree_index_if_current_matches_path(target_path)
             if target_item is None:
                 target_item = self._find_visible_destination_item_by_path(target_path)
@@ -25040,11 +25135,7 @@ class MainWindow(QMainWindow):
             log_info(
                 "debug_pass_remove_planned_allocation",
                 node_id_excerpt=str((node_data or {}).get("id", "") or "")[:120],
-                path_excerpt=str(
-                    (node_data or {}).get("display_path")
-                    or (node_data or {}).get("item_path")
-                    or ""
-                )[:200],
+                semantic_path_excerpt=str(self._destination_row_semantic_path(node_data or {}) or "")[:240],
             )
         move_index = self.find_planned_move_index_by_destination(node_data)
         if move_index is None:
@@ -25077,6 +25168,14 @@ class MainWindow(QMainWindow):
         )
 
     def build_planned_move_record(self, source_node, destination_node):
+        dest_sem = self._destination_row_semantic_path(destination_node)
+        dest_path_field = (
+            dest_sem
+            or destination_node.get("display_path")
+            or destination_node.get("item_path")
+            or destination_node.get("destination_path")
+            or "/"
+        )
         return {
             "source_id": source_node.get("id", ""),
             "source_name": source_node.get("name", "Unnamed Item"),
@@ -25085,7 +25184,7 @@ class MainWindow(QMainWindow):
             "source": dict(source_node),
             "destination_id": destination_node.get("id", ""),
             "destination_name": destination_node.get("name", "Unnamed Item"),
-            "destination_path": destination_node.get("display_path") or destination_node.get("item_path") or "/",
+            "destination_path": dest_path_field,
             "destination": dict(destination_node),
             "status": "Draft",
         }
@@ -31030,13 +31129,7 @@ class MainWindow(QMainWindow):
     def _destination_target_path_for_node(self, node_data):
         if not isinstance(node_data, dict):
             return ""
-        raw_path = (
-            node_data.get("destination_path")
-            or node_data.get("display_path")
-            or node_data.get("item_path")
-            or ""
-        )
-        return self._canonical_destination_projection_path(raw_path) or self.normalize_memory_path(raw_path)
+        return self._destination_row_semantic_path(node_data)
 
     def _move_destination_target_path(self, move):
         if not isinstance(move, dict):
@@ -31277,6 +31370,14 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "Assign", "Select a valid destination folder before assigning.")
                 return
 
+            if is_dev_mode():
+                sem = self._destination_row_semantic_path(destination_node)
+                self._log_destination_action_target(
+                    "assign",
+                    selected_semantic_path=sem,
+                    resolved_target_path=self._destination_target_path_for_node(destination_node),
+                )
+
             submitted_move = self._find_submitted_move_by_source_node(source_node)
             if submitted_move is not None:
                 self._show_submitted_item_locked_message(
@@ -31311,6 +31412,14 @@ class MainWindow(QMainWindow):
                     return
 
                 self._mark_allocation_resolved(existing_move)
+                if is_dev_mode():
+                    log_info(
+                        "planned_destination_mutation",
+                        action="assign_override",
+                        move_index=existing_index,
+                        before_destination_path=self._move_destination_target_path(existing_move),
+                        after_destination_path=self._destination_target_path_for_node(destination_node),
+                    )
                 replacement_move = self.build_planned_move_record(source_node, destination_node)
                 replacement_move["allocation_method"] = "Manual - Override"
                 self.planned_moves[existing_index] = replacement_move
@@ -31447,7 +31556,14 @@ class MainWindow(QMainWindow):
                 if move_index is not None:
                     target_move = self.planned_moves[move_index]
                     if is_dev_mode():
-                        log_info("debug_pass_unassign", via="destination_tree", move_index=move_index)
+                        log_info(
+                            "debug_pass_unassign",
+                            via="destination_tree",
+                            move_index=move_index,
+                            visible_semantic_path=self._destination_row_semantic_path(dest_node),
+                            matched_destination_path=self._move_destination_target_path(target_move),
+                            matched_allocation_path=self._allocation_projection_path(target_move),
+                        )
                     if self._is_move_submitted(target_move):
                         self._show_submitted_item_locked_message(
                             "Unassign",
