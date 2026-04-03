@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import (
     Qt,
+    QCoreApplication,
     QDir,
     QObject,
     QThread,
@@ -331,6 +332,118 @@ class FolderLoadWorker(QThread):
 OZLINK_DESTINATION_PLANNING_DRAG_MIME = "application/x-ozlink-destination-planning-drag"
 
 _DRAGTRACE_MSG = "DRAGTRACE"
+_DRAGPROOF_MSG = "DRAGPROOF"
+
+_DRAGPROOF_DRAG_EVENT_TYPES = (
+    QEvent.Type.DragEnter,
+    QEvent.Type.DragMove,
+    QEvent.Type.Drop,
+    QEvent.Type.DragLeave,
+)
+
+_ozlink_dragproof_saved_notify = None
+
+
+def _dragproof_destination_tree_ids(tree) -> dict:
+    if tree is None:
+        return {
+            "tree_class": None,
+            "tree_id": None,
+            "viewport_id": None,
+            "header_id": None,
+            "vsb_id": None,
+            "hsb_id": None,
+        }
+    try:
+        vp = tree.viewport()
+        hdr = tree.header()
+        vsb = tree.verticalScrollBar()
+        hsb = tree.horizontalScrollBar()
+        return {
+            "tree_class": tree.__class__.__name__,
+            "tree_id": id(tree),
+            "viewport_id": id(vp),
+            "header_id": id(hdr),
+            "vsb_id": id(vsb),
+            "hsb_id": id(hsb),
+        }
+    except Exception:
+        return {
+            "tree_class": type(tree).__name__,
+            "tree_id": id(tree),
+            "viewport_id": None,
+            "header_id": None,
+            "vsb_id": None,
+            "hsb_id": None,
+        }
+
+
+def dragproof_log(phase: str, tree, **extra) -> None:
+    payload = {"phase": phase, **_dragproof_destination_tree_ids(tree)}
+    payload.update(extra)
+    log_info(_DRAGPROOF_MSG, **payload)
+
+
+def _dragproof_dest_ids_for_main_window(mw) -> dict:
+    """Reference SharePoint destination tree vs active (may be local) tree for DRAGTRACE start."""
+    if mw is None:
+        return {
+            "dest_tree_id": None,
+            "dest_viewport_id": None,
+            "dest_header_id": None,
+            "active_tree_id": None,
+            "active_viewport_id": None,
+            "active_header_id": None,
+            "browse_mode": None,
+        }
+    ref = getattr(mw, "destination_tree_widget", None)
+    dref = _dragproof_destination_tree_ids(ref)
+    act = mw._active_destination_tree_widget()
+    dact = _dragproof_destination_tree_ids(act)
+    return {
+        "dest_tree_id": dref.get("tree_id"),
+        "dest_viewport_id": dref.get("viewport_id"),
+        "dest_header_id": dref.get("header_id"),
+        "active_tree_id": dact.get("tree_id"),
+        "active_viewport_id": dact.get("viewport_id"),
+        "active_header_id": dact.get("header_id"),
+        "browse_mode": mw._planning_browse_mode("destination"),
+    }
+
+
+def _dragproof_qcore_notify(self, receiver, event):
+    et = event.type()
+    if et in _DRAGPROOF_DRAG_EVENT_TYPES:
+        try:
+            acc = event.isAccepted()
+        except Exception:
+            acc = False
+        try:
+            log_info(
+                _DRAGPROOF_MSG,
+                phase="app_event",
+                receiver_class=receiver.__class__.__name__,
+                receiver_id=id(receiver),
+                ev=int(et),
+                accepted=acc,
+                proposed=_dragtrace_proposed_int(event),
+                drop=_dragtrace_drop_action_int(event),
+            )
+        except Exception:
+            pass
+    return _ozlink_dragproof_saved_notify(self, receiver, event)
+
+
+def install_dragproof_qcoreapplication_notify_hook() -> None:
+    """Intercept QCoreApplication.notify once to log real drag event receivers (per-widget delivery)."""
+    global _ozlink_dragproof_saved_notify
+    from PySide6.QtWidgets import QApplication
+
+    if QApplication.instance() is None or getattr(QCoreApplication, "_ozlink_dragproof_notify_installed", False):
+        return
+    _ozlink_dragproof_saved_notify = QCoreApplication.notify
+    QCoreApplication.notify = _dragproof_qcore_notify
+    QCoreApplication._ozlink_dragproof_notify_installed = True
 
 
 def _dragtrace_global_pos_str(event) -> str:
@@ -792,6 +905,9 @@ class DestinationPlanningTreeWidget(QTreeWidget):
             cls="QTreeWidget",
             path=start_path[:200],
             mime_present=True,
+            initiator_tree_id=id(self),
+            initiator_viewport_id=id(self.viewport()),
+            **_dragproof_dest_ids_for_main_window(mw),
         )
         self._manual_drag_source_item = source_item
         self._dd_drag_active = True
@@ -1177,6 +1293,9 @@ class DestinationPlanningTreeView(QTreeView):
             cls="QTreeView",
             path=start_path[:200],
             mime_present=True,
+            initiator_tree_id=id(self),
+            initiator_viewport_id=id(self.viewport()),
+            **_dragproof_dest_ids_for_main_window(mw),
         )
         self._manual_drag_source_persistent = QPersistentModelIndex(source_index)
         self._dd_drag_active = True
@@ -1967,6 +2086,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        install_dragproof_qcoreapplication_notify_hook()
 
         self._base_window_title = "Ozlink IT – SharePoint File Relocation Console"
         self.setWindowTitle(self._base_window_title)
@@ -4090,6 +4210,13 @@ class MainWindow(QMainWindow):
         self.destination_local_fs_tree.selectionModel().selectionChanged.connect(
             lambda *_a: self.on_tree_selection_changed("destination")
         )
+        dragproof_log("tree_installed", self.destination_tree_widget)
+        dragproof_log(
+            "tree_shown",
+            self.destination_tree_widget,
+            browse_mode=self._planning_browse_mode("destination"),
+            reason="post_planning_panel_wiring",
+        )
         self.source_platform_combo.currentIndexChanged.connect(
             lambda _i: self._apply_planning_panel_platform("source", self.source_platform_combo.currentData())
         )
@@ -4768,6 +4895,7 @@ class MainWindow(QMainWindow):
             tree._ozlink_main_window = self
             if hasattr(tree, "proposedBranchMoveRequested"):
                 tree.proposedBranchMoveRequested.connect(self.handle_destination_manual_drag_move)
+            dragproof_log("tree_created", tree)
 
         local_tree = QTreeView()
         local_tree.setModel(local_model)
@@ -5027,6 +5155,16 @@ class MainWindow(QMainWindow):
         self._refresh_local_platform_root_label(panel_key)
         self.update_selector_context_labels()
         self.on_tree_selection_changed(panel_key)
+        if panel_key == "destination":
+            ts = self._destination_tree_stack
+            dragproof_log(
+                "tree_shown",
+                self.destination_tree_widget,
+                browse_mode=mode,
+                tree_stack_current=ts.currentIndex() if ts is not None else None,
+                reason="apply_planning_panel_platform",
+            )
+            dragproof_log("tree_shown_active", self._active_destination_tree_widget(), browse_mode=mode)
 
     def _refresh_local_platform_root_label(self, panel_key: str) -> None:
         label = (
@@ -19382,6 +19520,11 @@ class MainWindow(QMainWindow):
 
             QTimer.singleShot(0, _retry_bind)
             return None
+        dragproof_log(
+            "tree_rebound",
+            getattr(self, "destination_tree_widget", None),
+            hook="_bind_destination_tree_from_future_state_model",
+        )
         nodes = model.get("nodes") or {}
         if self._destination_future_bind_should_chunk_async(model, on_complete=on_complete):
             if on_complete is None:
