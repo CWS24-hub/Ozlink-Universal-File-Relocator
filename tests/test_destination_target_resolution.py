@@ -118,7 +118,7 @@ def test_paste_here_pins_context_row_without_target_path_scan():
 
     draft_args = {}
 
-    def draft(s, t):
+    def draft(s, t, **_kwargs):
         draft_args["source"] = s
         draft_args["target"] = t
 
@@ -153,6 +153,97 @@ def test_paste_here_nested_semantic_path_from_captured_payload():
     sem = mw._destination_row_semantic_path(nested)
     assert "Employee Hours" in sem.replace("/", "\\")
     assert "2025-26" in sem.replace("/", "\\")
+
+
+def test_paste_here_row_eligibility_allows_allocated_folder_container():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    pl = {
+        "is_folder": True,
+        "planned_allocation": True,
+        "node_origin": "PlannedAllocation",
+        "display_path": "Root\\Finance\\Employee Hours",
+        "item_path": "Root\\Finance\\Employee Hours",
+        "tree_role": "destination",
+    }
+    ok, reason = mw._paste_here_row_eligibility(pl)
+    assert ok
+    assert reason == "allowed_allocated_folder_container"
+    assert mw._paste_here_destination_row_allowed(pl) is True
+
+
+def test_paste_here_row_eligibility_normal_folder():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    pl = {
+        "is_folder": True,
+        "node_origin": "Real",
+        "display_path": "Root\\Finance\\Payroll",
+        "item_path": "Root\\Finance\\Payroll",
+        "tree_role": "destination",
+    }
+    ok, reason = mw._paste_here_row_eligibility(pl)
+    assert ok
+    assert reason == "allowed_normal_folder"
+
+
+def test_paste_here_row_eligibility_denies_projected_descendant():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    pl = {
+        "is_folder": True,
+        "node_origin": "projectedallocationdescendant",
+        "tree_role": "destination",
+    }
+    ok, reason = mw._paste_here_row_eligibility(pl)
+    assert not ok
+    assert "projected" in reason
+
+
+def test_handle_destination_draft_move_accepts_allocated_folder_only_for_paste_kwarg():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    src_ix = MagicMock()
+    tgt_ix = MagicMock()
+    alloc_folder = {
+        "is_folder": True,
+        "planned_allocation": True,
+        "node_origin": "PlannedAllocation",
+        "display_path": "Root\\A\\B",
+        "item_path": "Root\\A\\B",
+    }
+    source_node = {"name": "Item", "display_path": "Root\\S\\Item", "item_path": "Root\\S\\Item"}
+
+    def gdata(ix):
+        if ix is src_ix:
+            return source_node
+        if ix is tgt_ix:
+            return alloc_folder
+        return None
+
+    mw.get_tree_item_node_data = gdata
+    mw.node_is_proposed = lambda n: False
+    moved = []
+
+    def do_move(s, t):
+        moved.append(True)
+        return True
+
+    mw._move_planned_destination_node = do_move
+    mw.refresh_planned_moves_table = lambda: None
+    mw._schedule_deferred_destination_materialization = lambda *a, **k: None
+    mw._persist_planning_change = lambda *a, **k: None
+    mw.planned_moves_status = MagicMock()
+    mw.destination_tree_status = MagicMock()
+    mw.clear_selection_details = lambda: None
+    mw._perf_explorer_log = lambda *a, **k: None
+
+    mw.handle_destination_draft_move(src_ix, tgt_ix, _paste_here_target=True)
+    assert moved == [True]
+
+    moved.clear()
+    mw.handle_destination_draft_move(src_ix, tgt_ix)
+    assert moved == []
 
 
 def test_normalize_paste_destination_row_ref_column_zero():

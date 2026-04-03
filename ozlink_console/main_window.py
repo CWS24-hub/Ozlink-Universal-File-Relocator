@@ -24064,7 +24064,6 @@ class MainWindow(QMainWindow):
             paste_action.setEnabled(
                 bool(getattr(self, "_destination_cut_buffer", None))
                 and is_folder
-                and not is_planned_allocation
                 and not is_projected_descendant
                 and not is_local_fs_dest
             )
@@ -24662,7 +24661,7 @@ class MainWindow(QMainWindow):
         self._persist_planning_change("planned_item_moved")
         return True
 
-    def handle_destination_draft_move(self, source_item, target_item):
+    def handle_destination_draft_move(self, source_item, target_item, *, _paste_here_target=False):
         _perf_t = QElapsedTimer()
         _perf_d = is_dev_mode()
         if _perf_d:
@@ -24679,13 +24678,16 @@ class MainWindow(QMainWindow):
                     target_path_excerpt=str((target_node or {}).get("display_path", "") or "")[:160],
                     source_semantic=str(self._destination_row_semantic_path(source_node or {}) or "")[:240],
                     target_semantic=str(self._destination_row_semantic_path(target_node or {}) or "")[:240],
+                    paste_here_target=_paste_here_target,
                 )
             if not source_node or not target_node:
                 return
             if not target_node.get("is_folder"):
                 self.destination_tree_status.setText("Drop onto a destination folder.")
                 return
-            if self.node_is_planned_allocation(target_node):
+            if self.node_is_planned_allocation(target_node) and not (
+                _paste_here_target and bool(target_node.get("is_folder"))
+            ):
                 self.destination_tree_status.setText("Cannot move items under a planned allocation node.")
                 return
 
@@ -24837,22 +24839,27 @@ class MainWindow(QMainWindow):
             return None
         return ref
 
-    def _paste_here_destination_row_allowed(self, pl: dict) -> bool:
-        """Same eligibility as Paste Here in the destination context menu (paste-only)."""
+    def _paste_here_row_eligibility(self, pl: dict) -> tuple[bool, str]:
+        """Paste Here target eligibility and reason code (paste-only; used for logging)."""
         if not isinstance(pl, dict) or not pl:
-            return False
+            return False, "denied_empty_payload"
         if self._planning_browse_mode("destination") == "local":
-            return False
+            return False, "denied_local_browse"
         origin = str(pl.get("node_origin", "")).lower()
         if origin == "localfilesystem":
-            return False
+            return False, "denied_local_fs_row"
         if not bool(pl.get("is_folder")):
-            return False
-        if self.node_is_planned_allocation(pl):
-            return False
+            return False, "denied_not_folder"
         if origin == "projectedallocationdescendant":
-            return False
-        return True
+            return False, "denied_projected_descendant"
+        if self.node_is_planned_allocation(pl):
+            return True, "allowed_allocated_folder_container"
+        return True, "allowed_normal_folder"
+
+    def _paste_here_destination_row_allowed(self, pl: dict) -> bool:
+        """Same eligibility as Paste Here in the destination context menu (paste-only)."""
+        ok, _reason = self._paste_here_row_eligibility(pl)
+        return ok
 
     def handle_paste_destination_item(self, target_node, *, paste_target_item=None):
         _perf_t = QElapsedTimer()
@@ -24868,14 +24875,31 @@ class MainWindow(QMainWindow):
                 log_info("debug_pass_paste_destination", phase="start")
             ancestor_fallback = False
             paste_context_row_path_captured = ""
+            paste_row_type = "none"
+            paste_allowed_reason = ""
+            paste_denied_reason = ""
+            allocated_folder_paste_handling = False
             target_item = None
             ref = self._normalize_paste_destination_row_ref(paste_target_item)
             if ref is not None:
                 pl = self.get_tree_item_node_data(ref)
-                if pl and self._paste_here_destination_row_allowed(pl):
-                    target_node = pl
-                    target_item = ref
-                    paste_context_row_path_captured = self._destination_row_semantic_path(pl) or ""
+                if pl:
+                    ok_elig, elig_reason = self._paste_here_row_eligibility(pl)
+                    if self.node_is_planned_allocation(pl) and bool(pl.get("is_folder")):
+                        paste_row_type = "allocated_folder"
+                    elif bool(pl.get("is_folder")):
+                        paste_row_type = "normal_folder"
+                    else:
+                        paste_row_type = "non_folder"
+                    if ok_elig:
+                        paste_allowed_reason = elig_reason
+                    else:
+                        paste_denied_reason = elig_reason
+                    if ok_elig:
+                        target_node = pl
+                        target_item = ref
+                        paste_context_row_path_captured = self._destination_row_semantic_path(pl) or ""
+                        allocated_folder_paste_handling = paste_row_type == "allocated_folder"
             target_path = self._destination_row_semantic_path(target_node)
             if not target_path:
                 self.destination_tree_status.setText("Could not resolve the destination folder for paste.")
@@ -24885,15 +24909,27 @@ class MainWindow(QMainWindow):
             if target_item is None:
                 target_item = self._find_visible_destination_item_by_path(target_path)
                 ancestor_fallback = True
+            if paste_row_type == "none" and target_item is not None:
+                fp = self.get_tree_item_node_data(target_item) or {}
+                if self.node_is_planned_allocation(fp) and bool(fp.get("is_folder")):
+                    paste_row_type = "allocated_folder"
+                elif bool(fp.get("is_folder")):
+                    paste_row_type = "normal_folder"
             paste_target_row_path_committed = self._destination_row_semantic_path(
                 self.get_tree_item_node_data(target_item) or target_node or {}
             ) or target_path
+            if paste_row_type == "allocated_folder":
+                allocated_folder_paste_handling = True
             if is_dev_mode():
                 log_info(
                     "paste_here_row_resolution",
+                    paste_row_type=paste_row_type,
+                    paste_allowed_reason=paste_allowed_reason or "",
+                    paste_denied_reason=paste_denied_reason or "",
                     paste_context_row_path_captured=str(paste_context_row_path_captured)[:240],
                     paste_target_row_path_committed=str(paste_target_row_path_committed)[:240],
                     ancestor_fallback=ancestor_fallback,
+                    allocated_folder_paste_handling=allocated_folder_paste_handling,
                 )
                 self._log_destination_action_target(
                     "paste",
@@ -24918,7 +24954,7 @@ class MainWindow(QMainWindow):
                 self._destination_cut_buffer = None
                 return
 
-            self.handle_destination_draft_move(source_item, target_item)
+            self.handle_destination_draft_move(source_item, target_item, _paste_here_target=True)
             self._destination_cut_buffer = None
 
         finally:
