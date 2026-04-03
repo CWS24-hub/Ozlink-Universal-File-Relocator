@@ -47,6 +47,7 @@ from PySide6.QtCore import (
     QSettings,
     QUrl,
     QPoint,
+    QPointF,
     QEvent,
     QEventLoop,
     QElapsedTimer,
@@ -1812,6 +1813,111 @@ class _PerfExplorerTimer:
         return False
 
 
+class FramelessTitleBar(QWidget):
+    """Minimal desktop-style title strip (VS Code–like): drag, double-click maximize, sys buttons."""
+
+    def __init__(self, main_window: QMainWindow):
+        super().__init__(main_window)
+        self._main = main_window
+        self.setObjectName("FramelessTitleBar")
+        self.setFixedHeight(32)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        self._drag_anchor: QPointF | None = None
+        self._window_start_geo: QRect | None = None
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 0, 2, 0)
+        layout.setSpacing(8)
+
+        self._title_label = QLabel(main_window._base_window_title)
+        self._title_label.setObjectName("TitleBarCaptionLabel")
+        self._title_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        self._title_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self._title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        layout.addWidget(self._title_label, 1)
+
+        def _mk_btn(text: str, obj_name: str, tip: str) -> QPushButton:
+            b = QPushButton(text)
+            b.setObjectName(obj_name)
+            b.setFixedSize(46, 32)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+            b.setToolTip(tip)
+            return b
+
+        self._btn_min = _mk_btn("\u2014", "TitleBarSysButton", "Minimize")
+        self._btn_max = _mk_btn("\u25a1", "TitleBarSysButton", "Maximize")
+        self._btn_close = _mk_btn("\u2715", "TitleBarCloseButton", "Close")
+
+        self._btn_min.clicked.connect(self._main.showMinimized)
+        self._btn_max.clicked.connect(self._toggle_maximize)
+        self._btn_close.clicked.connect(self._main.close)
+
+        layout.addWidget(self._btn_min, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(self._btn_max, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(self._btn_close, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+    def _toggle_maximize(self):
+        if self._main.isMaximized():
+            self._main.showNormal()
+        else:
+            self._main.showMaximized()
+        self._sync_maximize_glyph()
+
+    def _sync_maximize_glyph(self):
+        if self._main.isMaximized():
+            self._btn_max.setText("\u29c9")
+            self._btn_max.setToolTip("Restore")
+        else:
+            self._btn_max.setText("\u25a1")
+            self._btn_max.setToolTip("Maximize")
+
+    def _is_on_sys_button(self, pos: QPoint) -> bool:
+        return any(
+            btn.geometry().contains(pos)
+            for btn in (self._btn_min, self._btn_max, self._btn_close)
+        )
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self._is_on_sys_button(event.position().toPoint()):
+                return super().mousePressEvent(event)
+            if self._main.isMaximized():
+                self._main.showNormal()
+            self._drag_anchor = event.globalPosition()
+            self._window_start_geo = self._main.frameGeometry()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (
+            event.buttons() & Qt.MouseButton.LeftButton
+            and self._drag_anchor is not None
+            and self._window_start_geo is not None
+        ):
+            delta = event.globalPosition() - self._drag_anchor
+            self._main.move(self._window_start_geo.topLeft() + delta.toPoint())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_anchor = None
+        self._window_start_geo = None
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self._is_on_sys_button(event.position().toPoint()):
+                return super().mouseDoubleClickEvent(event)
+            self._toggle_maximize()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
 class MainWindow(QMainWindow):
     @staticmethod
     def _source_tree_model_view_effective() -> bool:
@@ -1847,14 +1953,7 @@ class MainWindow(QMainWindow):
 
         self._base_window_title = "Ozlink IT – SharePoint File Relocation Console"
         self.setWindowTitle(self._base_window_title)
-        self.setWindowFlags(
-            Qt.Window
-            | Qt.WindowTitleHint
-            | Qt.WindowSystemMenuHint
-            | Qt.WindowMinimizeButtonHint
-            | Qt.WindowMaximizeButtonHint
-            | Qt.WindowCloseButtonHint
-        )
+        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         self.resize(1600, 980)
 
         self.graph = GraphClient()
@@ -2111,6 +2210,7 @@ class MainWindow(QMainWindow):
         self.root_layout.setContentsMargins(0, 0, 0, 0)
         self.root_layout.setSpacing(0)
 
+        self.build_custom_window_chrome()
         self.build_top_bar()
         self.build_main_area()
         self.build_bottom_status_bar()
@@ -2387,6 +2487,60 @@ class MainWindow(QMainWindow):
                 color: #ECEEF2;
                 font-family: "Segoe UI", "Segoe UI Variable", sans-serif;
                 font-size: 10pt;
+            }
+
+            QWidget#FramelessTitleBar {
+                background-color: #0b0f14;
+                border: none;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+            }
+
+            QLabel#TitleBarCaptionLabel {
+                color: rgba(236, 241, 247, 0.78);
+                font-size: 12px;
+                font-weight: 500;
+                letter-spacing: 0.01em;
+            }
+
+            QPushButton#TitleBarSysButton {
+                background-color: transparent;
+                border: none;
+                color: rgba(203, 213, 225, 0.9);
+                font-size: 11px;
+                font-weight: 500;
+                border-radius: 0px;
+                padding: 0px;
+                margin: 0px;
+            }
+
+            QPushButton#TitleBarSysButton:hover {
+                background-color: rgba(255, 255, 255, 0.08);
+                color: #f1f5f9;
+            }
+
+            QPushButton#TitleBarSysButton:pressed {
+                background-color: rgba(255, 255, 255, 0.05);
+            }
+
+            QPushButton#TitleBarCloseButton {
+                background-color: transparent;
+                border: none;
+                color: rgba(203, 213, 225, 0.9);
+                font-size: 12px;
+                font-weight: 500;
+                border-radius: 0px;
+                padding: 0px;
+                margin: 0px;
+            }
+
+            QPushButton#TitleBarCloseButton:hover {
+                background-color: #c42b1c;
+                color: #ffffff;
+            }
+
+            QPushButton#TitleBarCloseButton:pressed {
+                background-color: #a82518;
+                color: #ffffff;
             }
 
             QFrame#TopBar {
@@ -3059,6 +3213,11 @@ class MainWindow(QMainWindow):
                 background-color: rgba(56, 189, 248, 0.35);
             }
         """)
+
+    def build_custom_window_chrome(self):
+        self._custom_title_bar = FramelessTitleBar(self)
+        self._custom_window_title_label = self._custom_title_bar._title_label
+        self.root_layout.addWidget(self._custom_title_bar)
 
     def build_top_bar(self):
         self.top_bar = QFrame()
@@ -5137,6 +5296,9 @@ class MainWindow(QMainWindow):
         if status_text:
             title = f"{title} • {status_text}"
         self.setWindowTitle(title)
+        cap = getattr(self, "_custom_window_title_label", None)
+        if cap is not None:
+            cap.setText(title)
 
     def _collect_current_source_projection_paths(self):
         source_projection_paths = set(self._build_source_materialization_paths())
@@ -5474,6 +5636,95 @@ class MainWindow(QMainWindow):
         if not self._silent_graph_restore_scheduled:
             self._silent_graph_restore_scheduled = True
             self._schedule_safe_timer(200, "silent_graph_session_restore", self._begin_silent_graph_session_restore)
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.Type.WindowStateChange:
+            tb = getattr(self, "_custom_title_bar", None)
+            if tb is not None:
+                tb._sync_maximize_glyph()
+        super().changeEvent(event)
+
+    def nativeEvent(self, eventType, message):
+        if sys.platform != "win32":
+            return False, 0
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except ImportError:
+            return False, 0
+        et = eventType
+        if isinstance(et, QByteArray):
+            et = bytes(et)
+        elif not isinstance(et, (bytes, bytearray)):
+            return False, 0
+        if et != b"windows_generic_MSG":
+            return False, 0
+        WM_NCHITTEST = 0x0084
+        try:
+            msg = wintypes.MSG.from_address(int(message))
+        except (TypeError, ValueError, OSError):
+            return False, 0
+        if msg.message != WM_NCHITTEST:
+            return False, 0
+
+        lp = int(msg.lParam)
+        gx = lp & 0xFFFF
+        if gx >= 32768:
+            gx -= 65536
+        gy = (lp >> 16) & 0xFFFF
+        if gy >= 32768:
+            gy -= 65536
+        gpt = QPoint(int(gx), int(gy))
+        pos = self.mapFromGlobal(gpt)
+
+        menu_h = 0
+        mb = self.menuBar()
+        if mb is not None and mb.isVisible():
+            menu_h = mb.height()
+        if pos.y() < menu_h:
+            return False, 0
+
+        if self.isMaximized():
+            tb = getattr(self, "_custom_title_bar", None)
+            if tb is not None and not self._frameless_hit_sys_buttons_global(gpt):
+                tl = tb.mapTo(self, QPoint(0, 0))
+                if QRect(tl, tb.size()).contains(pos):
+                    return True, 2
+            return False, 0
+
+        edge = 6
+        w, h = self.width(), self.height()
+        on_left = pos.x() < edge
+        on_right = pos.x() >= w - edge
+        on_bottom = pos.y() >= h - edge
+        if on_bottom and on_left:
+            return True, 16
+        if on_bottom and on_right:
+            return True, 17
+        if on_left:
+            return True, 10
+        if on_right:
+            return True, 11
+        if on_bottom:
+            return True, 15
+
+        tb = getattr(self, "_custom_title_bar", None)
+        if tb is not None:
+            tl = tb.mapTo(self, QPoint(0, 0))
+            trect = QRect(tl, tb.size())
+            if trect.contains(pos):
+                if self._frameless_hit_sys_buttons_global(gpt):
+                    return False, 0
+                return True, 2
+
+        return False, 0
+
+    def _frameless_hit_sys_buttons_global(self, gpt: QPoint) -> bool:
+        tb = getattr(self, "_custom_title_bar", None)
+        if tb is None:
+            return False
+        local = tb.mapFromGlobal(gpt)
+        return tb._is_on_sys_button(local)
 
     def show(self):
         print("[window-startup] show() called")
@@ -7056,14 +7307,7 @@ class MainWindow(QMainWindow):
         return available_geometry.intersects(visible_rect)
 
     def _apply_native_window_flags(self):
-        self.setWindowFlags(
-            Qt.Window
-            | Qt.WindowTitleHint
-            | Qt.WindowSystemMenuHint
-            | Qt.WindowMinimizeButtonHint
-            | Qt.WindowMaximizeButtonHint
-            | Qt.WindowCloseButtonHint
-        )
+        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
 
     def _log_post_startup_state(self):
         print(
@@ -12628,7 +12872,8 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(max(0, int(delay_ms)), _run)
 
     def _refresh_source_projection_for_paths(self, paths, phase_name, trigger_path=""):
-        if self._expand_all_pending.get("source"):
+        _expand_pending = getattr(self, "_expand_all_pending", None) or {}
+        if _expand_pending.get("source"):
             self._source_projection_refresh_paths.update(paths or [])
             self._schedule_source_projection_refresh_for_paths(
                 paths or set(),
@@ -14856,6 +15101,201 @@ class MainWindow(QMainWindow):
 
     def _allocation_move_key(self, move):
         return self._allocation_projection_path(move)
+
+    def _rewrite_nonprimary_planned_moves_destination_prefix(
+        self, old_root: str, new_root: str, *, primary_move: dict | None
+    ) -> list[dict]:
+        """When a planned allocation relocates, rewrite other draft moves whose projection lived under old_root.
+
+        Keeps ``planned_moves`` / manifest / execution steps consistent for per-item rows under a moved folder branch.
+        """
+        out: list[dict] = []
+        if not isinstance(primary_move, dict):
+            primary_move = None
+        norm_old = (
+            self._canonical_destination_projection_path(self.normalize_memory_path(old_root))
+            or self.normalize_memory_path(old_root)
+        ).rstrip("\\")
+        norm_new = (
+            self._canonical_destination_projection_path(self.normalize_memory_path(new_root))
+            or self.normalize_memory_path(new_root)
+        ).rstrip("\\")
+        if not norm_old or not norm_new:
+            return out
+        old_cf = norm_old.casefold()
+        for m in self.planned_moves:
+            if primary_move is not None and m is primary_move:
+                continue
+            if self._is_move_submitted(m):
+                continue
+            proj = self._allocation_projection_path(m)
+            if not proj:
+                continue
+            proj_n = (
+                self._canonical_destination_projection_path(proj) or self.normalize_memory_path(proj)
+            ).rstrip("\\")
+            pcf = proj_n.casefold()
+            if pcf == old_cf:
+                rel_suffix = ""
+            elif pcf.startswith(old_cf + "\\"):
+                rel_suffix = proj_n[len(norm_old) + 1 :]
+            else:
+                continue
+            next_full = self.normalize_memory_path(f"{norm_new}\\{rel_suffix}") if rel_suffix else norm_new
+            segs = [x for x in next_full.split("\\") if x]
+            if not segs:
+                continue
+            parent_path = "\\".join(segs[:-1]) if len(segs) > 1 else ""
+            leaf = segs[-1]
+            m["destination_path"] = parent_path
+            m["target_name"] = leaf
+            m["destination_name"] = leaf
+            dest = m.get("destination")
+            if isinstance(dest, dict):
+                dest = dict(dest)
+                dest["display_path"] = next_full
+                dest["item_path"] = next_full
+                dest["destination_path"] = parent_path
+                dest["name"] = leaf
+                m["destination"] = dest
+            out.append(m)
+        return out
+
+    def _expand_source_projection_paths_for_move_network(self, move: dict) -> set[str]:
+        """Source tree paths to refresh so relationship / via labels match ``planned_moves`` for this row and descendants."""
+        paths: set[str] = set()
+        if not isinstance(move, dict):
+            return paths
+        src = move.get("source") if isinstance(move.get("source"), dict) else {}
+        root_raw = self._tree_item_path(src) or move.get("source_path", "")
+        canon = self._canonical_source_projection_path(root_raw)
+        if canon:
+            paths.add(canon)
+        if bool(src.get("is_folder")) and root_raw:
+            for other in self.planned_moves:
+                if other is move:
+                    continue
+                other_src = other.get("source") if isinstance(other.get("source"), dict) else {}
+                other_raw = self._tree_item_path(other_src) or other.get("source_path", "")
+                if not other_raw:
+                    continue
+                if self.source_item_path_is_descendant_of(other_raw, root_raw):
+                    op = self._canonical_source_projection_path(other_raw)
+                    if op:
+                        paths.add(op)
+        return paths
+
+    def _collect_source_projection_paths_under_destination_allocation_prefix(self, prefix: str) -> set[str]:
+        """Union of source projection roots for moves whose allocation projection is under ``prefix``."""
+        paths: set[str] = set()
+        norm = (
+            self._canonical_destination_projection_path(self.normalize_memory_path(prefix))
+            or self.normalize_memory_path(str(prefix or "").strip())
+        ).rstrip("\\")
+        if not norm:
+            return paths
+        pcf = norm.casefold()
+        for m in self.planned_moves:
+            proj = self._allocation_projection_path(m)
+            if not proj:
+                continue
+            proj_n = (
+                self._canonical_destination_projection_path(proj) or self.normalize_memory_path(proj)
+            ).rstrip("\\")
+            qcf = proj_n.casefold()
+            if qcf != pcf and not qcf.startswith(pcf + "\\"):
+                continue
+            paths |= self._expand_source_projection_paths_for_move_network(m)
+        return paths
+
+    def _finalize_destination_move_planning_consistency(
+        self,
+        primary_move: dict,
+        *,
+        rewritten_related: list[dict] | None,
+        old_destination_projection: str,
+        new_destination_projection: str,
+        table_refreshed: bool,
+        incremental_lightweight: bool,
+        from_manual_planning_drag: bool,
+    ) -> None:
+        """Invalidate path lookup caches, synchronously refresh affected source rows, emit MOVEAUDIT (dev, manual)."""
+        rewritten_related = rewritten_related or []
+        self._invalidate_projection_lookup_caches(bump_generation=False)
+        paths: set[str] = set()
+        paths |= self._expand_source_projection_paths_for_move_network(primary_move)
+        for m in rewritten_related:
+            paths |= self._expand_source_projection_paths_for_move_network(m)
+        normalized_paths = {self._canonical_source_projection_path(p) for p in paths if p}
+        normalized_paths.discard("")
+        source_traceability_updated = False
+        tw = getattr(self, "source_tree_widget", None)
+        if normalized_paths and tw is not None:
+            phase = (
+                "planned_destination_move_sync_light"
+                if incremental_lightweight
+                else "planned_destination_move_sync_heavy"
+            )
+            self._refresh_source_projection_for_paths(
+                normalized_paths,
+                phase,
+                trigger_path=sorted(normalized_paths, key=len)[0],
+            )
+            source_traceability_updated = True
+        if tw is not None:
+            tw.viewport().update()
+
+        if from_manual_planning_drag and is_dev_mode():
+            src_path = self._canonical_source_projection_path(
+                str(primary_move.get("source_path", "") or "").strip()
+            ) or self._canonical_source_projection_path(self._tree_item_path(primary_move.get("source") or {}))
+            log_info(
+                "MOVEAUDIT",
+                source_path=str(src_path or "")[:500],
+                old_destination_path=str(old_destination_projection or "")[:500],
+                new_destination_path=str(new_destination_projection or "")[:500],
+                affected_record_count=int(1 + len(rewritten_related)),
+                planned_move_map_updated=True,
+                source_traceability_updated=source_traceability_updated,
+                planned_moves_table_updated=bool(table_refreshed),
+                execution_state_updated=True,
+                descendant_count=int(len(rewritten_related)),
+                incremental_lightweight=bool(incremental_lightweight),
+            )
+
+    def _sync_planning_after_proposed_branch_destination_relocate(
+        self, paths_to_refresh: set, *, old_path: str, new_path: str, table_refreshed: bool = False
+    ) -> None:
+        """After :meth:`_rewrite_proposed_branch_runtime_paths`, refresh source relationship state synchronously."""
+        self._invalidate_projection_lookup_caches(bump_generation=False)
+        normalized = {self._canonical_source_projection_path(p) for p in (paths_to_refresh or set()) if p}
+        normalized.discard("")
+        tw = getattr(self, "source_tree_widget", None)
+        trace_updated = False
+        if normalized and tw is not None:
+            self._refresh_source_projection_for_paths(
+                normalized,
+                "proposed_branch_destination_relocate",
+                trigger_path=sorted(normalized, key=len)[0],
+            )
+            trace_updated = True
+        if tw is not None:
+            tw.viewport().update()
+        if is_dev_mode():
+            log_info(
+                "MOVEAUDIT",
+                kind="proposed_branch_relocate",
+                source_path="",
+                old_destination_path=str(old_path or "")[:500],
+                new_destination_path=str(new_path or "")[:500],
+                affected_record_count=int(len(normalized)),
+                planned_move_map_updated=True,
+                source_traceability_updated=trace_updated,
+                planned_moves_table_updated=bool(table_refreshed),
+                execution_state_updated=True,
+                descendant_count=0,
+                incremental_lightweight=True,
+            )
 
     def _pilot_norm_destination_identity(self, path: str) -> str:
         """Canonical destination path for pilot pickers (matches dialog _norm_identity_dir)."""
@@ -25989,6 +26429,21 @@ class MainWindow(QMainWindow):
             self.planned_moves.append(override_move)
             self.planned_moves_status.setText("Planned item moved.")
             self.refresh_planned_moves_table()
+            old_dest_audit = str(
+                self._allocation_projection_path(inherited_move)
+                or self._move_destination_target_path(inherited_move)
+                or ""
+            )[:500]
+            new_dest_audit = str(self._allocation_projection_path(override_move) or "")[:500]
+            self._finalize_destination_move_planning_consistency(
+                override_move,
+                rewritten_related=[],
+                old_destination_projection=old_dest_audit,
+                new_destination_projection=new_dest_audit,
+                table_refreshed=True,
+                incremental_lightweight=False,
+                from_manual_planning_drag=from_manual_planning_drag,
+            )
             self._schedule_deferred_destination_materialization("planned_item_moved", delay_ms=220)
             self._persist_planning_change("planned_item_moved")
             return True
@@ -25999,6 +26454,23 @@ class MainWindow(QMainWindow):
         move["destination"] = dict(destination_node)
         move["target_name"] = target_name
 
+        new_proj = self._allocation_projection_path(move)
+        if old_snap:
+            old_proj = self._allocation_projection_path(old_snap)
+        else:
+            old_proj = (
+                self._canonical_destination_projection_path(current_projection_path)
+                or self.normalize_memory_path(current_projection_path)
+            )
+        rewritten_related: list[dict] = []
+        if old_proj and new_proj:
+            o = str(old_proj).rstrip("\\").casefold()
+            n = str(new_proj).rstrip("\\").casefold()
+            if o != n:
+                rewritten_related = self._rewrite_nonprimary_planned_moves_destination_prefix(
+                    str(old_proj).rstrip("\\"), str(new_proj).rstrip("\\"), primary_move=move
+                )
+
         self.planned_moves_status.setText("Planned item moved.")
 
         incremental_kind = ""
@@ -26007,6 +26479,7 @@ class MainWindow(QMainWindow):
         elif from_manual_planning_drag:
             incremental_kind = "manual"
 
+        move_perf_timer = None
         if incremental_kind and move is not None:
             move_perf_timer = QElapsedTimer()
             move_perf_timer.start()
@@ -26043,6 +26516,15 @@ class MainWindow(QMainWindow):
                 )
             if quick_path_ok:
                 self.refresh_planned_moves_table()
+                self._finalize_destination_move_planning_consistency(
+                    move,
+                    rewritten_related=rewritten_related,
+                    old_destination_projection=str(old_proj or "")[:500],
+                    new_destination_projection=str(new_proj or "")[:500],
+                    table_refreshed=True,
+                    incremental_lightweight=True,
+                    from_manual_planning_drag=from_manual_planning_drag,
+                )
                 self._bump_destination_materialized_overlay_fingerprint(
                     phase="paste_touch_reapply",
                     first_render_path="_reapply_allocation_overlays_for_paste_touch_paths",
@@ -26067,11 +26549,20 @@ class MainWindow(QMainWindow):
                         rebind_called=False,
                         touch_reapply_total=touch_reapply_total,
                         scrubbed_projection_nodes=scrubbed,
-                        elapsed_ms=move_perf_timer.elapsed(),
+                        elapsed_ms=move_perf_timer.elapsed() if move_perf_timer is not None else 0,
                     )
                 return True
 
         self.refresh_planned_moves_table()
+        self._finalize_destination_move_planning_consistency(
+            move,
+            rewritten_related=rewritten_related,
+            old_destination_projection=str(old_proj or "")[:500],
+            new_destination_projection=str(new_proj or "")[:500],
+            table_refreshed=True,
+            incremental_lightweight=False,
+            from_manual_planning_drag=from_manual_planning_drag,
+        )
         self._schedule_deferred_destination_materialization("planned_item_moved", delay_ms=220)
         self._persist_planning_change("planned_item_moved")
         if from_manual_planning_drag and move is not None:
@@ -26088,7 +26579,7 @@ class MainWindow(QMainWindow):
                 refinalise_called=True,
                 rebind_called=True,
                 incremental_touch_failed=touch_failed,
-                elapsed_ms=move_perf_timer.elapsed(),
+                elapsed_ms=move_perf_timer.elapsed() if move_perf_timer is not None else 0,
             )
         return True
 
@@ -26349,6 +26840,9 @@ class MainWindow(QMainWindow):
                         return
                     original_parent = source_item.parent()
                     source_was_expanded = tree.isExpanded(source_item)
+                    proposed_reloc_sync_paths = self._collect_source_projection_paths_under_destination_allocation_prefix(
+                        source_path
+                    )
                     self._rewrite_proposed_branch_runtime_paths(source_path, new_path)
                     nested = model.remove_node_at(source_item)
                     if nested is None:
@@ -26373,6 +26867,13 @@ class MainWindow(QMainWindow):
                             )
                         tree.setCurrentIndex(new_child_ix)
                     self.destination_tree_status.setText("Proposed folder moved.")
+                    self.refresh_planned_moves_table()
+                    self._sync_planning_after_proposed_branch_destination_relocate(
+                        proposed_reloc_sync_paths,
+                        old_path=source_path,
+                        new_path=new_path,
+                        table_refreshed=True,
+                    )
                     self._persist_planning_change_lightweight()
                     self.on_tree_selection_changed("destination")
                     return
@@ -26380,6 +26881,9 @@ class MainWindow(QMainWindow):
                 original_parent = source_item.parent()
                 source_was_expanded = source_item.isExpanded()
 
+                proposed_reloc_sync_paths = self._collect_source_projection_paths_under_destination_allocation_prefix(
+                    source_path
+                )
                 self._rewrite_proposed_branch_runtime_paths(source_path, new_path)
                 if original_parent is not None:
                     original_parent.removeChild(source_item)
@@ -26397,6 +26901,13 @@ class MainWindow(QMainWindow):
                 self.destination_tree_widget.setCurrentItem(source_item)
                 source_item.setSelected(True)
                 self.destination_tree_status.setText("Proposed folder moved.")
+                self.refresh_planned_moves_table()
+                self._sync_planning_after_proposed_branch_destination_relocate(
+                    proposed_reloc_sync_paths,
+                    old_path=source_path,
+                    new_path=new_path,
+                    table_refreshed=True,
+                )
                 self._persist_planning_change_lightweight()
                 self.on_tree_selection_changed("destination")
                 return
