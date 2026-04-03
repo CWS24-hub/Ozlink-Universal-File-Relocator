@@ -195,17 +195,34 @@ def test_paste_here_row_eligibility_normal_folder():
     assert reason == "allowed_normal_folder"
 
 
-def test_paste_here_row_eligibility_denies_projected_descendant():
+def test_paste_here_row_eligibility_allows_projected_allocation_descendant_folder():
     _qapp()
     mw = MainWindow.__new__(MainWindow)
     pl = {
         "is_folder": True,
         "node_origin": "projectedallocationdescendant",
+        "planned_allocation_descendant": True,
+        "display_path": r"Root\Finance\Employee Hours\2025-26",
+        "item_path": r"Root\Finance\Employee Hours\2025-26",
+        "tree_role": "destination",
+    }
+    ok, reason = mw._paste_here_row_eligibility(pl)
+    assert ok
+    assert reason == "allowed_allocation_descendant_folder"
+
+
+def test_paste_here_row_eligibility_denies_projected_descendant_file():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    pl = {
+        "is_folder": False,
+        "node_origin": "projectedallocationdescendant",
+        "planned_allocation_descendant": True,
         "tree_role": "destination",
     }
     ok, reason = mw._paste_here_row_eligibility(pl)
     assert not ok
-    assert "projected" in reason
+    assert reason == "denied_not_folder"
 
 
 def test_handle_destination_draft_move_accepts_allocated_folder_for_organization():
@@ -917,7 +934,8 @@ def test_manual_drop_allows_allocated_folder_container():
     assert meta["resolved_target_path"]
 
 
-def test_manual_drop_rejects_projected_allocation_descendant_folder_row():
+def test_manual_drop_allows_projected_allocation_descendant_folder_on_item():
+    """Visible allocation-projected descendant folders (e.g. 2025-26) are valid OnItem targets."""
     _qapp()
     model = DestinationPlanningTreeModel(destination_index_key_fn=_dest_key)
     model.reset_root_payloads(
@@ -926,10 +944,39 @@ def test_manual_drop_rejects_projected_allocation_descendant_folder_row():
                 "base_display_label": "Proj",
                 "name": "Proj",
                 "is_folder": True,
-                "item_path": r"Root\Proj",
-                "display_path": r"Root\Proj",
+                "item_path": r"Root\Parent\2025-26",
+                "display_path": r"Root\Parent\2025-26",
                 "tree_role": "destination",
                 "node_origin": "projectedallocationdescendant",
+                "planned_allocation_descendant": True,
+            }
+        ]
+    )
+    ix = model.index(0, 0, QModelIndex())
+    mw = MainWindow.__new__(MainWindow)
+    commit_ix, meta = mw._resolve_destination_manual_drop_folder_index(
+        ix, QAbstractItemView.DropIndicatorPosition.OnItem
+    )
+    assert commit_ix == ix
+    assert meta["drop_rejected_reason"] == ""
+    assert meta["resolved_target_path"]
+    assert meta["indicator_mode"] == "on_folder"
+
+
+def test_manual_drop_rejects_projected_allocation_descendant_file_row():
+    _qapp()
+    model = DestinationPlanningTreeModel(destination_index_key_fn=_dest_key)
+    model.reset_root_payloads(
+        [
+            {
+                "base_display_label": "f.txt",
+                "name": "f.txt",
+                "is_folder": False,
+                "item_path": r"Root\Parent\f.txt",
+                "display_path": r"Root\Parent\f.txt",
+                "tree_role": "destination",
+                "node_origin": "projectedallocationdescendant",
+                "planned_allocation_descendant": True,
             }
         ]
     )
@@ -939,7 +986,98 @@ def test_manual_drop_rejects_projected_allocation_descendant_folder_row():
         ix, QAbstractItemView.DropIndicatorPosition.OnItem
     )
     assert commit_ix is None
-    assert meta["drop_rejected_reason"] == "target_not_eligible"
+    assert meta["drop_rejected_reason"] == "file_row_top_level"
+
+
+def test_manual_drop_nested_allocation_descendant_folder_on_item():
+    _qapp()
+    parent = {
+        "base_display_label": "EH",
+        "name": "Employee Hours",
+        "is_folder": True,
+        "item_path": r"Root\Finance\Employee Hours",
+        "display_path": r"Root\Finance\Employee Hours",
+        "planned_allocation": True,
+        "node_origin": "PlannedAllocation",
+        "tree_role": "destination",
+    }
+    child = {
+        "base_display_label": "2025-26",
+        "name": "2025-26",
+        "is_folder": True,
+        "item_path": r"Root\Finance\Employee Hours\2025-26",
+        "display_path": r"Root\Finance\Employee Hours\2025-26",
+        "node_origin": "projectedallocationdescendant",
+        "planned_allocation_descendant": True,
+        "tree_role": "destination",
+    }
+    model = DestinationPlanningTreeModel(destination_index_key_fn=_dest_key)
+    model.reset_root_payloads([parent])
+    p_ix = model.index(0, 0, QModelIndex())
+    model.replace_all_children(p_ix, [child])
+    child_ix = model.index(0, 0, p_ix)
+    mw = MainWindow.__new__(MainWindow)
+    commit_ix, meta = mw._resolve_destination_manual_drop_folder_index(
+        child_ix, QAbstractItemView.DropIndicatorPosition.OnItem
+    )
+    assert commit_ix == child_ix
+    assert meta["drop_rejected_reason"] == ""
+    assert r"Root\Finance\Employee Hours\2025-26" in (meta["resolved_target_path"] or "").replace("/", "\\")
+
+
+def test_manual_planning_drag_nested_descendant_folder_hover_overlay_matches_commit_qtreeview():
+    _qapp()
+    parent = {
+        "base_display_label": "EH",
+        "name": "Employee Hours",
+        "is_folder": True,
+        "item_path": r"Root\Finance\Employee Hours",
+        "display_path": r"Root\Finance\Employee Hours",
+        "planned_allocation": True,
+        "node_origin": "PlannedAllocation",
+        "tree_role": "destination",
+    }
+    child = {
+        "base_display_label": "2025-26",
+        "name": "2025-26",
+        "is_folder": True,
+        "item_path": r"Root\Finance\Employee Hours\2025-26",
+        "display_path": r"Root\Finance\Employee Hours\2025-26",
+        "node_origin": "projectedallocationdescendant",
+        "planned_allocation_descendant": True,
+        "tree_role": "destination",
+    }
+    model = DestinationPlanningTreeModel(destination_index_key_fn=_dest_key)
+    model.reset_root_payloads([_proposed_src_payload(), parent])
+    parent_top_ix = model.index(1, 0, QModelIndex())
+    model.replace_all_children(parent_top_ix, [child])
+    child_ix = model.index(0, 0, parent_top_ix)
+    tree = DestinationPlanningTreeView()
+    tree.setModel(model)
+    mw = MainWindow.__new__(MainWindow)
+    tree._ozlink_main_window = mw
+    tree.resize(720, 520)
+    tree.show()
+    tree.expandAll()
+    QApplication.processEvents()
+    assert tree.visualRect(child_ix).isValid()
+
+    src_ix = model.index(0, 0, QModelIndex())
+    p0 = tree.visualRect(src_ix).center()
+    p1 = tree.visualRect(child_ix).center()
+    dist = QApplication.startDragDistance()
+    _send_vp_mouse(tree, QEvent.Type.MouseButtonPress, p0)
+    _send_vp_mouse(
+        tree,
+        QEvent.Type.MouseMove,
+        p0 + QPoint(dist + 40, 0),
+        button=Qt.MouseButton.NoButton,
+        buttons=Qt.MouseButton.LeftButton,
+    )
+    tree._planning_manual_update_hover_view(p1)
+    expected = QModelIndex(tree._dd_overlay_commit)
+    assert expected.isValid()
+    assert expected.siblingAtColumn(0) == child_ix
 
 
 def test_manual_planning_drag_mime_is_registered_on_mimedata():
@@ -1256,17 +1394,18 @@ def test_manual_planning_drag_hover_overlay_matches_allocated_folder_omit_is_fol
 
 
 def test_manual_planning_drag_invalid_target_rejects_qtreeview():
+    """Top-level file row: no parent folder to commit into."""
     tree, model, _mw = _planning_view_for_manual_drag(
         [
             _proposed_src_payload(),
             {
-                "base_display_label": "Proj",
-                "name": "Proj",
-                "is_folder": True,
-                "item_path": r"Root\Proj",
-                "display_path": r"Root\Proj",
+                "base_display_label": "onlyfile.txt",
+                "name": "onlyfile.txt",
+                "is_folder": False,
+                "item_path": r"Root\onlyfile.txt",
+                "display_path": r"Root\onlyfile.txt",
                 "tree_role": "destination",
-                "node_origin": "projectedallocationdescendant",
+                "node_origin": "Real",
             },
         ]
     )
