@@ -14611,6 +14611,12 @@ class MainWindow(QMainWindow):
         if self.node_is_planned_allocation(node_data):
             self._apply_tree_item_visual_state(item, node_data)
             self._refresh_destination_item_visibility(item)
+            if bool(node_data.get("is_folder", True)):
+                self._dev_log_destination_folder_allocation_lifecycle(
+                    "folder_allocation_badge_refresh_only",
+                    self._tree_item_path(node_data),
+                    source="_ensure_planned_allocation_overlay_on_real_item",
+                )
             return
 
         parent_data = parent_item.data(0, Qt.UserRole) or {}
@@ -14641,6 +14647,12 @@ class MainWindow(QMainWindow):
         else:
             item.setChildIndicatorPolicy(QTreeWidgetItem.DontShowIndicator)
         self._refresh_destination_item_visibility(item)
+        if is_folder:
+            self._dev_log_destination_folder_allocation_lifecycle(
+                "folder_allocation_badge_attached",
+                projection_path,
+                source="_ensure_planned_allocation_overlay_on_real_item",
+            )
 
     def _ensure_planned_allocation_overlay_on_real_model_index(self, parent_ix, child_ix, move):
         model = getattr(self, "destination_planning_model", None)
@@ -14656,6 +14668,12 @@ class MainWindow(QMainWindow):
 
             model.update_payload_for_index(child_ix, _m_same)
             self._refresh_destination_item_visibility_index(child_ix)
+            if bool(node_data.get("is_folder", True)):
+                self._dev_log_destination_folder_allocation_lifecycle(
+                    "folder_allocation_badge_refresh_only",
+                    self._tree_item_path(node_data),
+                    source="_ensure_planned_allocation_overlay_on_real_model_index",
+                )
             return
         parent_data = parent_ix.data(Qt.UserRole) or {}
         parent_path = self._tree_item_path(parent_data)
@@ -14685,6 +14703,12 @@ class MainWindow(QMainWindow):
 
         model.update_payload_for_index(child_ix, _m)
         self._refresh_destination_item_visibility_index(child_ix)
+        if is_folder:
+            self._dev_log_destination_folder_allocation_lifecycle(
+                "folder_allocation_badge_attached",
+                projection_path,
+                source="_ensure_planned_allocation_overlay_on_real_model_index",
+            )
 
     def _build_allocation_tree_node(self, move, parent_data):
         source_node = move.get("source", {})
@@ -14733,6 +14757,12 @@ class MainWindow(QMainWindow):
             node_state="allocated",
             created_virtual=True,
         )
+        if is_folder:
+            self._dev_log_destination_folder_allocation_lifecycle(
+                "folder_allocation_virtual_row_built",
+                projection_path,
+                source="_build_allocation_tree_node",
+            )
         return node
 
     def _build_allocation_payload(self, move, parent_data):
@@ -16335,6 +16365,7 @@ class MainWindow(QMainWindow):
                 last_render_path="_finish_destination_future_async_projection",
                 visible_future_branch_count=visible_future_branch_count,
             )
+            self._dev_log_watch_folder_badge_owners("_finish_destination_future_async_projection")
 
     def _run_destination_future_projection_chunk(self):
         state = self._destination_future_projection_async_state
@@ -16576,6 +16607,58 @@ class MainWindow(QMainWindow):
         self._refresh_destination_real_tree_snapshot(force=True)
         return self._destination_overlay_fingerprint_context(False)[3]
 
+    def _dev_log_destination_folder_allocation_lifecycle(self, phase: str, path_hint: str, *, source: str) -> None:
+        if not is_dev_mode():
+            return
+        ex = str(path_hint or "").replace("\n", " ")[:180]
+        low = ex.casefold()
+        log_info(
+            "destination_allocation_folder_lifecycle",
+            phase=phase,
+            path_excerpt=ex,
+            watch_row=any(x in low for x in ("100gopro", "employee hours")),
+            source=source,
+        )
+
+    def _dev_log_watch_folder_badge_owners(self, context: str) -> None:
+        """Dev-only: sample rows whose path contains known folder container names from manual QA."""
+        if not is_dev_mode():
+            return
+        tree = getattr(self, "destination_tree_widget", None)
+        if tree is None or tree.topLevelItemCount() <= 0:
+            log_info(
+                "destination_allocation_folder_lifecycle",
+                phase="final_watch_folder_badge_probe",
+                context=context,
+                rows=[],
+            )
+            return
+        watches = ("100GOPRO", "Employee Hours")
+        rows = []
+        for ti in range(tree.topLevelItemCount()):
+            root = tree.topLevelItem(ti)
+            for item in self._iter_tree_items(root):
+                nd = item.data(0, Qt.UserRole) or {}
+                if not isinstance(nd, dict):
+                    continue
+                sp = self._destination_row_semantic_path(nd) or ""
+                if not sp or not any(w in sp for w in watches):
+                    continue
+                label = str(nd.get("base_display_label", "") or item.text(0) or "")[:120]
+                rows.append(
+                    {
+                        "path": sp[:200],
+                        "has_allocated_tag": "[Allocated]" in label,
+                        "planned_allocation": bool(nd.get("planned_allocation")),
+                    }
+                )
+        log_info(
+            "destination_allocation_folder_lifecycle",
+            phase="final_watch_folder_badge_probe",
+            context=context,
+            rows=rows[:16],
+        )
+
     def _destination_materialize_reason_may_skip_without_interrupting_async(self, reason: str) -> bool:
         r = str(reason or "")
         if r in _DESTINATION_MATERIALIZE_BENIGN_SECOND_PASS_REASONS:
@@ -16603,19 +16686,42 @@ class MainWindow(QMainWindow):
             )
 
     def _try_skip_redundant_destination_future_model_materialize(self, reason) -> int | None:
-        """If overlay fingerprint matches last materialization, skip a redundant bind (preserve async projection)."""
+        """If overlay fingerprint matches last materialization, skip a redundant bind (preserve async projection).
+
+        Only *benign* second-pass reasons may skip. Non-benign reasons may cancel in-flight descendant
+        projection; they must never hit a fp-based skip afterward or we drop the full rebind that
+        restores folder-level [Allocated] chrome on real rows.
+        """
         tree = getattr(self, "destination_tree_widget", None)
         if tree is None or self._planning_tree_top_level_count(tree) <= 0:
             return None
+        r = str(reason or "")
+        benign = self._destination_materialize_reason_may_skip_without_interrupting_async(r)
         try:
             current_full_fp = self._current_destination_full_overlay_fingerprint()
         except Exception:
             current_full_fp = ""
         last_fp = str(getattr(self, "_destination_last_materialized_overlay_fp", "") or "")
-        if not current_full_fp or not last_fp or current_full_fp != last_fp:
-            return None
+        fp_match = bool(current_full_fp and last_fp and current_full_fp == last_fp)
         async_on = getattr(self, "_destination_future_projection_async_state", None) is not None
-        if async_on and not self._destination_materialize_reason_may_skip_without_interrupting_async(str(reason or "")):
+        if is_dev_mode() and fp_match and not benign:
+            log_info(
+                "destination_double_render_guard",
+                phase="redundant_skip_declined_non_benign",
+                incoming_reason=r,
+                fp_match=True,
+                note="full_materialize_required_after_possible_async_cancel",
+            )
+        if not fp_match:
+            if is_dev_mode() and benign:
+                log_info(
+                    "destination_double_render_guard",
+                    phase="materialize_allowed_fp_mismatch",
+                    incoming_reason=r,
+                    fp_match=False,
+                )
+            return None
+        if not benign:
             return None
         visible_future_branch_count = self._count_visible_destination_future_state_nodes()
         if is_dev_mode():
@@ -16623,7 +16729,7 @@ class MainWindow(QMainWindow):
                 "destination_double_render_guard",
                 phase="redundant_materialize_skipped",
                 first_render_path="visible_tree_matches_overlay_fp",
-                second_scheduled_reason=str(reason or ""),
+                second_scheduled_reason=r,
                 async_projection_preserved=async_on,
                 skipped=True,
                 visible_future_branch_count=visible_future_branch_count,
@@ -18669,6 +18775,7 @@ class MainWindow(QMainWindow):
                     last_render_path="_complete_full_destination_bind",
                     visible_future_branch_count=applied_count,
                 )
+                self._dev_log_watch_folder_badge_owners("_complete_full_destination_bind")
 
         bind_out = self._bind_destination_tree_from_future_state_model(
             model,

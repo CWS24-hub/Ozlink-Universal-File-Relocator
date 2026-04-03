@@ -459,6 +459,33 @@ def test_try_skip_redundant_destination_materialize_none_when_async_and_non_beni
     assert out is None
 
 
+def test_try_skip_redundant_non_benign_never_skips_when_fp_matches_without_async():
+    """Non-benign materialize must run full rebind if needed; fp match alone is not enough."""
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    mw.destination_tree_widget = MagicMock()
+    mw._planning_tree_top_level_count = lambda _t: 1
+    mw._destination_last_materialized_overlay_fp = "samefp"
+    mw._current_destination_full_overlay_fingerprint = lambda: "samefp"
+    mw._destination_future_projection_async_state = None
+    out = mw._try_skip_redundant_destination_future_model_materialize("planned_item_moved")
+    assert out is None
+
+
+def test_try_skip_redundant_skips_when_benign_fp_matches_without_async():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    mw.destination_tree_widget = MagicMock()
+    mw._planning_tree_top_level_count = lambda _t: 1
+    mw._destination_last_materialized_overlay_fp = "x"
+    mw._current_destination_full_overlay_fingerprint = lambda: "x"
+    mw._destination_future_projection_async_state = None
+    mw._count_visible_destination_future_state_nodes = lambda: 4
+    mw._log_restore_phase = lambda *a, **kwargs: None
+    mw._set_tree_status_message = lambda *a, **k: None
+    assert mw._try_skip_redundant_destination_future_model_materialize("source_folder_load_success") == 4
+
+
 def test_try_skip_redundant_destination_materialize_none_when_fp_mismatch():
     _qapp()
     mw = MainWindow.__new__(MainWindow)
