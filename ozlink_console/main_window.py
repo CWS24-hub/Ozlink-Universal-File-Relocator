@@ -373,6 +373,18 @@ def _dragtrace_proposed_int(event):
         return None
 
 
+def _qt_drop_action_to_int(action) -> int | None:
+    """PySide6 drag.exec() may return DropAction enum; int() on it raises on some Python/Qt stacks."""
+    if action is None:
+        return None
+    try:
+        if hasattr(action, "value"):
+            return int(action.value)
+        return int(action)
+    except Exception:
+        return None
+
+
 class _DestinationDragTraceEventFilter(QObject):
     """Temporary: log drag-related events on tree and children; never consumes events."""
 
@@ -784,7 +796,7 @@ class DestinationPlanningTreeWidget(QTreeWidget):
             cls="QTreeWidget",
             path=start_path[:200],
             mime_present=True,
-            exec_return=int(exec_result),
+            exec_return=_qt_drop_action_to_int(exec_result),
         )
         self._dd_drag_active = False
         self._manual_drag_source_item = None
@@ -1169,7 +1181,7 @@ class DestinationPlanningTreeView(QTreeView):
             cls="QTreeView",
             path=start_path[:200],
             mime_present=True,
-            exec_return=int(exec_result),
+            exec_return=_qt_drop_action_to_int(exec_result),
         )
         self._dd_drag_active = False
         self._manual_drag_source_persistent = QPersistentModelIndex()
