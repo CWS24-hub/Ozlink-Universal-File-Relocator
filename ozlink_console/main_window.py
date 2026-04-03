@@ -24068,7 +24068,11 @@ class MainWindow(QMainWindow):
                 and not is_projected_descendant
                 and not is_local_fs_dest
             )
-            paste_action.triggered.connect(lambda: self.handle_paste_destination_item(node_data))
+            paste_action.triggered.connect(
+                lambda _=False, nd=dict(node_data), pit=item: self.handle_paste_destination_item(
+                    nd, paste_target_item=pit
+                )
+            )
 
             menu.addSeparator()
 
@@ -24823,7 +24827,34 @@ class MainWindow(QMainWindow):
             if _perf_d:
                 _perf_explorer_log("handle_cut_destination_item", elapsed_ms=_perf_t.elapsed())
 
-    def handle_paste_destination_item(self, target_node):
+    def _normalize_paste_destination_row_ref(self, ref):
+        """Column-0 QModelIndex or QTreeWidgetItem for Paste Here only (context-menu capture)."""
+        if ref is None:
+            return None
+        if self._destination_tree_uses_model_view():
+            if isinstance(ref, QModelIndex) and ref.isValid():
+                return ref.siblingAtColumn(0) if ref.column() != 0 else ref
+            return None
+        return ref
+
+    def _paste_here_destination_row_allowed(self, pl: dict) -> bool:
+        """Same eligibility as Paste Here in the destination context menu (paste-only)."""
+        if not isinstance(pl, dict) or not pl:
+            return False
+        if self._planning_browse_mode("destination") == "local":
+            return False
+        origin = str(pl.get("node_origin", "")).lower()
+        if origin == "localfilesystem":
+            return False
+        if not bool(pl.get("is_folder")):
+            return False
+        if self.node_is_planned_allocation(pl):
+            return False
+        if origin == "projectedallocationdescendant":
+            return False
+        return True
+
+    def handle_paste_destination_item(self, target_node, *, paste_target_item=None):
         _perf_t = QElapsedTimer()
         _perf_d = is_dev_mode()
         if _perf_d:
@@ -24835,20 +24866,42 @@ class MainWindow(QMainWindow):
                 return
             if is_dev_mode():
                 log_info("debug_pass_paste_destination", phase="start")
+            ancestor_fallback = False
+            paste_context_row_path_captured = ""
+            target_item = None
+            ref = self._normalize_paste_destination_row_ref(paste_target_item)
+            if ref is not None:
+                pl = self.get_tree_item_node_data(ref)
+                if pl and self._paste_here_destination_row_allowed(pl):
+                    target_node = pl
+                    target_item = ref
+                    paste_context_row_path_captured = self._destination_row_semantic_path(pl) or ""
             target_path = self._destination_row_semantic_path(target_node)
             if not target_path:
                 self.destination_tree_status.setText("Could not resolve the destination folder for paste.")
                 return
+            if target_item is None:
+                target_item = self._destination_tree_index_if_current_matches_path(target_path)
+            if target_item is None:
+                target_item = self._find_visible_destination_item_by_path(target_path)
+                ancestor_fallback = True
+            paste_target_row_path_committed = self._destination_row_semantic_path(
+                self.get_tree_item_node_data(target_item) or target_node or {}
+            ) or target_path
             if is_dev_mode():
+                log_info(
+                    "paste_here_row_resolution",
+                    paste_context_row_path_captured=str(paste_context_row_path_captured)[:240],
+                    paste_target_row_path_committed=str(paste_target_row_path_committed)[:240],
+                    ancestor_fallback=ancestor_fallback,
+                )
                 self._log_destination_action_target(
                     "paste",
                     selected_semantic_path=target_path,
-                    resolved_target_path=target_path,
+                    resolved_target_path=paste_target_row_path_committed,
                     cut_buffer_path=str(payload.get("path") or payload.get("display_path") or ""),
+                    ancestor_fallback=ancestor_fallback,
                 )
-            target_item = self._destination_tree_index_if_current_matches_path(target_path)
-            if target_item is None:
-                target_item = self._find_visible_destination_item_by_path(target_path)
             if target_item is None:
                 self.destination_tree_status.setText("The destination folder is not visible yet.")
                 return

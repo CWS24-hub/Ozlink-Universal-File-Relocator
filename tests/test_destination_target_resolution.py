@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+from PySide6.QtGui import QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import QApplication
 
 from ozlink_console.main_window import MainWindow
@@ -80,6 +81,95 @@ def test_build_planned_move_record_destination_path_uses_semantic_path():
     rec = mw.build_planned_move_record(src, dest)
     assert "Other" not in rec["destination_path"]
     assert rec["destination_path"] == mw._destination_row_semantic_path(dest)
+
+
+def test_paste_here_pins_context_row_without_target_path_scan():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    target_ix = MagicMock()
+    target_ix.isValid.return_value = True
+    target_ix.column.return_value = 0
+    source_ix = MagicMock()
+    source_ix.isValid.return_value = True
+    source_ix.column.return_value = 0
+    find_calls = []
+
+    def find_vis(path):
+        find_calls.append(path)
+        return source_ix
+
+    def gdata(ix):
+        if ix is target_ix:
+            return {
+                "is_folder": True,
+                "tree_role": "destination",
+                "node_origin": "Real",
+                "display_path": "Root\\Finance\\Nested",
+                "item_path": "Root\\Finance\\Nested",
+            }
+        if ix is source_ix:
+            return {
+                "name": "Item",
+                "display_path": "Root\\Src\\Item",
+                "item_path": "Root\\Src\\Item",
+                "tree_role": "destination",
+            }
+        return None
+
+    draft_args = {}
+
+    def draft(s, t):
+        draft_args["source"] = s
+        draft_args["target"] = t
+
+    mw._destination_cut_buffer = {"path": "Root\\Src\\Item", "display_path": "Root\\Src\\Item"}
+    mw._normalize_paste_destination_row_ref = lambda r: r
+    mw._paste_here_destination_row_allowed = lambda pl: True
+    mw.get_tree_item_node_data = gdata
+    mw._destination_row_semantic_path = lambda n: str(
+        n.get("item_path") or n.get("display_path") or ""
+    )
+    mw._destination_tree_index_if_current_matches_path = lambda p: None
+    mw._find_visible_destination_item_by_path = find_vis
+    mw.handle_destination_draft_move = draft
+    mw._perf_explorer_log = lambda *a, **k: None
+
+    mw.handle_paste_destination_item({"display_path": "ignored"}, paste_target_item=target_ix)
+
+    assert draft_args.get("target") is target_ix
+    assert len(find_calls) == 1
+
+
+def test_paste_here_nested_semantic_path_from_captured_payload():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    nested = {
+        "is_folder": True,
+        "tree_role": "destination",
+        "node_origin": "Real",
+        "display_path": "Root\\Finance\\Employee Hours\\2025-26",
+        "item_path": "Root\\Finance\\Employee Hours\\2025-26",
+    }
+    sem = mw._destination_row_semantic_path(nested)
+    assert "Employee Hours" in sem.replace("/", "\\")
+    assert "2025-26" in sem.replace("/", "\\")
+
+
+def test_normalize_paste_destination_row_ref_column_zero():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    mw._destination_tree_uses_model_view = lambda: True
+    model = QStandardItemModel()
+    model.setColumnCount(3)
+    row0 = QStandardItem("c0")
+    row1 = QStandardItem("c1")
+    row2 = QStandardItem("c2")
+    model.appendRow([row0, row1, row2])
+    ix_col1 = model.indexFromItem(row1)
+    assert ix_col1.column() == 1
+    out = mw._normalize_paste_destination_row_ref(ix_col1)
+    assert out.column() == 0
+    assert out.row() == ix_col1.row()
 
 
 def test_select_canonical_destination_item_prefers_current_index_when_in_candidates():
