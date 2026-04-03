@@ -31,10 +31,18 @@ class _Node:
         self._children = children
 
     def is_placeholder(self) -> bool:
-        return bool(self.payload.get("placeholder"))
+        pl = getattr(self, "payload", None)
+        if not isinstance(pl, dict):
+            return True
+        return bool(pl.get("placeholder"))
 
     def is_folder(self) -> bool:
-        return not self.is_placeholder() and bool(self.payload.get("is_folder"))
+        if self.is_placeholder():
+            return False
+        pl = getattr(self, "payload", None)
+        if not isinstance(pl, dict):
+            return False
+        return bool(pl.get("is_folder"))
 
 
 class DestinationPlanningTreeModel(QAbstractItemModel):
@@ -111,7 +119,9 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         node = self._node(index)
         if node is None:
             return None
-        p = node.payload
+        p = getattr(node, "payload", None)
+        if not isinstance(p, dict):
+            return None
         col = index.column()
         if role == Qt.DisplayRole:
             if col == 0:
@@ -142,7 +152,13 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         if not index.isValid():
             return Qt.NoItemFlags
         node = self._node(index)
-        if node and node.is_placeholder() and node.payload.get("placeholder_role") == "empty_library_message":
+        pl = getattr(node, "payload", None) if node is not None else None
+        if (
+            node
+            and node.is_placeholder()
+            and isinstance(pl, dict)
+            and pl.get("placeholder_role") == "empty_library_message"
+        ):
             return Qt.NoItemFlags
         if node and node.is_placeholder():
             return Qt.NoItemFlags
@@ -158,7 +174,8 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             return True
         if len(node._children) > 0:
             return True
-        return bool(node.payload.get("_destination_expand_affordance"))
+        pl = getattr(node, "payload", None)
+        return isinstance(pl, dict) and bool(pl.get("_destination_expand_affordance"))
 
     def _reindex(self, parent_node: _Node) -> None:
         ch = parent_node._children or []
@@ -356,7 +373,8 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         if parent_node is None or not parent_node._children:
             return
         for row in range(len(parent_node._children) - 1, -1, -1):
-            if parent_node._children[row].payload.get("placeholder"):
+            ch_pl = getattr(parent_node._children[row], "payload", None)
+            if isinstance(ch_pl, dict) and ch_pl.get("placeholder"):
                 victim = parent_node._children[row]
                 self._unregister_subtree_paths(victim)
                 self.beginRemoveRows(parent, row, row)
