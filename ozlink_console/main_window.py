@@ -115,6 +115,19 @@ from ozlink_console.planned_move_graph_resolve import (
     enrich_single_planned_move,
     refresh_planned_move_source_from_graph,
 )
+
+# Combined deferred refresh must not rebuild the destination future model when every queued
+# reason already applied destination allocation overlays incrementally (or only needs source projection).
+_INCREMENTAL_DEFERRED_PLANNING_REFRESH_REASONS = frozenset(
+    {
+        "planned_move_removed",
+        "planned_allocation_removed",
+        "planned_move_added",
+        "planned_move_override_added",
+        "planning_change_lightweight",
+        "planned_item_moved_paste_quick",
+    }
+)
 from ozlink_console.transfer_job_runner import (
     is_absolute_local_path,
     load_manifest_json,
@@ -4292,15 +4305,25 @@ class MainWindow(QMainWindow):
         # Skip synchronous destination future-model bind when the UI was already updated
         # incrementally (add/remove allocation overlays). Full binds can freeze for large libraries.
         skip_full_destination_future_model = bool(reasons) and all(
-            r
-            in (
-                "planned_move_removed",
-                "planned_allocation_removed",
-                "planned_move_added",
-                "planned_move_override_added",
-            )
-            for r in reasons
+            r in _INCREMENTAL_DEFERRED_PLANNING_REFRESH_REASONS for r in reasons
         )
+        if is_dev_mode():
+            if skip_full_destination_future_model:
+                log_info(
+                    "deferred_planning_refresh",
+                    mode="incremental_only",
+                    reasons=combined_reason,
+                    skip_full_destination=True,
+                )
+            else:
+                violators = [r for r in reasons if r not in _INCREMENTAL_DEFERRED_PLANNING_REFRESH_REASONS]
+                log_info(
+                    "deferred_planning_refresh",
+                    mode="full_destination_finalize",
+                    reasons=combined_reason,
+                    skip_full_destination=False,
+                    non_incremental_reasons=violators,
+                )
 
         with _PerfExplorerTimer(
             "run_deferred_planning_refresh",
@@ -4310,12 +4333,7 @@ class MainWindow(QMainWindow):
         ):
             try:
                 if getattr(self, "destination_tree_widget", None) is not None:
-                    if skip_full_destination_future_model:
-                        log_info(
-                            "Planning deferred refresh skipped full destination rebuild (incremental planning).",
-                            reasons=combined_reason,
-                        )
-                    else:
+                    if not skip_full_destination_future_model:
                         self._materialize_destination_future_model(f"deferred_{combined_reason}")
             except Exception as exc:
                 self._log_restore_exception("deferred_planning_refresh.destination", exc)
@@ -14295,6 +14313,81 @@ class MainWindow(QMainWindow):
             if self._paths_equivalent(stored_parent_path, parent_path, "destination"):
                 matches.extend(bucket.values())
         return matches
+
+    def _allocation_parent_candidates_for_touch_paths(self, touch_paths):
+        """Unresolved allocation parents that are the touch path itself or a strict ancestor of it."""
+        out = set()
+        raw = [p for p in touch_paths if p]
+        if not raw:
+            return out
+        for sp in list(self.unresolved_allocations_by_parent_path.keys()):
+            sp_c = self._canonical_destination_projection_path(self.normalize_memory_path(sp)) or self.normalize_memory_path(
+                sp
+            )
+            sp_cf = sp_c.casefold()
+            for tp in raw:
+                tp_c = self._canonical_destination_projection_path(self.normalize_memory_path(tp)) or self.normalize_memory_path(
+                    tp
+                )
+                tp_cf = tp_c.casefold()
+                if self._paths_equivalent(sp, tp, "destination"):
+                    out.add(sp)
+                    break
+                if tp_cf.startswith(sp_cf + "\\") or tp_cf == sp_cf:
+                    out.add(sp)
+                    break
+        return out
+
+    def _reapply_allocation_overlays_for_paste_touch_paths(self, old_p, new_p, target_path):
+        """Re-apply allocation overlays for every unresolved parent affected by a paste move (quick path)."""
+        touch = (old_p, new_p, target_path)
+        candidates = self._allocation_parent_candidates_for_touch_paths(touch)
+        if not candidates:
+            return 0, {}
+
+        def _sort_key(s):
+            s_c = self.normalize_memory_path(s)
+            return (len([x for x in s_c.split("\\") if x]), s_c.casefold())
+
+        total = 0
+        per = {}
+        for sp in sorted(candidates, key=_sort_key):
+            try:
+                with _PerfExplorerTimer("paste_touch_reapply", parent_path=str(sp)[:120]):
+                    parent_item = self._ensure_destination_projection_path(sp)
+                    if parent_item is None:
+                        per[str(sp)[:200]] = 0
+                        continue
+                    n = self._apply_allocation_children_to_item(parent_item)
+                    total += n
+                    per[str(sp)[:200]] = n
+            except Exception as exc:
+                self._log_restore_exception("reapply_allocation_overlays_for_paste_touch_paths", exc)
+                per[str(sp)[:200]] = 0
+        return total, per
+
+    def _dev_paste_allocation_badge_row(self, path_hint):
+        if not path_hint:
+            return None
+        proj = self._canonical_destination_projection_path(self.normalize_memory_path(path_hint)) or self.normalize_memory_path(
+            path_hint
+        )
+        ix = self._find_visible_destination_item_by_path(proj)
+        if ix is None:
+            return {"path": proj[:160], "visible": False}
+        if isinstance(ix, QModelIndex):
+            nd = dict(ix.data(Qt.UserRole) or {})
+        else:
+            nd = dict(ix.data(0, Qt.UserRole) or {})
+        label = str(nd.get("base_display_label", nd.get("name", "")) or "")
+        return {
+            "path": proj[:160],
+            "visible": True,
+            "planned_allocation": bool(nd.get("planned_allocation")),
+            "node_origin": str(nd.get("node_origin", "") or "")[:48],
+            "has_allocated_tag": "[Allocated]" in label,
+            "label_excerpt": label[:72],
+        }
 
     def _tree_item_path(self, node_data):
         return self.normalize_memory_path(
@@ -24317,12 +24410,15 @@ class MainWindow(QMainWindow):
             self._remove_visible_destination_subtree_by_prefix(child, normalized_target)
         return False
 
-    def _persist_planning_change_lightweight(self):
+    def _persist_planning_change_lightweight(
+        self, *, planning_refresh_reason="planning_change_lightweight", notify_saved=True
+    ):
         self._save_draft_shell(force=True)
         self._rebuild_submission_visual_cache()
         self._queue_deferred_planning_refresh(
-            "planning_change_lightweight",
+            planning_refresh_reason,
             source_projection_paths=self._collect_current_source_projection_paths(),
+            notify_saved=notify_saved,
         )
         self.update_progress_summaries()
         try:
@@ -24714,30 +24810,37 @@ class MainWindow(QMainWindow):
         if from_paste_here and move is not None:
             scrubbed = self._quick_remove_planned_move_from_destination_tree(old_snap) if old_snap else 0
             self._reset_unresolved_allocation_queue()
-            applied = self._register_and_project_planned_move(move, reason="planned_item_moved_paste")
             old_p = self._allocation_parent_path(old_snap) if old_snap else ""
             new_p = self._allocation_parent_path(move)
-            reapplied_old = 0
-            if old_p and new_p and not self._paths_equivalent(old_p, new_p, "destination"):
-                p_ix = self._find_visible_destination_item_by_path(old_p)
-                if p_ix is not None:
-                    reapplied_old = self._apply_allocation_children_to_item(p_ix)
+            candidate_parents = sorted(self._allocation_parent_candidates_for_touch_paths((old_p, new_p, target_path)))
+            touch_reapply_total, touch_reapply_per_parent = self._reapply_allocation_overlays_for_paste_touch_paths(
+                old_p, new_p, target_path
+            )
+            quick_path_ok = touch_reapply_total > 0
+            finalize_reason = "" if quick_path_ok else "touch_reapply_total_zero"
+            moved_proj = self._allocation_projection_path(move)
             if is_dev_mode():
+                badges = {
+                    "moved_item_row": self._dev_paste_allocation_badge_row(moved_proj),
+                    "target_parent_row": self._dev_paste_allocation_badge_row(target_path),
+                    "new_alloc_parent_row": self._dev_paste_allocation_badge_row(new_p),
+                }
                 log_info(
                     "paste_post_move_refresh",
-                    refresh_mode="quick" if applied > 0 else "finalize_fallback",
-                    quick_apply_children=applied,
+                    quick_path_ok=quick_path_ok,
+                    touch_reapply_total=touch_reapply_total,
+                    touch_reapply_per_parent=touch_reapply_per_parent,
                     scrubbed_projection_nodes=scrubbed,
-                    reapplied_old_parent_overlays=reapplied_old,
+                    touch_candidate_parents=len(candidate_parents),
                     target_folder_path=str(target_path)[:240],
                     old_alloc_parent=str(old_p)[:240],
                     new_alloc_parent=str(new_p)[:240],
-                    finalize_reason="" if applied > 0 else "quick_apply_returned_zero",
-                    allocation_badge_note="reapplied_sibling_overlays" if reapplied_old else "none",
+                    finalize_reason=finalize_reason,
+                    allocation_badge_snapshot=badges,
                 )
-            if applied > 0:
+            if quick_path_ok:
                 self.refresh_planned_moves_table()
-                self._persist_planning_change_lightweight()
+                self._persist_planning_change_lightweight(planning_refresh_reason="planned_item_moved_paste_quick")
                 return True
 
         self.refresh_planned_moves_table()

@@ -1443,7 +1443,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._rebuild_submission_visual_cache = lambda: setattr(window, "_cache_rebuilt", True)
         window._collect_current_source_projection_paths = lambda: {"FTBMRoot", "FTBMRoot\\Contracts"}
         window._queue_deferred_planning_refresh = (
-            lambda reason, source_projection_paths=None, delay_ms=None: setattr(
+            lambda reason, source_projection_paths=None, delay_ms=None, notify_saved=True: setattr(
                 window,
                 "_queued_refresh",
                 (reason, set(source_projection_paths or set()), delay_ms),
@@ -1489,6 +1489,47 @@ class DestinationReplayRegressionTests(unittest.TestCase):
             ({"FTBMRoot\\Contracts"}, "source_projection_deferred_move_folder", 50),
         )
         self.assertEqual(window._title_status, "")
+
+    def test_deferred_planning_refresh_skips_destination_materialize_for_lightweight_reasons(self):
+        window = MainWindow.__new__(MainWindow)
+        window.destination_tree_widget = _TreeStub()
+        window.source_tree_widget = _TreeStub()
+        window._deferred_planning_refresh_pending = True
+        window._deferred_planning_refresh_reasons = ["planning_change_lightweight"]
+        window._deferred_source_projection_paths = set()
+        materialized = []
+        window._materialize_destination_future_model = lambda reason: materialized.append(reason)
+        window._schedule_source_projection_refresh_for_paths = lambda *a, **k: None
+        window.update_progress_summaries = lambda: None
+        window._set_window_title_status = lambda status_text="": None
+        window._log_restore_exception = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("unexpected exception")
+        )
+
+        window._run_deferred_planning_refresh()
+
+        self.assertFalse(materialized)
+
+    def test_deferred_planning_refresh_materializes_when_reason_not_incremental(self):
+        window = MainWindow.__new__(MainWindow)
+        window.destination_tree_widget = _TreeStub()
+        window.source_tree_widget = _TreeStub()
+        window._deferred_planning_refresh_pending = True
+        window._deferred_planning_refresh_reasons = ["planning_change_lightweight", "planned_item_moved"]
+        window._deferred_source_projection_paths = set()
+        materialized = []
+        window._materialize_destination_future_model = lambda reason: materialized.append(reason)
+        window._schedule_source_projection_refresh_for_paths = lambda *a, **k: None
+        window.update_progress_summaries = lambda: None
+        window._set_window_title_status = lambda status_text="": None
+        window._log_restore_exception = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("unexpected exception")
+        )
+
+        window._run_deferred_planning_refresh()
+
+        self.assertEqual(len(materialized), 1)
+        self.assertIn("planned_item_moved", materialized[0])
 
     def test_finalize_cache_refresh_workspace_restore_reapplies_destination_overlay(self):
         window = MainWindow.__new__(MainWindow)

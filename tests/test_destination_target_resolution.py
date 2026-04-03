@@ -290,13 +290,13 @@ def test_move_planned_from_paste_uses_lightweight_persist_when_quick_apply_succe
     mw._find_visible_destination_item_by_path = lambda path: None
     mw._quick_remove_planned_move_from_destination_tree = lambda old: 0
     mw._reset_unresolved_allocation_queue = lambda: None
-    mw._register_and_project_planned_move = lambda m, reason="": 1
-    mw._apply_allocation_children_to_item = lambda ix: 0
+    mw._allocation_parent_candidates_for_touch_paths = lambda _t: {"Root\\NewParent"}
+    mw._reapply_allocation_overlays_for_paste_touch_paths = lambda o, n, t: (1, {"Root\\NewParent": 1})
     mw._paths_equivalent = lambda a, b, role: str(a).replace("/", "\\") == str(b).replace("/", "\\")
     scheduled = []
     mw._schedule_deferred_destination_materialization = lambda r, delay_ms=180: scheduled.append((r, delay_ms))
     lightweight = []
-    mw._persist_planning_change_lightweight = lambda: lightweight.append(True)
+    mw._persist_planning_change_lightweight = lambda **kw: lightweight.append(kw)
 
     def heavy_persist(r):
         raise AssertionError("heavy persist should not run when quick apply succeeds")
@@ -311,7 +311,8 @@ def test_move_planned_from_paste_uses_lightweight_persist_when_quick_apply_succe
 
     assert mw._move_planned_destination_node(src, tgt, from_paste_here=True) is True
     assert not scheduled
-    assert lightweight == [True]
+    assert len(lightweight) == 1
+    assert lightweight[0].get("planning_refresh_reason") == "planned_item_moved_paste_quick"
     assert move["destination_path"] == "Root\\NewParent"
 
 
@@ -341,8 +342,8 @@ def test_move_planned_from_paste_falls_back_finalize_when_quick_apply_zero():
     mw._find_visible_destination_item_by_path = lambda path: None
     mw._quick_remove_planned_move_from_destination_tree = lambda old: 0
     mw._reset_unresolved_allocation_queue = lambda: None
-    mw._register_and_project_planned_move = lambda m, reason="": 0
-    mw._apply_allocation_children_to_item = lambda ix: 0
+    mw._allocation_parent_candidates_for_touch_paths = lambda _t: set()
+    mw._reapply_allocation_overlays_for_paste_touch_paths = lambda o, n, t: (0, {})
     mw._paths_equivalent = lambda a, b, role: False
     scheduled = []
     mw._schedule_deferred_destination_materialization = lambda r, delay_ms=180: scheduled.append((r, delay_ms))
@@ -397,4 +398,52 @@ def test_select_canonical_destination_item_prefers_current_index_when_in_candida
     items = [other, prefer]
     chosen = mw._select_canonical_destination_item(items, prefer=prefer)
     assert chosen is prefer
+
+
+def test_allocation_parent_candidates_includes_ancestors_of_touch_paths():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    mw.unresolved_allocations_by_parent_path = {
+        "Root\\Media": {"a": {}},
+        "Root\\Media\\100GOPRO": {"b": {}},
+    }
+    c = mw._allocation_parent_candidates_for_touch_paths(["Root\\Media\\100GOPRO\\file.txt"])
+    assert "Root\\Media" in c
+    assert "Root\\Media\\100GOPRO" in c
+
+
+def test_reapply_paste_touch_paths_calls_ensure_projection_and_apply_children():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    mw.unresolved_allocations_by_parent_path = {"Root\\New": {}}
+    mw._allocation_parent_candidates_for_touch_paths = lambda _t: {"Root\\New"}
+    calls = []
+    mw._ensure_destination_projection_path = lambda p: calls.append(("ensure", p)) or "stub-item"
+    mw._apply_allocation_children_to_item = lambda ix: calls.append(("apply", ix)) or 1
+    mw._log_restore_exception = lambda *a, **k: None
+    total, per = mw._reapply_allocation_overlays_for_paste_touch_paths("", "Root\\New", "Root\\New")
+    assert total == 1
+    assert per.get("Root\\New") == 1
+    assert ("ensure", "Root\\New") in calls
+    assert ("apply", "stub-item") in calls
+
+
+def test_deferred_planning_refresh_skips_destination_for_paste_quick_reason():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    stub = MagicMock()
+    stub.viewport.return_value.update = lambda: None
+    mw.destination_tree_widget = stub
+    mw.source_tree_widget = stub
+    mw._deferred_planning_refresh_pending = True
+    mw._deferred_planning_refresh_reasons = ["planned_item_moved_paste_quick"]
+    mw._deferred_source_projection_paths = set()
+    materialized = []
+    mw._materialize_destination_future_model = lambda reason: materialized.append(reason)
+    mw._schedule_source_projection_refresh_for_paths = lambda *a, **k: None
+    mw.update_progress_summaries = lambda: None
+    mw._set_window_title_status = lambda status_text="": None
+    mw._log_restore_exception = lambda *a, **k: None
+    mw._run_deferred_planning_refresh()
+    assert not materialized
 
