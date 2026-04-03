@@ -8,7 +8,7 @@ from PySide6.QtCore import QByteArray, QModelIndex, QMimeData, Qt
 from PySide6.QtGui import QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import QAbstractItemView, QApplication
 
-from ozlink_console.main_window import MainWindow, OZLINK_DESTINATION_PLANNING_DRAG_MIME
+from ozlink_console.main_window import MainWindow, OZLINK_DESTINATION_PLANNING_DRAG_MIME, _destination_drop_band_margin_px
 from ozlink_console.tree_models.destination_planning_model import DestinationPlanningTreeModel
 
 
@@ -676,7 +676,8 @@ def test_manual_drop_between_nested_rows_resolves_parent_folder():
         assert meta["drop_rejected_reason"] == ""
 
 
-def test_manual_drop_between_top_level_rows_rejected_without_path_fallback():
+def test_manual_drop_top_level_between_folder_falls_back_to_hovered_folder():
+    """Above/Below on a top-level folder row targets that folder (no silent root rejection)."""
     _qapp()
     model = DestinationPlanningTreeModel(destination_index_key_fn=_dest_key)
     model.reset_root_payloads(
@@ -706,8 +707,83 @@ def test_manual_drop_between_top_level_rows_rejected_without_path_fallback():
     commit_ix, meta = mw._resolve_destination_manual_drop_folder_index(
         b_ix, QAbstractItemView.DropIndicatorPosition.AboveItem
     )
+    assert commit_ix == b_ix
+    assert meta.get("top_level_between_fallback") is True
+    assert meta["drop_rejected_reason"] == ""
+    assert meta["resolved_target_path"]
+
+
+def test_manual_drop_top_level_between_file_row_still_unresolved():
+    _qapp()
+    model = DestinationPlanningTreeModel(destination_index_key_fn=_dest_key)
+    model.reset_root_payloads(
+        [
+            {
+                "base_display_label": "f.txt",
+                "name": "f.txt",
+                "is_folder": False,
+                "item_path": r"Root\f.txt",
+                "display_path": r"Root\f.txt",
+                "tree_role": "destination",
+                "node_origin": "Real",
+            },
+        ]
+    )
+    file_ix = model.index(0, 0, QModelIndex())
+    mw = MainWindow.__new__(MainWindow)
+    commit_ix, meta = mw._resolve_destination_manual_drop_folder_index(
+        file_ix, QAbstractItemView.DropIndicatorPosition.BelowItem
+    )
     assert commit_ix is None
-    assert meta["drop_rejected_reason"] == "between_rows_top_level"
+    assert meta["drop_rejected_reason"] == "between_rows_top_level_file"
+
+
+def test_destination_drop_band_margin_is_narrow():
+    assert _destination_drop_band_margin_px(40) <= 2
+    assert _destination_drop_band_margin_px(100) <= 2
+    assert _destination_drop_band_margin_px(8) >= 1
+
+
+def test_manual_drag_resolver_same_after_slight_dip_change_still_valid():
+    """Slight band change (OnItem vs Above on same folder) both resolve once margin/fallback apply."""
+    _qapp()
+    model = DestinationPlanningTreeModel(destination_index_key_fn=_dest_key)
+    model.reset_root_payloads(
+        [
+            {
+                "base_display_label": "D",
+                "name": "D",
+                "is_folder": True,
+                "item_path": r"Root\D",
+                "display_path": r"Root\D",
+                "tree_role": "destination",
+                "node_origin": "Real",
+            },
+        ]
+    )
+    folder_ix = model.index(0, 0, QModelIndex())
+    mw = MainWindow.__new__(MainWindow)
+    c_on, m_on = mw._resolve_destination_manual_drop_folder_index(
+        folder_ix, QAbstractItemView.DropIndicatorPosition.OnItem
+    )
+    c_ab, m_ab = mw._resolve_destination_manual_drop_folder_index(
+        folder_ix, QAbstractItemView.DropIndicatorPosition.AboveItem
+    )
+    assert c_on == folder_ix and c_ab == folder_ix
+    assert m_on["resolved_target_path"] == m_ab["resolved_target_path"]
+
+
+def test_manual_drop_strict_rejects_viewport_without_row():
+    _qapp()
+    model = DestinationPlanningTreeModel(destination_index_key_fn=_dest_key)
+    model.reset_root_payloads([])
+    mw = MainWindow.__new__(MainWindow)
+    invalid = QModelIndex()
+    commit_ix, meta = mw._resolve_destination_manual_drop_folder_index(
+        invalid, QAbstractItemView.DropIndicatorPosition.OnViewport
+    )
+    assert commit_ix is None
+    assert meta["drop_rejected_reason"] == "no_hover_row"
 
 
 def test_manual_drop_resolver_does_not_reset_model():
