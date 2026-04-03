@@ -3980,7 +3980,7 @@ class MainWindow(QMainWindow):
         self._planning_draft_overflow_btn = QToolButton(header_action_panel)
         self._planning_draft_overflow_btn.setObjectName("OverflowMenuButton")
         self._planning_draft_overflow_btn.setText("⋮")
-        self._planning_draft_overflow_btn.setToolTip("Draft actions: import, export, unlock")
+        self._planning_draft_overflow_btn.setToolTip("Draft actions: import, export, unlock, reset")
         self._planning_draft_overflow_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self._planning_draft_overflow_btn.setCursor(Qt.PointingHandCursor)
         _draft_menu = QMenu(self._planning_draft_overflow_btn)
@@ -3992,6 +3992,9 @@ class MainWindow(QMainWindow):
         _act_exp.triggered.connect(self._handle_export_draft)
         _act_unl = _draft_menu.addAction("Unlock Draft")
         _act_unl.triggered.connect(self._handle_unlock_draft)
+        _draft_menu.addSeparator()
+        _act_rst = _draft_menu.addAction("Reset Draft…")
+        _act_rst.triggered.connect(self._handle_reset_draft)
         self._planning_draft_overflow_btn.setMenu(_draft_menu)
         submit_row.addWidget(self._planning_draft_overflow_btn, 0, Qt.AlignRight)
 
@@ -6818,6 +6821,182 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             log_error("Draft export failed.", error=str(exc))
             QMessageBox.warning(self, "Export Draft", "Could not export the draft.")
+
+    def _planned_moves_serializable_for_backup(self) -> list:
+        """Best-effort JSON round-trip of runtime ``planned_moves`` for recovery tooling."""
+        out: list = []
+        for move in self.planned_moves:
+            if not isinstance(move, dict):
+                continue
+            try:
+                out.append(json.loads(json.dumps(move, default=str)))
+            except Exception:
+                out.append(
+                    {
+                        "_serialization_note": "partial",
+                        "source_path": str(move.get("source_path", "") or ""),
+                        "destination_path": str(move.get("destination_path", "") or ""),
+                    }
+                )
+        return out
+
+    def _build_draft_reset_backup_payload(self) -> dict:
+        """In-memory draft source of truth: session shell, persisted allocation rows, proposed, runtime moves."""
+        state = self._build_current_draft_shell_state(include_workspace_ui=True)
+        allocations = [row.to_dict() for row in self._build_memory_allocation_rows()]
+        proposed = [pf.to_dict() for pf in self._build_memory_proposed_folders()]
+        return {
+            "schema_version": 1,
+            "kind": "draft_reset_backup",
+            "created_utc": datetime.utcnow().isoformat(),
+            "draft_id": self.active_draft_session_id or "",
+            "session": state.to_dict(),
+            "allocations": allocations,
+            "proposed_folders": proposed,
+            "planned_moves": self._planned_moves_serializable_for_backup(),
+        }
+
+    def _apply_draft_reset_after_backup(self) -> None:
+        """Clear runtime draft/planning state, persist an empty draft, and refresh planning UI (roots preserved)."""
+        self._clear_runtime_draft_state(refresh_ui=False)
+        self._invalidate_projection_lookup_caches(bump_generation=True)
+        fresh = self._build_current_draft_shell_state(include_workspace_ui=True)
+        fresh.DraftId = self._create_new_draft_session_id()
+        fresh.CreatedUtc = datetime.utcnow().isoformat()
+        fresh.LastSavedUtc = fresh.CreatedUtc
+        operator_upn = self.current_session_context.get("operator_upn", "")
+        tenant_domain = self.current_session_context.get("tenant_domain", "")
+        fresh.SessionFingerprint = f"{operator_upn}|{tenant_domain}".strip("|")
+        if not fresh.DraftName:
+            op = self.current_session_context.get("operator_display_name", "") or "Planning Session"
+            fresh.DraftName = f"{op} Draft"
+        self.active_draft_session_id = fresh.DraftId
+        self._draft_shell_state = fresh
+        self._draft_shell_raw = fresh.to_dict()
+
+        self.memory_manager.save_allocations([], allow_empty=True)
+        self.memory_manager.save_proposed([], allow_empty=True)
+        self.memory_manager.save_session(fresh)
+        self.memory_manager.refresh_manifest(
+            draft_id=fresh.DraftId,
+            fingerprint=fresh.SessionFingerprint,
+            status="Healthy",
+        )
+        self._suppress_autosave = False
+        self._rebuild_submission_visual_cache()
+        self.refresh_planned_moves_table()
+        self.clear_selection_details()
+        self.update_progress_summaries()
+        if getattr(self, "planned_moves_status", None) is not None:
+            self.planned_moves_status.setText("Draft reset: clean baseline.")
+        if getattr(self, "source_tree_widget", None) is not None:
+            self._refresh_source_projection("draft_reset_source_reconcile")
+            self.source_tree_widget.viewport().update()
+        self._schedule_deferred_destination_materialization("draft_reset_destination_reconcile", delay_ms=220)
+        if getattr(self, "destination_tree_widget", None) is not None:
+            self.destination_tree_widget.viewport().update()
+
+    def _handle_reset_draft(self) -> None:
+        if self.memory_manager is None:
+            QMessageBox.information(self, "Reset Draft", "Draft storage is not available.")
+            return
+        if getattr(self, "_memory_restore_in_progress", False):
+            QMessageBox.information(
+                self,
+                "Reset Draft",
+                "Wait for the current memory restore to finish before resetting the draft.",
+            )
+            return
+
+        dlg = QMessageBox(self)
+        dlg.setIcon(QMessageBox.Icon.Warning)
+        dlg.setWindowTitle("Reset Draft")
+        dlg.setText(
+            "This clears all planned moves, proposed folders, and draft projections from this workspace."
+        )
+        dlg.setInformativeText(
+            "A timestamped backup file is saved first under your user Memory/Backups folder. "
+            "You stay signed in and your source/destination library selections stay as they are. "
+            "After reset, you start from a clean planning baseline (new empty draft)."
+        )
+        reset_btn = dlg.addButton("Create Backup && Reset", QMessageBox.ButtonRole.AcceptRole)
+        dlg.addButton(QMessageBox.StandardButton.Cancel)
+        dlg.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        dlg.exec()
+        if dlg.clickedButton() != reset_btn:
+            return
+
+        log_info(
+            "DRAFTRESET",
+            event="backup_started",
+            planned_moves_count=len(self.planned_moves),
+            proposed_folders_count=len(self.proposed_folders),
+        )
+        backup_path = ""
+        ac = pf = pm = 0
+        try:
+            if not self._ensure_active_draft_session():
+                raise RuntimeError("Could not prepare an active draft session for backup.")
+            payload = self._build_draft_reset_backup_payload()
+            ac = len(payload.get("allocations") or [])
+            pf = len(payload.get("proposed_folders") or [])
+            pm = len(payload.get("planned_moves") or [])
+            log_info(
+                "DRAFTRESET",
+                event="backup_payload_built",
+                allocation_count=ac,
+                proposed_count=pf,
+                planned_moves_runtime_count=pm,
+            )
+            backup_path = str(self.memory_manager.save_draft_reset_backup(payload))
+        except Exception as exc:
+            log_warn(
+                "DRAFTRESET",
+                event="reset_aborted_backup_failed",
+                error=str(exc),
+            )
+            QMessageBox.critical(
+                self,
+                "Reset Draft",
+                "Backup failed; the draft was not reset.\n\n" + str(exc),
+            )
+            return
+
+        log_info(
+            "DRAFTRESET",
+            event="backup_saved",
+            backup_path=backup_path,
+            restore_payload_counts=f"allocations={ac} proposed={pf} planned_moves_json={pm}",
+        )
+        log_info("DRAFTRESET", event="reset_started", backup_path=backup_path)
+        try:
+            self._apply_draft_reset_after_backup()
+        except Exception as exc:
+            log_error(
+                "DRAFTRESET",
+                event="reset_failed_after_backup",
+                error=str(exc),
+                backup_path=backup_path,
+            )
+            QMessageBox.critical(
+                self,
+                "Reset Draft",
+                "Backup was saved but clearing the workspace failed.\n"
+                f"Backup path:\n{backup_path}\n\nError:\n{exc}",
+            )
+            return
+
+        log_info(
+            "DRAFTRESET",
+            event="reset_completed",
+            backup_path=backup_path,
+            restore_payload_counts=f"allocations={ac} proposed={pf} planned_moves_json={pm}",
+        )
+        QMessageBox.information(
+            self,
+            "Reset Draft",
+            f"Draft reset complete. Backup saved to:\n{backup_path}",
+        )
 
     def _handle_import_draft(self):
         if self.memory_manager is None:

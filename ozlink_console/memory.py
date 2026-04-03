@@ -704,6 +704,33 @@ class MemoryManager:
         )
         self.save_manifest(manifest)
 
+    def save_draft_reset_backup(self, payload: dict[str, Any]) -> Path:
+        """Persist a single verified JSON snapshot under ``Memory/Backups`` (used before draft reset).
+
+        Raises if serialization, write, or post-read verification fails so callers can abort reset.
+        """
+        if not isinstance(payload, dict):
+            raise TypeError("draft reset backup payload must be a dict")
+        payload = dict(payload)
+        payload.setdefault("schema_version", 1)
+        text = json.dumps(payload, indent=2, ensure_ascii=False)
+        json.loads(text)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+        backup_path = self.backups / f"DraftReset_{stamp}.json"
+        self._atomic_write_text(backup_path, text)
+        if not backup_path.is_file() or backup_path.stat().st_size <= 0:
+            raise OSError(f"Draft reset backup missing or empty: {backup_path}")
+        roundtrip = json.loads(backup_path.read_text(encoding="utf-8"))
+        if int(roundtrip.get("schema_version", 0) or 0) != int(payload.get("schema_version", 1) or 1):
+            raise ValueError("Draft reset backup verification failed (schema_version mismatch)")
+        log_trace(
+            "memory",
+            "draft_reset_backup_written",
+            path=str(backup_path),
+            byte_size=backup_path.stat().st_size,
+        )
+        return backup_path
+
     def export_bundle(self, reason: str = "Manual", destination: Path | None = None) -> Path:
         if destination is None:
             destination = self.exports / ("Export_" + datetime.now().strftime("%Y%m%d-%H%M%S"))
