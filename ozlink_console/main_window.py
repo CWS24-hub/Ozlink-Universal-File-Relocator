@@ -310,10 +310,9 @@ class DestinationPlanningTreeWidget(QTreeWidget):
 
     def startDrag(self, supported_actions):
         self._dragged_item = self.currentItem()
-        try:
-            super().startDrag(supported_actions)
-        finally:
-            self._dragged_item = None
+        if self._dragged_item is None:
+            return
+        super().startDrag(supported_actions)
 
     def dropEvent(self, event):
         source_item = self._dragged_item
@@ -329,6 +328,7 @@ class DestinationPlanningTreeWidget(QTreeWidget):
                 drop_pos=(drop_pos.x(), drop_pos.y()),
             )
         if source_item is None or target_item is None or source_item is target_item:
+            self._dragged_item = None
             event.ignore()
             return
         self.proposedBranchMoveRequested.emit(source_item, target_item)
@@ -348,10 +348,9 @@ class DestinationPlanningTreeView(QTreeView):
 
     def startDrag(self, supported_actions):
         self._dragged_index = self.currentIndex()
-        try:
-            super().startDrag(supported_actions)
-        finally:
-            self._dragged_index = None
+        if self._dragged_index is None or not self._dragged_index.isValid():
+            return
+        super().startDrag(supported_actions)
 
     def dropEvent(self, event):
         source_ix = self._dragged_index
@@ -372,6 +371,7 @@ class DestinationPlanningTreeView(QTreeView):
             or not target_ix.isValid()
             or source_ix == target_ix
         ):
+            self._dragged_index = None
             event.ignore()
             return
         self.proposedBranchMoveRequested.emit(source_ix, target_ix)
@@ -21058,6 +21058,25 @@ class MainWindow(QMainWindow):
         if worker is not None:
             worker.deleteLater()
 
+    def _resolve_local_open_file_target(self, node_data):
+        """Return a normalised on-disk path only when the file exists locally (for OS default app)."""
+        if not isinstance(node_data, dict) or node_data.get("is_folder"):
+            return ""
+        for key in ("local_path", "file_path"):
+            raw = (node_data.get(key) or "").strip()
+            if not raw:
+                continue
+            try:
+                candidate = os.path.normpath(raw)
+            except (OSError, TypeError, ValueError):
+                continue
+            try:
+                if os.path.isfile(candidate):
+                    return candidate
+            except (OSError, TypeError, ValueError):
+                continue
+        return ""
+
     def _resolve_selection_actions(self, panel_key, node_data, traceability, metadata, planning_state=None):
         source_node = traceability.get("source_node", {}) if isinstance(traceability.get("source_node", {}), dict) else {}
         open_target = ""
@@ -21069,7 +21088,7 @@ class MainWindow(QMainWindow):
         dest_jump_enabled = False
 
         if panel_key == "source":
-            open_target = node_data.get("local_path") or node_data.get("file_path") or node_data.get("web_url", "")
+            open_target = self._resolve_local_open_file_target(node_data)
             browser_url = node_data.get("web_url", "")
             copy_link = browser_url or metadata["item_path"]
             if node_data.get("is_folder"):
@@ -21079,7 +21098,7 @@ class MainWindow(QMainWindow):
                 open_source_target = self._source_parent_path(traceability.get("source_path", metadata["item_path"]))
                 open_source_mode = "select_source_container"
         else:
-            open_target = source_node.get("local_path") or source_node.get("file_path") or source_node.get("web_url", "")
+            open_target = self._resolve_local_open_file_target(source_node)
             browser_url = node_data.get("web_url", "")
             copy_link = browser_url or metadata["item_path"]
             if traceability.get("source_path"):
@@ -21097,7 +21116,11 @@ class MainWindow(QMainWindow):
             "Open File": {
                 "enabled": bool(not node_data.get("is_folder") and open_target),
                 "target": open_target,
-                "tooltip": "Open this file directly." if (not node_data.get("is_folder") and open_target) else "Open File is only available for files with a usable target.",
+                "tooltip": (
+                    "Open this file with the default application on this PC."
+                    if (not node_data.get("is_folder") and open_target)
+                    else "Open File is only available when a synced/local file path exists on disk. Use Open in SharePoint for cloud-only items."
+                ),
             },
             "Open in SharePoint": {
                 "enabled": bool(browser_url),
@@ -23225,12 +23248,29 @@ class MainWindow(QMainWindow):
                 selected_item_type=metadata["item_type"],
             )
             return
-        target = action.get("target", "")
+        target = (action.get("target") or "").strip()
         opened = False
-        if target and (":\\" in target or target.startswith("\\\\")):
-            opened = QDesktopServices.openUrl(QUrl.fromLocalFile(target))
-        elif target:
-            opened = QDesktopServices.openUrl(QUrl(target))
+        if not target:
+            QMessageBox.information(
+                self,
+                "Open File",
+                "No local file path is available. Use Open in SharePoint for cloud items.",
+            )
+            return
+        try:
+            norm = os.path.normpath(target)
+        except (OSError, TypeError, ValueError):
+            norm = target
+        if os.path.isfile(norm):
+            opened = QDesktopServices.openUrl(QUrl.fromLocalFile(norm))
+        else:
+            QMessageBox.warning(
+                self,
+                "Open File",
+                "This item does not reference an existing file on this computer.\n"
+                "Use Open in SharePoint if the file is only in the cloud.",
+            )
+            return
         log_info(
             "selection_action_open_file",
             item_name=metadata["item_name"],
@@ -23677,6 +23717,28 @@ class MainWindow(QMainWindow):
 
         return None
 
+    def _planned_move_index_for_source_node(self, source_node):
+        """Resolve a planned move from a source tree row, including path fallback when ids diverge."""
+        if not isinstance(source_node, dict):
+            return None
+        if self.build_node_key(source_node, "source") is not None:
+            ix = self.find_planned_move_index_by_source(source_node)
+            if ix is not None:
+                return ix
+        sp = self._canonical_source_projection_path(
+            source_node.get("display_path") or source_node.get("item_path") or ""
+        )
+        if not sp:
+            return None
+        for index, existing_move in enumerate(self.planned_moves):
+            sm = existing_move.get("source") or {}
+            esp = self._canonical_source_projection_path(
+                sm.get("display_path") or sm.get("item_path") or str(existing_move.get("source_path", "") or "")
+            )
+            if esp and esp == sp:
+                return index
+        return None
+
     def find_planned_move_index_by_destination(self, destination_node):
         if not isinstance(destination_node, dict):
             return None
@@ -23759,7 +23821,7 @@ class MainWindow(QMainWindow):
             return
 
         selected_destination = self.get_selected_tree_node_data("destination")
-        has_assignment = self.find_planned_move_index_by_source(node_data) is not None
+        has_assignment = self._planned_move_index_for_source_node(node_data) is not None
         can_assign = self.node_is_valid_destination_target(selected_destination)
 
         menu = QMenu(self)
@@ -23937,13 +23999,17 @@ class MainWindow(QMainWindow):
     def handle_open_source_item(self, node_data):
         if str(node_data.get("node_origin", "")).lower() == "localfilesystem":
             p = node_data.get("item_path") or node_data.get("display_path") or ""
-            if p and Path(p).is_file() and QDesktopServices.openUrl(QUrl.fromLocalFile(str(p))):
+            if p and Path(p).is_file() and QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(p).resolve()))):
                 return
-        local_path = node_data.get("local_path") or node_data.get("file_path")
+        local_path = self._resolve_local_open_file_target(node_data)
         if local_path and QDesktopServices.openUrl(QUrl.fromLocalFile(local_path)):
             return
 
-        QMessageBox.information(self, "Open File", "Open File is not available for this item yet.")
+        QMessageBox.information(
+            self,
+            "Open File",
+            "No local file was found on disk. Use Open in Browser for SharePoint items.",
+        )
 
     def handle_open_item_in_browser(self, node_data):
         web_url = node_data.get("web_url")
@@ -24457,6 +24523,8 @@ class MainWindow(QMainWindow):
             move["target_name"] = target_name
 
         self.planned_moves_status.setText("Planned item moved.")
+        self.refresh_planned_moves_table()
+        self._schedule_deferred_destination_materialization("planned_item_moved", delay_ms=220)
         self._persist_planning_change("planned_item_moved")
         return True
 
@@ -24631,7 +24699,10 @@ class MainWindow(QMainWindow):
                 return
             if is_dev_mode():
                 log_info("debug_pass_paste_destination", phase="start")
-            target_path = target_node.get("display_path") or target_node.get("item_path") or ""
+            target_raw = target_node.get("display_path") or target_node.get("item_path") or ""
+            target_path = self._canonical_destination_projection_path(target_raw) or self.normalize_memory_path(
+                target_raw
+            )
             target_item = self._destination_tree_index_if_current_matches_path(target_path)
             if target_item is None:
                 target_item = self._find_visible_destination_item_by_path(target_path)
@@ -24639,7 +24710,10 @@ class MainWindow(QMainWindow):
                 self.destination_tree_status.setText("The destination folder is not visible yet.")
                 return
 
-            source_path = payload.get("path") or payload.get("display_path") or ""
+            source_raw = payload.get("path") or payload.get("display_path") or ""
+            source_path = self._canonical_destination_projection_path(source_raw) or self.normalize_memory_path(
+                source_raw
+            )
             source_item = self._destination_tree_index_if_current_matches_path(source_path)
             if source_item is None:
                 source_item = self._find_visible_destination_item_by_path(source_path)
@@ -31289,7 +31363,7 @@ class MainWindow(QMainWindow):
             # previously caused Unassign to target the wrong row or appear to do nothing.
             source_node = self.get_selected_tree_node_data("source")
             if source_node is not None:
-                move_index = self.find_planned_move_index_by_source(source_node)
+                move_index = self._planned_move_index_for_source_node(source_node)
                 if move_index is not None:
                     existing_move = self.planned_moves[move_index]
                     if is_dev_mode():
@@ -31319,13 +31393,13 @@ class MainWindow(QMainWindow):
                     )
                     return
 
-            selected_ranges = self.planned_moves_table.selectedRanges()
-            if selected_ranges:
-                row_index = selected_ranges[0].topRow()
-                if 0 <= row_index < len(self.planned_moves):
-                    target_move = self.planned_moves[row_index]
+            dest_node = self.get_selected_tree_node_data("destination")
+            if dest_node is not None:
+                move_index = self.find_planned_move_index_by_destination(dest_node)
+                if move_index is not None:
+                    target_move = self.planned_moves[move_index]
                     if is_dev_mode():
-                        log_info("debug_pass_unassign", via="planned_moves_table", row_index=row_index)
+                        log_info("debug_pass_unassign", via="destination_tree", move_index=move_index)
                     if self._is_move_submitted(target_move):
                         self._show_submitted_item_locked_message(
                             "Unassign",
@@ -31335,7 +31409,7 @@ class MainWindow(QMainWindow):
                         return
                     self._acknowledge_planning_mutation_ui("Removing assignment…")
                     removed_visually = self._quick_remove_planned_move_from_destination_tree(target_move) > 0
-                    self.planned_moves.pop(row_index)
+                    self.planned_moves.pop(move_index)
                     self._reset_unresolved_allocation_queue()
                     self.refresh_planned_moves_table()
                     self.planned_moves_status.setText("Planned move removed.")
@@ -31347,7 +31421,44 @@ class MainWindow(QMainWindow):
                     )
                     return
 
-            QMessageBox.information(self, "Unassign", "Select a planned move or select a source item with a planned move.")
+            row_index = -1
+            selected_ranges = self.planned_moves_table.selectedRanges()
+            if selected_ranges:
+                row_index = selected_ranges[0].topRow()
+            if row_index < 0:
+                cur = self.planned_moves_table.currentRow()
+                if cur >= 0:
+                    row_index = cur
+            if 0 <= row_index < len(self.planned_moves):
+                target_move = self.planned_moves[row_index]
+                if is_dev_mode():
+                    log_info("debug_pass_unassign", via="planned_moves_table", row_index=row_index)
+                if self._is_move_submitted(target_move):
+                    self._show_submitted_item_locked_message(
+                        "Unassign",
+                        f"'{target_move.get('source_name', 'This item')}'",
+                        self._submitted_batch_id_for_move(target_move),
+                    )
+                    return
+                self._acknowledge_planning_mutation_ui("Removing assignment…")
+                removed_visually = self._quick_remove_planned_move_from_destination_tree(target_move) > 0
+                self.planned_moves.pop(row_index)
+                self._reset_unresolved_allocation_queue()
+                self.refresh_planned_moves_table()
+                self.planned_moves_status.setText("Planned move removed.")
+                if not removed_visually:
+                    self._schedule_deferred_destination_materialization("unassign_tree_reconcile", delay_ms=220)
+                self._persist_planning_change(
+                    "planned_move_removed",
+                    source_projection_paths=self._narrow_source_projection_paths_for_move(target_move),
+                )
+                return
+
+            QMessageBox.information(
+                self,
+                "Unassign",
+                "Select a planned move, a source item with an assignment, or a destination item that shows the assignment.",
+            )
 
         finally:
             if _perf_d:
