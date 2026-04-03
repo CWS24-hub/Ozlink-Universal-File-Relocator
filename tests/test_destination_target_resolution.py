@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from PySide6.QtCore import QByteArray, QModelIndex, QMimeData, Qt
+from PySide6.QtCore import QByteArray, QEvent, QModelIndex, QMimeData, QPoint, Qt
 from PySide6.QtGui import QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import QAbstractItemView, QApplication
 
@@ -920,4 +920,137 @@ def test_destination_tree_drag_enter_accepts_move_action():
     tree.dragEnterEvent(ev)
     assert ev.isAccepted()
     assert ev.dropAction() == Qt.DropAction.MoveAction
+
+
+def test_destination_planning_tree_viewport_accepts_drops_widget_and_view():
+    """Child viewport must accept drops so Qt does not reject the drag before our handlers run."""
+    _qapp()
+    from ozlink_console.main_window import DestinationPlanningTreeView, DestinationPlanningTreeWidget
+
+    w = DestinationPlanningTreeWidget()
+    assert w.viewport().acceptDrops() is True
+    assert w.header().acceptDrops() is False
+
+    v = DestinationPlanningTreeView()
+    assert v.viewport().acceptDrops() is True
+    assert v.header().acceptDrops() is False
+
+
+def test_viewport_event_filter_drag_enter_accepts_valid_mime_qtreeview():
+    _qapp()
+    from PySide6.QtCore import QPoint
+    from PySide6.QtGui import QDragEnterEvent
+
+    from ozlink_console.main_window import DestinationPlanningTreeView
+
+    tree = DestinationPlanningTreeView()
+    md = QMimeData()
+    md.setData(OZLINK_DESTINATION_PLANNING_DRAG_MIME, QByteArray(b"v1"))
+    pos = QPoint(4, 4)
+    ev = QDragEnterEvent(
+        pos,
+        Qt.DropAction.MoveAction,
+        md,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    assert tree.eventFilter(tree.viewport(), ev) is True
+    assert ev.isAccepted()
+    assert ev.dropAction() == Qt.DropAction.MoveAction
+
+
+def test_viewport_event_filter_drag_enter_accepts_valid_mime_qtreewidget():
+    _qapp()
+    from PySide6.QtCore import QPoint
+    from PySide6.QtGui import QDragEnterEvent
+
+    from ozlink_console.main_window import DestinationPlanningTreeWidget
+
+    tree = DestinationPlanningTreeWidget()
+    md = QMimeData()
+    md.setData(OZLINK_DESTINATION_PLANNING_DRAG_MIME, QByteArray(b"v1"))
+    pos = QPoint(4, 4)
+    ev = QDragEnterEvent(
+        pos,
+        Qt.DropAction.MoveAction,
+        md,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    assert tree.eventFilter(tree.viewport(), ev) is True
+    assert ev.isAccepted()
+    assert ev.dropAction() == Qt.DropAction.MoveAction
+
+
+class _SyntheticDragMoveGlobalPos:
+    __slots__ = ("_pt",)
+
+    def __init__(self, pt: QPoint):
+        self._pt = pt
+
+    def toPoint(self) -> QPoint:
+        return self._pt
+
+
+class _SyntheticDragMoveEvent(QEvent):
+    """QDragMoveEvent from QtGui ctor may omit globalPosition() on some bindings; real drags provide it."""
+
+    def __init__(self, global_pt: QPoint, md: QMimeData):
+        super().__init__(QEvent.Type.DragMove)
+        self._md = md
+        self._global_pt = QPoint(global_pt)
+        self._accepted = False
+        self._drop_action = Qt.DropAction.IgnoreAction
+
+    def mimeData(self):
+        return self._md
+
+    def globalPosition(self):
+        return _SyntheticDragMoveGlobalPos(self._global_pt)
+
+    def setDropAction(self, action):
+        self._drop_action = action
+
+    def dropAction(self):
+        return self._drop_action
+
+    def accept(self):
+        self._accepted = True
+
+    def ignore(self):
+        self._accepted = False
+
+    def isAccepted(self):
+        return self._accepted
+
+
+def test_viewport_event_filter_drag_move_accepts_valid_mime_first_hover():
+    """First DragMove over empty viewport should provisionally accept (forbidden cursor regression)."""
+    _qapp()
+    from PySide6.QtGui import QDragEnterEvent
+
+    from ozlink_console.main_window import DestinationPlanningTreeView
+
+    tree = DestinationPlanningTreeView()
+    tree._ozlink_main_window = MagicMock()
+    tree.resize(400, 300)
+    tree.show()
+
+    md = QMimeData()
+    md.setData(OZLINK_DESTINATION_PLANNING_DRAG_MIME, QByteArray(b"v1"))
+    vp = tree.viewport()
+    local = QPoint(30, 40)
+    global_pt = vp.mapToGlobal(local)
+    enter = QDragEnterEvent(
+        local,
+        Qt.DropAction.MoveAction,
+        md,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    tree.eventFilter(vp, enter)
+    move = _SyntheticDragMoveEvent(global_pt, md)
+    assert tree.eventFilter(vp, move) is True
+    assert move.isAccepted()
+    assert move.dropAction() == Qt.DropAction.MoveAction
 

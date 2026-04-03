@@ -45,6 +45,7 @@ from PySide6.QtCore import (
     QSettings,
     QUrl,
     QPoint,
+    QEvent,
     QEventLoop,
     QElapsedTimer,
     QModelIndex,
@@ -337,6 +338,44 @@ def _destination_drop_band_margin_px(row_height: int) -> int:
     return max(1, min(2, h // 8))
 
 
+def _destination_manual_drag_viewport_event_filter(tree_self, tree_label: str, watched, event) -> bool | None:
+    """Return True/False if handled; None if this filter should not intercept (delegate to super().eventFilter)."""
+    et = event.type()
+    drag_types = (
+        QEvent.Type.DragEnter,
+        QEvent.Type.DragMove,
+        QEvent.Type.Drop,
+        QEvent.Type.DragLeave,
+    )
+    if et not in drag_types:
+        return None
+    vp = tree_self.viewport()
+    hdr = tree_self.header()
+    bars = (tree_self.verticalScrollBar(), tree_self.horizontalScrollBar())
+    if watched is not vp and watched is not hdr and watched not in bars:
+        return None
+    if et == QEvent.Type.DragEnter:
+        tree_self.dragEnterEvent(event)
+    elif et == QEvent.Type.DragMove:
+        tree_self.dragMoveEvent(event)
+    elif et == QEvent.Type.Drop:
+        tree_self.dropEvent(event)
+    elif et == QEvent.Type.DragLeave:
+        tree_self.dragLeaveEvent(event)
+    if is_dev_mode():
+        da = event.dropAction() if hasattr(event, "dropAction") else None
+        log_info(
+            "debug_pass_destination_manual_drag",
+            phase="event_filter",
+            tree=tree_label,
+            watched_class=watched.__class__.__name__,
+            event_type=int(et),
+            event_accepted=event.isAccepted(),
+            drop_action=int(da) if da is not None else None,
+        )
+    return True
+
+
 class DestinationPlanningTreeWidget(QTreeWidget):
     """Destination tree (QTreeWidget): manual planning drag — no model/Qt default drag pipeline."""
 
@@ -357,6 +396,24 @@ class DestinationPlanningTreeWidget(QTreeWidget):
         self._init_destination_drag_overlay_widgets()
         self.verticalScrollBar().valueChanged.connect(self._destination_drag_on_scroll)
         self.horizontalScrollBar().valueChanged.connect(self._destination_drag_on_scroll)
+        self._install_destination_manual_drag_child_drop_targets()
+
+    def _install_destination_manual_drag_child_drop_targets(self):
+        vp = self.viewport()
+        vp.setAcceptDrops(True)
+        vp.installEventFilter(self)
+        hdr = self.header()
+        hdr.setAcceptDrops(False)
+        hdr.installEventFilter(self)
+        for sb in (self.verticalScrollBar(), self.horizontalScrollBar()):
+            sb.setAcceptDrops(False)
+            sb.installEventFilter(self)
+
+    def eventFilter(self, watched, event):
+        r = _destination_manual_drag_viewport_event_filter(self, "QTreeWidget", watched, event)
+        if r is not None:
+            return r
+        return super().eventFilter(watched, event)
 
     def _init_destination_drag_overlay_widgets(self):
         vp = self.viewport()
@@ -422,10 +479,10 @@ class DestinationPlanningTreeWidget(QTreeWidget):
     def _drop_band_at_pos_widget(self, pos: QPoint) -> tuple[QTreeWidgetItem | None, int]:
         item = self.itemAt(pos)
         if item is None:
-            return None, int(QAbstractItemView.DropIndicatorPosition.OnViewport)
+            return None, QAbstractItemView.DropIndicatorPosition.OnViewport.value
         r = self.visualItemRect(item)
         if r.isNull() or r.height() <= 0:
-            return item, int(QAbstractItemView.DropIndicatorPosition.OnItem)
+            return item, QAbstractItemView.DropIndicatorPosition.OnItem.value
         y = pos.y() - r.top()
         h = r.height()
         margin = _destination_drop_band_margin_px(h)
@@ -435,7 +492,7 @@ class DestinationPlanningTreeWidget(QTreeWidget):
             dip = QAbstractItemView.DropIndicatorPosition.BelowItem
         else:
             dip = QAbstractItemView.DropIndicatorPosition.OnItem
-        return item, int(dip)
+        return item, dip.value
 
     def mousePressEvent(self, event):
         super().mousePressEvent(event)
@@ -518,7 +575,7 @@ class DestinationPlanningTreeWidget(QTreeWidget):
         pos = vp.mapFromGlobal(self._dd_last_cursor_global)
         ref_item, dip_int = self._drop_band_at_pos_widget(pos)
         dip = QAbstractItemView.DropIndicatorPosition(dip_int)
-        initial_dip = int(dip)
+        initial_dip = dip.value
         mw = getattr(self, "_ozlink_main_window", None)
         if mw is None:
             self._hide_destination_drop_overlay()
@@ -660,7 +717,7 @@ class DestinationPlanningTreeWidget(QTreeWidget):
                 hover_row_path=str(meta.get("hovered_path", ""))[:200],
                 hover_row_type=str(meta.get("hover_row_type", "")),
                 indicator_mode=str(meta.get("indicator_mode", "")),
-                drop_indicator=int(dip),
+                drop_indicator=dip.value,
                 resolved_target_path=str(meta.get("resolved_target_path", ""))[:200],
                 drop_committed_path=committed_path[:200],
                 drop_rejected_reason=drop_rejected,
@@ -701,6 +758,24 @@ class DestinationPlanningTreeView(QTreeView):
         self._init_destination_drag_overlay_widgets()
         self.verticalScrollBar().valueChanged.connect(self._destination_drag_on_scroll)
         self.horizontalScrollBar().valueChanged.connect(self._destination_drag_on_scroll)
+        self._install_destination_manual_drag_child_drop_targets()
+
+    def _install_destination_manual_drag_child_drop_targets(self):
+        vp = self.viewport()
+        vp.setAcceptDrops(True)
+        vp.installEventFilter(self)
+        hdr = self.header()
+        hdr.setAcceptDrops(False)
+        hdr.installEventFilter(self)
+        for sb in (self.verticalScrollBar(), self.horizontalScrollBar()):
+            sb.setAcceptDrops(False)
+            sb.installEventFilter(self)
+
+    def eventFilter(self, watched, event):
+        r = _destination_manual_drag_viewport_event_filter(self, "QTreeView", watched, event)
+        if r is not None:
+            return r
+        return super().eventFilter(watched, event)
 
     def _init_destination_drag_overlay_widgets(self):
         vp = self.viewport()
@@ -765,11 +840,11 @@ class DestinationPlanningTreeView(QTreeView):
     def _drop_band_at_pos_view(self, pos: QPoint) -> tuple[QModelIndex, int]:
         ix = self.indexAt(pos)
         if not ix.isValid():
-            return QModelIndex(), int(QAbstractItemView.DropIndicatorPosition.OnViewport)
+            return QModelIndex(), QAbstractItemView.DropIndicatorPosition.OnViewport.value
         ix0 = ix.siblingAtColumn(0) if ix.column() != 0 else ix
         r = self.visualRect(ix0)
         if not r.isValid() or r.height() <= 0:
-            return ix0, int(QAbstractItemView.DropIndicatorPosition.OnItem)
+            return ix0, QAbstractItemView.DropIndicatorPosition.OnItem.value
         y = pos.y() - r.top()
         h = r.height()
         margin = _destination_drop_band_margin_px(h)
@@ -779,7 +854,7 @@ class DestinationPlanningTreeView(QTreeView):
             dip = QAbstractItemView.DropIndicatorPosition.BelowItem
         else:
             dip = QAbstractItemView.DropIndicatorPosition.OnItem
-        return ix0, int(dip)
+        return ix0, dip.value
 
     def mousePressEvent(self, event):
         super().mousePressEvent(event)
@@ -864,7 +939,7 @@ class DestinationPlanningTreeView(QTreeView):
         pos = vp.mapFromGlobal(self._dd_last_cursor_global)
         ref_ix, dip_int = self._drop_band_at_pos_view(pos)
         dip = QAbstractItemView.DropIndicatorPosition(dip_int)
-        initial_dip = int(dip)
+        initial_dip = dip.value
         mw = getattr(self, "_ozlink_main_window", None)
         if mw is None:
             self._hide_destination_drop_overlay()
@@ -1006,7 +1081,7 @@ class DestinationPlanningTreeView(QTreeView):
                 hover_row_path=str(meta.get("hovered_path", ""))[:200],
                 hover_row_type=str(meta.get("hover_row_type", "")),
                 indicator_mode=str(meta.get("indicator_mode", "")),
-                drop_indicator=int(dip),
+                drop_indicator=dip.value,
                 resolved_target_path=str(meta.get("resolved_target_path", ""))[:200],
                 drop_committed_path=committed_path[:200],
                 drop_rejected_reason=drop_rejected,
@@ -4399,6 +4474,9 @@ class MainWindow(QMainWindow):
             # Manual planning drag/drop on destination trees only (no Qt default model drag pipeline).
             tree.setDragEnabled(False)
             tree.setAcceptDrops(True)
+            # Viewport is the real hit target for row drags; header/scrollbars forward via event filter.
+            tree.viewport().setAcceptDrops(True)
+            tree.header().setAcceptDrops(False)
             tree.setDropIndicatorShown(False)
             tree.setDragDropMode(QAbstractItemView.NoDragDrop)
             tree.setDefaultDropAction(Qt.MoveAction)
