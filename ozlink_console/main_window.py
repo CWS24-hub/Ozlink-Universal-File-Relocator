@@ -15208,6 +15208,14 @@ class MainWindow(QMainWindow):
             paths |= self._expand_source_projection_paths_for_move_network(m)
         return paths
 
+    def _planned_destination_move_origin(self, *, from_paste_here: bool, from_manual_planning_drag: bool) -> str:
+        """Stable label for diagnostics: every successful planned destination reparent uses one of these."""
+        if from_manual_planning_drag:
+            return "manual_drag"
+        if from_paste_here:
+            return "paste_here"
+        return "other"
+
     def _finalize_destination_move_planning_consistency(
         self,
         primary_move: dict,
@@ -15217,9 +15225,13 @@ class MainWindow(QMainWindow):
         new_destination_projection: str,
         table_refreshed: bool,
         incremental_lightweight: bool,
-        from_manual_planning_drag: bool,
+        move_origin: str,
     ) -> None:
-        """Invalidate path lookup caches, synchronously refresh affected source rows, emit MOVEAUDIT (dev, manual)."""
+        """Single post-move contract for all planned destination reparent paths (drag, paste, other).
+
+        Invalidates projection lookup caches (no planning generation bump), synchronously refreshes affected
+        source rows when the source tree exists, and emits MOVEAUDIT in dev mode for every origin.
+        """
         rewritten_related = rewritten_related or []
         self._invalidate_projection_lookup_caches(bump_generation=False)
         paths: set[str] = set()
@@ -15245,12 +15257,13 @@ class MainWindow(QMainWindow):
         if tw is not None:
             tw.viewport().update()
 
-        if from_manual_planning_drag and is_dev_mode():
+        if is_dev_mode():
             src_path = self._canonical_source_projection_path(
                 str(primary_move.get("source_path", "") or "").strip()
             ) or self._canonical_source_projection_path(self._tree_item_path(primary_move.get("source") or {}))
             log_info(
                 "MOVEAUDIT",
+                move_origin=str(move_origin or "other"),
                 source_path=str(src_path or "")[:500],
                 old_destination_path=str(old_destination_projection or "")[:500],
                 new_destination_path=str(new_destination_projection or "")[:500],
@@ -15284,6 +15297,7 @@ class MainWindow(QMainWindow):
         if is_dev_mode():
             log_info(
                 "MOVEAUDIT",
+                move_origin="proposed_branch_relocate",
                 kind="proposed_branch_relocate",
                 source_path="",
                 old_destination_path=str(old_path or "")[:500],
@@ -26391,6 +26405,10 @@ class MainWindow(QMainWindow):
             )
             return False
 
+        move_origin = self._planned_destination_move_origin(
+            from_paste_here=from_paste_here, from_manual_planning_drag=from_manual_planning_drag
+        )
+
         prev_dest = self._move_destination_target_path(move) if move is not None else ""
         if is_dev_mode():
             log_info(
@@ -26442,7 +26460,7 @@ class MainWindow(QMainWindow):
                 new_destination_projection=new_dest_audit,
                 table_refreshed=True,
                 incremental_lightweight=False,
-                from_manual_planning_drag=from_manual_planning_drag,
+                move_origin=move_origin,
             )
             self._schedule_deferred_destination_materialization("planned_item_moved", delay_ms=220)
             self._persist_planning_change("planned_item_moved")
@@ -26523,7 +26541,7 @@ class MainWindow(QMainWindow):
                     new_destination_projection=str(new_proj or "")[:500],
                     table_refreshed=True,
                     incremental_lightweight=True,
-                    from_manual_planning_drag=from_manual_planning_drag,
+                    move_origin=move_origin,
                 )
                 self._bump_destination_materialized_overlay_fingerprint(
                     phase="paste_touch_reapply",
@@ -26561,7 +26579,7 @@ class MainWindow(QMainWindow):
             new_destination_projection=str(new_proj or "")[:500],
             table_refreshed=True,
             incremental_lightweight=False,
-            from_manual_planning_drag=from_manual_planning_drag,
+            move_origin=move_origin,
         )
         self._schedule_deferred_destination_materialization("planned_item_moved", delay_ms=220)
         self._persist_planning_change("planned_item_moved")
