@@ -675,6 +675,128 @@ class TransferJobRunnerTests(unittest.TestCase):
         tr = [x for x in r.records if x.phase == "transfer"][0]
         self.assertEqual(tr.status, "dry_run")
 
+    def test_graph_folder_skipped_when_embedded_unsafe_index(self):
+        from unittest.mock import MagicMock
+
+        mock_g = MagicMock()
+        mock_g.start_drive_item_copy.return_value = "https://monitor"
+        mock_g.wait_graph_async_operation.return_value = None
+
+        manifest = {
+            "manifest_version": 2,
+            "proposed_folder_steps": [],
+            "execution_options": {"graph_unsafe_folder_step_indices": [0]},
+            "transfer_steps": [
+                {
+                    "index": 0,
+                    "operation": "copy",
+                    "source_path": "Lib\\Folder",
+                    "destination_path": "Root\\Folder",
+                    "source_name": "Folder",
+                    "destination_name": "Folder",
+                    "is_source_folder": True,
+                    "request_id": "",
+                    "status": "Draft",
+                    "allocation_method": "",
+                    "source_drive_id": "d1",
+                    "source_item_id": "fold1",
+                    "destination_drive_id": "d2",
+                    "destination_item_id": "parent1",
+                },
+            ],
+        }
+        r = run_manifest_local_filesystem(manifest, dry_run=False, graph_client=mock_g)
+        mock_g.start_drive_item_copy.assert_not_called()
+        skipped = [x for x in r.records if x.phase == "transfer" and x.status == "skipped"]
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("Graph folder copy blocked", skipped[0].detail)
+
+    def test_graph_folder_runs_when_embedded_empty_list(self):
+        """Embedded [] means the manifest was built with precise dirty detection: no unsafe folder steps."""
+        from unittest.mock import MagicMock
+
+        mock_g = MagicMock()
+        mock_g.start_drive_item_copy.return_value = "https://monitor"
+        mock_g.wait_graph_async_operation.return_value = None
+
+        manifest = {
+            "manifest_version": 2,
+            "proposed_folder_steps": [],
+            "execution_options": {"graph_unsafe_folder_step_indices": []},
+            "transfer_steps": [
+                {
+                    "index": 0,
+                    "operation": "copy",
+                    "source_path": "Lib\\Folder",
+                    "destination_path": "Root\\Folder",
+                    "source_name": "Folder",
+                    "destination_name": "Folder",
+                    "is_source_folder": True,
+                    "request_id": "",
+                    "status": "Draft",
+                    "allocation_method": "",
+                    "source_drive_id": "d1",
+                    "source_item_id": "fold1",
+                    "destination_drive_id": "d2",
+                    "destination_item_id": "parent1",
+                },
+            ],
+        }
+        run_manifest_local_filesystem(manifest, dry_run=False, graph_client=mock_g)
+        mock_g.start_drive_item_copy.assert_called_once()
+
+    def test_graph_folder_skipped_fallback_when_file_step_under_folder(self):
+        """Without embedded indices, conservative fallback blocks Graph folder copy if a file step nests under it."""
+        from unittest.mock import MagicMock
+
+        mock_g = MagicMock()
+        mock_g.start_drive_item_copy.return_value = "https://monitor"
+        mock_g.wait_graph_async_operation.return_value = None
+
+        manifest = {
+            "manifest_version": 2,
+            "proposed_folder_steps": [],
+            "transfer_steps": [
+                {
+                    "index": 0,
+                    "operation": "copy",
+                    "source_path": "Lib\\Folder",
+                    "destination_path": "Root\\Folder",
+                    "source_name": "Folder",
+                    "destination_name": "Folder",
+                    "is_source_folder": True,
+                    "request_id": "",
+                    "status": "Draft",
+                    "allocation_method": "",
+                    "source_drive_id": "d1",
+                    "source_item_id": "fold1",
+                    "destination_drive_id": "d2",
+                    "destination_item_id": "parent1",
+                },
+                {
+                    "index": 1,
+                    "operation": "copy",
+                    "source_path": "Lib\\Folder\\a.txt",
+                    "destination_path": "Root\\Folder",
+                    "source_name": "a.txt",
+                    "destination_name": "a.txt",
+                    "is_source_folder": False,
+                    "request_id": "",
+                    "status": "Draft",
+                    "allocation_method": "",
+                    "source_drive_id": "d1",
+                    "source_item_id": "file1",
+                    "destination_drive_id": "d2",
+                    "destination_item_id": "parent2",
+                },
+            ],
+        }
+        r = run_manifest_local_filesystem(manifest, dry_run=False, graph_client=mock_g)
+        self.assertEqual(mock_g.start_drive_item_copy.call_count, 1)
+        folder_rec = next(x for x in r.records if x.phase == "transfer" and x.step_index == 0)
+        self.assertEqual(folder_rec.status, "skipped")
+        self.assertIn("Graph folder copy blocked", folder_rec.detail)
+
     def test_summary_counts(self):
         m = {
             "manifest_version": 1,

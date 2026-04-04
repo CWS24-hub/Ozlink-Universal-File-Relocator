@@ -14,6 +14,10 @@ import requests
 
 from ozlink_console.audit_log import append_audit_event
 from ozlink_console.integrity import verify_copied_file, verify_copied_tree
+from ozlink_console.graph_folder_execution_safety import (
+    GRAPH_DIRTY_FOLDER_COPY_BLOCKED,
+    runner_should_block_graph_folder_copy_fallback,
+)
 from ozlink_console.logger import flush_logger, log_error, log_info
 
 SUPPORTED_MANIFEST_VERSIONS = frozenset({1, 2})
@@ -350,6 +354,16 @@ def run_manifest_local_filesystem(
         if str(x).strip()
     )
     plan_leaf_exclusions = list(opts.get("plan_leaf_exclusions") or [])
+    graph_unsafe_embedded_key_present = "graph_unsafe_folder_step_indices" in opts
+    graph_unsafe_folder_indices: set[int] = set()
+    if graph_unsafe_embedded_key_present:
+        for _x in opts.get("graph_unsafe_folder_step_indices") or []:
+            try:
+                v = int(_x)
+            except (TypeError, ValueError):
+                continue
+            if v >= 0:
+                graph_unsafe_folder_indices.add(v)
     if dry_run:
         pilot_max_graph_ops = 0
     graph_ops_used = 0
@@ -616,13 +630,28 @@ def run_manifest_local_filesystem(
                 )
                 continue
 
-            if is_folder and plan_leaf_exclusions:
-                log_info(
-                    "transfer_job_graph_folder_copy_plan_leaf_exclusions_unsupported",
-                    step_index=idx,
-                    exclusion_count=len(plan_leaf_exclusions),
-                    detail="plan_leaf_exclusions are not applied to Microsoft Graph folder copies; use local paths or per-file steps.",
-                )
+            if is_folder:
+                if graph_unsafe_embedded_key_present:
+                    graph_folder_blocked = idx in graph_unsafe_folder_indices
+                else:
+                    graph_folder_blocked = runner_should_block_graph_folder_copy_fallback(
+                        manifest, idx, step, plan_leaf_exclusions
+                    )
+                if graph_folder_blocked:
+                    log_info(
+                        "transfer_job_graph_folder_copy_blocked_dirty",
+                        step_index=idx,
+                        embedded_indices=graph_unsafe_embedded_key_present,
+                    )
+                    emit(
+                        StepRunRecord(
+                            "transfer",
+                            idx,
+                            "skipped",
+                            GRAPH_DIRTY_FOLDER_COPY_BLOCKED,
+                        )
+                    )
+                    continue
 
             if dry_run:
                 emit(

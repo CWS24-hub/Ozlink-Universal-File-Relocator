@@ -141,6 +141,7 @@ def build_simulation_manifest(
     notes: str = "",
     manifest_version: int = 1,
     plan_leaf_exclusions: list[str] | None = None,
+    graph_unsafe_folder_step_indices: list[int] | None = None,
 ) -> dict[str, Any]:
     """Return a JSON-serialisable manifest dict (simulation / handoff only)."""
     steps = [_planned_move_to_step(i, m).to_json_dict() for i, m in enumerate(planned_moves or [])]
@@ -154,6 +155,10 @@ def build_simulation_manifest(
     }
     if excl:
         execution_options["plan_leaf_exclusions"] = sorted(excl, key=lambda s: s.lower())
+    if graph_unsafe_folder_step_indices is not None:
+        execution_options["graph_unsafe_folder_step_indices"] = sorted(
+            {int(x) for x in graph_unsafe_folder_step_indices if int(x) >= 0}
+        )
     doc = SimulationManifest(
         manifest_version=int(manifest_version or 1),
         kind="simulation",

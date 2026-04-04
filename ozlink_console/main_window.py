@@ -88,6 +88,7 @@ from ozlink_console.logger import log_error, log_info, log_trace, log_warn
 from ozlink_console.memory import MemoryManager
 from ozlink_console.models import AllocationRow, ProposedFolder, SessionState, SubmissionBatch
 from ozlink_console.requests_store import RequestStore
+from ozlink_console.graph_folder_execution_safety import compute_graph_unsafe_folder_step_indices
 from ozlink_console.transfer_manifest import (
     build_simulation_manifest,
     upconvert_manifest_v1_to_v2,
@@ -18415,6 +18416,25 @@ class MainWindow(QMainWindow):
             return None
         return self._canonical_destination_projection_path(proj) or self.normalize_memory_path(proj)
 
+    def _compute_graph_unsafe_folder_step_indices(self) -> list[int]:
+        """Indices of planned folder moves that must not run as a single Microsoft Graph folder copy."""
+        excl_raw = getattr(self, "_plan_leaf_exclusions", set()) or set()
+        excl = {
+            self._canonical_source_projection_path(str(x))
+            for x in excl_raw
+            if str(x).strip()
+        }
+        return compute_graph_unsafe_folder_step_indices(
+            list(self.planned_moves or []),
+            excl,
+            canonical_source=lambda m: self._canonical_source_projection_path(m.get("source_path", "")),
+            path_is_descendant=lambda c, p: self._path_is_descendant(c, p, "source"),
+            allocation_projection_path=self._allocation_projection_path,
+            normalize_memory_path=self.normalize_memory_path,
+            canonical_destination_projection_path=self._canonical_destination_projection_path,
+            paths_equivalent=lambda a, b, role: self._paths_equivalent(a, b, role),
+        )
+
     def _planned_moves_duplicate_validation_error(self, moves) -> str:
         ds, dd = duplicate_collision_report_from_moves(
             list(moves or []),
@@ -29484,6 +29504,7 @@ class MainWindow(QMainWindow):
             notes="Simulation export from Ozlink Console. Local absolute paths can be run from the Execution page or Planned Moves (Run manifest).",
             manifest_version=2,
             plan_leaf_exclusions=sorted(getattr(self, "_plan_leaf_exclusions", set()) or []),
+            graph_unsafe_folder_step_indices=self._compute_graph_unsafe_folder_step_indices(),
         )
         try:
             write_manifest_json(path, manifest)

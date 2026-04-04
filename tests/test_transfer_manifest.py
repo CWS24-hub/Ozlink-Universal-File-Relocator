@@ -22,6 +22,25 @@ class TransferManifestTests(unittest.TestCase):
         self.assertIn("execution_options", m)
         self.assertTrue(m["execution_options"].get("verify_integrity"))
         self.assertNotIn("plan_leaf_exclusions", m["execution_options"])
+        self.assertNotIn("graph_unsafe_folder_step_indices", m["execution_options"])
+
+    def test_manifest_embeds_graph_unsafe_folder_step_indices_when_passed(self):
+        m = build_simulation_manifest(
+            planned_moves=[],
+            proposed_folders=[],
+            draft_id="D1",
+            graph_unsafe_folder_step_indices=[2, 0, 2],
+        )
+        self.assertEqual(m["execution_options"]["graph_unsafe_folder_step_indices"], [0, 2])
+
+    def test_manifest_embeds_empty_graph_unsafe_list_when_explicit(self):
+        m = build_simulation_manifest(
+            planned_moves=[],
+            proposed_folders=[],
+            draft_id="D1",
+            graph_unsafe_folder_step_indices=[],
+        )
+        self.assertEqual(m["execution_options"]["graph_unsafe_folder_step_indices"], [])
 
     def test_manifest_includes_plan_leaf_exclusions_when_present(self):
         m = build_simulation_manifest(
