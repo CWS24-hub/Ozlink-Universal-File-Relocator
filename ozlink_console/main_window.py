@@ -2141,6 +2141,7 @@ class MainWindow(QMainWindow):
         self.current_profile = None
         self.discovered_sites = []
         self.planned_moves = []
+        self._plan_leaf_exclusions = set()
         self._source_projection_descendants_cache = OrderedDict()
         self._source_projection_descendants_cache_limit = 96
         self._destination_indicator_dirty_semantic_paths = set()
@@ -5914,6 +5915,7 @@ class MainWindow(QMainWindow):
         self._restore_payload_source = ""
         self._restore_selected_candidate_path = ""
         self.planned_moves = []
+        self._plan_leaf_exclusions = set()
         self._clear_source_projection_descendants_cache()
         self.proposed_folders = []
         self._memory_restore_complete = False
@@ -6022,6 +6024,7 @@ class MainWindow(QMainWindow):
         if not state.DraftName:
             operator_display = self.current_session_context.get("operator_display_name", "") or "Planning Session"
             state.DraftName = f"{operator_display} Draft"
+        state.PlanLeafExclusions = sorted(getattr(self, "_plan_leaf_exclusions", set()) or [])
         return state
 
     def _create_new_draft_session_id(self):
@@ -6666,6 +6669,12 @@ class MainWindow(QMainWindow):
         self._draft_shell_raw = dict(session_raw or {})
         self.active_draft_session_id = session_state.DraftId or self.active_draft_session_id
         self.planned_moves = [self._build_restored_planned_move_record(row) for row in allocations]
+        self._plan_leaf_exclusions = set()
+        for p in getattr(session_state, "PlanLeafExclusions", None) or []:
+            if isinstance(p, str) and p.strip():
+                cp = self._canonical_source_projection_path(p)
+                if cp:
+                    self._plan_leaf_exclusions.add(cp)
         self._clear_source_projection_descendants_cache()
         self.proposed_folders = list(proposed)
         self._reset_unresolved_proposed_queue()
@@ -14789,6 +14798,17 @@ class MainWindow(QMainWindow):
                 "mismatch_reason": "",
             }
 
+        if not node_data.get("is_folder", True) and normalized_source_path and self._is_leaf_path_excluded_for_plan(
+            normalized_source_path
+        ):
+            return {
+                "mode": "excluded",
+                "suffix": "✗ excluded",
+                "raw_planned_source_path": "",
+                "normalized_planned_source_path": normalized_source_path,
+                "mismatch_reason": "",
+            }
+
         if inherited_move is not None:
             parent_name = inherited_move.get("source_name", "Mapped Parent")
             move_source = inherited_move.get("source", {})
@@ -17309,6 +17329,8 @@ class MainWindow(QMainWindow):
             )
             if not descendant_destination_path:
                 continue
+            if not descendant_data.get("is_folder", True) and self._is_leaf_path_excluded_for_plan(descendant_source_path):
+                continue
             exact_move = self._find_exact_planned_move_for_source_path(descendant_source_path)
             if exact_move is not None:
                 exact_destination_path = self._canonical_destination_projection_path(
@@ -17464,6 +17486,8 @@ class MainWindow(QMainWindow):
                 "\\".join([allocation_destination_path] + relative_segments)
             )
             if not descendant_destination_path:
+                continue
+            if not descendant_data.get("is_folder", True) and self._is_leaf_path_excluded_for_plan(descendant_source_path):
                 continue
 
             exact_move = self._find_exact_planned_move_for_source_path(descendant_source_path)
@@ -18268,8 +18292,8 @@ class MainWindow(QMainWindow):
             self._planned_move_by_source_path_cache_signature = signature
         return (getattr(self, "_planned_move_by_source_path_cache", {}) or {}).get(canonical_source_path)
 
-    def _find_inherited_planned_move_for_source_path(self, source_path):
-        canonical_source_path = self._canonical_source_projection_path(source_path)
+    def _find_inherited_planned_move_for_source_path_raw(self, canonical_source_path):
+        """Nearest ancestor folder move for a source path, ignoring leaf exclusions."""
         if not canonical_source_path:
             return None
         inherited_move = None
@@ -18283,6 +18307,31 @@ class MainWindow(QMainWindow):
                     inherited_move = move
                     inherited_path_length = len(move_source_path)
         return inherited_move
+
+    def _find_inherited_planned_move_for_source_path(self, source_path):
+        canonical_source_path = self._canonical_source_projection_path(source_path)
+        inherited = self._find_inherited_planned_move_for_source_path_raw(canonical_source_path)
+        if inherited is None:
+            return None
+        if self._is_leaf_path_excluded_for_plan(canonical_source_path):
+            return None
+        return inherited
+
+    def _is_leaf_path_excluded_for_plan(self, canonical_source_path):
+        if not canonical_source_path:
+            return False
+        return canonical_source_path in getattr(self, "_plan_leaf_exclusions", set())
+
+    def _canonical_source_path_for_planning_leaf(self, panel_key, node_data):
+        if panel_key == "source":
+            return self._canonical_source_projection_path(self._tree_item_path(node_data))
+        return self._canonical_source_projection_path(node_data.get("source_path", ""))
+
+    def _leaf_row_eligible_for_plan_rules(self, node_data):
+        return bool(node_data) and node_data.get("is_folder") is False and not node_data.get("placeholder")
+
+    def _planrule_log(self, event, **fields):
+        log_info("PLANRULE", event=event, **fields)
 
     def _source_subtree_fully_loaded_in_tree(self, item):
         """True when this node and all descendant folders have been expanded/loaded (no lazy placeholders)."""
@@ -23555,6 +23604,12 @@ class MainWindow(QMainWindow):
                     best_move = move
                     best_length = len(move_source_path)
 
+        if source_trace_path and node_data.get("is_folder") is False:
+            exact = self._find_exact_planned_move_for_source_path(source_trace_path)
+            if exact is not None:
+                return exact
+            if self._is_leaf_path_excluded_for_plan(source_trace_path):
+                return None
         return best_move
 
     def _build_planned_move_destination_lookup(self):
@@ -23631,14 +23686,26 @@ class MainWindow(QMainWindow):
             move = None
             if isinstance(traceability, dict):
                 move = traceability.get("move")
-            state = {
-                "mode": "direct" if move is not None else "none",
-                "direct_mapping": move is not None,
-                "inherited_mapping": False,
-                "inherited_from": "",
-                "resolved_destination_path": move.get("destination_path", "") if move is not None else "",
-                "move": move,
-            }
+            sp = self._canonical_source_projection_path(node_data.get("source_path", ""))
+            is_file = node_data.get("is_folder") is False
+            if move is None and is_file and sp and self._is_leaf_path_excluded_for_plan(sp):
+                state = {
+                    "mode": "excluded",
+                    "direct_mapping": False,
+                    "inherited_mapping": False,
+                    "inherited_from": "",
+                    "resolved_destination_path": "",
+                    "move": None,
+                }
+            else:
+                state = {
+                    "mode": "direct" if move is not None else "none",
+                    "direct_mapping": move is not None,
+                    "inherited_mapping": False,
+                    "inherited_from": "",
+                    "resolved_destination_path": move.get("destination_path", "") if move is not None else "",
+                    "move": move,
+                }
             log_info(
                 "selection_planning_state_resolved",
                 item_name=item_name,
@@ -23648,10 +23715,12 @@ class MainWindow(QMainWindow):
                 inherited_mapping=state["inherited_mapping"],
                 inherited_from=state["inherited_from"],
                 resolved_destination_path=state["resolved_destination_path"],
+                planning_mode=state.get("mode", ""),
             )
             return state
 
         source_path = self._tree_item_path(node_data)
+        normalized_source_path = self._canonical_source_projection_path(source_path)
         direct_move = None
         inherited_move = None
         inherited_path_length = -1
@@ -23697,6 +23766,24 @@ class MainWindow(QMainWindow):
                 inherited_mapping=False,
                 inherited_from="",
                 resolved_destination_path=state["resolved_destination_path"],
+            )
+        elif node_data.get("is_folder") is False and normalized_source_path and self._is_leaf_path_excluded_for_plan(
+            normalized_source_path
+        ):
+            state = {
+                "mode": "excluded",
+                "direct_mapping": False,
+                "inherited_mapping": False,
+                "inherited_from": "",
+                "resolved_destination_path": "",
+                "move": None,
+            }
+            log_info(
+                "selection_planning_state_excluded",
+                item_name=item_name,
+                item_path=item_path,
+                tree_role=panel_key,
+                resolved_destination_path="",
             )
         elif inherited_move is not None:
             state = {
@@ -23805,6 +23892,9 @@ class MainWindow(QMainWindow):
             elif planning_state_info.get("mode") == "inherited":
                 planning_state = "Inherited mapping"
                 destination_path = planning_state_info.get("resolved_destination_path", "")
+            elif planning_state_info.get("mode") == "excluded":
+                planning_state = "Excluded from plan"
+                destination_path = ""
             else:
                 planning_state = "Unplanned"
                 destination_path = ""
@@ -23814,6 +23904,8 @@ class MainWindow(QMainWindow):
                 planning_state = "Proposed"
             elif self.node_is_planned_allocation(node_data):
                 planning_state = "Allocated"
+            elif planning_state_info.get("mode") == "excluded":
+                planning_state = "Excluded from plan"
             elif str(node_data.get("node_origin", "")).lower() == "projectedallocationdescendant":
                 planning_state = "Projected descendant"
             elif str(node_data.get("node_origin", "")).lower() == "projecteddestination":
@@ -23850,6 +23942,11 @@ class MainWindow(QMainWindow):
                 body_text = f"This source {metadata['item_type'].lower()} is directly mapped to {move.get('destination_path', 'the planned destination')}."
             elif planning_state_info.get("mode") == "inherited" and move is not None:
                 body_text = f"This source {metadata['item_type'].lower()} inherits its mapping via {planning_state_info.get('inherited_from') or move.get('source_name', 'a mapped parent')}."
+            elif planning_state_info.get("mode") == "excluded":
+                body_text = (
+                    f"This source file is excluded from the plan: it will not move with its parent folder assignment. "
+                    f"Use Include in Plan to inherit the parent mapping again."
+                )
             else:
                 body_text = f"This source {metadata['item_type'].lower()} is currently not planned."
         else:
@@ -23857,6 +23954,10 @@ class MainWindow(QMainWindow):
                 body_text = "This destination folder is a proposed future-state folder."
             elif self.node_is_planned_allocation(node_data):
                 body_text = f"This destination {metadata['item_type'].lower()} is an allocated future-state node for {metadata['source_path']}."
+            elif planning_state_info.get("mode") == "excluded":
+                body_text = (
+                    "This file is excluded from the plan at the source: it will not be copied with the parent folder assignment."
+                )
             elif str(node_data.get("node_origin", "")).lower() == "projectedallocationdescendant":
                 body_text = "This destination item is a projected descendant of an allocated source folder."
             elif str(node_data.get("node_origin", "")).lower() == "projecteddestination":
@@ -27094,6 +27195,14 @@ class MainWindow(QMainWindow):
         unassign_action.setEnabled(has_assignment)
         unassign_action.triggered.connect(self.handle_unassign)
 
+        leaf_flags = self._plan_leaf_exclude_include_menu_flags("source", dict(node_data))
+        exclude_leaf_action = menu.addAction("Exclude from Plan")
+        exclude_leaf_action.setEnabled(leaf_flags["can_exclude"])
+        exclude_leaf_action.triggered.connect(lambda: self.handle_exclude_leaf_from_plan("source", dict(node_data)))
+        include_leaf_action = menu.addAction("Include in Plan")
+        include_leaf_action.setEnabled(leaf_flags["can_include"])
+        include_leaf_action.triggered.connect(lambda: self.handle_include_leaf_in_plan("source", dict(node_data)))
+
         menu.addSeparator()
 
         go_to_dest_action = menu.addAction("Go to Destination")
@@ -27214,6 +27323,14 @@ class MainWindow(QMainWindow):
             unassign_destination_action = menu.addAction("Unassign")
             unassign_destination_action.setEnabled(is_planned_allocation)
             unassign_destination_action.triggered.connect(lambda: self.handle_remove_planned_allocation(node_data))
+
+            leaf_flags = self._plan_leaf_exclude_include_menu_flags("destination", dict(node_data))
+            exclude_leaf_action = menu.addAction("Exclude from Plan")
+            exclude_leaf_action.setEnabled(leaf_flags["can_exclude"])
+            exclude_leaf_action.triggered.connect(lambda: self.handle_exclude_leaf_from_plan("destination", dict(node_data)))
+            include_leaf_action = menu.addAction("Include in Plan")
+            include_leaf_action.setEnabled(leaf_flags["can_include"])
+            include_leaf_action.triggered.connect(lambda: self.handle_include_leaf_in_plan("destination", dict(node_data)))
 
             menu.addSeparator()
 
@@ -27797,6 +27914,9 @@ class MainWindow(QMainWindow):
 
         destination_node = self._destination_target_snapshot(target_node, target_path)
         if move is None and inherited_move is not None:
+            _sp_discard = self._canonical_source_projection_path(source_node.get("source_path", ""))
+            if _sp_discard:
+                self._plan_leaf_exclusions.discard(_sp_discard)
             source_item = self._find_visible_source_item_by_path(source_node.get("source_path", ""))
             source_item_node = self._source_tree_row_payload(source_item) if source_item is not None else {}
             if not source_item_node:
@@ -28768,6 +28888,91 @@ class MainWindow(QMainWindow):
             "planned_allocation_removed",
             source_projection_paths=self._narrow_source_projection_paths_for_move(move),
         )
+
+    def _plan_leaf_exclude_include_menu_flags(self, panel_key, node_data):
+        if not self._leaf_row_eligible_for_plan_rules(node_data):
+            return {"can_exclude": False, "can_include": False}
+        canon = self._canonical_source_path_for_planning_leaf(panel_key, node_data)
+        if not canon:
+            return {"can_exclude": False, "can_include": False}
+        if self._is_leaf_path_excluded_for_plan(canon):
+            return {"can_exclude": False, "can_include": True}
+        direct = self._find_exact_planned_move_for_source_path(canon)
+        raw = self._find_inherited_planned_move_for_source_path_raw(canon)
+        if direct is not None or raw is not None:
+            return {"can_exclude": True, "can_include": False}
+        return {"can_exclude": False, "can_include": False}
+
+    def handle_exclude_leaf_from_plan(self, panel_key, node_data):
+        if not self._leaf_row_eligible_for_plan_rules(node_data):
+            return
+        canon = self._canonical_source_path_for_planning_leaf(panel_key, node_data)
+        if not canon or canon in self._plan_leaf_exclusions:
+            return
+        direct = self._find_exact_planned_move_for_source_path(canon)
+        raw = self._find_inherited_planned_move_for_source_path_raw(canon)
+        if direct is None and raw is None:
+            QMessageBox.information(
+                self,
+                "Exclude from Plan",
+                "This item is not covered by a folder assignment or direct mapping.",
+            )
+            return
+        old_state = "direct" if direct is not None else "inherited"
+        inherited_parent = ""
+        if raw is not None:
+            inherited_parent = str(self._canonical_source_projection_path(raw.get("source_path", "")) or "")[:500]
+        if direct is not None:
+            if self._is_move_submitted(direct):
+                self._show_submitted_item_locked_message(
+                    "Exclude from Plan",
+                    f"'{direct.get('source_name', 'This item')}'",
+                    self._submitted_batch_id_for_move(direct),
+                )
+                return
+            try:
+                self.planned_moves.remove(direct)
+            except ValueError:
+                pass
+            self._planned_move_by_source_path_cache_signature = None
+        self._plan_leaf_exclusions.add(canon)
+        self._planrule_log(
+            "leaf_exclude",
+            action_origin="exclude",
+            source_path=canon,
+            old_effective_state=old_state,
+            new_effective_state="excluded",
+            inherited_parent_path=inherited_parent,
+            direct_override_destination=str((direct or {}).get("destination_path", "") or "")[:500],
+            excluded=True,
+            execution_rule_resolved_as="excluded",
+        )
+        self.refresh_planned_moves_table()
+        self.planned_moves_status.setText("File excluded from plan.")
+        self._persist_planning_change("leaf_excluded_from_plan", source_projection_paths={canon})
+        self._schedule_deferred_destination_materialization("leaf_excluded_from_plan", delay_ms=220)
+
+    def handle_include_leaf_in_plan(self, panel_key, node_data):
+        if not self._leaf_row_eligible_for_plan_rules(node_data):
+            return
+        canon = self._canonical_source_path_for_planning_leaf(panel_key, node_data)
+        if not canon or canon not in self._plan_leaf_exclusions:
+            return
+        self._plan_leaf_exclusions.discard(canon)
+        raw = self._find_inherited_planned_move_for_source_path_raw(canon)
+        self._planrule_log(
+            "leaf_include",
+            action_origin="include",
+            source_path=canon,
+            old_effective_state="excluded",
+            new_effective_state="inherited" if raw is not None else "none",
+            inherited_parent_path=str(self._canonical_source_projection_path(raw.get("source_path", "")) if raw else "")[:500],
+            excluded=False,
+            execution_rule_resolved_as="inherited" if raw is not None else "none",
+        )
+        self.planned_moves_status.setText("File included in plan (inherits parent assignment if any).")
+        self._persist_planning_change("leaf_included_in_plan", source_projection_paths={canon})
+        self._schedule_deferred_destination_materialization("leaf_included_in_plan", delay_ms=220)
 
     def build_planned_move_record(self, source_node, destination_node):
         dest_sem = self._destination_row_semantic_path(destination_node)
