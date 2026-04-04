@@ -162,6 +162,10 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             return Qt.NoItemFlags
         if node and node.is_placeholder():
             return Qt.NoItemFlags
+        if isinstance(pl, dict) and (
+            pl.get("_inline_new_proposed") or pl.get("_inline_rename_proposed")
+        ):
+            return Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable
         return Qt.ItemIsEnabled | Qt.ItemIsSelectable
 
     def hasChildren(self, parent: QModelIndex) -> bool:

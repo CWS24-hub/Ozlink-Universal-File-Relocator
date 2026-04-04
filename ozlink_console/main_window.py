@@ -1283,6 +1283,10 @@ class DestinationPlanningTreeView(QTreeView):
 # Planning tree toolbar: expand/collapse-all glyphs (must match _set_expand_all_button_label).
 _EXPAND_ALL_TREE_GLYPH_EXPAND = "⤢"
 _EXPAND_ALL_TREE_GLYPH_COLLAPSE = "⤡"
+# Tree panel header: must stay a single glyph — IconToolButton is fixed 36px wide.
+_REFRESH_CACHE_TREE_GLYPH = "↻"
+_REFRESH_CACHE_TREE_TOOLTIP_IDLE = "Refresh folder cache for this tree"
+_REFRESH_CACHE_TREE_TOOLTIP_BUSY = "Refreshing folder cache…"
 
 
 class FullCountWorker(QThread):
@@ -1741,6 +1745,22 @@ class DestinationPlanningTreeDelegate(QStyledItemDelegate):
         painter.setPen(base_color)
         painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, display)
         painter.restore()
+
+    def setModelData(self, editor, model, index):
+        from ozlink_console.tree_models.destination_planning_model import DestinationPlanningTreeModel
+
+        if (
+            isinstance(model, DestinationPlanningTreeModel)
+            and index.isValid()
+            and index.column() == 0
+        ):
+            nd = index.data(Qt.UserRole) or {}
+            if nd.get("_inline_new_proposed") or nd.get("_inline_rename_proposed"):
+                if isinstance(editor, QLineEdit):
+                    text = editor.text().strip()
+                    self.window._commit_destination_inline_proposed_model_index(index, text)
+                    return
+        super().setModelData(editor, model, index)
 
 
 class ManifestRunWorker(QThread):
@@ -4822,9 +4842,9 @@ class MainWindow(QMainWindow):
 
         title = QLabel(title_text)
         title.setObjectName("SectionTitle")
-        refresh_cache_button = QPushButton("↻")
+        refresh_cache_button = QPushButton(_REFRESH_CACHE_TREE_GLYPH)
         refresh_cache_button.setObjectName("IconToolButton")
-        refresh_cache_button.setToolTip("Refresh folder cache for this tree")
+        refresh_cache_button.setToolTip(_REFRESH_CACHE_TREE_TOOLTIP_IDLE)
         refresh_cache_button.clicked.connect(
             lambda _=False, panel_key=panel_key: self.handle_refresh_cache_for_panel(panel_key)
         )
@@ -7648,6 +7668,17 @@ class MainWindow(QMainWindow):
     def handle_refresh_cache(self):
         self._request_cache_refresh_for_panels({"source", "destination"})
 
+    def _restore_refresh_cache_icon_buttons(self):
+        """Keep refresh controls icon-only (wide labels overflow the fixed-width toolbar)."""
+        if hasattr(self, "source_refresh_cache_button"):
+            self.source_refresh_cache_button.setEnabled(True)
+            self.source_refresh_cache_button.setText(_REFRESH_CACHE_TREE_GLYPH)
+            self.source_refresh_cache_button.setToolTip(_REFRESH_CACHE_TREE_TOOLTIP_IDLE)
+        if hasattr(self, "destination_refresh_cache_button"):
+            self.destination_refresh_cache_button.setEnabled(True)
+            self.destination_refresh_cache_button.setText(_REFRESH_CACHE_TREE_GLYPH)
+            self.destination_refresh_cache_button.setToolTip(_REFRESH_CACHE_TREE_TOOLTIP_IDLE)
+
     def handle_refresh_cache_for_panel(self, panel_key):
         if panel_key not in {"source", "destination"}:
             return
@@ -7710,12 +7741,12 @@ class MainWindow(QMainWindow):
                 self._set_tree_status_message("source", "Refreshing source cache...", loading=True)
                 if hasattr(self, "source_refresh_cache_button"):
                     self.source_refresh_cache_button.setEnabled(False)
-                    self.source_refresh_cache_button.setText("Refreshing...")
+                    self.source_refresh_cache_button.setToolTip(_REFRESH_CACHE_TREE_TOOLTIP_BUSY)
             if "destination" in self._pending_cache_refresh_panels:
                 self._set_tree_status_message("destination", "Refreshing destination cache...", loading=True)
                 if hasattr(self, "destination_refresh_cache_button"):
                     self.destination_refresh_cache_button.setEnabled(False)
-                    self.destination_refresh_cache_button.setText("Refreshing...")
+                    self.destination_refresh_cache_button.setToolTip(_REFRESH_CACHE_TREE_TOOLTIP_BUSY)
             if hasattr(self, "planned_moves_status"):
                 label = (
                     "Refreshing source and destination cache..."
@@ -9238,8 +9269,8 @@ class MainWindow(QMainWindow):
 
     def on_workspace_tab_changed(self, index):
         if not getattr(self, "_sharepoint_lazy_mode", False):
-            if hasattr(self, "workspace_tabs") and getattr(self, "_workspace_tabs_collapsed", False):
-                self._apply_workspace_tabs_collapsed_state(False)
+            # Do not force-expand here: tree selection calls setCurrentWidget(details_box), which
+            # emits currentChanged and would immediately undo a user collapse (non-lazy sessions).
             return
         if not hasattr(self, "workspace_tabs"):
             return
@@ -9297,23 +9328,28 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "workspace_tabs"):
             return
         self._workspace_tabs_collapsed = bool(collapsed)
-        if self._workspace_tabs_collapsed:
-            collapsed_height = self._workspace_tabs_collapsed_height()
-            self.workspace_tabs.setMinimumHeight(collapsed_height)
-            self.workspace_tabs.setMaximumHeight(collapsed_height)
-            self.workspace_tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            self.workspace_tabs_toggle_button.setText("▾")
-            self.workspace_tabs_toggle_button.setToolTip("Expand bottom panel")
-            self.workspace_tabs.setDocumentMode(True)
-        else:
-            self.workspace_tabs.setMinimumHeight(self._workspace_tabs_expanded_min_height)
-            self.workspace_tabs.setMaximumHeight(self._workspace_tabs_expanded_max_height)
-            self.workspace_tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-            self.workspace_tabs_toggle_button.setText("▴")
-            self.workspace_tabs_toggle_button.setToolTip("Collapse bottom panel")
-            self.workspace_tabs.setDocumentMode(False)
-        self.workspace_tabs.updateGeometry()
-        self.workspace_tabs.update()
+        tw = self.workspace_tabs
+        tw.blockSignals(True)
+        try:
+            if self._workspace_tabs_collapsed:
+                collapsed_height = self._workspace_tabs_collapsed_height()
+                tw.setMinimumHeight(collapsed_height)
+                tw.setMaximumHeight(collapsed_height)
+                tw.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+                self.workspace_tabs_toggle_button.setText("▾")
+                self.workspace_tabs_toggle_button.setToolTip("Expand bottom panel")
+                tw.setDocumentMode(True)
+            else:
+                tw.setMinimumHeight(self._workspace_tabs_expanded_min_height)
+                tw.setMaximumHeight(self._workspace_tabs_expanded_max_height)
+                tw.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+                self.workspace_tabs_toggle_button.setText("▴")
+                self.workspace_tabs_toggle_button.setToolTip("Collapse bottom panel")
+                tw.setDocumentMode(False)
+            tw.updateGeometry()
+            tw.update()
+        finally:
+            tw.blockSignals(False)
 
     def toggle_workspace_tabs_collapsed(self):
         self._apply_workspace_tabs_collapsed_state(not getattr(self, "_workspace_tabs_collapsed", False))
@@ -10789,12 +10825,7 @@ class MainWindow(QMainWindow):
     def on_cache_refresh_worker_finished(self):
         try:
             self.cache_refresh_worker = None
-            if hasattr(self, "source_refresh_cache_button"):
-                self.source_refresh_cache_button.setEnabled(True)
-                self.source_refresh_cache_button.setText("Refresh Cache")
-            if hasattr(self, "destination_refresh_cache_button"):
-                self.destination_refresh_cache_button.setEnabled(True)
-                self.destination_refresh_cache_button.setText("Refresh Cache")
+            self._restore_refresh_cache_icon_buttons()
             if not self._pending_cache_refresh_panels:
                 self._cache_refresh_restore_active = False
         except Exception as exc:
@@ -10876,6 +10907,7 @@ class MainWindow(QMainWindow):
             self._pending_cache_refresh_tree_snapshots = {}
             if hasattr(self, "planned_moves_status"):
                 self.planned_moves_status.setText("Could not refresh the SharePoint cache.")
+            self._restore_refresh_cache_icon_buttons()
             QMessageBox.warning(self, "Refresh Cache", "The SharePoint cache could not be refreshed.")
             self._log_restore_exception("on_cache_refresh_error", Exception(str(error)))
         except Exception as exc:
@@ -27801,10 +27833,24 @@ class MainWindow(QMainWindow):
 
     def _next_inline_proposed_folder_name(self, parent_item):
         existing_names = set()
-        for index in range(parent_item.childCount()):
-            child = parent_item.child(index)
-            child_data = child.data(0, Qt.UserRole) or {}
-            existing_names.add(str(child_data.get("name") or child.text(0) or "").strip().lower())
+        if isinstance(parent_item, QModelIndex):
+            if not parent_item.isValid():
+                pass
+            else:
+                par = parent_item.siblingAtColumn(0) if parent_item.column() != 0 else parent_item
+                model = par.model()
+                if model is not None:
+                    for r in range(model.rowCount(par)):
+                        cix = model.index(r, 0, par)
+                        child_data = cix.data(Qt.UserRole) or {}
+                        label = str(child_data.get("name") or cix.data(Qt.DisplayRole) or "").strip().lower()
+                        if label:
+                            existing_names.add(label)
+        else:
+            for index in range(parent_item.childCount()):
+                child = parent_item.child(index)
+                child_data = child.data(0, Qt.UserRole) or {}
+                existing_names.add(str(child_data.get("name") or child.text(0) or "").strip().lower())
 
         base_name = "New Folder"
         if base_name.lower() not in existing_names:
@@ -27991,6 +28037,8 @@ class MainWindow(QMainWindow):
         return False
 
     def _begin_inline_proposed_folder_creation(self, destination_node, parent_item):
+        if isinstance(parent_item, QModelIndex):
+            return self._begin_inline_proposed_folder_creation_index(destination_node, parent_item)
         proposed_path_base = self._tree_item_path(destination_node)
         default_name = self._next_inline_proposed_folder_name(parent_item)
         proposed_path = self.normalize_memory_path(
@@ -28035,8 +28083,86 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(180, _start_inline_edit)
         return item
 
+    def _begin_inline_proposed_folder_creation_index(self, destination_node, parent_ix: QModelIndex):
+        model = getattr(self, "destination_planning_model", None)
+        tree = getattr(self, "destination_tree_widget", None)
+        if model is None or tree is None or not parent_ix.isValid():
+            return None
+        parent_col0 = parent_ix.siblingAtColumn(0) if parent_ix.column() != 0 else parent_ix
+        proposed_path_base = self._tree_item_path(destination_node)
+        default_name = self._next_inline_proposed_folder_name(parent_col0)
+        proposed_path = self.normalize_memory_path(
+            "\\".join(part for part in [proposed_path_base, default_name] if part)
+        )
+        parent_data = dict(parent_col0.data(Qt.UserRole) or {})
+        base_label = self._tree_name_column_label(default_name, tag="(Proposed)")
+        temp_node = {
+            "id": f"INLINE-PROP-{datetime.utcnow().strftime('%H%M%S%f')[-8:]}",
+            "name": default_name,
+            "real_name": default_name,
+            "display_path": proposed_path,
+            "item_path": proposed_path,
+            "destination_path": proposed_path,
+            "tree_role": "destination",
+            "drive_id": parent_data.get("drive_id", ""),
+            "site_id": parent_data.get("site_id", ""),
+            "site_name": parent_data.get("site_name", ""),
+            "library_id": parent_data.get("library_id", ""),
+            "library_name": parent_data.get("library_name", ""),
+            "is_folder": True,
+            "children_loaded": True,
+            "load_failed": False,
+            "proposed": True,
+            "node_origin": "Proposed",
+            "web_url": parent_data.get("web_url", ""),
+            "base_display_label": base_label,
+            "overlay_state": "proposed",
+            "_inline_new_proposed": True,
+            "_inline_commit_ready": False,
+            "_inline_parent_path": proposed_path_base,
+        }
+        self._apply_tree_item_visual_state(None, temp_node)
+        self._remove_placeholder_children(parent_col0)
+        model.append_child_payloads(parent_col0, [temp_node])
+        new_row = model.rowCount(parent_col0) - 1
+        if new_row < 0:
+            return None
+        new_ix = model.index(new_row, 0, parent_col0)
+        if not new_ix.isValid():
+            return None
+        tree.expand(parent_col0)
+        tree.scrollTo(new_ix)
+        sm = tree.selectionModel()
+        if sm is not None:
+            sm.setCurrentIndex(
+                new_ix,
+                QItemSelectionModel.SelectionFlag.ClearAndSelect
+                | QItemSelectionModel.SelectionFlag.Rows,
+            )
+        self.destination_tree_status.setText("Type the new folder name and press Enter.")
+
+        def _start_inline_edit(ix=new_ix, tree_ref=tree):
+            nd = ix.data(Qt.UserRole) or {}
+            self._inline_proposed_commit_item_id = str(nd.get("id", "") or "")
+            tree_ref.setFocus()
+            tree_ref.scrollTo(ix)
+            sm2 = tree_ref.selectionModel()
+            if sm2 is not None:
+                sm2.setCurrentIndex(
+                    ix,
+                    QItemSelectionModel.SelectionFlag.ClearAndSelect
+                    | QItemSelectionModel.SelectionFlag.Rows,
+                )
+            tree_ref.edit(ix)
+
+        QTimer.singleShot(180, _start_inline_edit)
+        return new_ix
+
     def _begin_inline_proposed_folder_rename(self, item):
         if item is None:
+            return
+        if isinstance(item, QModelIndex):
+            self._begin_inline_proposed_folder_rename_index(item)
             return
         node_data = self.get_tree_item_node_data(item) or {}
         original_path = self.normalize_memory_path(node_data.get("display_path") or node_data.get("item_path") or "")
@@ -28056,6 +28182,40 @@ class MainWindow(QMainWindow):
             index = self.destination_tree_widget.indexFromItem(target_item, 0)
             if index.isValid():
                 self.destination_tree_widget.edit(index)
+
+        QTimer.singleShot(180, _start_inline_edit)
+
+    def _begin_inline_proposed_folder_rename_index(self, index: QModelIndex):
+        model = getattr(self, "destination_planning_model", None)
+        tree = getattr(self, "destination_tree_widget", None)
+        if model is None or tree is None or not index.isValid():
+            return
+        ix0 = index.siblingAtColumn(0) if index.column() != 0 else index
+        node_data = dict(ix0.data(Qt.UserRole) or {})
+        original_path = self.normalize_memory_path(node_data.get("display_path") or node_data.get("item_path") or "")
+        if not original_path:
+            return
+
+        def _mut(p):
+            p["_inline_rename_proposed"] = True
+            p["_inline_original_path"] = original_path
+
+        model.update_payload_for_index(ix0, _mut)
+        self.destination_tree_status.setText("Type the new folder name and press Enter.")
+
+        def _start_inline_edit(ix=ix0, tw=tree):
+            current_node = ix.data(Qt.UserRole) or {}
+            self._inline_proposed_commit_item_id = str(current_node.get("id", "") or "")
+            tw.setFocus()
+            tw.scrollTo(ix)
+            sm = tw.selectionModel()
+            if sm is not None:
+                sm.setCurrentIndex(
+                    ix,
+                    QItemSelectionModel.SelectionFlag.ClearAndSelect
+                    | QItemSelectionModel.SelectionFlag.Rows,
+                )
+            tw.edit(ix)
 
         QTimer.singleShot(180, _start_inline_edit)
 
@@ -28093,12 +28253,10 @@ class MainWindow(QMainWindow):
         if parent_item is None:
             QMessageBox.information(self, "Propose Folder", "The selected destination folder is not visible yet.")
             return
+        resolved_parent = parent_item
         QTimer.singleShot(
             0,
-            lambda destination_node=destination_node: self._begin_inline_proposed_folder_creation(
-                destination_node,
-                self._find_visible_destination_item_by_path(self._tree_item_path(destination_node)),
-            ) if self._find_visible_destination_item_by_path(self._tree_item_path(destination_node)) is not None else None,
+            lambda dn=destination_node, rp=resolved_parent: self._begin_inline_proposed_folder_creation(dn, rp),
         )
 
     def _rewrite_proposed_branch_runtime_paths(self, original_path, updated_path):
@@ -28992,6 +29150,164 @@ class MainWindow(QMainWindow):
             if _perf_d:
                 _perf_explorer_log("handle_paste_destination_item", elapsed_ms=_perf_t.elapsed())
 
+    def _expand_destination_tree_to_show_model_index(self, ix: QModelIndex) -> None:
+        tree = getattr(self, "destination_tree_widget", None)
+        if tree is None or not ix.isValid():
+            return
+        p = ix.parent()
+        while p.isValid():
+            tree.expand(p)
+            p = p.parent()
+
+    def _commit_destination_inline_proposed_model_index(self, index: QModelIndex, folder_name: str) -> None:
+        model = getattr(self, "destination_planning_model", None)
+        tree = getattr(self, "destination_tree_widget", None)
+        if model is None or tree is None or not index.isValid():
+            return
+        ix0 = index.siblingAtColumn(0) if index.column() != 0 else index
+        node_data = dict(ix0.data(Qt.UserRole) or {})
+        is_new_inline = bool(node_data.get("_inline_new_proposed"))
+        is_rename_inline = bool(node_data.get("_inline_rename_proposed"))
+        if not is_new_inline and not is_rename_inline:
+            return
+        inline_id = str(node_data.get("id", "") or "")
+        if not inline_id:
+            return
+        # QTreeView has no itemChanged hook; a single global id breaks if another inline edit
+        # overwrites it before Enter. Legacy QTreeWidget still gates on the tracked id.
+        if not self._destination_tree_uses_model_view():
+            if inline_id != getattr(self, "_inline_proposed_commit_item_id", ""):
+                return
+
+        parent_ix = ix0.parent()
+        parent_for_exists = parent_ix if parent_ix.isValid() else QModelIndex()
+
+        parent_path = self.normalize_memory_path(node_data.get("_inline_parent_path", ""))
+        original_path = self.normalize_memory_path(node_data.get("_inline_original_path", ""))
+        if not folder_name:
+            if is_rename_inline:
+                fallback_name = (
+                    self._path_segments(original_path)[-1]
+                    if self._path_segments(original_path)
+                    else node_data.get("name", "")
+                )
+
+                def _mut_cancel_rename(p):
+                    p["_inline_rename_proposed"] = False
+                    p["name"] = str(fallback_name or "").strip() or p.get("name", "")
+                    nm = str(p.get("name") or "").strip()
+                    p["base_display_label"] = self._tree_name_column_label(nm, tag="(Proposed)")
+
+                model.update_payload_for_index(ix0, _mut_cancel_rename)
+                self._apply_tree_item_visual_state(None, dict(ix0.data(Qt.UserRole) or {}))
+                self._inline_proposed_commit_item_id = ""
+                self.destination_tree_status.setText("Proposed folder rename cancelled.")
+                return
+            model.remove_node_at(ix0)
+            self._inline_proposed_commit_item_id = ""
+            self.destination_tree_status.setText("Proposed folder creation cancelled.")
+            return
+
+        target_parent_path = parent_path if is_new_inline else self._destination_parent_path(original_path)
+        proposed_path = self.normalize_memory_path(
+            "\\".join(part for part in [target_parent_path, folder_name] if part)
+        )
+        if self._destination_path_exists_under_parent(
+            parent_for_exists, proposed_path, ignore_item=ix0
+        ):
+            QMessageBox.information(
+                self,
+                "Proposed Folder",
+                "A folder with that name already exists here.",
+            )
+            pm = QPersistentModelIndex(ix0)
+            QTimer.singleShot(
+                120,
+                lambda pm=pm, tw=tree: tw.edit(QModelIndex(pm)) if pm.isValid() else None,
+            )
+            return
+
+        if is_new_inline:
+            parent_data = self.get_tree_item_node_data(parent_ix) or {}
+            proposed_folder = ProposedFolder(
+                DestinationId=f"PROP-{datetime.utcnow().strftime('%H%M%S%f')[-8:]}",
+                FolderName=folder_name,
+                DestinationPath=proposed_path,
+                ParentPath=target_parent_path,
+                DestinationDriveId=str(parent_data.get("drive_id", "") or ""),
+                DestinationParentItemId=str(parent_data.get("id", "") or ""),
+                IsSelectable=True,
+                IsProposed=True,
+                Status="Proposed",
+            )
+            self.proposed_folders = [
+                row
+                for row in self.proposed_folders
+                if self._proposed_destination_path(row) != self._proposed_destination_path(proposed_folder)
+            ]
+            self.proposed_folders.append(proposed_folder)
+
+            def _mut_new_done(p):
+                p["name"] = folder_name
+                p["real_name"] = folder_name
+                p["display_path"] = proposed_path
+                p["item_path"] = proposed_path
+                p["destination_path"] = proposed_path
+                p["_inline_new_proposed"] = False
+                p["base_display_label"] = self._tree_name_column_label(folder_name, tag="(Proposed)")
+
+            model.update_payload_for_index(ix0, _mut_new_done)
+            self._apply_tree_item_visual_state(None, dict(ix0.data(Qt.UserRole) or {}))
+            self._inline_proposed_commit_item_id = ""
+            self.destination_tree_status.setText("Proposed folder added.")
+            self._save_draft_shell(force=True)
+            self._rebuild_submission_visual_cache()
+            self.update_progress_summaries()
+            selected_ix = self._find_visible_destination_item_by_path(proposed_path)
+            if selected_ix is not None and isinstance(selected_ix, QModelIndex) and selected_ix.isValid():
+                self._expand_destination_tree_to_show_model_index(selected_ix)
+                sm = tree.selectionModel()
+                if sm is not None:
+                    sel = selected_ix.siblingAtColumn(0) if selected_ix.column() != 0 else selected_ix
+                    sm.setCurrentIndex(
+                        sel,
+                        QItemSelectionModel.SelectionFlag.ClearAndSelect
+                        | QItemSelectionModel.SelectionFlag.Rows,
+                    )
+                self.on_tree_selection_changed("destination")
+            return
+
+        self._rewrite_proposed_branch_runtime_paths(original_path, proposed_path)
+        self._rename_visible_destination_subtree_index(ix0, original_path, proposed_path)
+        refreshed = dict(ix0.data(Qt.UserRole) or {})
+        refreshed["_inline_rename_proposed"] = False
+        refreshed["base_display_label"] = self._tree_name_column_label(
+            str(refreshed.get("name") or folder_name or "").strip(),
+            tag="(Proposed)",
+        )
+
+        def _mut_rename_done(p):
+            p.clear()
+            p.update(refreshed)
+
+        model.update_payload_for_index(ix0, _mut_rename_done)
+        self._apply_tree_item_visual_state(None, dict(ix0.data(Qt.UserRole) or {}))
+        self._inline_proposed_commit_item_id = ""
+        self.destination_tree_status.setText("Proposed folder renamed.")
+        self._persist_planning_change_lightweight()
+        selected_ix = self._find_visible_destination_item_by_path(proposed_path)
+        if selected_ix is not None and isinstance(selected_ix, QModelIndex) and selected_ix.isValid():
+            self._expand_destination_tree_to_show_model_index(selected_ix)
+            sm = tree.selectionModel()
+            if sm is not None:
+                sel = selected_ix.siblingAtColumn(0) if selected_ix.column() != 0 else selected_ix
+                sm.setCurrentIndex(
+                    sel,
+                    QItemSelectionModel.SelectionFlag.ClearAndSelect
+                    | QItemSelectionModel.SelectionFlag.Rows,
+                )
+            self.on_tree_selection_changed("destination")
+
     def on_destination_tree_item_changed(self, item, column):
         if column != 0:
             return
@@ -29154,7 +29470,13 @@ class MainWindow(QMainWindow):
                 or self._proposed_destination_path(row).startswith(target_path + "\\")
             )
         ]
-        self._remove_visible_destination_subtree_by_prefix(item, target_path)
+        if isinstance(item, QModelIndex):
+            model = getattr(self, "destination_planning_model", None)
+            if model is not None:
+                ix0 = item.siblingAtColumn(0) if item.column() != 0 else item
+                model.remove_node_at(ix0)
+        else:
+            self._remove_visible_destination_subtree_by_prefix(item, target_path)
 
         self.destination_tree_status.setText("Proposed folder deleted.")
         self.clear_selection_details()
@@ -29248,6 +29570,7 @@ class MainWindow(QMainWindow):
         else:
             move["target_name"] = new_name
         self.planned_moves_status.setText("Planned item renamed.")
+        self.refresh_planned_moves_table()
         self._persist_planning_change("planned_item_renamed")
 
     def handle_remove_planned_allocation(self, node_data):
