@@ -89,8 +89,13 @@ from ozlink_console.memory import MemoryManager
 from ozlink_console.models import AllocationRow, ProposedFolder, SessionState, SubmissionBatch
 from ozlink_console.requests_store import RequestStore
 from ozlink_console.graph_folder_execution_safety import compute_graph_unsafe_folder_step_indices
+from ozlink_console.graph_folder_execution_expansion import expand_graph_transfer_steps
+from ozlink_console.plan_execution_duplicate_validation import (
+    duplicate_collision_report_from_transfer_steps,
+)
 from ozlink_console.transfer_manifest import (
     build_simulation_manifest,
+    expanded_graph_steps_to_transfer_step_json_dicts,
     upconvert_manifest_v1_to_v2,
     write_manifest_json,
     _planned_move_to_step,
@@ -18435,6 +18440,42 @@ class MainWindow(QMainWindow):
             paths_equivalent=lambda a, b, role: self._paths_equivalent(a, b, role),
         )
 
+    def _compute_graph_expanded_transfer_steps_json(self) -> list[dict] | None:
+        """Graph execution expansion from current plan; None = omit (runner uses block/fallback)."""
+        unsafe = self._compute_graph_unsafe_folder_step_indices()
+        if not unsafe:
+            return None
+        excl_raw = getattr(self, "_plan_leaf_exclusions", set()) or set()
+        excl = {
+            self._canonical_source_projection_path(str(x))
+            for x in excl_raw
+            if str(x).strip()
+        }
+        try:
+            expanded = expand_graph_transfer_steps(
+                list(self.planned_moves or []),
+                excl,
+                canonical_source=lambda m: self._canonical_source_projection_path(m.get("source_path", "")),
+                path_is_descendant=lambda c, p: self._path_is_descendant(c, p, "source"),
+                allocation_projection_path=self._allocation_projection_path,
+                normalize_memory_path=self.normalize_memory_path,
+                canonical_destination_projection_path=self._canonical_destination_projection_path,
+                paths_equivalent=lambda a, b, role: self._paths_equivalent(a, b, role),
+            )
+        except ValueError as exc:
+            log_warn("graph_expansion_duplicate_internal", error=str(exc))
+            return None
+        rows = expanded_graph_steps_to_transfer_step_json_dicts(list(self.planned_moves or []), expanded)
+        ds, dd = duplicate_collision_report_from_transfer_steps(rows)
+        if ds or dd:
+            log_warn(
+                "graph_expansion_manifest_duplicate_collision",
+                duplicate_sources=ds,
+                duplicate_destinations=dd,
+            )
+            return None
+        return rows
+
     def _planned_moves_duplicate_validation_error(self, moves) -> str:
         ds, dd = duplicate_collision_report_from_moves(
             list(moves or []),
@@ -29505,6 +29546,7 @@ class MainWindow(QMainWindow):
             manifest_version=2,
             plan_leaf_exclusions=sorted(getattr(self, "_plan_leaf_exclusions", set()) or []),
             graph_unsafe_folder_step_indices=self._compute_graph_unsafe_folder_step_indices(),
+            graph_expanded_transfer_steps=self._compute_graph_expanded_transfer_steps_json(),
         )
         try:
             write_manifest_json(path, manifest)

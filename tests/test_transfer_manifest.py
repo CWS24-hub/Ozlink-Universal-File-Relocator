@@ -42,6 +42,35 @@ class TransferManifestTests(unittest.TestCase):
         )
         self.assertEqual(m["execution_options"]["graph_unsafe_folder_step_indices"], [])
 
+    def test_manifest_embeds_graph_expanded_transfer_steps_when_passed(self):
+        exp = [
+            {
+                "index": 0,
+                "operation": "copy",
+                "source_path": "Lib\\a",
+                "destination_path": "Root\\b",
+                "source_name": "a",
+                "destination_name": "a",
+                "is_source_folder": False,
+                "planned_move_index": 2,
+                "request_id": "",
+                "status": "Draft",
+                "allocation_method": "",
+                "step_uid": "NOREQ::0",
+            }
+        ]
+        m = build_simulation_manifest(
+            planned_moves=[],
+            proposed_folders=[],
+            draft_id="D1",
+            graph_expanded_transfer_steps=exp,
+        )
+        self.assertEqual(m["execution_options"]["graph_expanded_transfer_steps"], exp)
+
+    def test_manifest_omits_graph_expanded_when_not_passed(self):
+        m = build_simulation_manifest(planned_moves=[], proposed_folders=[], draft_id="D1")
+        self.assertNotIn("graph_expanded_transfer_steps", m["execution_options"])
+
     def test_manifest_includes_plan_leaf_exclusions_when_present(self):
         m = build_simulation_manifest(
             planned_moves=[],

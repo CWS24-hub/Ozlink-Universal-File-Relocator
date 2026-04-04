@@ -132,6 +132,24 @@ def _proposed_to_step(index: int, pf: ProposedFolder) -> ProposedFolderStep:
     )
 
 
+def expanded_graph_steps_to_transfer_step_json_dicts(
+    planned_moves: list[dict[str, Any]],
+    expanded: list[Any],
+) -> list[dict[str, Any]]:
+    """Build transfer_step JSON dicts from expansion output (sequential index, drive ids from planned move)."""
+    out: list[dict[str, Any]] = []
+    moves = list(planned_moves or [])
+    for i, eg in enumerate(expanded):
+        pm = int(getattr(eg, "planned_move_index", -1))
+        if pm < 0 or pm >= len(moves):
+            continue
+        m = moves[pm]
+        step = _planned_move_to_step(i, m).to_json_dict()
+        step["planned_move_index"] = pm
+        out.append(step)
+    return out
+
+
 def build_simulation_manifest(
     *,
     planned_moves: list[dict[str, Any]],
@@ -142,6 +160,7 @@ def build_simulation_manifest(
     manifest_version: int = 1,
     plan_leaf_exclusions: list[str] | None = None,
     graph_unsafe_folder_step_indices: list[int] | None = None,
+    graph_expanded_transfer_steps: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Return a JSON-serialisable manifest dict (simulation / handoff only)."""
     steps = [_planned_move_to_step(i, m).to_json_dict() for i, m in enumerate(planned_moves or [])]
@@ -159,6 +178,8 @@ def build_simulation_manifest(
         execution_options["graph_unsafe_folder_step_indices"] = sorted(
             {int(x) for x in graph_unsafe_folder_step_indices if int(x) >= 0}
         )
+    if graph_expanded_transfer_steps is not None:
+        execution_options["graph_expanded_transfer_steps"] = list(graph_expanded_transfer_steps)
     doc = SimulationManifest(
         manifest_version=int(manifest_version or 1),
         kind="simulation",

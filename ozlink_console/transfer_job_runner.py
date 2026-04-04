@@ -354,6 +354,7 @@ def run_manifest_local_filesystem(
         if str(x).strip()
     )
     plan_leaf_exclusions = list(opts.get("plan_leaf_exclusions") or [])
+    graph_expanded_steps = list(opts.get("graph_expanded_transfer_steps") or [])
     graph_unsafe_embedded_key_present = "graph_unsafe_folder_step_indices" in opts
     graph_unsafe_folder_indices: set[int] = set()
     if graph_unsafe_embedded_key_present:
@@ -557,7 +558,14 @@ def run_manifest_local_filesystem(
         else:
             emit(StepRunRecord("proposed_folder", idx, "ok", f"mkdir {dst}", attempts=attempts))
 
-    for step in manifest.get("transfer_steps") or []:
+    def _graph_expansion_then_transfer_steps():
+        if graph_expanded_steps and graph_client is not None:
+            for s in graph_expanded_steps:
+                yield s, True
+        for s in manifest.get("transfer_steps") or []:
+            yield s, False
+
+    for step, from_graph_expansion in _graph_expansion_then_transfer_steps():
         idx = int(step.get("index", -1))
         op = str(step.get("operation", "copy")).lower()
         if op != "copy":
@@ -569,6 +577,15 @@ def run_manifest_local_filesystem(
         is_folder = bool(step.get("is_source_folder", False))
         dest_name = str(step.get("destination_name", "") or step.get("source_name", "") or "").strip()
         step_uid = str(step.get("step_uid", "") or "").strip()
+
+        if (
+            not from_graph_expansion
+            and graph_expanded_steps
+            and graph_client is not None
+            and _step_graph_ready(step)
+            and not (is_absolute_local_path(src) and is_absolute_local_path(dst))
+        ):
+            continue
 
         if pilot_transfer_step_indices and idx not in pilot_transfer_step_indices:
             emit(
@@ -630,7 +647,7 @@ def run_manifest_local_filesystem(
                 )
                 continue
 
-            if is_folder:
+            if is_folder and not from_graph_expansion:
                 if graph_unsafe_embedded_key_present:
                     graph_folder_blocked = idx in graph_unsafe_folder_indices
                 else:

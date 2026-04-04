@@ -797,6 +797,62 @@ class TransferJobRunnerTests(unittest.TestCase):
         self.assertEqual(folder_rec.status, "skipped")
         self.assertIn("Graph folder copy blocked", folder_rec.detail)
 
+    def test_graph_expanded_transfer_steps_runs_copy_without_folder_block(self):
+        """Expanded list runs Graph copies; unsafe folder row in transfer_steps does not duplicate Graph."""
+        from unittest.mock import MagicMock
+
+        mock_g = MagicMock()
+        mock_g.start_drive_item_copy.return_value = "https://monitor"
+        mock_g.wait_graph_async_operation.return_value = None
+
+        manifest = {
+            "manifest_version": 2,
+            "proposed_folder_steps": [],
+            "execution_options": {
+                "graph_unsafe_folder_step_indices": [0],
+                "graph_expanded_transfer_steps": [
+                    {
+                        "index": 0,
+                        "operation": "copy",
+                        "source_path": "Lib\\Folder\\a.txt",
+                        "destination_path": "Root\\Dest",
+                        "source_name": "a.txt",
+                        "destination_name": "a.txt",
+                        "is_source_folder": False,
+                        "request_id": "REQ",
+                        "status": "Draft",
+                        "allocation_method": "",
+                        "step_uid": "REQ::0",
+                        "planned_move_index": 1,
+                        "source_drive_id": "d1",
+                        "source_item_id": "i1",
+                        "destination_drive_id": "d2",
+                        "destination_item_id": "parent1",
+                    }
+                ],
+            },
+            "transfer_steps": [
+                {
+                    "index": 0,
+                    "operation": "copy",
+                    "source_path": "Lib\\Folder",
+                    "destination_path": "Root\\Folder",
+                    "source_name": "Folder",
+                    "destination_name": "Folder",
+                    "is_source_folder": True,
+                    "request_id": "",
+                    "status": "Draft",
+                    "allocation_method": "",
+                    "source_drive_id": "d1",
+                    "source_item_id": "fold1",
+                    "destination_drive_id": "d2",
+                    "destination_item_id": "parent1",
+                },
+            ],
+        }
+        run_manifest_local_filesystem(manifest, dry_run=False, graph_client=mock_g)
+        mock_g.start_drive_item_copy.assert_called_once()
+
     def test_summary_counts(self):
         m = {
             "manifest_version": 1,
