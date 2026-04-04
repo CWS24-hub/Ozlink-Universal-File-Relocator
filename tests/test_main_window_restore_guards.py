@@ -30,6 +30,9 @@ class _AbortHost:
         self._suppress_autosave = False
         self.logged = []
 
+    def _update_source_count_labels(self, loaded_items) -> None:
+        """Stub: MainWindow._enter_restore_abort_mode refreshes count labels after full-count cleanup."""
+
     def _restore_abort_active(self) -> bool:
         return bool(self._restore_abort_mode)
 
