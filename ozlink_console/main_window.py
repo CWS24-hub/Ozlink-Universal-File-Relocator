@@ -17802,15 +17802,28 @@ class MainWindow(QMainWindow):
     def _destination_projection_eager_expand_all_destination(self):
         return bool((getattr(self, "_workspace_restore_expanded_all_intent", None) or {}).get("destination"))
 
+    def _destination_bind_allocation_descendants_eager_active(self):
+        """When False, bind never hydrates full allocation subtrees (lazy expand path only).
+
+        Tests may enable this and override ``_destination_bind_should_apply_allocation_descendants_now``
+        to exercise eager bind-time projection without walking every allocation row on each bind.
+        """
+        return False
+
     def _destination_bind_should_apply_allocation_descendants_now(self, allocation_semantic_path, normalized_targets):
         """Whether to materialize all projected descendants during bind (eager).
 
-        Always **False**: projected descendants stay lazy on bind. Expand-all and session restore
-        hydrate progressively via the destination expand-all queue, expand signals, and
-        ``_hydrate_destination_allocations_for_expanded_paths_*`` after bind (signals unblocked).
+        When ``_destination_bind_allocation_descendants_eager_active()`` is False (production),
+        projected descendants stay lazy on bind. Expand-all and session restore hydrate via the
+        destination expand-all queue, expand signals, and ``_hydrate_destination_allocations_for_expanded_paths_*``
+        after bind (signals unblocked).
 
-        ``allocation_semantic_path`` and ``normalized_targets`` are retained for call-site compatibility.
+        ``allocation_semantic_path`` and ``normalized_targets`` are retained for call-site compatibility
+        when eager bind is enabled in future or in tests.
         """
+        if not self._destination_bind_allocation_descendants_eager_active():
+            _ = (allocation_semantic_path, normalized_targets)
+            return False
         _ = (allocation_semantic_path, normalized_targets)
         return False
 
@@ -17883,6 +17896,31 @@ class MainWindow(QMainWindow):
             applied_count = 0
             allocation_pass = 0
             visited = 0
+            if not self._destination_bind_allocation_descendants_eager_active():
+                for ix in dmodel.iter_depth_first():
+                    visited += 1
+                    if visited % 40 == 0:
+                        QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+                    node_data = ix.data(Qt.UserRole) or {}
+                    if not self.node_is_planned_allocation(node_data):
+                        continue
+                    if not bool(node_data.get("is_folder", False)):
+                        continue
+                    if not bool(node_data.get("allocation_descendants_applied")):
+                        continue
+                    if bool(node_data.get("children_loaded")):
+                        continue
+                    nd = dict(node_data)
+                    nd["children_loaded"] = True
+                    nd["projection_unresolved_terminal"] = False
+
+                    def _mut(p):
+                        p.clear()
+                        p.update(nd)
+
+                    dmodel.update_payload_for_index(ix, _mut)
+                return applied_count
+
             pm_lookup = self._build_planned_move_destination_lookup()
             for ix, move in self._destination_model_build_allocation_apply_pairs(dmodel, pm_lookup):
                 visited += 1
@@ -17928,6 +17966,27 @@ class MainWindow(QMainWindow):
         applied_count = 0
         allocation_pass = 0
         visited = 0
+        if not self._destination_bind_allocation_descendants_eager_active():
+            for index in range(tree.topLevelItemCount()):
+                for item in self._iter_tree_items(tree.topLevelItem(index)):
+                    visited += 1
+                    if visited % 40 == 0:
+                        QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+                    node_data = item.data(0, Qt.UserRole) or {}
+                    if not self.node_is_planned_allocation(node_data):
+                        continue
+                    if not bool(node_data.get("is_folder", False)):
+                        continue
+                    if not bool(node_data.get("allocation_descendants_applied")):
+                        continue
+                    if bool(node_data.get("children_loaded")):
+                        continue
+                    nd = dict(node_data)
+                    nd["children_loaded"] = True
+                    nd["projection_unresolved_terminal"] = False
+                    item.setData(0, Qt.UserRole, nd)
+            return applied_count
+
         pm_lookup = self._build_planned_move_destination_lookup()
         alloc_by_path = pm_lookup.get("alloc_by_path") or {}
         for index in range(tree.topLevelItemCount()):
@@ -20768,8 +20827,10 @@ class MainWindow(QMainWindow):
     def _destination_future_bind_should_chunk_async(self, model, *, on_complete):
         """Use QTimer-sliced bind when the unique-path map is large or allocation merge will be heavy.
 
-        A small ``nodes`` dict (e.g. 169 paths) can still expand into thousands of tree rows and
-        minutes of synchronous ``_apply_visible_destination_allocation_descendants`` work.
+        A small ``nodes`` dict (e.g. 169 paths) can still expand into thousands of tree rows; when
+        bind-time allocation descendant hydration is enabled, ``_apply_visible_destination_allocation_descendants``
+        can dominate wall time. Production keeps that path lazy and only patches rows already marked
+        ``allocation_descendants_applied``.
         """
         nodes = model.get("nodes") or {}
         n_paths = len(nodes)

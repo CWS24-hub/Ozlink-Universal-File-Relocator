@@ -77,6 +77,7 @@ def test_apply_visible_model_branch_uses_flag_not_child_presence():
     mw._destination_model_build_allocation_apply_pairs = lambda _m, _l: [(ix, move)]  # noqa: E731
     mw._destination_bind_normalized_expanded_targets = lambda _ep: {"\\Alloc"}  # noqa: E731
     mw._destination_semantic_path = lambda _nd: "\\Alloc"  # noqa: E731
+    mw._destination_bind_allocation_descendants_eager_active = lambda: True  # noqa: E731
     mw._destination_bind_should_apply_allocation_descendants_now = lambda _sem, _nt: True  # noqa: E731
     applied = {"n": 0}
 
@@ -114,6 +115,7 @@ def test_apply_visible_model_skips_apply_when_descendants_already_applied():
     mw._destination_model_build_allocation_apply_pairs = lambda _m, _l: [(ix, move)]  # noqa: E731
     mw._destination_bind_normalized_expanded_targets = lambda _ep: {"\\Alloc"}  # noqa: E731
     mw._destination_semantic_path = lambda _nd: "\\Alloc"  # noqa: E731
+    mw._destination_bind_allocation_descendants_eager_active = lambda: True  # noqa: E731
     mw._destination_bind_should_apply_allocation_descendants_now = lambda _sem, _nt: True  # noqa: E731
 
     def _fail_apply(*_a, **_k):
