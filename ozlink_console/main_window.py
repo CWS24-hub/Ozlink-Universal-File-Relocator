@@ -7035,6 +7035,28 @@ class MainWindow(QMainWindow):
             )[:200],
         }
 
+    def _clear_stale_pending_folder_loads_if_no_workers(self) -> None:
+        """Drop stuck pending-folder keys when no root/folder workers are running (unblocks Reset Draft)."""
+        if MainWindow._root_load_worker_running(self, "source") or MainWindow._root_load_worker_running(
+            self, "destination"
+        ):
+            return
+        if MainWindow._any_folder_load_worker_running(self):
+            return
+        pending = getattr(self, "pending_folder_loads", None) or {}
+        ps = pending.get("source", set()) or set()
+        pd = pending.get("destination", set()) or set()
+        if not ps and not pd:
+            return
+        log_warn(
+            "DRAFTRESET",
+            event="stale_pending_folder_loads_cleared_idle_workers",
+            pending_source=len(ps),
+            pending_destination=len(pd),
+        )
+        pending.setdefault("source", set()).clear()
+        pending.setdefault("destination", set()).clear()
+
     def _release_stalled_memory_restore_gate_for_reset_draft(self) -> None:
         """Clear bookkeeping flags that kept finalize from running when no async work remains."""
         log_info(
@@ -7054,17 +7076,29 @@ class MainWindow(QMainWindow):
             return
         if getattr(self, "_memory_restore_in_progress", False):
             self._finalize_memory_restore_if_ready("reset_draft_precheck")
+        self._clear_stale_pending_folder_loads_if_no_workers()
         if getattr(self, "_memory_restore_in_progress", False) and self._memory_restore_async_busy_for_reset_draft():
             log_warn(
                 "DRAFTRESET",
                 event="reset_draft_blocked_precheck",
                 **self._reset_draft_memory_restore_diagnostics(),
             )
-            QMessageBox.information(
-                self,
-                "Reset Draft",
-                "Wait for the current memory restore to finish before resetting the draft.",
+            wait_box = QMessageBox(self)
+            wait_box.setIcon(QMessageBox.Icon.Information)
+            wait_box.setWindowTitle("Reset Draft")
+            wait_box.setText(
+                "The workspace is still loading or reconciling your saved draft. "
+                "Reset is paused until that finishes so your backup stays consistent."
             )
+            wait_box.setInformativeText(
+                "Most of the time this finishes within a minute or two after sign-in. "
+                "If you have many planned moves, trees and projections can keep working for several minutes.\n\n"
+                "If the window has looked fully idle (no loading in the trees) for more than about ten minutes "
+                "and you still see this, close and restart the app, then try Reset Draft again.\n\n"
+                "Technical detail is logged under your Ozlink console Logs folder "
+                "(search the newest OzlinkConsole log for DRAFTRESET / reset_draft_blocked_precheck)."
+            )
+            wait_box.exec()
             return
 
         dlg = QMessageBox(self)
@@ -7087,6 +7121,7 @@ class MainWindow(QMainWindow):
 
         if getattr(self, "_memory_restore_in_progress", False):
             self._finalize_memory_restore_if_ready("reset_draft_precheck_post_confirm")
+        self._clear_stale_pending_folder_loads_if_no_workers()
         if getattr(self, "_memory_restore_in_progress", False):
             if self._memory_restore_async_busy_for_reset_draft():
                 QMessageBox.critical(
