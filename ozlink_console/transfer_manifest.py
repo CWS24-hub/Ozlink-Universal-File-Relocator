@@ -140,12 +140,20 @@ def build_simulation_manifest(
     tenant_hint: str = "",
     notes: str = "",
     manifest_version: int = 1,
+    plan_leaf_exclusions: list[str] | None = None,
 ) -> dict[str, Any]:
     """Return a JSON-serialisable manifest dict (simulation / handoff only)."""
     steps = [_planned_move_to_step(i, m).to_json_dict() for i, m in enumerate(planned_moves or [])]
     proposed = [
         _proposed_to_step(i, pf).to_json_dict() for i, pf in enumerate(proposed_folders or [])
     ]
+    excl = [str(x) for x in (plan_leaf_exclusions or []) if str(x).strip()]
+    execution_options: dict[str, Any] = {
+        "governance_schema": "ozlink/v1",
+        "verify_integrity": True,
+    }
+    if excl:
+        execution_options["plan_leaf_exclusions"] = sorted(excl, key=lambda s: s.lower())
     doc = SimulationManifest(
         manifest_version=int(manifest_version or 1),
         kind="simulation",
@@ -155,10 +163,7 @@ def build_simulation_manifest(
         transfer_steps=steps,
         proposed_folder_steps=proposed,
         notes=str(notes or ""),
-        execution_options={
-            "governance_schema": "ozlink/v1",
-            "verify_integrity": True,
-        },
+        execution_options=execution_options,
     )
     return doc.to_json_dict()
 

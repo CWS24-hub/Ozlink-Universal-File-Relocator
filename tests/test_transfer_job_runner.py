@@ -718,6 +718,64 @@ class TransferJobRunnerTests(unittest.TestCase):
         self.assertEqual(s["local_mkdir"], 0)
         self.assertEqual(s["proposed_skipped_non_local"], 0)
 
+    def test_copytree_respects_plan_leaf_exclusions_and_direct_file_steps(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            src_f = td / "src" / "F"
+            src_f.mkdir(parents=True)
+            (src_f / "keep.txt").write_text("keep", encoding="utf-8")
+            (src_f / "ex.txt").write_text("bad", encoding="utf-8")
+            (src_f / "direct.txt").write_text("direct", encoding="utf-8")
+            dst_f = td / "dst" / "F"
+            dst_alt = td / "dst" / "alt"
+            dst_alt.mkdir(parents=True)
+
+            manifest = {
+                "manifest_version": 2,
+                "kind": "simulation",
+                "transfer_steps": [
+                    {
+                        "index": 0,
+                        "operation": "copy",
+                        "source_path": str(src_f),
+                        "destination_path": str(dst_f),
+                        "source_name": "F",
+                        "destination_name": "F",
+                        "is_source_folder": True,
+                        "request_id": "R0",
+                        "status": "Draft",
+                        "allocation_method": "",
+                        "step_uid": "R0::0",
+                    },
+                    {
+                        "index": 1,
+                        "operation": "copy",
+                        "source_path": str(src_f / "direct.txt"),
+                        "destination_path": str(dst_alt),
+                        "source_name": "direct.txt",
+                        "destination_name": "direct.txt",
+                        "is_source_folder": False,
+                        "request_id": "R1",
+                        "status": "Draft",
+                        "allocation_method": "",
+                        "step_uid": "R1::1",
+                    },
+                ],
+                "proposed_folder_steps": [],
+                "execution_options": {
+                    "verify_integrity": False,
+                    "plan_leaf_exclusions": [r"F\ex.txt"],
+                },
+            }
+            r = run_manifest_local_filesystem(manifest, dry_run=False, verify_integrity=False)
+            self.assertTrue(any(x.status == "ok" for x in r.records))
+            self.assertTrue((dst_f / "keep.txt").exists())
+            self.assertFalse((dst_f / "ex.txt").exists())
+            self.assertTrue((dst_alt / "direct.txt").exists())
+            self.assertEqual((dst_alt / "direct.txt").read_text(encoding="utf-8"), "direct")
+
     def test_round_trip_load_json(self):
         import tempfile
 

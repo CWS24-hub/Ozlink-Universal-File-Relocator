@@ -40,6 +40,67 @@ def _path_depth_for_sort(path: str) -> int:
     return len(parts)
 
 
+def _direct_file_sources_under_folder_root(
+    manifest: dict[str, Any],
+    folder_step_index: int,
+    folder_src: Path,
+) -> set[str]:
+    """
+    Absolute paths of non-folder transfer steps whose source is under folder_src.
+
+    Those files must be skipped by copytree so their own copy steps apply (direct override).
+    """
+    folder_resolved = folder_src.resolve()
+    out: set[str] = set()
+    for st in manifest.get("transfer_steps") or []:
+        if int(st.get("index", -1)) == folder_step_index:
+            continue
+        if str(st.get("operation", "")).lower() != "copy":
+            continue
+        if bool(st.get("is_source_folder", False)):
+            continue
+        sp = str(st.get("source_path") or "").strip()
+        if not sp:
+            continue
+        try:
+            Path(sp).resolve().relative_to(folder_resolved)
+        except ValueError:
+            continue
+        out.add(str(Path(sp).resolve()))
+    return out
+
+
+def _copytree_ignore_for_plan_rules(
+    manifest: dict[str, Any],
+    folder_step_index: int,
+    folder_src: Path,
+    plan_leaf_exclusions: list[str],
+) -> Callable[[str, list[str]], list[str]]:
+    """shutil.copytree ignore=… factory: skip excluded leaves and direct per-file steps under this folder."""
+    from ozlink_console.planning_resolution import local_absolute_path_matches_canonical_projection
+
+    direct_abs = _direct_file_sources_under_folder_root(manifest, folder_step_index, folder_src)
+    exclusions = [str(x) for x in plan_leaf_exclusions if str(x).strip()]
+
+    def ignore(dir_str: str, names: list[str]) -> list[str]:
+        ignored: list[str] = []
+        for name in names:
+            full = Path(dir_str) / name
+            if not full.is_file():
+                continue
+            rp = str(full.resolve())
+            if rp in direct_abs:
+                ignored.append(name)
+                continue
+            for ex in exclusions:
+                if local_absolute_path_matches_canonical_projection(rp, ex):
+                    ignored.append(name)
+                    break
+        return ignored
+
+    return ignore
+
+
 def _graph_async_monitor_auth_poll_failure(exc: BaseException) -> bool:
     """True when the async copy monitor poll failed with HTTP 401 (copy may still have completed)."""
     return isinstance(exc, requests.HTTPError) and exc.response is not None and exc.response.status_code == 401
@@ -288,6 +349,7 @@ def run_manifest_local_filesystem(
         for x in (opts.get("pilot_transfer_destination_paths") or [])
         if str(x).strip()
     )
+    plan_leaf_exclusions = list(opts.get("plan_leaf_exclusions") or [])
     if dry_run:
         pilot_max_graph_ops = 0
     graph_ops_used = 0
@@ -554,6 +616,14 @@ def run_manifest_local_filesystem(
                 )
                 continue
 
+            if is_folder and plan_leaf_exclusions:
+                log_info(
+                    "transfer_job_graph_folder_copy_plan_leaf_exclusions_unsupported",
+                    step_index=idx,
+                    exclusion_count=len(plan_leaf_exclusions),
+                    detail="plan_leaf_exclusions are not applied to Microsoft Graph folder copies; use local paths or per-file steps.",
+                )
+
             if dry_run:
                 emit(
                     StepRunRecord(
@@ -692,7 +762,8 @@ def run_manifest_local_filesystem(
 
             def _tree() -> None:
                 dst_p.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copytree(src_p, dst_p, dirs_exist_ok=True)
+                ign = _copytree_ignore_for_plan_rules(manifest, idx, src_p, plan_leaf_exclusions)
+                shutil.copytree(src_p, dst_p, dirs_exist_ok=True, ignore=ign)
 
             attempts, exc = _retry_call(_tree, max_retries=max_retries, base_delay_sec=base_delay_sec)
             if exc is not None:

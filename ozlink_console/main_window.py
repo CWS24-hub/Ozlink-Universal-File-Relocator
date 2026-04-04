@@ -94,6 +94,7 @@ from ozlink_console.transfer_manifest import (
     write_manifest_json,
     _planned_move_to_step,
 )
+from ozlink_console.planning_resolution import find_inherited_planned_move_for_source_path_raw
 from ozlink_console.draft_snapshot.recursive_subtree_expansion import (
     allocation_row_dict_for_expanded_file,
     compose_path_under_folder,
@@ -18294,19 +18295,12 @@ class MainWindow(QMainWindow):
 
     def _find_inherited_planned_move_for_source_path_raw(self, canonical_source_path):
         """Nearest ancestor folder move for a source path, ignoring leaf exclusions."""
-        if not canonical_source_path:
-            return None
-        inherited_move = None
-        inherited_path_length = -1
-        for move in self.planned_moves:
-            move_source_path = self._canonical_source_projection_path(move.get("source_path", ""))
-            if not move_source_path or move_source_path == canonical_source_path:
-                continue
-            if self._path_is_descendant(canonical_source_path, move_source_path, "source"):
-                if len(move_source_path) > inherited_path_length:
-                    inherited_move = move
-                    inherited_path_length = len(move_source_path)
-        return inherited_move
+        return find_inherited_planned_move_for_source_path_raw(
+            canonical_source_path,
+            self.planned_moves,
+            lambda m: self._canonical_source_projection_path(m.get("source_path", "")),
+            lambda c, p: self._path_is_descendant(c, p, "source"),
+        )
 
     def _find_inherited_planned_move_for_source_path(self, source_path):
         canonical_source_path = self._canonical_source_projection_path(source_path)
@@ -29356,6 +29350,7 @@ class MainWindow(QMainWindow):
             tenant_hint=tenant_hint,
             notes="Simulation export from Ozlink Console. Local absolute paths can be run from the Execution page or Planned Moves (Run manifest).",
             manifest_version=2,
+            plan_leaf_exclusions=sorted(getattr(self, "_plan_leaf_exclusions", set()) or []),
         )
         try:
             write_manifest_json(path, manifest)

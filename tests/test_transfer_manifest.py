@@ -21,6 +21,19 @@ class TransferManifestTests(unittest.TestCase):
         self.assertEqual(m["proposed_folder_steps"], [])
         self.assertIn("execution_options", m)
         self.assertTrue(m["execution_options"].get("verify_integrity"))
+        self.assertNotIn("plan_leaf_exclusions", m["execution_options"])
+
+    def test_manifest_includes_plan_leaf_exclusions_when_present(self):
+        m = build_simulation_manifest(
+            planned_moves=[],
+            proposed_folders=[],
+            draft_id="D1",
+            plan_leaf_exclusions=[r"lib\a\x.bin", r"lib\b\y.txt"],
+        )
+        self.assertEqual(
+            m["execution_options"]["plan_leaf_exclusions"],
+            [r"lib\a\x.bin", r"lib\b\y.txt"],
+        )
 
     def test_planned_moves_and_proposed_round_trip_file(self):
         moves = [
