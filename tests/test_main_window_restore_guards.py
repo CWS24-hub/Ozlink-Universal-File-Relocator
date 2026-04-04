@@ -145,6 +145,50 @@ def test_schedule_post_login_phase4_skips_when_abort_active():
     assert host.calls == []
 
 
+def test_reset_draft_async_busy_false_on_idle_host():
+    host = type(
+        "Host",
+        (),
+        {
+            "_memory_ui_rebind_in_progress": False,
+            "_root_tree_bind_in_progress": False,
+            "root_load_workers": {},
+            "pending_folder_loads": {"source": set(), "destination": set()},
+            "_destination_restore_materialization_queue": [],
+            "_source_restore_materialization_queue": [],
+            "_destination_chunked_bind_state": None,
+            "_destination_future_bind_sync_active": False,
+            "_destination_future_projection_async_state": None,
+            "_destination_snapshot_chunked_restore_active": False,
+            "_expand_all_pending": {"source": False, "destination": False},
+            "_lazy_destination_projection_pending_reason": "",
+        },
+    )()
+    assert MainWindow._memory_restore_async_busy_for_reset_draft(host) is False
+
+
+def test_reset_draft_async_busy_true_when_destination_root_worker():
+    host = type(
+        "Host",
+        (),
+        {
+            "_memory_ui_rebind_in_progress": False,
+            "_root_tree_bind_in_progress": False,
+            "root_load_workers": {"destination": {"id": "w1"}},
+            "pending_folder_loads": {"source": set(), "destination": set()},
+            "_destination_restore_materialization_queue": [],
+            "_source_restore_materialization_queue": [],
+            "_destination_chunked_bind_state": None,
+            "_destination_future_bind_sync_active": False,
+            "_destination_future_projection_async_state": None,
+            "_destination_snapshot_chunked_restore_active": False,
+            "_expand_all_pending": {"source": False, "destination": False},
+            "_lazy_destination_projection_pending_reason": "",
+        },
+    )()
+    assert MainWindow._memory_restore_async_busy_for_reset_draft(host) is True
+
+
 def test_schedule_post_login_phase4_invokes_safe_invoke_when_pending():
     class Host:
         def __init__(self) -> None:

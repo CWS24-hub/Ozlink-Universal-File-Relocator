@@ -6942,11 +6942,57 @@ class MainWindow(QMainWindow):
             cache_invalidation_done=True,
         )
 
+    def _memory_restore_async_busy_for_reset_draft(self) -> bool:
+        """True while tree loads, projection binds, or expand-all could still be running."""
+        if getattr(self, "_memory_ui_rebind_in_progress", False):
+            return True
+        if getattr(self, "_root_tree_bind_in_progress", False):
+            return True
+        workers = getattr(self, "root_load_workers", None) or {}
+        if workers.get("source") or workers.get("destination"):
+            return True
+        pending = getattr(self, "pending_folder_loads", None) or {}
+        if pending.get("source") or pending.get("destination"):
+            return True
+        if len(getattr(self, "_destination_restore_materialization_queue", []) or []):
+            return True
+        if len(getattr(self, "_source_restore_materialization_queue", []) or []):
+            return True
+        if getattr(self, "_destination_chunked_bind_state", None) is not None:
+            return True
+        if getattr(self, "_destination_future_bind_sync_active", False):
+            return True
+        if getattr(self, "_destination_future_projection_async_state", None) is not None:
+            return True
+        if getattr(self, "_destination_snapshot_chunked_restore_active", False):
+            return True
+        expand_pending = getattr(self, "_expand_all_pending", None) or {}
+        if expand_pending.get("source") or expand_pending.get("destination"):
+            return True
+        if bool(getattr(self, "_lazy_destination_projection_pending_reason", "")):
+            return True
+        return False
+
+    def _release_stalled_memory_restore_gate_for_reset_draft(self) -> None:
+        """Clear bookkeeping flags that kept finalize from running when no async work remains."""
+        log_info(
+            "DRAFTRESET",
+            event="stalled_memory_restore_gate_release",
+            had_overlay_pending=bool(getattr(self, "_restore_destination_overlay_pending", False)),
+        )
+        self._restore_destination_overlay_pending = False
+        setattr(self, "_destination_root_prime_pending", False)
+        self._reset_unresolved_proposed_queue()
+        self._reset_unresolved_allocation_queue()
+        self._finalize_memory_restore_if_ready("reset_draft_stalled_gate_release")
+
     def _handle_reset_draft(self) -> None:
         if self.memory_manager is None:
             QMessageBox.information(self, "Reset Draft", "Draft storage is not available.")
             return
         if getattr(self, "_memory_restore_in_progress", False):
+            self._finalize_memory_restore_if_ready("reset_draft_precheck")
+        if getattr(self, "_memory_restore_in_progress", False) and self._memory_restore_async_busy_for_reset_draft():
             QMessageBox.information(
                 self,
                 "Reset Draft",
@@ -6970,6 +7016,27 @@ class MainWindow(QMainWindow):
         dlg.setDefaultButton(QMessageBox.StandardButton.Cancel)
         dlg.exec()
         if dlg.clickedButton() != reset_btn:
+            return
+
+        if getattr(self, "_memory_restore_in_progress", False):
+            self._finalize_memory_restore_if_ready("reset_draft_precheck_post_confirm")
+        if getattr(self, "_memory_restore_in_progress", False):
+            if self._memory_restore_async_busy_for_reset_draft():
+                QMessageBox.critical(
+                    self,
+                    "Reset Draft",
+                    "Memory restore became active before the backup could start. "
+                    "Wait for trees and planning views to finish loading, then try again.",
+                )
+                return
+            self._release_stalled_memory_restore_gate_for_reset_draft()
+        if getattr(self, "_memory_restore_in_progress", False):
+            QMessageBox.critical(
+                self,
+                "Reset Draft",
+                "The workspace is still marked as restoring memory state and cannot be reset safely. "
+                "Try again shortly, or restart the app if this persists.",
+            )
             return
 
         log_info(
