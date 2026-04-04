@@ -4106,6 +4106,7 @@ class MainWindow(QMainWindow):
         )
         self.planned_moves_box, self.planned_moves_table, self.planned_moves_status = self.build_planned_moves_panel()
         self.details_box = self.build_details_panel()
+        self.preview_tab_box = self.build_preview_tab_panel()
         (
             self.suggestions_box,
             self.suggestions_table,
@@ -4206,6 +4207,7 @@ class MainWindow(QMainWindow):
         self.workspace_tabs.addTab(self.planned_moves_box, "Planned Moves")
         self.workspace_tabs.addTab(self.suggestions_box, "Suggestions")
         self.workspace_tabs.addTab(self.needs_review_box, "Needs Review")
+        self.workspace_tabs.addTab(self.preview_tab_box, "Preview")
         self._workspace_tabs_expanded_min_height = 268
         self._workspace_tabs_expanded_max_height = 380
         self._workspace_tabs_collapsed = False
@@ -8018,23 +8020,6 @@ class MainWindow(QMainWindow):
         self.details_metadata_summary.setPlainText("Select an item to review its metadata.")
         metadata_layout.addWidget(self.details_metadata_summary, 1)
 
-        preview_card = QFrame()
-        preview_card.setObjectName("TreeSurface")
-        preview_card.setMinimumWidth(160)
-        preview_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        preview_layout = QVBoxLayout(preview_card)
-        preview_layout.setContentsMargins(8, 8, 8, 8)
-        preview_layout.setSpacing(4)
-        preview_title = QLabel("Preview")
-        preview_title.setObjectName("HeaderEyebrow")
-        self.details_preview = QTextEdit()
-        self.details_preview.setReadOnly(True)
-        self.details_preview.setObjectName("DetailsNotes")
-        self.details_preview.setMinimumHeight(80)
-        self.details_preview.setPlainText("Preview not available in this version.")
-        preview_layout.addWidget(preview_title)
-        preview_layout.addWidget(self.details_preview, 1)
-
         self.details_notes = QTextEdit()
         self.details_notes.setReadOnly(True)
         self.details_notes.setObjectName("DetailsNotes")
@@ -8043,17 +8028,124 @@ class MainWindow(QMainWindow):
         self.details_notes.setPlainText("Selection guidance and allocation notes will appear here.")
         self.details_notes.hide()
 
-        meta_preview_row = QHBoxLayout()
-        meta_preview_row.setContentsMargins(0, 0, 0, 0)
-        meta_preview_row.setSpacing(10)
-        meta_preview_row.addWidget(metadata_wrap, 11)
-        meta_preview_row.addWidget(preview_card, 9)
-
         layout.addWidget(title)
-        layout.addLayout(meta_preview_row, 1)
+        layout.addWidget(metadata_wrap, 1)
         layout.addLayout(actions_row)
 
         return box
+
+    def build_preview_tab_panel(self):
+        """Dedicated Preview tab: explicit workflow via tree context menu (no auto-load on selection)."""
+        box = QFrame()
+        box.setObjectName("SectionBox")
+        box.setMinimumWidth(0)
+        box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        outer = QVBoxLayout(box)
+        outer.setContentsMargins(12, 10, 12, 10)
+        outer.setSpacing(8)
+
+        self.preview_stack = QStackedWidget()
+        self.preview_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        empty_page = QWidget()
+        empty_layout = QVBoxLayout(empty_page)
+        empty_layout.setContentsMargins(8, 8, 8, 8)
+        self.preview_empty_label = QLabel(
+            "Select a file or folder in a tree and choose Preview to open it here.\n\n"
+            "Preview does not load automatically when you change selection."
+        )
+        self.preview_empty_label.setObjectName("CardBody")
+        self.preview_empty_label.setWordWrap(True)
+        empty_layout.addWidget(self.preview_empty_label)
+        empty_layout.addStretch(1)
+
+        loading_page = QWidget()
+        loading_layout = QVBoxLayout(loading_page)
+        loading_layout.setContentsMargins(8, 8, 8, 8)
+        self.preview_loading_label = QLabel("Loading preview…")
+        self.preview_loading_label.setObjectName("SectionTitle")
+        loading_layout.addWidget(self.preview_loading_label)
+        loading_layout.addStretch(1)
+
+        unsupported_page = QWidget()
+        unsupported_layout = QVBoxLayout(unsupported_page)
+        unsupported_layout.setContentsMargins(8, 8, 8, 8)
+        self.preview_unsupported_label = QLabel("")
+        self.preview_unsupported_label.setObjectName("CardBody")
+        self.preview_unsupported_label.setWordWrap(True)
+        unsupported_layout.addWidget(self.preview_unsupported_label)
+        unsupported_layout.addStretch(1)
+
+        content_page = QWidget()
+        content_layout = QVBoxLayout(content_page)
+        content_layout.setContentsMargins(8, 8, 8, 8)
+        content_layout.setSpacing(6)
+        self.preview_header_title = QLabel("")
+        self.preview_header_title.setObjectName("SectionTitle")
+        self.preview_header_path = QLabel("")
+        self.preview_header_path.setObjectName("MutedText")
+        self.preview_header_path.setWordWrap(True)
+        self.preview_body_text = QTextEdit()
+        self.preview_body_text.setReadOnly(True)
+        self.preview_body_text.setObjectName("DetailsNotes")
+        self.preview_body_text.setMinimumHeight(120)
+        self.preview_body_text.setPlainText("")
+        btn_row = QHBoxLayout()
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_row.setSpacing(8)
+        self.preview_tab_open_file_btn = QPushButton("Open File")
+        self.preview_tab_open_file_btn.setMinimumHeight(28)
+        self.preview_tab_open_file_btn.setToolTip("Open with the default application on this PC (same as Selection Details).")
+        self.preview_tab_open_file_btn.clicked.connect(self.handle_open_selected_file)
+        btn_row.addWidget(self.preview_tab_open_file_btn)
+        btn_row.addStretch(1)
+        content_layout.addWidget(self.preview_header_title)
+        content_layout.addWidget(self.preview_header_path)
+        content_layout.addWidget(self.preview_body_text, 1)
+        content_layout.addLayout(btn_row)
+
+        self.preview_stack.addWidget(empty_page)
+        self.preview_stack.addWidget(loading_page)
+        self.preview_stack.addWidget(unsupported_page)
+        self.preview_stack.addWidget(content_page)
+        self._preview_stack_empty = 0
+        self._preview_stack_loading = 1
+        self._preview_stack_unsupported = 2
+        self._preview_stack_content = 3
+
+        outer.addWidget(self.preview_stack, 1)
+        self.preview_stack.setCurrentIndex(self._preview_stack_empty)
+        return box
+
+    def _preview_tab_set_empty_state(self, message=None):
+        if not hasattr(self, "preview_stack"):
+            return
+        text = message if message is not None else (
+            "Select a file or folder and choose Preview to open it here.\n\n"
+            "Preview does not load automatically when you change selection."
+        )
+        self.preview_empty_label.setText(text)
+        self.preview_stack.setCurrentIndex(self._preview_stack_empty)
+
+    def _preview_tab_set_loading(self):
+        if not hasattr(self, "preview_stack"):
+            return
+        self.preview_loading_label.setText("Loading preview…")
+        self.preview_stack.setCurrentIndex(self._preview_stack_loading)
+
+    def _preview_tab_set_unsupported(self, message):
+        if not hasattr(self, "preview_stack"):
+            return
+        self.preview_unsupported_label.setText(message)
+        self.preview_stack.setCurrentIndex(self._preview_stack_unsupported)
+
+    def _preview_tab_set_content(self, title, path, body):
+        if not hasattr(self, "preview_stack"):
+            return
+        self.preview_header_title.setText(title or "")
+        self.preview_header_path.setText(path or "")
+        self.preview_body_text.setPlainText(body or "")
+        self.preview_stack.setCurrentIndex(self._preview_stack_content)
 
     def build_planned_moves_panel(self):
         box = QFrame()
@@ -23834,27 +23926,43 @@ class MainWindow(QMainWindow):
             text = text[:12000].rstrip() + "\n\n[Preview truncated]"
         return text
 
-    def _set_details_preview_text(self, text):
-        if hasattr(self, "details_preview"):
-            self.details_preview.setPlainText(text)
+    def _invalidate_preview_on_selection_change(self):
+        """Clear Preview tab and cancel in-flight preview when tree selection changes (no auto-load)."""
+        previous_request_id = self._active_preview_request_id
+        if previous_request_id and self._preview_worker is not None and self._preview_worker.isRunning():
+            self._retired_preview_workers[previous_request_id] = self._preview_worker
+        self._active_preview_request_id = 0
+        if hasattr(self, "preview_stack"):
+            self._preview_tab_set_empty_state(
+                "Select a file or folder and choose Preview to open it here.\n\n"
+                "Preview does not load automatically when you change selection."
+            )
 
-    def _start_selection_preview(self, context):
+    def _start_preview_tab_load(self, context):
+        """Load Preview tab content for the given planning context (explicit Preview action only)."""
+        if not context or not hasattr(self, "preview_stack"):
+            return
         target = self._preview_target_for_context(context)
+        notes = context.get("notes_preview", {}) or {}
+        metadata = context.get("metadata", {}) or {}
         if not target:
-            self._set_details_preview_text(context.get("notes_preview", {}).get("preview_text", "Preview not available."))
+            fallback = notes.get("preview_text", "Preview is not available for this selection.")
+            self._preview_tab_set_unsupported(fallback)
             return
 
         cache_key = (target.get("drive_id", ""), target.get("item_id", ""))
         cached_text = self._preview_text_cache.get(cache_key)
         if cached_text:
-            self._set_details_preview_text(cached_text)
+            title = metadata.get("item_name", target.get("name", ""))
+            path = metadata.get("item_path", target.get("path", ""))
+            self._preview_tab_set_content(title, path, cached_text)
             return
 
         self._preview_request_sequence += 1
         request_id = self._preview_request_sequence
         previous_request_id = self._active_preview_request_id
         self._active_preview_request_id = request_id
-        self._set_details_preview_text("Loading file preview...")
+        self._preview_tab_set_loading()
 
         if self._preview_worker is not None and self._preview_worker.isRunning():
             self._retired_preview_workers[previous_request_id] = self._preview_worker
@@ -23871,6 +23979,13 @@ class MainWindow(QMainWindow):
         worker.finished.connect(lambda request_id=request_id: self._safe_invoke("preview.finished", self.on_preview_finished, request_id))
         worker.start()
 
+    def _handle_context_menu_preview(self, panel_key, node_data):
+        context = self._resolve_selected_item_context(panel_key, dict(node_data))
+        self._update_selection_details(context, invalidate_preview_on_selection=False)
+        if hasattr(self, "workspace_tabs") and hasattr(self, "preview_tab_box"):
+            self.workspace_tabs.setCurrentWidget(self.preview_tab_box)
+        self._start_preview_tab_load(context)
+
     def on_preview_success(self, payload, request_id, context):
         if request_id != self._active_preview_request_id:
             return
@@ -23883,7 +23998,10 @@ class MainWindow(QMainWindow):
         if not preview_text:
             preview_text = self._preview_fallback_text(context)
         self._preview_text_cache[(drive_id, item_id)] = preview_text
-        self._set_details_preview_text(preview_text)
+        metadata = context.get("metadata", {}) or {}
+        title = metadata.get("item_name", item_name)
+        path = metadata.get("item_path", "")
+        self._preview_tab_set_content(title, path, preview_text)
         log_info("selection_preview_loaded", item_name=item_name, item_id=item_id, preview_length=len(preview_text))
 
     def on_preview_error(self, payload, request_id, context):
@@ -23891,7 +24009,11 @@ class MainWindow(QMainWindow):
             return
         preview_text = self._preview_fallback_text(context)
         error = payload.get("error", "Unknown preview error.")
-        self._set_details_preview_text(f"{preview_text}\n\nPreview could not be loaded.\n{error}")
+        metadata = context.get("metadata", {}) or {}
+        title = metadata.get("item_name", payload.get("item_name", ""))
+        path = metadata.get("item_path", "")
+        combined = f"{preview_text}\n\nPreview could not be loaded.\n{error}"
+        self._preview_tab_set_content(title, path, combined)
         log_warn("selection_preview_failed", item_name=payload.get("item_name", ""), item_id=payload.get("item_id", ""), error=error)
 
     def on_preview_finished(self, request_id):
@@ -24046,7 +24168,7 @@ class MainWindow(QMainWindow):
             )
         return context
 
-    def _update_selection_details(self, context):
+    def _update_selection_details(self, context, invalidate_preview_on_selection=True):
         metadata = context["metadata"]
         notes_preview = context["notes_preview"]
 
@@ -24068,11 +24190,11 @@ class MainWindow(QMainWindow):
             self.details_metadata_summary.setPlainText("\n".join(metadata_lines))
         if hasattr(self, "details_notes"):
             self.details_notes.setPlainText(notes_preview["notes_text"])
-        self.details_preview.setPlainText(notes_preview["preview_text"])
         self._current_details_context = context
         self._current_details_node_data = dict(context["node_data"])
         self._current_details_panel_key = context["panel_key"]
-        self._start_selection_preview(context)
+        if invalidate_preview_on_selection:
+            self._invalidate_preview_on_selection_change()
 
         log_info(
             "selection_details_metadata_bound",
@@ -26057,8 +26179,11 @@ class MainWindow(QMainWindow):
             self.details_metadata_summary.setPlainText("Select an item to review its metadata.")
         if hasattr(self, "details_notes"):
             self.details_notes.setPlainText("Selection guidance and allocation notes will appear here.")
-        if hasattr(self, "details_preview"):
-            self.details_preview.setPlainText("Select an item to preview its planning context.")
+        if hasattr(self, "preview_stack"):
+            self._preview_tab_set_empty_state(
+                "Select a file or folder and choose Preview to open it here.\n\n"
+                "Preview does not load automatically when you change selection."
+            )
         self._active_preview_request_id = 0
         self.update_details_action_state()
 
@@ -26787,6 +26912,9 @@ class MainWindow(QMainWindow):
 
         menu.addSeparator()
 
+        preview_action = menu.addAction("Preview")
+        preview_action.triggered.connect(lambda: self._handle_context_menu_preview("source", dict(node_data)))
+
         open_file_action = menu.addAction("Open File")
         open_file_action.triggered.connect(lambda: self.handle_open_source_item(node_data))
 
@@ -26895,6 +27023,9 @@ class MainWindow(QMainWindow):
             unassign_destination_action.triggered.connect(lambda: self.handle_remove_planned_allocation(node_data))
 
             menu.addSeparator()
+
+            preview_action = menu.addAction("Preview")
+            preview_action.triggered.connect(lambda: self._handle_context_menu_preview("destination", dict(node_data)))
 
             open_file_action = menu.addAction("Open File")
             open_file_action.setEnabled(not is_folder)
