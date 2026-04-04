@@ -2158,6 +2158,7 @@ class MainWindow(QMainWindow):
         self._lazy_destination_projection_timer.setSingleShot(True)
         self._lazy_destination_projection_timer.timeout.connect(self._run_lazy_destination_projection_refresh)
         self._destination_future_projection_async_state = None
+        self._destination_incremental_merge_in_progress = False
         self._destination_future_projection_timer = QTimer(self)
         self._destination_future_projection_timer.setSingleShot(True)
         self._destination_future_projection_timer.timeout.connect(self._run_destination_future_projection_chunk)
@@ -19246,8 +19247,8 @@ class MainWindow(QMainWindow):
         self._set_tree_status_message("destination", status_msg, loading=True)
         timer = QElapsedTimer()
         timer.start()
-        ms_budget = 12
-        max_items = 280
+        ms_budget = 10
+        max_items = 200
         items_this_tick = 0
         while True:
             if state["move_index"] >= len(state["moves"]):
@@ -21374,6 +21375,7 @@ class MainWindow(QMainWindow):
                 entry_roots_after=len(entry_roots),
             )
 
+        self._destination_incremental_merge_in_progress = True
         tree.blockSignals(True)
         try:
             merge_group_t0 = time.perf_counter()
@@ -21387,6 +21389,14 @@ class MainWindow(QMainWindow):
                     [s.lower() for s in self._path_segments(p)],
                 ),
             )
+            merge_yield_counter = 0
+
+            def _maybe_yield_incremental_merge_ui() -> None:
+                nonlocal merge_yield_counter
+                merge_yield_counter += 1
+                if merge_yield_counter % 18 == 0:
+                    QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+
             if self._destination_tree_uses_model_view():
                 if dmodel is None:
                     return visible_future_branch_count
@@ -21400,13 +21410,17 @@ class MainWindow(QMainWindow):
                                 child_path=root_path,
                                 parent_path=parent_path,
                             )
+                            _maybe_yield_incremental_merge_ui()
+                        QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
                         continue
                     child_map = self._destination_children_semantic_map_index(parent_item)
                     placeholder_cleared = False
                     for root_path in roots_here:
                         if root_path in child_map:
+                            _maybe_yield_incremental_merge_ui()
                             continue
                         if self._find_destination_child_by_path(parent_item, root_path):
+                            _maybe_yield_incremental_merge_ui()
                             continue
                         if not placeholder_cleared:
                             self._remove_placeholder_children(parent_item)
@@ -21416,6 +21430,9 @@ class MainWindow(QMainWindow):
                         if new_ix is not None and new_ix.isValid():
                             child_map[root_path] = new_ix
                         self._sort_destination_future_children_index(parent_item)
+                        _maybe_yield_incremental_merge_ui()
+
+                    QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
 
                 for r in range(dmodel.rowCount(QModelIndex())):
                     tix = dmodel.index(r, 0, QModelIndex())
@@ -21431,13 +21448,17 @@ class MainWindow(QMainWindow):
                                 child_path=root_path,
                                 parent_path=parent_path,
                             )
+                            _maybe_yield_incremental_merge_ui()
+                        QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
                         continue
                     child_map = self._destination_children_semantic_map_widget(parent_item)
                     placeholder_cleared = False
                     for root_path in roots_here:
                         if root_path in child_map:
+                            _maybe_yield_incremental_merge_ui()
                             continue
                         if self._find_destination_child_by_path(parent_item, root_path):
+                            _maybe_yield_incremental_merge_ui()
                             continue
                         if not placeholder_cleared:
                             self._remove_placeholder_children(parent_item)
@@ -21446,6 +21467,9 @@ class MainWindow(QMainWindow):
                         parent_item.addChild(child_item)
                         child_map[root_path] = child_item
                         self._sort_destination_future_children(parent_item)
+                        _maybe_yield_incremental_merge_ui()
+
+                    QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
 
                 for index in range(tree.topLevelItemCount()):
                     top_item = tree.topLevelItem(index)
@@ -21493,6 +21517,7 @@ class MainWindow(QMainWindow):
             return visible_future_branch_count
         finally:
             tree.blockSignals(False)
+            self._destination_incremental_merge_in_progress = False
 
     def _materialize_destination_future_model(
         self, reason, *, allow_defer=True, prefer_chunked_projection=False, narrow_restore_real_snapshot=False
@@ -21520,6 +21545,14 @@ class MainWindow(QMainWindow):
         self, reason, *, allow_defer=True, prefer_chunked_projection=False, narrow_restore_real_snapshot=False
     ):
         self._destination_future_model_last_blocked_source_restore = False
+
+        if getattr(self, "_destination_incremental_merge_in_progress", False):
+            self._log_restore_phase(
+                "destination_future_model_materialize_skipped",
+                reason=str(reason or ""),
+                skip_reason="incremental_merge_in_progress",
+            )
+            return 0
 
         # Each destination folder_worker_success used to call this path and the cancel below
         # would tear down fast-first-paint + background incremental merge, restarting the
