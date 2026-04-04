@@ -67,3 +67,21 @@ def test_full_overlay_fingerprint_skip_flag():
         skip_allocation_descendants=True,
     )
     assert fp != fp2
+
+
+def test_full_overlay_fingerprint_restrict_real_snapshot_flag():
+    base = full_overlay_fingerprint(
+        moves_sig="m",
+        proposed_sig="p",
+        snapshot_sig="s",
+        skip_allocation_descendants=False,
+        restrict_real_snapshot=False,
+    )
+    narrow = full_overlay_fingerprint(
+        moves_sig="m",
+        proposed_sig="p",
+        snapshot_sig="s",
+        skip_allocation_descendants=False,
+        restrict_real_snapshot=True,
+    )
+    assert base != narrow

@@ -76,6 +76,10 @@ def full_overlay_fingerprint(
     proposed_sig: str,
     snapshot_sig: str,
     skip_allocation_descendants: bool,
+    restrict_real_snapshot: bool = False,
 ) -> str:
-    raw = f"{moves_sig}|{proposed_sig}|{snapshot_sig}|{int(bool(skip_allocation_descendants))}"
+    raw = (
+        f"{moves_sig}|{proposed_sig}|{snapshot_sig}|{int(bool(skip_allocation_descendants))}"
+        f"|{int(bool(restrict_real_snapshot))}"
+    )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()

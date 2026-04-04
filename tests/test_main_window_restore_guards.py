@@ -74,10 +74,14 @@ class _MaterializeSkipHost:
         self.cancel_projection_calls.append(str(reason or ""))
 
     def _materialize_destination_future_model_body(
-        self, reason, *, allow_defer=True, prefer_chunked_projection=False
+        self, reason, *, allow_defer=True, prefer_chunked_projection=False, narrow_restore_real_snapshot=False
     ):
         return MainWindow._materialize_destination_future_model_body(
-            self, reason, allow_defer=allow_defer, prefer_chunked_projection=prefer_chunked_projection
+            self,
+            reason,
+            allow_defer=allow_defer,
+            prefer_chunked_projection=prefer_chunked_projection,
+            narrow_restore_real_snapshot=narrow_restore_real_snapshot,
         )
 
 

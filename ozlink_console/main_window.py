@@ -2086,6 +2086,7 @@ class MainWindow(QMainWindow):
         self._memory_ui_rebind_in_progress = False
         self._suppress_selector_change_handlers = False
         self._restore_destination_overlay_pending = False
+        self._restore_narrow_destination_future_snapshot_once = False
         self._root_tree_bind_in_progress = False
         self._skip_root_bind_body_for_isolation = False
         self._suppress_autosave = True
@@ -11401,6 +11402,13 @@ class MainWindow(QMainWindow):
                 draft_id=self.active_draft_session_id,
                 autosave_suppressed=self._suppress_autosave,
             )
+            if (self.planned_moves or self.proposed_folders) and not getattr(self, "_sharepoint_lazy_mode", False):
+                self._restore_narrow_destination_future_snapshot_once = True
+                self._log_restore_phase(
+                    "restore_narrow_destination_future_snapshot_scheduled",
+                    planned_moves_count=len(self.planned_moves or []),
+                    proposed_folders_count=len(self.proposed_folders or []),
+                )
             # Phase 4 must not use QTimer.singleShot(0): long synchronous post-restore work
             # (expanded-path replay, allocation projection Graph calls on the UI thread) can
             # starve the timer for minutes, leaving restore_in_progress stuck and the app frozen.
@@ -11482,6 +11490,9 @@ class MainWindow(QMainWindow):
                     "phase4_destination_overlay",
                     allow_defer=True,
                     prefer_chunked_projection=True,
+                    narrow_restore_real_snapshot=getattr(
+                        self, "_restore_narrow_destination_future_snapshot_once", False
+                    ),
                 )
             self._restore_destination_overlay_pending = bool(
                 self._unresolved_proposed_queue_size() > 0 or self._unresolved_allocation_queue_size() > 0
@@ -11520,6 +11531,8 @@ class MainWindow(QMainWindow):
         self._pending_destination_navigation = None
         self._prime_source_root_children_after_snapshot()
         self._prime_destination_root_children_after_snapshot()
+        if getattr(self, "_restore_narrow_destination_future_snapshot_once", False):
+            self._restore_narrow_destination_future_snapshot_once = False
         self._try_flush_destination_future_model_after_source_restore("memory_restore_finalize")
         self._log_restore_state_snapshot(
             "restore_final_ready",
@@ -17975,7 +17988,7 @@ class MainWindow(QMainWindow):
         """Real (non-overlay) destination rows changed; next overlay build must rescan the tree."""
         self._destination_real_tree_snapshot_stale = True
 
-    def _refresh_destination_real_tree_snapshot(self, *, force: bool = False):
+    def _refresh_destination_real_tree_snapshot(self, *, force: bool = False, merge_full_tree_snapshot: bool = True):
         if not force and not getattr(self, "_destination_real_tree_snapshot_stale", True):
             if is_dev_mode():
                 _perf_explorer_log("destination_real_tree_snapshot_refresh_skipped", reason="snapshot_still_fresh")
@@ -17994,7 +18007,8 @@ class MainWindow(QMainWindow):
                 self._collect_real_destination_snapshot_entries(tree.topLevelItem(index), snapshot)
 
         full_snapshot_available = (
-            bool(self._destination_full_tree_snapshot)
+            merge_full_tree_snapshot
+            and bool(self._destination_full_tree_snapshot)
             and self._destination_full_tree_completed_drive_id == current_drive_id
         )
         if not full_snapshot_available:
@@ -18017,7 +18031,7 @@ class MainWindow(QMainWindow):
         self._destination_real_tree_snapshot = merged_snapshot
         self._destination_real_tree_snapshot_stale = False
 
-    def _ensure_visible_destination_root_children_in_model(self, model_nodes):
+    def _ensure_visible_destination_root_children_in_model(self, model_nodes, *, planning_relevant_paths: set[str] | None = None):
         if self._destination_tree_uses_model_view():
             dmodel = getattr(self, "destination_planning_model", None)
             if dmodel is None:
@@ -18041,6 +18055,10 @@ class MainWindow(QMainWindow):
                     continue
                 semantic_path = self._destination_semantic_path(child_data)
                 if not semantic_path:
+                    continue
+                if planning_relevant_paths is not None and not self._is_destination_semantic_path_planning_relevant(
+                    semantic_path, planning_relevant_paths
+                ):
                     continue
                 name = child_data.get("name") or self._path_segments(semantic_path)[-1]
                 self._upsert_destination_model_node(
@@ -18074,6 +18092,10 @@ class MainWindow(QMainWindow):
             semantic_path = self._destination_semantic_path(child_data)
             if not semantic_path:
                 continue
+            if planning_relevant_paths is not None and not self._is_destination_semantic_path_planning_relevant(
+                semantic_path, planning_relevant_paths
+            ):
+                continue
             name = child_data.get("name") or self._path_segments(semantic_path)[-1]
             self._upsert_destination_model_node(
                 model_nodes,
@@ -18086,6 +18108,59 @@ class MainWindow(QMainWindow):
             self._attach_destination_model_child(model_nodes, "Root", semantic_path)
             ensured_count += 1
         return ensured_count
+
+    def _collect_destination_planning_relevant_semantic_paths(self) -> set[str]:
+        """Canonical destination paths (and ancestor prefixes) implied by proposed folders and planned moves."""
+        out: set[str] = {"Root", ""}
+        for pf in self.proposed_folders or []:
+            dest = self._proposed_destination_path(pf)
+            if not dest:
+                continue
+            out.add(dest)
+            segs = self._path_segments(dest)
+            if len(segs) > 1:
+                parent_path = self.normalize_memory_path("\\".join(segs[:-1]))
+                for prefix in self._destination_projection_prefixes(parent_path):
+                    px = self.normalize_memory_path(prefix)
+                    if px:
+                        out.add(px)
+        for move in self.planned_moves or []:
+            parent_path = self._allocation_parent_path(move)
+            alloc_path = self._allocation_projection_path(move)
+            for p in (parent_path, alloc_path):
+                if not p:
+                    continue
+                out.add(p)
+                segs = self._path_segments(p)
+                if len(segs) > 1:
+                    parent_only = self.normalize_memory_path("\\".join(segs[:-1]))
+                    for prefix in self._destination_projection_prefixes(parent_only):
+                        px = self.normalize_memory_path(prefix)
+                        if px:
+                            out.add(px)
+        return out
+
+    def _is_destination_semantic_path_planning_relevant(self, semantic_path: str, relevant_paths: set[str]) -> bool:
+        return self._is_destination_real_snapshot_node_planning_relevant({"semantic_path": semantic_path}, relevant_paths)
+
+    def _is_destination_real_snapshot_node_planning_relevant(
+        self, snapshot_node: dict, relevant_paths: set[str]
+    ) -> bool:
+        sp = self.normalize_memory_path(snapshot_node.get("semantic_path", "") or "")
+        if not sp:
+            return False
+        sp_cf = sp.casefold()
+        if sp in relevant_paths:
+            return True
+        for rel in relevant_paths:
+            if not rel or rel == "Root":
+                continue
+            rel_cf = rel.casefold()
+            if sp_cf == rel_cf:
+                return True
+            if sp_cf.startswith(rel_cf + "\\"):
+                return True
+        return False
 
     def _destination_root_base_data(self):
         tree = getattr(self, "destination_tree_widget", None)
@@ -19284,7 +19359,9 @@ class MainWindow(QMainWindow):
             "total_allocation_nodes": total_allocation_nodes,
         }
 
-    def _destination_overlay_fingerprint_context(self, skip_allocation_descendants: bool):
+    def _destination_overlay_fingerprint_context(
+        self, skip_allocation_descendants: bool, restrict_real_snapshot: bool = False
+    ):
         current_drive_id = self._current_selected_destination_drive_id() or self.pending_root_drive_ids.get(
             "destination", ""
         ) or ""
@@ -19308,6 +19385,7 @@ class MainWindow(QMainWindow):
             proposed_sig=prop_sig,
             snapshot_sig=snap_sig,
             skip_allocation_descendants=bool(skip_allocation_descendants),
+            restrict_real_snapshot=bool(restrict_real_snapshot),
         )
         return snap_sig, prop_sig, moves_sig, full_fp
 
@@ -19523,9 +19601,16 @@ class MainWindow(QMainWindow):
         return visible_future_branch_count
 
     def _store_destination_future_model_overlay_cache(
-        self, payload, snap_sig, prop_sig, skip_allocation_descendants: bool
+        self,
+        payload,
+        snap_sig,
+        prop_sig,
+        skip_allocation_descendants: bool,
+        restrict_real_snapshot_import: bool = False,
     ):
-        _, _, moves_sig, full_fp = self._destination_overlay_fingerprint_context(skip_allocation_descendants)
+        _, _, moves_sig, full_fp = self._destination_overlay_fingerprint_context(
+            skip_allocation_descendants, restrict_real_snapshot_import
+        )
         self._destination_future_model_overlay_cache = {
             "full_fp": full_fp,
             "moves_sig": moves_sig,
@@ -19533,6 +19618,7 @@ class MainWindow(QMainWindow):
             "snapshot_sig": snap_sig,
             "proposed_sig": prop_sig,
             "skip_allocation_descendants": bool(skip_allocation_descendants),
+            "restrict_real_snapshot_import": bool(restrict_real_snapshot_import),
             "payload": copy.deepcopy(payload),
         }
 
@@ -19593,6 +19679,7 @@ class MainWindow(QMainWindow):
         start_index: int,
         snap_sig: str,
         prop_sig: str,
+        restrict_real_snapshot_import: bool = False,
     ):
         model_nodes = copy.deepcopy(cached_payload["nodes"])
         real_child_counts = copy.deepcopy(cached_payload.get("_real_child_counts") or {})
@@ -19612,24 +19699,32 @@ class MainWindow(QMainWindow):
             total_allocation_nodes=total_allocation_nodes,
         )
         payload["_real_child_counts"] = real_child_counts
-        self._store_destination_future_model_overlay_cache(payload, snap_sig, prop_sig, skip_allocation_descendants)
+        self._store_destination_future_model_overlay_cache(
+            payload, snap_sig, prop_sig, skip_allocation_descendants, restrict_real_snapshot_import
+        )
         self._log_restore_phase(
             "destination_future_model_build_incremental_append_complete",
             added_moves=len(self.planned_moves) - start_index,
             branch_count=len(model_nodes),
         )
+        if restrict_real_snapshot_import:
+            self._restore_narrow_destination_future_snapshot_once = False
         return payload
 
-    def _build_destination_future_model(self, *, skip_allocation_descendants=False):
+    def _build_destination_future_model(self, *, skip_allocation_descendants=False, restrict_real_snapshot_import=False):
         self._log_restore_phase(
             "destination_future_model_build_started",
             planned_moves_count=len(self.planned_moves),
             proposed_folders_count=len(self.proposed_folders),
             skip_allocation_descendants=bool(skip_allocation_descendants),
+            restrict_real_snapshot_import=bool(restrict_real_snapshot_import),
         )
-        self._refresh_destination_real_tree_snapshot()
+        self._refresh_destination_real_tree_snapshot(merge_full_tree_snapshot=not restrict_real_snapshot_import)
         snap_sig, prop_sig, moves_sig, full_fp = self._destination_overlay_fingerprint_context(
-            skip_allocation_descendants
+            skip_allocation_descendants, restrict_real_snapshot_import
+        )
+        relevant_paths = (
+            self._collect_destination_planning_relevant_semantic_paths() if restrict_real_snapshot_import else None
         )
         cache = getattr(self, "_destination_future_model_overlay_cache", None)
         if cache is not None and cache.get("full_fp") == full_fp and cache.get("payload") is not None:
@@ -19638,12 +19733,15 @@ class MainWindow(QMainWindow):
                 branch_count=len((cache["payload"].get("nodes") or {})),
                 planned_moves_count=len(self.planned_moves),
             )
+            if restrict_real_snapshot_import:
+                self._restore_narrow_destination_future_snapshot_once = False
             return copy.deepcopy(cache["payload"])
         cur_sigs = move_list_signatures(self.planned_moves)
         if cache is not None and cache.get("payload") is not None:
             prev_sigs = cache.get("move_sigs") or []
             if (
                 cache.get("skip_allocation_descendants") == bool(skip_allocation_descendants)
+                and bool(cache.get("restrict_real_snapshot_import")) == bool(restrict_real_snapshot_import)
                 and cache.get("snapshot_sig") == snap_sig
                 and cache.get("proposed_sig") == prop_sig
                 and len(cur_sigs) > len(prev_sigs)
@@ -19660,6 +19758,7 @@ class MainWindow(QMainWindow):
                     start_index=len(prev_sigs),
                     snap_sig=snap_sig,
                     prop_sig=prop_sig,
+                    restrict_real_snapshot_import=restrict_real_snapshot_import,
                 )
 
         model_nodes = {}
@@ -19679,12 +19778,18 @@ class MainWindow(QMainWindow):
 
         real_child_counts = {}
         for snapshot_node in self._destination_real_tree_snapshot:
+            if restrict_real_snapshot_import and relevant_paths is not None:
+                if not self._is_destination_real_snapshot_node_planning_relevant(snapshot_node, relevant_paths):
+                    continue
             parent_path = snapshot_node.get("parent_semantic_path", "")
             real_child_counts[parent_path] = real_child_counts.get(parent_path, 0) + 1
             self._import_destination_real_snapshot(snapshot_node, model_nodes)
             total_real_nodes += 1
 
-        ensured_root_child_count = self._ensure_visible_destination_root_children_in_model(model_nodes)
+        ensured_root_child_count = self._ensure_visible_destination_root_children_in_model(
+            model_nodes,
+            planning_relevant_paths=relevant_paths if restrict_real_snapshot_import else None,
+        )
         if ensured_root_child_count:
             self._log_restore_phase(
                 "destination_visible_root_children_preserved",
@@ -19747,8 +19852,10 @@ class MainWindow(QMainWindow):
         )
         payload["_real_child_counts"] = real_child_counts
         self._store_destination_future_model_overlay_cache(
-            payload, snap_sig, prop_sig, skip_allocation_descendants
+            payload, snap_sig, prop_sig, skip_allocation_descendants, restrict_real_snapshot_import
         )
+        if restrict_real_snapshot_import:
+            self._restore_narrow_destination_future_snapshot_once = False
         return payload
 
     def _sort_destination_future_children(self, parent_item):
@@ -21307,7 +21414,7 @@ class MainWindow(QMainWindow):
             tree.blockSignals(False)
 
     def _materialize_destination_future_model(
-        self, reason, *, allow_defer=True, prefer_chunked_projection=False
+        self, reason, *, allow_defer=True, prefer_chunked_projection=False, narrow_restore_real_snapshot=False
     ):
         perf = QElapsedTimer()
         dev = is_dev_mode()
@@ -21315,7 +21422,10 @@ class MainWindow(QMainWindow):
             perf.start()
         try:
             return self._materialize_destination_future_model_body(
-                reason, allow_defer=allow_defer, prefer_chunked_projection=prefer_chunked_projection
+                reason,
+                allow_defer=allow_defer,
+                prefer_chunked_projection=prefer_chunked_projection,
+                narrow_restore_real_snapshot=narrow_restore_real_snapshot,
             )
         finally:
             if dev:
@@ -21326,7 +21436,7 @@ class MainWindow(QMainWindow):
                 )
 
     def _materialize_destination_future_model_body(
-        self, reason, *, allow_defer=True, prefer_chunked_projection=False
+        self, reason, *, allow_defer=True, prefer_chunked_projection=False, narrow_restore_real_snapshot=False
     ):
         self._destination_future_model_last_blocked_source_restore = False
 
@@ -21416,7 +21526,10 @@ class MainWindow(QMainWindow):
 
             def _retry_materialize():
                 self._materialize_destination_future_model(
-                    reason, allow_defer=allow_defer, prefer_chunked_projection=prefer_chunked_projection
+                    reason,
+                    allow_defer=allow_defer,
+                    prefer_chunked_projection=prefer_chunked_projection,
+                    narrow_restore_real_snapshot=narrow_restore_real_snapshot,
                 )
 
             QTimer.singleShot(0, _retry_materialize)
@@ -21444,7 +21557,10 @@ class MainWindow(QMainWindow):
             )
         if use_chunked:
             self._set_tree_status_message("destination", "Building destination preview…", loading=True)
-            model_fast = self._build_destination_future_model(skip_allocation_descendants=True)
+            model_fast = self._build_destination_future_model(
+                skip_allocation_descendants=True,
+                restrict_real_snapshot_import=bool(narrow_restore_real_snapshot),
+            )
             self._log_restore_phase(
                 "destination_future_model_fast_first_paint",
                 reason=reason,
@@ -21519,7 +21635,9 @@ class MainWindow(QMainWindow):
                 return 0
             return bind_out[0]
 
-        model = self._build_destination_future_model()
+        model = self._build_destination_future_model(
+            restrict_real_snapshot_import=bool(narrow_restore_real_snapshot),
+        )
         if "_real_child_counts" in model:
             del model["_real_child_counts"]
         self._log_restore_phase(
