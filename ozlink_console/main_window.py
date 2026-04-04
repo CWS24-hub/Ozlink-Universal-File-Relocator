@@ -135,6 +135,8 @@ _INCREMENTAL_DEFERRED_PLANNING_REFRESH_REASONS = frozenset(
         "planning_change_lightweight",
         "planned_item_moved_paste_quick",
         "planned_item_moved_manual_drag",
+        "leaf_excluded_from_plan",
+        "leaf_included_in_plan",
     }
 )
 
@@ -1636,15 +1638,18 @@ class SourceTreeRelationshipDelegate(QStyledItemDelegate):
 
     def paint(self, painter, option, index):
         node_data = index.data(Qt.UserRole) or {}
+        excluded = self.window._plan_leaf_exclusion_display_active("source", node_data)
         relationship = self.window.get_source_relationship_display(node_data)
-        if relationship["mode"] == "none":
+        if relationship["mode"] == "none" and not excluded:
             super().paint(painter, option, index)
             return
 
         custom_option = QStyleOptionViewItem(option)
         self.initStyleOption(custom_option, index)
         base_text = self.window.get_source_item_display_name(node_data, custom_option.text)
-        suffix_text = relationship["suffix"]
+        suffix_text = relationship["suffix"] if relationship["mode"] != "none" else ""
+        if excluded:
+            base_text = f"\u2298 {base_text}"
         custom_option.text = ""
 
         style = custom_option.widget.style() if custom_option.widget else QApplication.style()
@@ -1657,24 +1662,73 @@ class SourceTreeRelationshipDelegate(QStyledItemDelegate):
         painter.save()
         painter.setClipRect(text_rect)
 
-        base_color = QColor("#FFFFFF")
-        suffix_color = QColor("#59D88F") if relationship["mode"] == "direct" else QColor("#79B7FF")
-        if custom_option.state & QStyle.State_Selected:
-            suffix_color = QColor("#C8F7DA") if relationship["mode"] == "direct" else QColor("#D6E8FF")
-
-        metrics = custom_option.fontMetrics
+        font = QFont(custom_option.font)
+        if excluded:
+            font.setStrikeOut(True)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
         spacing = 8
         drawn_base = base_text
         drawn_base_width = metrics.horizontalAdvance(drawn_base)
         drawn_suffix = suffix_text
 
+        if excluded:
+            base_color = QColor("#9AA0A6")
+            if custom_option.state & QStyle.State_Selected:
+                base_color = QColor("#C8CED4")
+        else:
+            base_color = QColor("#FFFFFF")
+        suffix_color = QColor("#59D88F") if relationship["mode"] == "direct" else QColor("#79B7FF")
+        if custom_option.state & QStyle.State_Selected:
+            suffix_color = QColor("#C8F7DA") if relationship["mode"] == "direct" else QColor("#D6E8FF")
+
         painter.setPen(base_color)
         painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, drawn_base)
 
-        suffix_x = text_rect.x() + drawn_base_width + spacing
-        suffix_rect = QRect(suffix_x, text_rect.y(), max(text_rect.right() - suffix_x, 0), text_rect.height())
-        painter.setPen(suffix_color)
-        painter.drawText(suffix_rect, Qt.AlignVCenter | Qt.AlignLeft, drawn_suffix)
+        if drawn_suffix:
+            suffix_x = text_rect.x() + drawn_base_width + spacing
+            suffix_rect = QRect(suffix_x, text_rect.y(), max(text_rect.right() - suffix_x, 0), text_rect.height())
+            painter.setPen(suffix_color)
+            painter.drawText(suffix_rect, Qt.AlignVCenter | Qt.AlignLeft, drawn_suffix)
+        painter.restore()
+
+
+class DestinationPlanningTreeDelegate(QStyledItemDelegate):
+    """Muted strikethrough + glyph for source files excluded from the plan (destination projection)."""
+
+    def __init__(self, window, parent=None):
+        super().__init__(parent)
+        self.window = window
+
+    def paint(self, painter, option, index):
+        node_data = index.data(Qt.UserRole) or {}
+        if not self.window._plan_leaf_exclusion_display_active("destination", node_data):
+            super().paint(painter, option, index)
+            return
+
+        custom_option = QStyleOptionViewItem(option)
+        self.initStyleOption(custom_option, index)
+        base_text = self.window.get_source_item_display_name(node_data, custom_option.text)
+        display = f"\u2298 {base_text}"
+        custom_option.text = ""
+
+        style = custom_option.widget.style() if custom_option.widget else QApplication.style()
+        style.drawControl(QStyle.CE_ItemViewItem, custom_option, painter, custom_option.widget)
+
+        text_rect = style.subElementRect(QStyle.SE_ItemViewItemText, custom_option, custom_option.widget)
+        if not text_rect.isValid():
+            text_rect = custom_option.rect.adjusted(4, 0, -4, 0)
+
+        painter.save()
+        painter.setClipRect(text_rect)
+        font = QFont(custom_option.font)
+        font.setStrikeOut(True)
+        painter.setFont(font)
+        base_color = QColor("#9AA0A6")
+        if custom_option.state & QStyle.State_Selected:
+            base_color = QColor("#C8CED4")
+        painter.setPen(base_color)
+        painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, display)
         painter.restore()
 
 
@@ -4158,6 +4212,9 @@ class MainWindow(QMainWindow):
                 lambda: self.on_tree_selection_changed("destination")
             )
             self.destination_tree_widget.itemChanged.connect(self.on_destination_tree_item_changed)
+        self.destination_tree_widget.setItemDelegate(
+            DestinationPlanningTreeDelegate(self, self.destination_tree_widget)
+        )
         self.source_tree_widget.setContextMenuPolicy(Qt.CustomContextMenu)
         self.source_tree_widget.customContextMenuRequested.connect(self.show_source_context_menu)
         self.source_local_fs_tree.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -18316,6 +18373,31 @@ class MainWindow(QMainWindow):
             return False
         return canonical_source_path in getattr(self, "_plan_leaf_exclusions", set())
 
+    def _plan_leaf_exclusion_display_active(self, panel_key, node_data):
+        """True when this row is a file whose canonical source path is in PlanLeafExclusions."""
+        if not node_data or node_data.get("is_folder") is not False:
+            return False
+        if panel_key == "source":
+            canon = self._canonical_source_projection_path(self._tree_item_path(node_data))
+        else:
+            canon = self._canonical_source_projection_path(node_data.get("source_path", ""))
+        return bool(canon and self._is_leaf_path_excluded_for_plan(canon))
+
+    def _mark_destination_indicators_for_leaf_planning_change(self, *, removed_direct_move=None, inherited_move=None):
+        """Partial destination indicator refresh (avoids full destination materialization)."""
+        paths: list[str] = []
+        if removed_direct_move:
+            dp = str(removed_direct_move.get("destination_path") or "").strip()
+            if dp:
+                paths.append(dp)
+        if inherited_move:
+            dp = str(inherited_move.get("destination_path") or "").strip()
+            if dp:
+                paths.append(dp)
+        if paths:
+            self._mark_destination_indicator_dirty_paths(paths)
+            self._schedule_refresh_destination_tree_indicators(delay_ms=30)
+
     def _canonical_source_path_for_planning_leaf(self, panel_key, node_data):
         if panel_key == "source":
             return self._canonical_source_projection_path(self._tree_item_path(node_data))
@@ -28916,6 +28998,7 @@ class MainWindow(QMainWindow):
         inherited_parent = ""
         if raw is not None:
             inherited_parent = str(self._canonical_source_projection_path(raw.get("source_path", "")) or "")[:500]
+        removed_direct_move = None
         if direct is not None:
             if self._is_move_submitted(direct):
                 self._show_submitted_item_locked_message(
@@ -28924,6 +29007,7 @@ class MainWindow(QMainWindow):
                     self._submitted_batch_id_for_move(direct),
                 )
                 return
+            removed_direct_move = direct
             try:
                 self.planned_moves.remove(direct)
             except ValueError:
@@ -28937,14 +29021,21 @@ class MainWindow(QMainWindow):
             old_effective_state=old_state,
             new_effective_state="excluded",
             inherited_parent_path=inherited_parent,
-            direct_override_destination=str((direct or {}).get("destination_path", "") or "")[:500],
+            direct_override_destination=str((removed_direct_move or {}).get("destination_path", "") or "")[:500],
             excluded=True,
             execution_rule_resolved_as="excluded",
         )
+        self._mark_destination_indicators_for_leaf_planning_change(
+            removed_direct_move=removed_direct_move,
+            inherited_move=raw,
+        )
         self.refresh_planned_moves_table()
         self.planned_moves_status.setText("File excluded from plan.")
-        self._persist_planning_change("leaf_excluded_from_plan", source_projection_paths={canon})
-        self._schedule_deferred_destination_materialization("leaf_excluded_from_plan", delay_ms=220)
+        self._persist_planning_change_lightweight(
+            planning_refresh_reason="leaf_excluded_from_plan",
+            notify_saved=False,
+            deferred_source_projection_paths={canon},
+        )
 
     def handle_include_leaf_in_plan(self, panel_key, node_data):
         if not self._leaf_row_eligible_for_plan_rules(node_data):
@@ -28964,9 +29055,16 @@ class MainWindow(QMainWindow):
             excluded=False,
             execution_rule_resolved_as="inherited" if raw is not None else "none",
         )
+        self._mark_destination_indicators_for_leaf_planning_change(
+            removed_direct_move=None,
+            inherited_move=raw,
+        )
         self.planned_moves_status.setText("File included in plan (inherits parent assignment if any).")
-        self._persist_planning_change("leaf_included_in_plan", source_projection_paths={canon})
-        self._schedule_deferred_destination_materialization("leaf_included_in_plan", delay_ms=220)
+        self._persist_planning_change_lightweight(
+            planning_refresh_reason="leaf_included_in_plan",
+            notify_saved=False,
+            deferred_source_projection_paths={canon},
+        )
 
     def build_planned_move_record(self, source_node, destination_node):
         dest_sem = self._destination_row_semantic_path(destination_node)
