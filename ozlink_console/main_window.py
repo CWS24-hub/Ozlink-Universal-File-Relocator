@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox, QFormLayout, QTreeView, QFileSystemModel,
     QSpinBox,
     QToolButton,
+    QScrollArea,
 )
 from PySide6.QtCore import (
     Qt,
@@ -68,6 +69,7 @@ from PySide6.QtGui import (
     QKeySequence,
     QPainter,
     QPolygon,
+    QPixmap,
 )
 
 from ozlink_console.graph import GraphClient
@@ -1304,11 +1306,17 @@ class FullCountWorker(QThread):
             })
 
 
+# In-app Planning Preview: Qt decodes these via QPixmap.loadFromData (no external viewer).
+_PREVIEW_IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"})
+_PREVIEW_FETCH_BYTES_DEFAULT = 262144
+_PREVIEW_FETCH_BYTES_IMAGE = 5 * 1024 * 1024
+
+
 class FilePreviewWorker(QThread):
     success = Signal(dict)
     error = Signal(dict)
 
-    def __init__(self, graph, drive_id, item_id, *, item_name="", max_bytes=262144):
+    def __init__(self, graph, drive_id, item_id, *, item_name="", max_bytes=_PREVIEW_FETCH_BYTES_DEFAULT):
         super().__init__()
         self.graph = graph
         self.drive_id = drive_id
@@ -2155,6 +2163,7 @@ class MainWindow(QMainWindow):
         self._current_details_panel_key = ""
         self._current_details_context = None
         self._preview_text_cache = {}
+        self._preview_image_bytes_cache = {}
         self._preview_request_sequence = 0
         self._active_preview_request_id = 0
         self._preview_worker = None
@@ -8090,6 +8099,27 @@ class MainWindow(QMainWindow):
         self.preview_body_text.setObjectName("DetailsNotes")
         self.preview_body_text.setMinimumHeight(120)
         self.preview_body_text.setPlainText("")
+        self.preview_image_scroll = QScrollArea()
+        self.preview_image_scroll.setObjectName("PreviewImageScroll")
+        self.preview_image_scroll.setWidgetResizable(True)
+        self.preview_image_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.preview_image_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.preview_image_scroll.setMinimumHeight(120)
+        self.preview_image_label = QLabel()
+        self.preview_image_label.setAlignment(Qt.AlignCenter)
+        self.preview_image_label.setObjectName("PreviewImageLabel")
+        self.preview_image_label.setScaledContents(False)
+        self.preview_image_scroll.setWidget(self.preview_image_label)
+        self._preview_image_viewport = self.preview_image_scroll.viewport()
+        try:
+            self._preview_image_viewport.installEventFilter(self)
+        except RuntimeError:
+            # Unit tests may build panels via MainWindow.__new__ without QObject __init__.
+            pass
+        self._preview_pixmap_full = None
+        self.preview_body_stack = QStackedWidget()
+        self.preview_body_stack.addWidget(self.preview_body_text)
+        self.preview_body_stack.addWidget(self.preview_image_scroll)
         btn_row = QHBoxLayout()
         btn_row.setContentsMargins(0, 0, 0, 0)
         btn_row.setSpacing(8)
@@ -8101,7 +8131,7 @@ class MainWindow(QMainWindow):
         btn_row.addStretch(1)
         content_layout.addWidget(self.preview_header_title)
         content_layout.addWidget(self.preview_header_path)
-        content_layout.addWidget(self.preview_body_text, 1)
+        content_layout.addWidget(self.preview_body_stack, 1)
         content_layout.addLayout(btn_row)
 
         self.preview_stack.addWidget(empty_page)
@@ -8125,18 +8155,33 @@ class MainWindow(QMainWindow):
             "Preview does not load automatically when you change selection."
         )
         self.preview_empty_label.setText(text)
+        self._preview_pixmap_full = None
+        if hasattr(self, "preview_image_label"):
+            self.preview_image_label.clear()
+        if hasattr(self, "preview_body_stack"):
+            self.preview_body_stack.setCurrentIndex(0)
         self.preview_stack.setCurrentIndex(self._preview_stack_empty)
 
     def _preview_tab_set_loading(self):
         if not hasattr(self, "preview_stack"):
             return
         self.preview_loading_label.setText("Loading preview…")
+        self._preview_pixmap_full = None
+        if hasattr(self, "preview_image_label"):
+            self.preview_image_label.clear()
+        if hasattr(self, "preview_body_stack"):
+            self.preview_body_stack.setCurrentIndex(0)
         self.preview_stack.setCurrentIndex(self._preview_stack_loading)
 
     def _preview_tab_set_unsupported(self, message):
         if not hasattr(self, "preview_stack"):
             return
         self.preview_unsupported_label.setText(message)
+        self._preview_pixmap_full = None
+        if hasattr(self, "preview_image_label"):
+            self.preview_image_label.clear()
+        if hasattr(self, "preview_body_stack"):
+            self.preview_body_stack.setCurrentIndex(0)
         self.preview_stack.setCurrentIndex(self._preview_stack_unsupported)
 
     def _preview_tab_set_content(self, title, path, body):
@@ -8144,8 +8189,50 @@ class MainWindow(QMainWindow):
             return
         self.preview_header_title.setText(title or "")
         self.preview_header_path.setText(path or "")
+        self._preview_pixmap_full = None
+        if hasattr(self, "preview_image_label"):
+            self.preview_image_label.clear()
+        if hasattr(self, "preview_body_stack"):
+            self.preview_body_stack.setCurrentIndex(0)
         self.preview_body_text.setPlainText(body or "")
         self.preview_stack.setCurrentIndex(self._preview_stack_content)
+
+    def _refresh_preview_image_scaled(self):
+        """Scale the full-resolution pixmap to the scroll viewport (keeps aspect ratio)."""
+        pm = getattr(self, "_preview_pixmap_full", None)
+        if pm is None or pm.isNull():
+            if hasattr(self, "preview_image_label"):
+                self.preview_image_label.clear()
+            return
+        vp = getattr(self, "preview_image_scroll", None)
+        if vp is None:
+            return
+        vw = vp.viewport().width()
+        vh = vp.viewport().height()
+        if vw < 64:
+            vw = 640
+        if vh < 64:
+            vh = 480
+        scaled = pm.scaled(max(80, vw - 8), max(80, vh - 8), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.preview_image_label.setPixmap(scaled)
+
+    def _preview_tab_set_image_content(self, title, path, pm):
+        if not hasattr(self, "preview_stack"):
+            return
+        self.preview_header_title.setText(title or "")
+        self.preview_header_path.setText(path or "")
+        self.preview_body_text.clear()
+        self._preview_pixmap_full = QPixmap(pm) if pm is not None and not pm.isNull() else None
+        if hasattr(self, "preview_body_stack"):
+            self.preview_body_stack.setCurrentIndex(1)
+        self._refresh_preview_image_scaled()
+        self.preview_stack.setCurrentIndex(self._preview_stack_content)
+
+    def eventFilter(self, obj, event):
+        if obj is getattr(self, "_preview_image_viewport", None) and event.type() == QEvent.Type.Resize:
+            if getattr(self, "_preview_pixmap_full", None) is not None and not self._preview_pixmap_full.isNull():
+                self._refresh_preview_image_scaled()
+        return super().eventFilter(obj, event)
 
     def build_planned_moves_panel(self):
         box = QFrame()
@@ -23859,6 +23946,17 @@ class MainWindow(QMainWindow):
         suffix = Path(str(name or "")).suffix.lower()
         return suffix
 
+    def _preview_is_image_file(self, item_name):
+        return self._preview_file_extension(item_name) in _PREVIEW_IMAGE_EXTENSIONS
+
+    def _preview_fetch_max_bytes(self, item_name):
+        if self._preview_is_image_file(item_name):
+            return _PREVIEW_FETCH_BYTES_IMAGE
+        return _PREVIEW_FETCH_BYTES_DEFAULT
+
+    def _preview_log_event(self, event, **fields):
+        log_info("PREVIEW", event=event, **fields)
+
     def _preview_fallback_text(self, context):
         metadata = context.get("metadata", {}) if context else {}
         item_type = metadata.get("item_type", "Item")
@@ -23945,17 +24043,49 @@ class MainWindow(QMainWindow):
         target = self._preview_target_for_context(context)
         notes = context.get("notes_preview", {}) or {}
         metadata = context.get("metadata", {}) or {}
+        self._preview_log_event(
+            "preview_load_start",
+            preview_target_resolved=bool(target),
+            preview_target_kind=("graph_file" if target else "none"),
+        )
         if not target:
             fallback = notes.get("preview_text", "Preview is not available for this selection.")
             self._preview_tab_set_unsupported(fallback)
+            self._preview_log_event(
+                "preview_render",
+                preview_render_mode="unsupported",
+                preview_failure_reason="no_graph_target",
+            )
             return
 
         cache_key = (target.get("drive_id", ""), target.get("item_id", ""))
+        item_name = target.get("name", "")
+        cached_image = self._preview_image_bytes_cache.get(cache_key)
+        if cached_image is not None:
+            pm = QPixmap()
+            if pm.loadFromData(QByteArray(cached_image)):
+                title = metadata.get("item_name", target.get("name", ""))
+                path = metadata.get("item_path", target.get("path", ""))
+                self._preview_tab_set_image_content(title, path, pm)
+                self._preview_log_event(
+                    "preview_render",
+                    preview_render_mode="image",
+                    preview_from_cache=True,
+                    preview_fetch_max_bytes=self._preview_fetch_max_bytes(item_name),
+                )
+                return
+
         cached_text = self._preview_text_cache.get(cache_key)
         if cached_text:
             title = metadata.get("item_name", target.get("name", ""))
             path = metadata.get("item_path", target.get("path", ""))
             self._preview_tab_set_content(title, path, cached_text)
+            self._preview_log_event(
+                "preview_render",
+                preview_render_mode="text",
+                preview_from_cache=True,
+                preview_fetch_max_bytes=self._preview_fetch_max_bytes(item_name),
+            )
             return
 
         self._preview_request_sequence += 1
@@ -23967,11 +24097,18 @@ class MainWindow(QMainWindow):
         if self._preview_worker is not None and self._preview_worker.isRunning():
             self._retired_preview_workers[previous_request_id] = self._preview_worker
 
+        max_bytes = self._preview_fetch_max_bytes(item_name)
+        self._preview_log_event(
+            "preview_worker_start",
+            preview_fetch_max_bytes=max_bytes,
+            preview_expect_image=self._preview_is_image_file(item_name),
+        )
         worker = FilePreviewWorker(
             self.graph,
             target.get("drive_id", ""),
             target.get("item_id", ""),
-            item_name=target.get("name", ""),
+            item_name=item_name,
+            max_bytes=max_bytes,
         )
         self._preview_worker = worker
         worker.success.connect(lambda payload, request_id=request_id, context=context: self._safe_invoke("preview.success", self.on_preview_success, payload, request_id, context))
@@ -23980,10 +24117,20 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _handle_context_menu_preview(self, panel_key, node_data):
+        was_collapsed = bool(getattr(self, "_workspace_tabs_collapsed", False))
+        if was_collapsed:
+            self._apply_workspace_tabs_collapsed_state(False)
         context = self._resolve_selected_item_context(panel_key, dict(node_data))
         self._update_selection_details(context, invalidate_preview_on_selection=False)
         if hasattr(self, "workspace_tabs") and hasattr(self, "preview_tab_box"):
             self.workspace_tabs.setCurrentWidget(self.preview_tab_box)
+        self._preview_log_event(
+            "preview_requested",
+            panel_key=panel_key,
+            preview_panel_expanded=("yes" if was_collapsed else "no"),
+            preview_bottom_panel_was_collapsed=was_collapsed,
+            workspace_panel_expanded_after=not getattr(self, "_workspace_tabs_collapsed", False),
+        )
         self._start_preview_tab_load(context)
 
     def on_preview_success(self, payload, request_id, context):
@@ -23994,13 +24141,53 @@ class MainWindow(QMainWindow):
         item_id = payload.get("item_id", "")
         item_name = payload.get("item_name", "")
         content = payload.get("content", b"") or b""
-        preview_text = self._extract_preview_text(item_name, content)
-        if not preview_text:
-            preview_text = self._preview_fallback_text(context)
-        self._preview_text_cache[(drive_id, item_id)] = preview_text
         metadata = context.get("metadata", {}) or {}
         title = metadata.get("item_name", item_name)
         path = metadata.get("item_path", "")
+
+        if self._preview_is_image_file(item_name):
+            pm = QPixmap()
+            if pm.loadFromData(QByteArray(content)) and not pm.isNull():
+                self._preview_image_bytes_cache[(drive_id, item_id)] = bytes(content)
+                self._preview_tab_set_image_content(title, path, pm)
+                self._preview_log_event(
+                    "preview_render",
+                    preview_render_mode="image",
+                    preview_bytes=len(content),
+                    item_name=item_name,
+                )
+                log_info(
+                    "selection_preview_loaded",
+                    item_name=item_name,
+                    item_id=item_id,
+                    preview_mode="image",
+                    preview_bytes=len(content),
+                )
+                return
+            self._preview_log_event(
+                "preview_render",
+                preview_render_mode="fallback",
+                preview_failure_reason="image_decode_failed",
+                item_name=item_name,
+            )
+
+        preview_text = self._extract_preview_text(item_name, content)
+        if not preview_text:
+            preview_text = self._preview_fallback_text(context)
+            self._preview_log_event(
+                "preview_render",
+                preview_render_mode="fallback",
+                preview_failure_reason="no_text_extract",
+                item_name=item_name,
+            )
+        else:
+            self._preview_log_event(
+                "preview_render",
+                preview_render_mode="text",
+                preview_length=len(preview_text),
+                item_name=item_name,
+            )
+        self._preview_text_cache[(drive_id, item_id)] = preview_text
         self._preview_tab_set_content(title, path, preview_text)
         log_info("selection_preview_loaded", item_name=item_name, item_id=item_id, preview_length=len(preview_text))
 
@@ -24014,6 +24201,12 @@ class MainWindow(QMainWindow):
         path = metadata.get("item_path", "")
         combined = f"{preview_text}\n\nPreview could not be loaded.\n{error}"
         self._preview_tab_set_content(title, path, combined)
+        self._preview_log_event(
+            "preview_render",
+            preview_render_mode="error",
+            preview_failure_reason=str(error),
+            item_name=payload.get("item_name", ""),
+        )
         log_warn("selection_preview_failed", item_name=payload.get("item_name", ""), item_id=payload.get("item_id", ""), error=error)
 
     def on_preview_finished(self, request_id):
