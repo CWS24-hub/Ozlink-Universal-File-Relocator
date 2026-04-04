@@ -137,6 +137,7 @@ def test_apply_draft_reset_after_backup_clears_runtime_and_persists_empty():
     mw._set_planning_site_selectors_no_selection = MagicMock()
     mw._reset_planning_trees_to_select_library_prompt = MagicMock()
     mw._refresh_planning_loading_banner = MagicMock()
+    mw._clear_execution_manifest_for_workspace_reset = MagicMock()
 
     def _fresh(**_kw):
         return SessionState(
@@ -175,6 +176,7 @@ def test_apply_draft_reset_after_backup_clears_runtime_and_persists_empty():
     mw.populate_planning_selectors.assert_called_once()
     pop_args, pop_kw = mw.populate_planning_selectors.call_args
     assert pop_kw.get("auto_load_initial") is False
+    mw._clear_execution_manifest_for_workspace_reset.assert_called_once()
 
 
 def test_refresh_source_projection_refreshes_visuals_when_no_planned_moves():
@@ -247,6 +249,7 @@ def test_apply_draft_reset_stops_deferred_planning_timer_and_clears_queues():
     mw._set_planning_site_selectors_no_selection = MagicMock()
     mw._reset_planning_trees_to_select_library_prompt = MagicMock()
     mw._refresh_planning_loading_banner = MagicMock()
+    mw._clear_execution_manifest_for_workspace_reset = MagicMock()
 
     def _fresh(**_kw):
         return SessionState(DraftId="")

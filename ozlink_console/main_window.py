@@ -6887,6 +6887,7 @@ class MainWindow(QMainWindow):
         self._set_planning_site_selectors_no_selection()
         self._reset_planning_trees_to_select_library_prompt()
         self._refresh_planning_loading_banner()
+        self._clear_execution_manifest_for_workspace_reset()
         fresh = self._build_current_draft_shell_state(include_workspace_ui=True)
         fresh.DraftId = self._create_new_draft_session_id()
         fresh.CreatedUtc = datetime.utcnow().isoformat()
@@ -7178,7 +7179,8 @@ class MainWindow(QMainWindow):
             "A timestamped backup is saved under your user Memory/Backups folder. "
             "You remain signed in to Microsoft 365; rediscover sites if needed, then pick "
             "source and destination sites and libraries again. "
-            "Nothing is cleared outside this app’s Memory folder except what you replace by planning again."
+            "The Execution page is cleared too (no manifest in memory; “last manifest” path is forgotten). "
+            "Nothing else outside this app’s Memory folder is removed."
         )
         reset_btn = dlg.addButton("Backup && Reset Workspace", QMessageBox.ButtonRole.AcceptRole)
         dlg.addButton(QMessageBox.StandardButton.Cancel)
@@ -28659,6 +28661,29 @@ class MainWindow(QMainWindow):
     def _execution_saved_manifest_exists(self) -> bool:
         p = self._execution_saved_manifest_path()
         return bool(p) and Path(p).is_file()
+
+    def _clear_execution_manifest_for_workspace_reset(self) -> None:
+        """Clear Execution page manifest memory, UI, and last path in QSettings (factory workspace reset)."""
+        self._execution_manifest_path = ""
+        self._execution_manifest = None
+        QSettings().remove("execution/last_manifest_path")
+        if getattr(self, "execution_manifest_path_label", None) is not None:
+            self.execution_manifest_path_label.setText("No manifest loaded.")
+            self.execution_manifest_path_label.setStyleSheet("color: palette(mid);")
+        self._refresh_execution_summary_panel()
+        if getattr(self, "execution_status_label", None) is not None:
+            self.execution_status_label.setText("")
+        cb = getattr(self, "execution_snapshot_scoped_checkbox", None)
+        if cb is not None:
+            cb.blockSignals(True)
+            cb.setChecked(False)
+            cb.blockSignals(False)
+        rec = getattr(self, "execution_snapshot_recursive_subtree_checkbox", None)
+        if rec is not None:
+            rec.setChecked(False)
+        self._on_execution_snapshot_scoped_toggled(False)
+        self._update_manifest_run_buttons_state()
+        log_info("DRAFTRESET", event="execution_manifest_cleared_for_workspace_reset")
 
     def _apply_execution_manifest(self, path: str, manifest: dict) -> None:
         self._execution_manifest_path = str(path)
