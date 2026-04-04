@@ -8374,6 +8374,11 @@ class MainWindow(QMainWindow):
         loading_layout.addWidget(loading_title)
         loading_layout.addWidget(loading_detail)
 
+        plan_review_summary = QLabel("Plan review: 0 planned move(s), 0 proposed folder(s) in draft.")
+        plan_review_summary.setObjectName("MutedText")
+        plan_review_summary.setWordWrap(True)
+        self.plan_review_summary_label = plan_review_summary
+
         table = QTableWidget(0, 5)
         table.setHorizontalHeaderLabels([
             "Source Name",
@@ -8425,10 +8430,30 @@ class MainWindow(QMainWindow):
         export_hint.setObjectName("MutedText")
         export_hint.setWordWrap(True)
 
+        proposed_heading = QLabel("Proposed folders (draft)")
+        proposed_heading.setObjectName("SectionTitle")
+
+        proposed_table = QTableWidget(0, 3)
+        proposed_table.setHorizontalHeaderLabels(["Name", "Parent path", "Status"])
+        proposed_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        proposed_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        proposed_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        proposed_table.verticalHeader().setVisible(False)
+        proposed_table.horizontalHeader().setStretchLastSection(True)
+        proposed_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        proposed_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        proposed_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        proposed_table.setMaximumHeight(220)
+        proposed_table.setMinimumHeight(72)
+        self.proposed_folders_table = proposed_table
+
         layout.addWidget(loading_banner)
+        layout.addWidget(plan_review_summary)
         layout.addWidget(export_hint)
         layout.addLayout(simulate_row)
         layout.addWidget(table, 1)
+        layout.addWidget(proposed_heading)
+        layout.addWidget(proposed_table, 0)
         layout.addWidget(status)
 
         return box, table, status
@@ -29261,8 +29286,8 @@ class MainWindow(QMainWindow):
             self._inline_proposed_commit_item_id = ""
             self.destination_tree_status.setText("Proposed folder added.")
             self._save_draft_shell(force=True)
-            self._rebuild_submission_visual_cache()
             self.update_progress_summaries()
+            self.refresh_planned_moves_table()
             selected_ix = self._find_visible_destination_item_by_path(proposed_path)
             if selected_ix is not None and isinstance(selected_ix, QModelIndex) and selected_ix.isValid():
                 self._expand_destination_tree_to_show_model_index(selected_ix)
@@ -29295,6 +29320,7 @@ class MainWindow(QMainWindow):
         self._inline_proposed_commit_item_id = ""
         self.destination_tree_status.setText("Proposed folder renamed.")
         self._persist_planning_change_lightweight()
+        self.refresh_planned_moves_table()
         selected_ix = self._find_visible_destination_item_by_path(proposed_path)
         if selected_ix is not None and isinstance(selected_ix, QModelIndex) and selected_ix.isValid():
             self._expand_destination_tree_to_show_model_index(selected_ix)
@@ -29397,8 +29423,8 @@ class MainWindow(QMainWindow):
             self._inline_proposed_commit_item_id = ""
             self.destination_tree_status.setText("Proposed folder added.")
             self._save_draft_shell(force=True)
-            self._rebuild_submission_visual_cache()
             self.update_progress_summaries()
+            self.refresh_planned_moves_table()
             selected_item = self._find_visible_destination_item_by_path(proposed_path)
             if selected_item is not None:
                 parent = selected_item.parent()
@@ -29420,6 +29446,7 @@ class MainWindow(QMainWindow):
         self._inline_proposed_commit_item_id = ""
         self.destination_tree_status.setText("Proposed folder renamed.")
         self._persist_planning_change_lightweight()
+        self.refresh_planned_moves_table()
         selected_item = self._find_visible_destination_item_by_path(proposed_path)
         if selected_item is not None:
             self.destination_tree_widget.setCurrentItem(selected_item)
@@ -29481,6 +29508,7 @@ class MainWindow(QMainWindow):
         self.destination_tree_status.setText("Proposed folder deleted.")
         self.clear_selection_details()
         self._persist_planning_change_lightweight()
+        self.refresh_planned_moves_table()
 
     def handle_rename_planned_item(self, node_data):
         move_index = self.find_planned_move_index_by_destination(node_data)
@@ -33894,6 +33922,58 @@ class MainWindow(QMainWindow):
             return
         self._run_transfer_manifest_from_path_with_dialogs(path)
 
+    def _update_plan_review_summary(self):
+        label = getattr(self, "plan_review_summary_label", None)
+        if label is None:
+            return
+        nm = len(getattr(self, "planned_moves", []) or [])
+        npf = len(getattr(self, "proposed_folders", []) or [])
+        label.setText(
+            f"Plan review: {nm} planned move(s), {npf} proposed folder(s) in draft."
+        )
+
+    def _refresh_proposed_folders_table(self):
+        table = getattr(self, "proposed_folders_table", None)
+        if table is None:
+            return
+        rows = list(getattr(self, "proposed_folders", []) or [])
+        table.clearSpans()
+        table.setRowCount(len(rows))
+        for row_index, pf in enumerate(rows):
+            if isinstance(pf, dict):
+                try:
+                    pf = ProposedFolder.from_dict(pf)
+                except Exception:
+                    continue
+            elif not isinstance(pf, ProposedFolder):
+                continue
+            name = str(pf.FolderName or "").strip()
+            parent = str(pf.ParentPath or "").strip()
+            is_submitted = self._is_proposed_folder_submitted(pf)
+            status_text = "Submitted" if is_submitted else (str(pf.Status or "").strip() or "Draft")
+            dest_path = self._proposed_destination_path(pf) or str(pf.DestinationPath or "").strip()
+            values = [name, parent, status_text]
+            for column_index, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                item.setData(Qt.UserRole, row_index)
+                if is_submitted:
+                    item.setBackground(QBrush(QColor("#1B2942")))
+                    if column_index == 2:
+                        item.setForeground(QBrush(QColor("#FFC14D")))
+                    else:
+                        item.setForeground(QBrush(QColor("#D6E8FF")))
+                    batch_id = self._submitted_batch_id_for_proposed_folder(pf)
+                    item.setToolTip(
+                        f"Submitted and locked in batch {batch_id}."
+                        if batch_id
+                        else "Submitted and locked."
+                    )
+                else:
+                    item.setToolTip(dest_path if dest_path else "Draft proposed folder")
+                table.setItem(row_index, column_index, item)
+        table.clearSelection()
+
     def refresh_planned_moves_table(self):
         self._rebuild_submission_visual_cache()
         loading_message = self._planning_workspace_loading_message()
@@ -33915,6 +33995,8 @@ class MainWindow(QMainWindow):
             self.planned_moves_table.setSpan(0, 0, 1, self.planned_moves_table.columnCount())
             self.planned_moves_status.setText("Planning workspace is still loading...")
             self.planned_moves_table.clearSelection()
+            self._refresh_proposed_folders_table()
+            self._update_plan_review_summary()
             return
 
         self.planned_moves_table.clearSpans()
@@ -33958,6 +34040,8 @@ class MainWindow(QMainWindow):
             self.planned_moves_status.setText("No planned moves yet.")
 
         self.planned_moves_table.clearSelection()
+        self._refresh_proposed_folders_table()
+        self._update_plan_review_summary()
         if hasattr(self, "source_tree_widget"):
             self.source_tree_widget.viewport().update()
         self._refresh_planning_loading_banner()
