@@ -3993,7 +3993,7 @@ class MainWindow(QMainWindow):
         _act_unl = _draft_menu.addAction("Unlock Draft")
         _act_unl.triggered.connect(self._handle_unlock_draft)
         _draft_menu.addSeparator()
-        _act_rst = _draft_menu.addAction("Reset Draft…")
+        _act_rst = _draft_menu.addAction("Reset Workspace…")
         _act_rst.triggered.connect(self._handle_reset_draft)
         self._planning_draft_overflow_btn.setMenu(_draft_menu)
         submit_row.addWidget(self._planning_draft_overflow_btn, 0, Qt.AlignRight)
@@ -6858,7 +6858,7 @@ class MainWindow(QMainWindow):
         }
 
     def _apply_draft_reset_after_backup(self) -> None:
-        """Clear runtime draft/planning state, persist an empty draft, and refresh planning UI (roots preserved)."""
+        """Clear draft memory, reset planning trees and selectors (factory-style), persist a new empty session."""
         pre_pm = len(self.planned_moves)
         pre_pf = len(self.proposed_folders)
         log_info(
@@ -6877,6 +6877,16 @@ class MainWindow(QMainWindow):
         self._source_projection_refresh_scheduled = False
         self._source_projection_refresh_paths = set()
         self._invalidate_projection_lookup_caches(bump_generation=True)
+        self._cancel_destination_future_async_projection("draft_factory_reset")
+        self._destination_expand_all_after_full_tree = False
+        self.reset_root_panels()
+        self.populate_planning_selectors(
+            list(getattr(self, "discovered_sites", None) or []),
+            auto_load_initial=False,
+        )
+        self._set_planning_site_selectors_no_selection()
+        self._reset_planning_trees_to_select_library_prompt()
+        self._refresh_planning_loading_banner()
         fresh = self._build_current_draft_shell_state(include_workspace_ui=True)
         fresh.DraftId = self._create_new_draft_session_id()
         fresh.CreatedUtc = datetime.utcnow().isoformat()
@@ -6905,7 +6915,7 @@ class MainWindow(QMainWindow):
         self.clear_selection_details()
         self.update_progress_summaries()
         if getattr(self, "planned_moves_status", None) is not None:
-            self.planned_moves_status.setText("Draft reset: clean baseline.")
+            self.planned_moves_status.setText("Workspace reset: choose source and destination libraries, then plan.")
         source_traceability_cleared = False
         if getattr(self, "source_tree_widget", None) is not None:
             self._refresh_source_projection("draft_reset_source_reconcile")
@@ -6940,6 +6950,7 @@ class MainWindow(QMainWindow):
             destination_materialize_return=dest_materialize_return,
             planned_moves_table_cleared=True,
             cache_invalidation_done=True,
+            factory_workspace_reset=True,
         )
 
     @staticmethod
@@ -7122,7 +7133,7 @@ class MainWindow(QMainWindow):
 
     def _handle_reset_draft(self) -> None:
         if self.memory_manager is None:
-            QMessageBox.information(self, "Reset Draft", "Draft storage is not available.")
+            QMessageBox.information(self, "Reset Workspace", "Draft storage is not available.")
             return
         if getattr(self, "_memory_restore_in_progress", False):
             self._finalize_memory_restore_if_ready("reset_draft_precheck")
@@ -7138,7 +7149,7 @@ class MainWindow(QMainWindow):
             )
             wait_box = QMessageBox(self)
             wait_box.setIcon(QMessageBox.Icon.Information)
-            wait_box.setWindowTitle("Reset Draft")
+            wait_box.setWindowTitle("Reset Workspace")
             wait_box.setText(
                 "The workspace is still loading or reconciling your saved draft. "
                 "Reset is paused until that finishes so your backup stays consistent."
@@ -7158,16 +7169,18 @@ class MainWindow(QMainWindow):
 
         dlg = QMessageBox(self)
         dlg.setIcon(QMessageBox.Icon.Warning)
-        dlg.setWindowTitle("Reset Draft")
+        dlg.setWindowTitle("Reset Workspace")
         dlg.setText(
-            "This clears all planned moves, proposed folders, and draft projections from this workspace."
+            "This backs up your current draft, then performs a factory-style reset: "
+            "new empty draft, cleared trees, and no site or library selected."
         )
         dlg.setInformativeText(
-            "A timestamped backup file is saved first under your user Memory/Backups folder. "
-            "You stay signed in and your source/destination library selections stay as they are. "
-            "After reset, you start from a clean planning baseline (new empty draft)."
+            "A timestamped backup is saved under your user Memory/Backups folder. "
+            "You remain signed in to Microsoft 365; rediscover sites if needed, then pick "
+            "source and destination sites and libraries again. "
+            "Nothing is cleared outside this app’s Memory folder except what you replace by planning again."
         )
-        reset_btn = dlg.addButton("Create Backup && Reset", QMessageBox.ButtonRole.AcceptRole)
+        reset_btn = dlg.addButton("Backup && Reset Workspace", QMessageBox.ButtonRole.AcceptRole)
         dlg.addButton(QMessageBox.StandardButton.Cancel)
         dlg.setDefaultButton(QMessageBox.StandardButton.Cancel)
         dlg.exec()
@@ -7184,7 +7197,7 @@ class MainWindow(QMainWindow):
             if self._memory_restore_async_busy_for_reset_draft():
                 QMessageBox.critical(
                     self,
-                    "Reset Draft",
+                    "Reset Workspace",
                     "Memory restore became active before the backup could start. "
                     "Wait for trees and planning views to finish loading, then try again.",
                 )
@@ -7193,7 +7206,7 @@ class MainWindow(QMainWindow):
         if getattr(self, "_memory_restore_in_progress", False):
             QMessageBox.critical(
                 self,
-                "Reset Draft",
+                "Reset Workspace",
                 "The workspace is still marked as restoring memory state and cannot be reset safely. "
                 "Try again shortly, or restart the app if this persists.",
             )
@@ -7230,8 +7243,8 @@ class MainWindow(QMainWindow):
             )
             QMessageBox.critical(
                 self,
-                "Reset Draft",
-                "Backup failed; the draft was not reset.\n\n" + str(exc),
+                "Reset Workspace",
+                "Backup failed; the workspace was not reset.\n\n" + str(exc),
             )
             return
 
@@ -7253,7 +7266,7 @@ class MainWindow(QMainWindow):
             )
             QMessageBox.critical(
                 self,
-                "Reset Draft",
+                "Reset Workspace",
                 "Backup was saved but clearing the workspace failed.\n"
                 f"Backup path:\n{backup_path}\n\nError:\n{exc}",
             )
@@ -7267,8 +7280,8 @@ class MainWindow(QMainWindow):
         )
         QMessageBox.information(
             self,
-            "Reset Draft",
-            f"Draft reset complete. Backup saved to:\n{backup_path}",
+            "Reset Workspace",
+            f"Workspace reset complete. Backup saved to:\n{backup_path}",
         )
 
     def _handle_import_draft(self):
@@ -11890,6 +11903,19 @@ class MainWindow(QMainWindow):
         self._set_expand_all_button_label("destination", False)
         self._destination_restore_materialization_user_paused = False
         self._schedule_progress_summary_refresh()
+
+    def _set_planning_site_selectors_no_selection(self) -> None:
+        """Clear source/destination site picker selection (no site chosen until the user picks again)."""
+        for label in ("Source Site", "Destination Site"):
+            selector = self.planning_inputs.get(label)
+            if selector is None:
+                continue
+            selector.blockSignals(True)
+            selector.setCurrentIndex(-1)
+            selector.blockSignals(False)
+        self.bottom_source.setText("Source: Not Set")
+        self.bottom_destination.setText("Destination: Not Set")
+        self.update_selector_context_labels()
 
     def set_tree_placeholder(self, panel_key, message):
         if panel_key == "source":

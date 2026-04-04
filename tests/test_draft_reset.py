@@ -130,6 +130,13 @@ def test_apply_draft_reset_after_backup_clears_runtime_and_persists_empty():
     mw._clear_runtime_draft_state = _minimal_clear
     mw._invalidate_projection_lookup_caches = MagicMock()
     mw._create_new_draft_session_id = lambda: "NEW-DRAFT-ID"
+    mw._cancel_destination_future_async_projection = MagicMock()
+    mw.discovered_sites = []
+    mw.reset_root_panels = MagicMock()
+    mw.populate_planning_selectors = MagicMock()
+    mw._set_planning_site_selectors_no_selection = MagicMock()
+    mw._reset_planning_trees_to_select_library_prompt = MagicMock()
+    mw._refresh_planning_loading_banner = MagicMock()
 
     def _fresh(**_kw):
         return SessionState(
@@ -164,6 +171,10 @@ def test_apply_draft_reset_after_backup_clears_runtime_and_persists_empty():
     call_kw = mw._materialize_destination_future_model.call_args.kwargs
     assert call_kw.get("allow_defer") is False
     mw._refresh_source_projection.assert_called_once()
+    mw.reset_root_panels.assert_called_once()
+    mw.populate_planning_selectors.assert_called_once()
+    pop_args, pop_kw = mw.populate_planning_selectors.call_args
+    assert pop_kw.get("auto_load_initial") is False
 
 
 def test_refresh_source_projection_refreshes_visuals_when_no_planned_moves():
@@ -229,6 +240,13 @@ def test_apply_draft_reset_stops_deferred_planning_timer_and_clears_queues():
     mw._clear_runtime_draft_state = _minimal_clear
     mw._invalidate_projection_lookup_caches = MagicMock()
     mw._create_new_draft_session_id = lambda: "NEW-ID"
+    mw._cancel_destination_future_async_projection = MagicMock()
+    mw.discovered_sites = []
+    mw.reset_root_panels = MagicMock()
+    mw.populate_planning_selectors = MagicMock()
+    mw._set_planning_site_selectors_no_selection = MagicMock()
+    mw._reset_planning_trees_to_select_library_prompt = MagicMock()
+    mw._refresh_planning_loading_banner = MagicMock()
 
     def _fresh(**_kw):
         return SessionState(DraftId="")
