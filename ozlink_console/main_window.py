@@ -12001,11 +12001,10 @@ class MainWindow(QMainWindow):
                     node_data["children_loaded"] = False
                     node_data["load_failed"] = False
                     self.set_tree_item_node_data(item, node_data)
+                    tree_panel = self.source_tree_widget if panel_key == "source" else self.destination_tree_widget
                     if isinstance(item, QModelIndex):
-                        if panel_key == "source":
-                            tree_src = getattr(self, "source_tree_widget", None)
-                            if tree_src is not None and bool(tree_src.isExpanded(item)):
-                                self.on_tree_item_expanded(panel_key, item)
+                        if tree_panel is not None and bool(tree_panel.isExpanded(item)):
+                            self._ensure_tree_item_load_started(panel_key, item)
                     else:
                         if item.isExpanded():
                             self.on_tree_item_expanded(panel_key, item)
