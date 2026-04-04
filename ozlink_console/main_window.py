@@ -2194,6 +2194,7 @@ class MainWindow(QMainWindow):
         self._full_count_sequence = 0
         self._active_full_count_worker_id = 0
         self._retired_full_count_workers = {}
+        self._full_count_pending_drive_id_after_restore = ""
         self._workflow_not_planned_rows = []
         self._workflow_suggestion_rows = []
         self._workflow_needs_review_rows = []
@@ -6225,6 +6226,11 @@ class MainWindow(QMainWindow):
         self._deferred_source_projection_paths = set()
         self._memory_restore_in_progress = False
         self._memory_restore_background_trees = False
+        self._full_count_pending_drive_id_after_restore = ""
+        loaded_items = (
+            self.count_tree_items(self.source_tree_widget) if hasattr(self, "source_tree_widget") else 0
+        )
+        self._update_source_count_labels(loaded_items)
         # Keep autosave suppressed so partially-restored state cannot overwrite disk snapshot.
         self._suppress_autosave = True
         self._log_restore_phase(
@@ -8539,10 +8545,22 @@ class MainWindow(QMainWindow):
             return library.get("id", "")
         return ""
 
+    def _memory_restore_blocks_source_full_count(self) -> bool:
+        """True while memory restore owns the session; full library counts must not run yet."""
+        return bool(
+            getattr(self, "_memory_restore_in_progress", False)
+            or getattr(self, "_memory_restore_background_trees", False)
+        )
+
     def _graph_file_count_display(self):
         current_drive_id = self._current_selected_source_drive_id()
         if not current_drive_id:
             return "0"
+        if (
+            self._memory_restore_blocks_source_full_count()
+            and str(getattr(self, "_full_count_pending_drive_id_after_restore", "") or "") == current_drive_id
+        ):
+            return "Deferred"
         if (
             self.full_source_file_count is not None
             and self._full_count_completed_drive_id == current_drive_id
@@ -8560,6 +8578,11 @@ class MainWindow(QMainWindow):
         current_drive_id = self._current_selected_source_drive_id()
         if not current_drive_id:
             return "0"
+        if (
+            self._memory_restore_blocks_source_full_count()
+            and str(getattr(self, "_full_count_pending_drive_id_after_restore", "") or "") == current_drive_id
+        ):
+            return "Deferred"
         if (
             self.full_source_folder_count is not None
             and self._full_count_completed_drive_id == current_drive_id
@@ -8607,6 +8630,7 @@ class MainWindow(QMainWindow):
         self._full_count_error_message = ""
         self._full_count_requested_drive_id = ""
         self._full_count_completed_drive_id = ""
+        self._full_count_pending_drive_id_after_restore = ""
         self._update_source_count_labels(0)
 
     def _reset_destination_full_tree_state(self):
@@ -8949,6 +8973,19 @@ class MainWindow(QMainWindow):
             self._reset_full_count_state()
             return
 
+        if self._memory_restore_blocks_source_full_count():
+            self._full_count_pending_drive_id_after_restore = str(drive_id)
+            log_info(
+                "full_count_skipped_restore_active",
+                drive_id=drive_id,
+                reason="memory_restore_blocks_source_full_count",
+            )
+            loaded_items = (
+                self.count_tree_items(self.source_tree_widget) if hasattr(self, "source_tree_widget") else 0
+            )
+            self._update_source_count_labels(loaded_items)
+            return
+
         if (
             self.full_count_worker is not None
             and self.full_count_worker.isRunning()
@@ -8999,7 +9036,6 @@ class MainWindow(QMainWindow):
         return (
             len(self.planned_moves) > 12
             or len(getattr(self, "_source_restore_materialization_queue", []) or []) > 15
-            or bool(getattr(self, "_memory_restore_in_progress", False))
             or bool(ep.get("source"))
             or bool(ep.get("destination"))
         )
@@ -9007,13 +9043,25 @@ class MainWindow(QMainWindow):
     def _schedule_full_count_with_restore_backoff(self, drive_id):
         if not drive_id:
             return
+        if self._memory_restore_blocks_source_full_count():
+            self._full_count_pending_drive_id_after_restore = str(drive_id)
+            log_info(
+                "full_count_deferred_restore_active",
+                drive_id=drive_id,
+                reason="skip_schedule_until_memory_restore_finishes",
+            )
+            loaded_items = (
+                self.count_tree_items(self.source_tree_widget) if hasattr(self, "source_tree_widget") else 0
+            )
+            self._update_source_count_labels(loaded_items)
+            return
         if self._heavy_session_for_background_graph_walk():
             delay_ms = 42000
             log_info(
                 "full_count_deferred",
                 drive_id=drive_id,
                 delay_ms=delay_ms,
-                reason="heavy_restore_session",
+                reason="heavy_session_background_graph_walk",
                 planned_moves=len(self.planned_moves),
             )
 
@@ -9022,11 +9070,38 @@ class MainWindow(QMainWindow):
                     return
                 if self.full_count_worker is not None and self.full_count_worker.isRunning():
                     return
+                if self._memory_restore_blocks_source_full_count():
+                    self._full_count_pending_drive_id_after_restore = str(drive_id)
+                    log_info(
+                        "full_count_deferred_restore_active",
+                        drive_id=drive_id,
+                        reason="heavy_backoff_timer_skipped_restore_still_active",
+                    )
+                    loaded = (
+                        self.count_tree_items(self.source_tree_widget)
+                        if hasattr(self, "source_tree_widget")
+                        else 0
+                    )
+                    self._update_source_count_labels(loaded)
+                    return
                 self.start_full_count_worker(drive_id)
 
             QTimer.singleShot(delay_ms, _deferred)
             return
         self.start_full_count_worker(drive_id)
+
+    def _flush_pending_source_full_count_after_memory_restore(self) -> None:
+        pending = str(getattr(self, "_full_count_pending_drive_id_after_restore", "") or "")
+        if not pending:
+            return
+        self._full_count_pending_drive_id_after_restore = ""
+        if pending != self._current_selected_source_drive_id():
+            loaded_items = (
+                self.count_tree_items(self.source_tree_widget) if hasattr(self, "source_tree_widget") else 0
+            )
+            self._update_source_count_labels(loaded_items)
+            return
+        self._schedule_full_count_with_restore_backoff(pending)
 
     def on_full_count_success(self, payload, worker_id):
         drive_id = payload.get("drive_id", "")
@@ -11545,6 +11620,7 @@ class MainWindow(QMainWindow):
         # This keeps startup fast and avoids immediately replacing snapshot content with live root fetches.
         self._schedule_live_root_refresh("source", delay_ms=900, force_refresh=False)
         self._schedule_live_root_refresh("destination", delay_ms=1200, force_refresh=False)
+        self._flush_pending_source_full_count_after_memory_restore()
         # Older/path-only drafts (e.g. first-generation builds) may have missed Graph id enrichment
         # because _try_resolve_planned_move_graph_ids_debounced returns while restore was still in progress.
         self._schedule_post_memory_restore_graph_id_enrichment()
@@ -11655,6 +11731,11 @@ class MainWindow(QMainWindow):
         if self._restore_abort_active():
             self._memory_restore_in_progress = False
             self._memory_restore_background_trees = False
+            self._full_count_pending_drive_id_after_restore = ""
+            loaded_items = (
+                self.count_tree_items(self.source_tree_widget) if hasattr(self, "source_tree_widget") else 0
+            )
+            self._update_source_count_labels(loaded_items)
             self._memory_restore_complete = False
             self._suppress_autosave = True
             self._log_restore_phase(
