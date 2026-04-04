@@ -6942,14 +6942,36 @@ class MainWindow(QMainWindow):
             cache_invalidation_done=True,
         )
 
+    @staticmethod
+    def _qt_worker_is_running(worker) -> bool:
+        try:
+            return worker is not None and worker.isRunning()
+        except RuntimeError:
+            return False
+
+    @staticmethod
+    def _root_load_worker_running(win, panel_key: str) -> bool:
+        entry = (getattr(win, "root_load_workers", None) or {}).get(panel_key) or {}
+        return MainWindow._qt_worker_is_running(entry.get("worker"))
+
+    @staticmethod
+    def _any_folder_load_worker_running(win) -> bool:
+        for entry in (getattr(win, "folder_load_workers", None) or {}).values():
+            if MainWindow._qt_worker_is_running((entry or {}).get("worker")):
+                return True
+        return False
+
     def _memory_restore_async_busy_for_reset_draft(self) -> bool:
         """True while tree loads, projection binds, or expand-all could still be running."""
         if getattr(self, "_memory_ui_rebind_in_progress", False):
             return True
         if getattr(self, "_root_tree_bind_in_progress", False):
             return True
-        workers = getattr(self, "root_load_workers", None) or {}
-        if workers.get("source") or workers.get("destination"):
+        if MainWindow._root_load_worker_running(self, "source") or MainWindow._root_load_worker_running(
+            self, "destination"
+        ):
+            return True
+        if MainWindow._any_folder_load_worker_running(self):
             return True
         pending = getattr(self, "pending_folder_loads", None) or {}
         if pending.get("source") or pending.get("destination"):
@@ -6973,6 +6995,46 @@ class MainWindow(QMainWindow):
             return True
         return False
 
+    def _reset_draft_memory_restore_diagnostics(self) -> dict:
+        """Structured snapshot for logs when Reset Draft is blocked (see DRAFTRESET)."""
+        workers = getattr(self, "root_load_workers", None) or {}
+        pending = getattr(self, "pending_folder_loads", None) or {}
+        src_root = workers.get("source") or {}
+        dst_root = workers.get("destination") or {}
+        src_w = src_root.get("worker")
+        dst_w = dst_root.get("worker")
+
+        return {
+            "memory_restore_in_progress": bool(getattr(self, "_memory_restore_in_progress", False)),
+            "memory_ui_rebind_in_progress": bool(getattr(self, "_memory_ui_rebind_in_progress", False)),
+            "root_tree_bind_in_progress": bool(getattr(self, "_root_tree_bind_in_progress", False)),
+            "source_root_worker_registered": bool(src_root),
+            "source_root_worker_running": MainWindow._qt_worker_is_running(src_w),
+            "destination_root_worker_registered": bool(dst_root),
+            "destination_root_worker_running": MainWindow._qt_worker_is_running(dst_w),
+            "folder_workers_running": MainWindow._any_folder_load_worker_running(self),
+            "pending_source_folder_loads": len(pending.get("source", set()) or set()),
+            "pending_destination_folder_loads": len(pending.get("destination", set()) or set()),
+            "unresolved_proposed": self._unresolved_proposed_queue_size(),
+            "unresolved_allocation": self._unresolved_allocation_queue_size(),
+            "destination_materialization_queue": len(getattr(self, "_destination_restore_materialization_queue", []) or []),
+            "source_materialization_queue": len(getattr(self, "_source_restore_materialization_queue", []) or []),
+            "restore_destination_overlay_pending": bool(getattr(self, "_restore_destination_overlay_pending", False)),
+            "destination_root_prime_pending": bool(getattr(self, "_destination_root_prime_pending", False)),
+            "destination_chunked_bind_state": getattr(self, "_destination_chunked_bind_state", None) is not None,
+            "destination_future_bind_sync_active": bool(getattr(self, "_destination_future_bind_sync_active", False)),
+            "destination_future_projection_async_state": getattr(self, "_destination_future_projection_async_state", None)
+            is not None,
+            "destination_snapshot_chunked_restore_active": bool(
+                getattr(self, "_destination_snapshot_chunked_restore_active", False)
+            ),
+            "expand_all_pending_source": bool((getattr(self, "_expand_all_pending", None) or {}).get("source")),
+            "expand_all_pending_destination": bool((getattr(self, "_expand_all_pending", None) or {}).get("destination")),
+            "lazy_destination_projection_pending_reason": str(
+                getattr(self, "_lazy_destination_projection_pending_reason", "") or ""
+            )[:200],
+        }
+
     def _release_stalled_memory_restore_gate_for_reset_draft(self) -> None:
         """Clear bookkeeping flags that kept finalize from running when no async work remains."""
         log_info(
@@ -6993,6 +7055,11 @@ class MainWindow(QMainWindow):
         if getattr(self, "_memory_restore_in_progress", False):
             self._finalize_memory_restore_if_ready("reset_draft_precheck")
         if getattr(self, "_memory_restore_in_progress", False) and self._memory_restore_async_busy_for_reset_draft():
+            log_warn(
+                "DRAFTRESET",
+                event="reset_draft_blocked_precheck",
+                **self._reset_draft_memory_restore_diagnostics(),
+            )
             QMessageBox.information(
                 self,
                 "Reset Draft",
@@ -10924,12 +10991,34 @@ class MainWindow(QMainWindow):
         unresolved_count = self._unresolved_proposed_queue_size() + self._unresolved_allocation_queue_size()
         destination_queue_size = len(getattr(self, "_destination_restore_materialization_queue", []) or [])
         pending_destination_root_load = 1 if self.root_load_workers.get("destination") else 0
+        pending_destination_folder_loads = bool(self.pending_folder_loads.get("destination"))
+        root_prime_pending = bool(getattr(self, "_destination_root_prime_pending", False))
+        # Overlay pending can remain True after unresolved queues drain (e.g. phase4 set it earlier);
+        # if there is no destination work left, clear it so restore can finalize and Reset Draft can run.
+        if (
+            not unresolved_count
+            and not destination_queue_size
+            and not pending_destination_root_load
+            and not pending_destination_folder_loads
+            and not root_prime_pending
+            and getattr(self, "_restore_destination_overlay_pending", False)
+        ):
+            self._restore_destination_overlay_pending = False
+            self._log_restore_phase(
+                "restore_destination_overlay_pending_cleared_no_outstanding_work",
+                finalize_reason=reason,
+            )
+            unresolved_count = self._unresolved_proposed_queue_size() + self._unresolved_allocation_queue_size()
+            destination_queue_size = len(getattr(self, "_destination_restore_materialization_queue", []) or [])
+            pending_destination_root_load = 1 if self.root_load_workers.get("destination") else 0
+            pending_destination_folder_loads = bool(self.pending_folder_loads.get("destination"))
+            root_prime_pending = bool(getattr(self, "_destination_root_prime_pending", False))
         destination_busy = bool(
             unresolved_count
             or destination_queue_size
             or getattr(self, "_restore_destination_overlay_pending", False)
-            or getattr(self, "_destination_root_prime_pending", False)
-            or bool(self.pending_folder_loads.get("destination"))
+            or root_prime_pending
+            or pending_destination_folder_loads
             or pending_destination_root_load
         )
         if destination_busy:

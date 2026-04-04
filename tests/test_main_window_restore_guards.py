@@ -153,6 +153,7 @@ def test_reset_draft_async_busy_false_on_idle_host():
             "_memory_ui_rebind_in_progress": False,
             "_root_tree_bind_in_progress": False,
             "root_load_workers": {},
+            "folder_load_workers": {},
             "pending_folder_loads": {"source": set(), "destination": set()},
             "_destination_restore_materialization_queue": [],
             "_source_restore_materialization_queue": [],
@@ -167,14 +168,47 @@ def test_reset_draft_async_busy_false_on_idle_host():
     assert MainWindow._memory_restore_async_busy_for_reset_draft(host) is False
 
 
-def test_reset_draft_async_busy_true_when_destination_root_worker():
+class _RunningWorker:
+    def isRunning(self):
+        return True
+
+
+def test_reset_draft_async_busy_false_when_root_entry_but_worker_not_running():
+    class _StoppedWorker:
+        def isRunning(self):
+            return False
+
     host = type(
         "Host",
         (),
         {
             "_memory_ui_rebind_in_progress": False,
             "_root_tree_bind_in_progress": False,
-            "root_load_workers": {"destination": {"id": "w1"}},
+            "root_load_workers": {"destination": {"id": "w1", "worker": _StoppedWorker()}},
+            "folder_load_workers": {},
+            "pending_folder_loads": {"source": set(), "destination": set()},
+            "_destination_restore_materialization_queue": [],
+            "_source_restore_materialization_queue": [],
+            "_destination_chunked_bind_state": None,
+            "_destination_future_bind_sync_active": False,
+            "_destination_future_projection_async_state": None,
+            "_destination_snapshot_chunked_restore_active": False,
+            "_expand_all_pending": {"source": False, "destination": False},
+            "_lazy_destination_projection_pending_reason": "",
+        },
+    )()
+    assert MainWindow._memory_restore_async_busy_for_reset_draft(host) is False
+
+
+def test_reset_draft_async_busy_true_when_destination_root_worker_running():
+    host = type(
+        "Host",
+        (),
+        {
+            "_memory_ui_rebind_in_progress": False,
+            "_root_tree_bind_in_progress": False,
+            "root_load_workers": {"destination": {"id": "w1", "worker": _RunningWorker()}},
+            "folder_load_workers": {},
             "pending_folder_loads": {"source": set(), "destination": set()},
             "_destination_restore_materialization_queue": [],
             "_source_restore_materialization_queue": [],
