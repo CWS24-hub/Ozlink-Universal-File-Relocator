@@ -63,6 +63,7 @@ class ManifestGraphExpansionIntegrationTests(unittest.TestCase):
         rows = expanded_graph_steps_to_transfer_step_json_dicts(moves, expanded)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["planned_move_index"], 0)
+        self.assertEqual(rows[0]["step_uid"], "NOREQ::0")
         self.assertTrue(rows[0]["is_source_folder"])
 
     def test_dirty_nested_clean_subfolder_single_folder_step_in_json(self):

@@ -176,6 +176,21 @@ def _step_graph_ready(step: dict[str, Any]) -> bool:
     )
 
 
+def _pilot_planned_move_key_for_step(step: dict[str, Any]) -> int:
+    """Planned-move index for pilot filters. Expanded steps use ``planned_move_index`` when present."""
+    if "planned_move_index" in step:
+        try:
+            pm = int(step.get("planned_move_index", -1))
+        except (TypeError, ValueError):
+            pm = -1
+        if pm >= 0:
+            return pm
+    try:
+        return int(step.get("index", -1))
+    except (TypeError, ValueError):
+        return -1
+
+
 def _proposed_graph_ready(step: dict[str, Any]) -> bool:
     return bool(
         str(step.get("folder_name", "") or "").strip()
@@ -577,6 +592,7 @@ def run_manifest_local_filesystem(
         is_folder = bool(step.get("is_source_folder", False))
         dest_name = str(step.get("destination_name", "") or step.get("source_name", "") or "").strip()
         step_uid = str(step.get("step_uid", "") or "").strip()
+        pilot_move_key = _pilot_planned_move_key_for_step(step)
 
         if (
             not from_graph_expansion
@@ -587,13 +603,13 @@ def run_manifest_local_filesystem(
         ):
             continue
 
-        if pilot_transfer_step_indices and idx not in pilot_transfer_step_indices:
+        if pilot_transfer_step_indices and pilot_move_key not in pilot_transfer_step_indices:
             emit(
                 StepRunRecord(
                     "transfer",
                     idx,
                     "skipped",
-                    f"pilot_transfer_step_indices filter: idx {idx} not selected",
+                    f"pilot_transfer_step_indices filter: planned move {pilot_move_key} not selected",
                 )
             )
             continue

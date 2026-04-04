@@ -136,7 +136,11 @@ def expanded_graph_steps_to_transfer_step_json_dicts(
     planned_moves: list[dict[str, Any]],
     expanded: list[Any],
 ) -> list[dict[str, Any]]:
-    """Build transfer_step JSON dicts from expansion output (sequential index, drive ids from planned move)."""
+    """Build transfer_step JSON dicts from expansion output.
+
+    ``index`` is the expanded row number (logging); ``planned_move_index`` is the source planned move.
+    ``step_uid`` matches the corresponding legacy transfer step for that planned move (pilot UIDs).
+    """
     out: list[dict[str, Any]] = []
     moves = list(planned_moves or [])
     for i, eg in enumerate(expanded):
@@ -146,6 +150,8 @@ def expanded_graph_steps_to_transfer_step_json_dicts(
         m = moves[pm]
         step = _planned_move_to_step(i, m).to_json_dict()
         step["planned_move_index"] = pm
+        req = str(m.get("request_id", "") or "").strip()
+        step["step_uid"] = f"{req or 'NOREQ'}::{pm}"
         out.append(step)
     return out
 

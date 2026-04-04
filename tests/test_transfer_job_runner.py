@@ -92,6 +92,7 @@ class TransferJobRunnerTests(unittest.TestCase):
             }
             r = run_manifest_local_filesystem(manifest, dry_run=False)
             self.assertTrue(any("pilot_transfer_step_indices filter" in x.detail for x in r.records))
+            self.assertTrue(any("planned move 0 not selected" in x.detail for x in r.records))
 
     def test_pilot_filter_by_step_uid(self):
         import tempfile
@@ -822,7 +823,7 @@ class TransferJobRunnerTests(unittest.TestCase):
                         "request_id": "REQ",
                         "status": "Draft",
                         "allocation_method": "",
-                        "step_uid": "REQ::0",
+                        "step_uid": "REQ::1",
                         "planned_move_index": 1,
                         "source_drive_id": "d1",
                         "source_item_id": "i1",
@@ -852,6 +853,284 @@ class TransferJobRunnerTests(unittest.TestCase):
         }
         run_manifest_local_filesystem(manifest, dry_run=False, graph_client=mock_g)
         mock_g.start_drive_item_copy.assert_called_once()
+
+    def test_pilot_indices_expanded_run_all_rows_for_same_planned_move(self):
+        """Selecting planned move 0 runs every expanded step derived from it (not only row index 0)."""
+        from unittest.mock import MagicMock
+
+        mock_g = MagicMock()
+        mock_g.start_drive_item_copy.return_value = "https://monitor"
+        mock_g.wait_graph_async_operation.return_value = None
+
+        manifest = {
+            "manifest_version": 2,
+            "proposed_folder_steps": [],
+            "execution_options": {
+                "pilot_transfer_step_indices": [0],
+                "graph_expanded_transfer_steps": [
+                    {
+                        "index": 0,
+                        "operation": "copy",
+                        "source_path": "Lib\\Folder\\a.txt",
+                        "destination_path": "Root\\Dest",
+                        "source_name": "a.txt",
+                        "destination_name": "a.txt",
+                        "is_source_folder": False,
+                        "request_id": "REQ",
+                        "status": "Draft",
+                        "allocation_method": "",
+                        "planned_move_index": 0,
+                        "source_drive_id": "d1",
+                        "source_item_id": "i1",
+                        "destination_drive_id": "d2",
+                        "destination_item_id": "p1",
+                    },
+                    {
+                        "index": 1,
+                        "operation": "copy",
+                        "source_path": "Lib\\Folder\\b.txt",
+                        "destination_path": "Root\\Dest",
+                        "source_name": "b.txt",
+                        "destination_name": "b.txt",
+                        "is_source_folder": False,
+                        "request_id": "REQ",
+                        "status": "Draft",
+                        "allocation_method": "",
+                        "planned_move_index": 0,
+                        "source_drive_id": "d1",
+                        "source_item_id": "i2",
+                        "destination_drive_id": "d2",
+                        "destination_item_id": "p1",
+                    },
+                ],
+            },
+            "transfer_steps": [
+                {
+                    "index": 0,
+                    "operation": "copy",
+                    "source_path": "Lib\\Folder",
+                    "destination_path": "Root\\Folder",
+                    "source_name": "Folder",
+                    "destination_name": "Folder",
+                    "is_source_folder": True,
+                    "request_id": "",
+                    "status": "Draft",
+                    "allocation_method": "",
+                    "source_drive_id": "d1",
+                    "source_item_id": "fold1",
+                    "destination_drive_id": "d2",
+                    "destination_item_id": "parent1",
+                },
+            ],
+        }
+        run_manifest_local_filesystem(manifest, dry_run=False, graph_client=mock_g)
+        self.assertEqual(mock_g.start_drive_item_copy.call_count, 2)
+
+    def test_pilot_indices_expanded_skip_when_planned_move_not_selected(self):
+        from unittest.mock import MagicMock
+
+        mock_g = MagicMock()
+        mock_g.start_drive_item_copy.return_value = "https://monitor"
+        mock_g.wait_graph_async_operation.return_value = None
+
+        manifest = {
+            "manifest_version": 2,
+            "proposed_folder_steps": [],
+            "execution_options": {
+                "pilot_transfer_step_indices": [999],
+                "graph_expanded_transfer_steps": [
+                    {
+                        "index": 0,
+                        "operation": "copy",
+                        "source_path": "Lib\\Folder\\a.txt",
+                        "destination_path": "Root\\Dest",
+                        "source_name": "a.txt",
+                        "destination_name": "a.txt",
+                        "is_source_folder": False,
+                        "request_id": "REQ",
+                        "status": "Draft",
+                        "allocation_method": "",
+                        "planned_move_index": 0,
+                        "source_drive_id": "d1",
+                        "source_item_id": "i1",
+                        "destination_drive_id": "d2",
+                        "destination_item_id": "p1",
+                    },
+                ],
+            },
+            "transfer_steps": [
+                {
+                    "index": 0,
+                    "operation": "copy",
+                    "source_path": "Lib\\Folder",
+                    "destination_path": "Root\\Folder",
+                    "source_name": "Folder",
+                    "destination_name": "Folder",
+                    "is_source_folder": True,
+                    "request_id": "",
+                    "status": "Draft",
+                    "allocation_method": "",
+                    "source_drive_id": "d1",
+                    "source_item_id": "fold1",
+                    "destination_drive_id": "d2",
+                    "destination_item_id": "parent1",
+                },
+            ],
+        }
+        r = run_manifest_local_filesystem(manifest, dry_run=False, graph_client=mock_g)
+        mock_g.start_drive_item_copy.assert_not_called()
+        self.assertTrue(any("planned move 0 not selected" in x.detail for x in r.records))
+
+    def test_pilot_mixed_expanded_and_legacy_local_respects_planned_move_key(self):
+        """Expanded steps use planned_move_index; legacy rows without it still use step index."""
+        import tempfile
+        from unittest.mock import MagicMock
+
+        mock_g = MagicMock()
+        mock_g.start_drive_item_copy.return_value = "https://monitor"
+        mock_g.wait_graph_async_operation.return_value = None
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            src = td / "local.txt"
+            src.write_text("z", encoding="utf-8")
+            dst = td / "out" / "local.txt"
+
+            manifest = {
+                "manifest_version": 2,
+                "proposed_folder_steps": [],
+                "execution_options": {
+                    "pilot_transfer_step_indices": [0],
+                    "graph_expanded_transfer_steps": [
+                        {
+                            "index": 0,
+                            "operation": "copy",
+                            "source_path": "Lib\\Folder\\a.txt",
+                            "destination_path": "Root\\Dest",
+                            "source_name": "a.txt",
+                            "destination_name": "a.txt",
+                            "is_source_folder": False,
+                            "request_id": "REQ",
+                            "status": "Draft",
+                            "allocation_method": "",
+                            "planned_move_index": 0,
+                            "source_drive_id": "d1",
+                            "source_item_id": "i1",
+                            "destination_drive_id": "d2",
+                            "destination_item_id": "p1",
+                        },
+                    ],
+                },
+                "transfer_steps": [
+                    {
+                        "index": 0,
+                        "operation": "copy",
+                        "source_path": "Lib\\Folder",
+                        "destination_path": "Root\\Folder",
+                        "source_name": "Folder",
+                        "destination_name": "Folder",
+                        "is_source_folder": True,
+                        "request_id": "",
+                        "status": "Draft",
+                        "allocation_method": "",
+                        "source_drive_id": "d1",
+                        "source_item_id": "fold1",
+                        "destination_drive_id": "d2",
+                        "destination_item_id": "parent1",
+                    },
+                    {
+                        "index": 1,
+                        "operation": "copy",
+                        "source_path": str(src),
+                        "destination_path": str(dst),
+                        "source_name": "local.txt",
+                        "destination_name": "local.txt",
+                        "is_source_folder": False,
+                        "request_id": "",
+                        "status": "Draft",
+                        "allocation_method": "",
+                    },
+                ],
+            }
+            r = run_manifest_local_filesystem(manifest, dry_run=False, graph_client=mock_g)
+            mock_g.start_drive_item_copy.assert_called_once()
+            self.assertFalse(dst.exists())
+            self.assertTrue(any("planned move 1 not selected" in x.detail for x in r.records))
+
+    def test_pilot_uids_expanded_shared_uid_runs_all_derived_steps(self):
+        """Multiple expanded rows share the same step_uid (planned move); pilot UID selects all."""
+        from unittest.mock import MagicMock
+
+        mock_g = MagicMock()
+        mock_g.start_drive_item_copy.return_value = "https://monitor"
+        mock_g.wait_graph_async_operation.return_value = None
+
+        manifest = {
+            "manifest_version": 2,
+            "proposed_folder_steps": [],
+            "execution_options": {
+                "pilot_transfer_step_uids": ["REQ::0"],
+                "graph_expanded_transfer_steps": [
+                    {
+                        "index": 0,
+                        "operation": "copy",
+                        "source_path": "Lib\\a.txt",
+                        "destination_path": "Root\\D",
+                        "source_name": "a.txt",
+                        "destination_name": "a.txt",
+                        "is_source_folder": False,
+                        "request_id": "REQ",
+                        "status": "Draft",
+                        "allocation_method": "",
+                        "step_uid": "REQ::0",
+                        "planned_move_index": 0,
+                        "source_drive_id": "d1",
+                        "source_item_id": "i1",
+                        "destination_drive_id": "d2",
+                        "destination_item_id": "p1",
+                    },
+                    {
+                        "index": 1,
+                        "operation": "copy",
+                        "source_path": "Lib\\b.txt",
+                        "destination_path": "Root\\D",
+                        "source_name": "b.txt",
+                        "destination_name": "b.txt",
+                        "is_source_folder": False,
+                        "request_id": "REQ",
+                        "status": "Draft",
+                        "allocation_method": "",
+                        "step_uid": "REQ::0",
+                        "planned_move_index": 0,
+                        "source_drive_id": "d1",
+                        "source_item_id": "i2",
+                        "destination_drive_id": "d2",
+                        "destination_item_id": "p1",
+                    },
+                ],
+            },
+            "transfer_steps": [
+                {
+                    "index": 0,
+                    "operation": "copy",
+                    "source_path": "Lib\\Folder",
+                    "destination_path": "Root\\Folder",
+                    "source_name": "Folder",
+                    "destination_name": "Folder",
+                    "is_source_folder": True,
+                    "request_id": "REQ",
+                    "status": "Draft",
+                    "allocation_method": "",
+                    "step_uid": "REQ::0",
+                    "source_drive_id": "d1",
+                    "source_item_id": "fold1",
+                    "destination_drive_id": "d2",
+                    "destination_item_id": "parent1",
+                },
+            ],
+        }
+        run_manifest_local_filesystem(manifest, dry_run=False, graph_client=mock_g)
+        self.assertEqual(mock_g.start_drive_item_copy.call_count, 2)
 
     def test_summary_counts(self):
         m = {
