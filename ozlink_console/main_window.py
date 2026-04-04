@@ -3820,6 +3820,30 @@ class MainWindow(QMainWindow):
         planning_loading_layout.addWidget(self.planning_loading_loading_detail)
         self.planning_loading_banner.hide()
 
+        self.planning_graph_assurance_banner = QFrame()
+        self.planning_graph_assurance_banner.setObjectName("SoftBanner")
+        graph_as_layout = QVBoxLayout(self.planning_graph_assurance_banner)
+        graph_as_layout.setContentsMargins(14, 10, 14, 10)
+        graph_as_layout.setSpacing(6)
+        graph_as_top = QHBoxLayout()
+        graph_as_top.setContentsMargins(0, 0, 0, 0)
+        graph_as_top.setSpacing(12)
+        self.planning_graph_assurance_title = QLabel("Microsoft 365 linkage")
+        self.planning_graph_assurance_title.setObjectName("SectionTitle")
+        self.planning_graph_assurance_dismiss_btn = QPushButton("Dismiss")
+        self.planning_graph_assurance_dismiss_btn.setObjectName("SecondaryButton")
+        self.planning_graph_assurance_dismiss_btn.setMinimumHeight(28)
+        self.planning_graph_assurance_dismiss_btn.setCursor(Qt.PointingHandCursor)
+        self.planning_graph_assurance_dismiss_btn.clicked.connect(self._dismiss_planning_graph_linkage_assurance_banner)
+        graph_as_top.addWidget(self.planning_graph_assurance_title, 1)
+        graph_as_top.addWidget(self.planning_graph_assurance_dismiss_btn, 0, Qt.AlignRight)
+        self.planning_graph_assurance_detail = QLabel("")
+        self.planning_graph_assurance_detail.setObjectName("CardBody")
+        self.planning_graph_assurance_detail.setWordWrap(True)
+        graph_as_layout.addLayout(graph_as_top)
+        graph_as_layout.addWidget(self.planning_graph_assurance_detail)
+        self.planning_graph_assurance_banner.hide()
+
         self.planning_inputs["Source Site"].currentIndexChanged.connect(
             lambda _: self.on_site_selector_changed("source")
         )
@@ -3980,7 +4004,9 @@ class MainWindow(QMainWindow):
         self._planning_draft_overflow_btn = QToolButton(header_action_panel)
         self._planning_draft_overflow_btn.setObjectName("OverflowMenuButton")
         self._planning_draft_overflow_btn.setText("⋮")
-        self._planning_draft_overflow_btn.setToolTip("Draft actions: import, export, unlock, reset")
+        self._planning_draft_overflow_btn.setToolTip(
+            "Draft actions: import, export, open workspace reset backups folder, restore reset backup, unlock, reset"
+        )
         self._planning_draft_overflow_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self._planning_draft_overflow_btn.setCursor(Qt.PointingHandCursor)
         _draft_menu = QMenu(self._planning_draft_overflow_btn)
@@ -3990,6 +4016,10 @@ class MainWindow(QMainWindow):
         _act_imp.triggered.connect(self._handle_import_draft)
         _act_exp = _draft_menu.addAction("Export Draft")
         _act_exp.triggered.connect(self._handle_export_draft)
+        _act_open_bak = _draft_menu.addAction("Open Workspace Reset Backups Folder")
+        _act_open_bak.triggered.connect(self._handle_open_memory_backups_folder)
+        _act_rstbak = _draft_menu.addAction("Restore Workspace Reset Backup…")
+        _act_rstbak.triggered.connect(self._handle_restore_workspace_reset_backup)
         _act_unl = _draft_menu.addAction("Unlock Draft")
         _act_unl.triggered.connect(self._handle_unlock_draft)
         _draft_menu.addSeparator()
@@ -4044,6 +4074,7 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(header_action_panel, 0, 3, 3, 1, Qt.AlignTop | Qt.AlignRight)
         header_layout.addWidget(planning_ctx_bar, 1, 0, 1, 3)
         header_layout.addWidget(self.planning_loading_banner, 2, 0, 1, 4)
+        header_layout.addWidget(self.planning_graph_assurance_banner, 3, 0, 1, 4)
         header_layout.setColumnStretch(0, 2)
         header_layout.setColumnStretch(1, 2)
         header_layout.setColumnStretch(2, 2)
@@ -7132,6 +7163,37 @@ class MainWindow(QMainWindow):
         self._reset_unresolved_allocation_queue()
         self._finalize_memory_restore_if_ready("reset_draft_stalled_gate_release")
 
+    def _prepare_memory_restore_finalize_for_reset_workspace(self) -> None:
+        """Clear stale destination bookkeeping so finalize can run (user confirmed Backup && Reset)."""
+        if MainWindow._root_load_worker_running(self, "source") or MainWindow._root_load_worker_running(
+            self, "destination"
+        ):
+            return
+        if MainWindow._any_folder_load_worker_running(self):
+            return
+        for pk in ("source", "destination"):
+            if (self.root_load_workers or {}).get(pk):
+                self.root_load_workers.pop(pk, None)
+                log_warn("DRAFTRESET", event="stale_root_worker_registry_cleared", panel_key=pk)
+        self._destination_restore_materialization_queue = []
+        self._restore_destination_overlay_pending = False
+        setattr(self, "_destination_root_prime_pending", False)
+        self._reset_unresolved_proposed_queue()
+        self._reset_unresolved_allocation_queue()
+        self.pending_folder_loads.setdefault("source", set()).clear()
+        self.pending_folder_loads.setdefault("destination", set()).clear()
+        self._finalize_memory_restore_if_ready("reset_workspace_prepare_finalize")
+
+    def _force_memory_restore_complete_after_reset_workspace_confirm(self) -> None:
+        """Last resort when finalize still cannot clear the flag after user confirmed reset."""
+        if not getattr(self, "_memory_restore_in_progress", False):
+            return
+        log_warn(
+            "DRAFTRESET",
+            event="memory_restore_finalize_forced_after_reset_workspace_confirm",
+        )
+        self._memory_restore_apply_finalize_success("reset_workspace_user_confirmed_force")
+
     def _handle_reset_draft(self) -> None:
         if self.memory_manager is None:
             QMessageBox.information(self, "Reset Workspace", "Draft storage is not available.")
@@ -7205,6 +7267,10 @@ class MainWindow(QMainWindow):
                 )
                 return
             self._release_stalled_memory_restore_gate_for_reset_draft()
+        if getattr(self, "_memory_restore_in_progress", False):
+            self._prepare_memory_restore_finalize_for_reset_workspace()
+        if getattr(self, "_memory_restore_in_progress", False):
+            self._force_memory_restore_complete_after_reset_workspace_confirm()
         if getattr(self, "_memory_restore_in_progress", False):
             QMessageBox.critical(
                 self,
@@ -7327,6 +7393,103 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             log_error("Draft import failed.", error=str(exc), source=source_file if 'source_file' in locals() else source_folder)
             QMessageBox.warning(self, "Import Draft", "Could not import the selected draft bundle.")
+
+    def _workspace_reset_backup_dialog_dir(self):
+        """Prefer ``Backups/WorkspaceReset``; fall back to ``Backups`` if older builds only wrote there."""
+        mm = self.memory_manager
+        if mm is None:
+            return None
+        wr = mm.workspace_reset_backups_dir
+        try:
+            wr.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        try:
+            if any(wr.glob("DraftReset*.json")):
+                return wr
+            if any(mm.backups.glob("DraftReset*.json")):
+                return mm.backups
+        except Exception:
+            pass
+        return wr
+
+    def _handle_open_memory_backups_folder(self) -> None:
+        """Open ``Memory/Backups/WorkspaceReset`` (DraftReset_*.json). The parent ``Backups`` folder also holds manifest rotation copies."""
+        if self.memory_manager is None:
+            QMessageBox.information(self, "Workspace reset backups", "Draft storage is not available right now.")
+            return
+        target = self._workspace_reset_backup_dialog_dir()
+        if target is None:
+            return
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Workspace reset backups",
+                f"Could not open folder:\n{exc}",
+            )
+            return
+        resolved = target.resolve()
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(resolved)))
+        log_info("Workspace reset backups folder opened.", path=str(resolved))
+
+    def _handle_restore_workspace_reset_backup(self) -> None:
+        """Restore a ``DraftReset_*.json`` created when using Backup && Reset Workspace."""
+        if self.memory_manager is None:
+            QMessageBox.information(self, "Restore Reset Backup", "Draft storage is not available right now.")
+            return
+        start_dir = self._workspace_reset_backup_dialog_dir()
+        if start_dir is None:
+            return
+        try:
+            start_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Restore Workspace Reset Backup",
+            str(start_dir),
+            "Workspace reset backup (DraftReset_*.json); JSON (*.json)",
+        )
+        if not path:
+            return
+        try:
+            session_state, allocations, proposed, session_raw, pm_override = self.memory_manager.apply_draft_reset_backup(
+                Path(path)
+            )
+            self._restore_memory_payload(session_state, allocations, proposed, session_raw)
+            if pm_override is not None:
+                self.planned_moves = list(pm_override)
+                self.refresh_planned_moves_table()
+                self._clear_source_projection_descendants_cache()
+            self._rebuild_submission_visual_cache()
+            self.update_progress_summaries()
+            if self.current_session_context.get("connected"):
+                self._apply_restored_selector_state()
+                try:
+                    self.ensure_planned_moves_resolved_via_graph(
+                        persist=True,
+                        quiet=False,
+                        refresh_sources=False,
+                    )
+                except Exception as exc:
+                    self._log_restore_exception("restore_workspace_reset_backup_graph_enrich", exc)
+            log_info("Workspace reset backup restored.", source=path)
+            self.refresh_requests_page()
+            QMessageBox.information(
+                self,
+                "Restore Reset Backup",
+                "The workspace reset backup was restored into your draft memory.\n\n"
+                "If sites and libraries do not match the tree, re-select them or use Refresh.",
+            )
+        except Exception as exc:
+            log_error("Restore workspace reset backup failed.", error=str(exc), source=path)
+            QMessageBox.warning(
+                self,
+                "Restore Reset Backup",
+                f"Could not restore backup:\n{exc}",
+            )
 
     def _handle_unlock_draft(self):
         submitted_moves = [
@@ -11083,6 +11246,141 @@ class MainWindow(QMainWindow):
         finally:
             self._finalize_memory_restore_if_ready("phase4_complete")
 
+    def _memory_restore_apply_finalize_success(self, reason: str = "") -> None:
+        """Apply the normal success-path side effects of memory restore finalize."""
+        self._restore_finalization_deferred_active = False
+        self._restore_finalization_deferred_reason = ""
+        self._memory_restore_in_progress = False
+        self._memory_restore_background_trees = False
+        self._memory_restore_complete = True
+        self._suppress_autosave = False
+        # Stop restore-driven source expansion work once restore is finalized.
+        # This prevents long-lived background source queue churn from competing
+        # with user-triggered expand-all actions.
+        self._source_restore_materialization_queue = []
+        self._source_restore_materialization_seen = set()
+        self._pending_source_navigation = None
+        self._pending_destination_navigation = None
+        self._prime_source_root_children_after_snapshot()
+        self._prime_destination_root_children_after_snapshot()
+        self._try_flush_destination_future_model_after_source_restore("memory_restore_finalize")
+        self._log_restore_state_snapshot(
+            "restore_final_ready",
+            destination_replay_invoked=False,
+            draft_id=self.active_draft_session_id,
+            autosave_suppressed=self._suppress_autosave,
+            finalization_reason=reason,
+        )
+        # After restoring from local memory/cache snapshot, do not force-clear tree cache.
+        # This keeps startup fast and avoids immediately replacing snapshot content with live root fetches.
+        self._schedule_live_root_refresh("source", delay_ms=900, force_refresh=False)
+        self._schedule_live_root_refresh("destination", delay_ms=1200, force_refresh=False)
+        # Older/path-only drafts (e.g. first-generation builds) may have missed Graph id enrichment
+        # because _try_resolve_planned_move_graph_ids_debounced returns while restore was still in progress.
+        self._schedule_post_memory_restore_graph_id_enrichment()
+
+    def _schedule_post_memory_restore_graph_id_enrichment(self) -> None:
+        """After successful memory-restore finalize, retry resolving drive/item ids from paths when needed."""
+        QTimer.singleShot(
+            2000,
+            lambda: self._safe_invoke(
+                "post_memory_restore_graph_id_enrichment",
+                self._post_memory_restore_graph_id_enrichment,
+            ),
+        )
+
+    def _dismiss_planning_graph_linkage_assurance_banner(self) -> None:
+        t = getattr(self, "_planning_graph_assurance_hide_timer", None)
+        if isinstance(t, QTimer):
+            t.stop()
+            self._planning_graph_assurance_hide_timer = None
+        b = getattr(self, "planning_graph_assurance_banner", None)
+        if b is not None:
+            b.hide()
+
+    def _show_planning_graph_linkage_assurance_banner(self, *, title: str, detail: str) -> None:
+        """Visible confirmation after post-restore Microsoft Graph linkage checks (upgrade / legacy drafts)."""
+        if getattr(self, "planning_graph_assurance_title", None) is None:
+            return
+        if getattr(self, "_planning_header_collapsed", False):
+            self._apply_planning_header_collapsed_state(False)
+        self.planning_graph_assurance_title.setText(title)
+        self.planning_graph_assurance_detail.setText(detail)
+        self.planning_graph_assurance_banner.show()
+        status = self.statusBar()
+        if status is not None:
+            status.showMessage(detail.replace("\n", " ")[:400], 50000)
+        t = getattr(self, "_planning_graph_assurance_hide_timer", None)
+        if isinstance(t, QTimer):
+            t.stop()
+        self._planning_graph_assurance_hide_timer = QTimer(self)
+        self._planning_graph_assurance_hide_timer.setSingleShot(True)
+        self._planning_graph_assurance_hide_timer.timeout.connect(self._dismiss_planning_graph_linkage_assurance_banner)
+        self._planning_graph_assurance_hide_timer.start(120000)
+
+    def _post_memory_restore_graph_id_enrichment(self) -> None:
+        if not self.current_session_context.get("connected"):
+            return
+        if self._restore_abort_active():
+            return
+        if getattr(self, "_memory_restore_in_progress", False):
+            return
+        if not self._graph_resolve_planning_context():
+            return
+        if not self.planned_moves and not self.proposed_folders:
+            return
+        if not self._planning_needs_graph_id_enrichment():
+            self._show_planning_graph_linkage_assurance_banner(
+                title="Microsoft 365 linkage verified",
+                detail=(
+                    "Your draft already has drive and item IDs for planned moves and proposed folders "
+                    "(nothing was missing after sign-in). You are ready to continue planning or submit."
+                ),
+            )
+            log_info(
+                "post_memory_restore_graph_id_enrichment",
+                event="skipped_already_linked",
+                planned_moves=len(self.planned_moves or []),
+                proposed_folders=len(self.proposed_folders or []),
+            )
+            return
+        log_info(
+            "post_memory_restore_graph_id_enrichment",
+            event="starting",
+            planned_moves=len(self.planned_moves or []),
+            proposed_folders=len(self.proposed_folders or []),
+        )
+        try:
+            move_rows_updated, proposed_updated = self.ensure_planned_moves_resolved_via_graph(
+                persist=True, quiet=True, refresh_sources=True
+            )
+            if move_rows_updated or proposed_updated:
+                self._show_planning_graph_linkage_assurance_banner(
+                    title="Microsoft 365 linkage updated",
+                    detail=(
+                        f"After opening your workspace, we matched your draft to SharePoint and refreshed "
+                        f"Graph metadata: {move_rows_updated} planned move row(s) (including source paths where needed) "
+                        f"and {proposed_updated} proposed folder(s). Changes are saved in your draft."
+                    ),
+                )
+            else:
+                self._show_planning_graph_linkage_assurance_banner(
+                    title="Microsoft 365 linkage checked",
+                    detail=(
+                        "We ran a SharePoint path check on your draft. No rows needed changes; "
+                        "your planned items already matched the current library view."
+                    ),
+                )
+        except Exception as exc:
+            log_warn("post_memory_restore_graph_id_enrichment_failed", error=str(exc))
+            self._show_planning_graph_linkage_assurance_banner(
+                title="Microsoft 365 linkage",
+                detail=(
+                    "Automatic Graph ID refresh did not complete. You can still plan; before submitting, "
+                    f"ensure you are online or try Refresh. Detail: {str(exc)[:200]}"
+                ),
+            )
+
     def _finalize_memory_restore_if_ready(self, reason=""):
         if self._restore_abort_active():
             self._memory_restore_in_progress = False
@@ -11158,31 +11456,7 @@ class MainWindow(QMainWindow):
             self._restore_finalization_deferred_reason = ""
         if not self._memory_restore_in_progress and self._memory_restore_complete and not self._suppress_autosave:
             return True
-        self._memory_restore_in_progress = False
-        self._memory_restore_background_trees = False
-        self._memory_restore_complete = True
-        self._suppress_autosave = False
-        # Stop restore-driven source expansion work once restore is finalized.
-        # This prevents long-lived background source queue churn from competing
-        # with user-triggered expand-all actions.
-        self._source_restore_materialization_queue = []
-        self._source_restore_materialization_seen = set()
-        self._pending_source_navigation = None
-        self._pending_destination_navigation = None
-        self._prime_source_root_children_after_snapshot()
-        self._prime_destination_root_children_after_snapshot()
-        self._try_flush_destination_future_model_after_source_restore("memory_restore_finalize")
-        self._log_restore_state_snapshot(
-            "restore_final_ready",
-            destination_replay_invoked=False,
-            draft_id=self.active_draft_session_id,
-            autosave_suppressed=self._suppress_autosave,
-            finalization_reason=reason,
-        )
-        # After restoring from local memory/cache snapshot, do not force-clear tree cache.
-        # This keeps startup fast and avoids immediately replacing snapshot content with live root fetches.
-        self._schedule_live_root_refresh("source", delay_ms=900, force_refresh=False)
-        self._schedule_live_root_refresh("destination", delay_ms=1200, force_refresh=False)
+        self._memory_restore_apply_finalize_success(reason)
         return True
 
     def _schedule_live_root_refresh(self, panel_key, delay_ms=1200, site=None, library=None, force_refresh=True):
@@ -26415,15 +26689,14 @@ class MainWindow(QMainWindow):
         )
 
     def node_is_valid_destination_target(self, node_data):
-        if node_data is None:
-            return False
+        """Whether Assign and related actions may use this destination row.
 
-        origin = str(node_data.get("node_origin", "")).lower()
-        return (
-            bool(node_data.get("is_folder"))
-            and not self.node_is_planned_allocation(node_data)
-            and origin not in {"projectedallocationdescendant"}
-        )
+        Must match :meth:`node_is_manual_drag_destination_folder` so context-menu Assign works on the same
+        folders as Explorer-style drag (including ``[Allocated]`` projection roots and allocation descendants).
+        Previously this rejected planned-allocation folders only, which disabled Assign after restore while
+        drag still worked.
+        """
+        return self.node_is_manual_drag_destination_folder(node_data)
 
     def node_is_manual_drag_destination_folder(self, node_data):
         """Folder rows that may receive Explorer-style manual planning drags.
@@ -28469,26 +28742,8 @@ class MainWindow(QMainWindow):
                     f"Updated {su} source path(s) to match current names in SharePoint."
                 )
 
-    def _try_resolve_planned_move_graph_ids_debounced(self) -> None:
-        if self._restore_abort_active() or getattr(self, "_memory_restore_in_progress", False):
-            self._log_restore_phase(
-                "graph_resolve_after_destination_root_skipped",
-                reason="restore_busy_or_abort",
-                restore_abort_reason=str(getattr(self, "_restore_abort_reason", "") or ""),
-            )
-            return
-        if not self.planned_moves:
-            return
-        src_ctx = self._graph_resolve_source_refresh_context()
-        if src_ctx:
-            su = self._refresh_planned_move_sources_from_sharepoint(src_ctx)
-            if su:
-                self._persist_planning_change("graph_ids_resolved_from_sharepoint_paths")
-                self.refresh_planned_moves_table()
-
-        ctx = self._graph_resolve_planning_context()
-        if not ctx:
-            return
+    def _planning_needs_graph_id_enrichment(self) -> bool:
+        """True when planned moves or proposed folders are missing Graph drive/item ids (legacy or path-only rows)."""
 
         def _move_needs_graph_resolve(m: dict) -> bool:
             src = m.get("source") or {}
@@ -28497,14 +28752,38 @@ class MainWindow(QMainWindow):
             has_dst = str(dst.get("id") or m.get("destination_id") or "").strip()
             return not has_src or not has_dst
 
-        missing_move = any(_move_needs_graph_resolve(m) for m in self.planned_moves)
+        missing_move = any(_move_needs_graph_resolve(m) for m in (self.planned_moves or []))
         missing_pf = any(
             (not str(getattr(pf, "DestinationDriveId", "") or "").strip())
             or (not str(getattr(pf, "DestinationParentItemId", "") or "").strip())
             for pf in (self.proposed_folders or [])
             if str(getattr(pf, "ParentPath", "") or "").strip()
         )
-        if not missing_move and not missing_pf:
+        return bool(missing_move or missing_pf)
+
+    def _try_resolve_planned_move_graph_ids_debounced(self) -> None:
+        if self._restore_abort_active() or getattr(self, "_memory_restore_in_progress", False):
+            self._log_restore_phase(
+                "graph_resolve_after_destination_root_skipped",
+                reason="restore_busy_or_abort",
+                restore_abort_reason=str(getattr(self, "_restore_abort_reason", "") or ""),
+            )
+            return
+        if not self.planned_moves and not self.proposed_folders:
+            return
+        if self.planned_moves:
+            src_ctx = self._graph_resolve_source_refresh_context()
+            if src_ctx:
+                su = self._refresh_planned_move_sources_from_sharepoint(src_ctx)
+                if su:
+                    self._persist_planning_change("graph_ids_resolved_from_sharepoint_paths")
+                    self.refresh_planned_moves_table()
+
+        ctx = self._graph_resolve_planning_context()
+        if not ctx:
+            return
+
+        if not self._planning_needs_graph_id_enrichment():
             return
         self.ensure_planned_moves_resolved_via_graph(persist=True, quiet=False, refresh_sources=False)
 

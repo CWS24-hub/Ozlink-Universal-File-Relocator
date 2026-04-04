@@ -29,6 +29,7 @@ def test_save_draft_reset_backup_writes_verified_json(tmp_path):
     path = mm.save_draft_reset_backup(payload)
     assert path.is_file()
     assert path.name.startswith("DraftReset_")
+    assert path.parent == mm.workspace_reset_backups_dir
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["schema_version"] == 1
     assert data["allocations"][0]["RequestId"] == "r1"
@@ -41,6 +42,61 @@ def test_save_draft_reset_backup_raises_typeerror_when_not_dict(tmp_path):
     mm.backups.mkdir(parents=True, exist_ok=True)
     with pytest.raises(TypeError):
         mm.save_draft_reset_backup("not-a-dict")  # type: ignore[arg-type]
+
+
+def test_apply_draft_reset_backup_writes_memory_files_and_returns_planned_moves(tmp_path):
+    mm = MemoryManager(tenant_domain="t.ex", operator_upn="u@t.ex")
+    root = tmp_path / "Memory"
+    root.mkdir(parents=True, exist_ok=True)
+    mm.root = root
+    mm.backups = root / "Backups"
+    mm.backups.mkdir(parents=True, exist_ok=True)
+    mm.paths = {
+        "allocations": root / "Draft-AllocationQueue.json",
+        "allocations_recovery": root / "Draft-AllocationQueue.recovery.json",
+        "proposed": root / "Draft-ProposedFolders.json",
+        "proposed_recovery": root / "Draft-ProposedFolders.recovery.json",
+        "session": root / "Draft-SessionState.json",
+        "session_recovery": root / "Draft-SessionState.recovery.json",
+        "manifest": root / "MemoryManifest.json",
+    }
+    mm.initialize_store()
+    backup = mm.backups / "DraftReset_unit.json"
+    backup.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "draft_reset_backup",
+                "session": {"DraftId": "DRAFT-UNIT", "DraftName": "Unit"},
+                "allocations": [
+                    {
+                        "RequestId": "r1",
+                        "SourceItemName": "a",
+                        "SourcePath": r"S\a",
+                        "SourceType": "folder",
+                        "RequestedDestinationPath": r"D\a",
+                        "AllocationMethod": "",
+                        "RequestedBy": "",
+                        "RequestedDate": "",
+                        "Status": "Pending",
+                    }
+                ],
+                "proposed_folders": [],
+                "planned_moves": [{"request_id": "r1", "source_path": r"S\a"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    session_state, allocations, proposed, _raw, pm = mm.apply_draft_reset_backup(backup)
+    assert session_state.DraftId == "DRAFT-UNIT"
+    assert len(allocations) == 1
+    assert allocations[0].RequestId == "r1"
+    assert proposed == []
+    assert pm is not None and len(pm) == 1
+    disk_alloc = json.loads(mm.paths["allocations"].read_text(encoding="utf-8"))
+    assert len(disk_alloc) == 1
+    disk_session = json.loads(mm.paths["session"].read_text(encoding="utf-8"))
+    assert disk_session.get("DraftId") == "DRAFT-UNIT"
 
 
 def test_handle_reset_draft_aborts_when_backup_raises(tmp_path):

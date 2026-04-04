@@ -46,6 +46,28 @@ def memory_root() -> Path:
 def legacy_memory_root() -> Path:
     return legacy_compatibility_root() / "Memory"
 
+
+def ensure_app_storage_directories() -> None:
+    """Create all standard Ozlink console folders under LocalAppData if they do not exist.
+
+    Call once at process startup (before logging). Re-entrant and safe if folders already exist.
+    Covers global roots used by logs, unscoped memory, exports, requests, cache, and legacy migration paths.
+    """
+    python_primary_storage_root().mkdir(parents=True, exist_ok=True)
+    legacy_compatibility_root().mkdir(parents=True, exist_ok=True)
+    legacy_memory_root().mkdir(parents=True, exist_ok=True)
+    # Each helper creates its directory tree
+    _ = logs_root()
+    _ = memory_root()
+    _ = backups_root()
+    _ = quarantine_root()
+    _ = exports_root()
+    _ = requests_root()
+    _ = test_requests_root()
+    _ = cache_root()
+    _ = graph_cache_root()
+
+
 def backups_root() -> Path:
     path = memory_root() / "Backups"
     path.mkdir(parents=True, exist_ok=True)
