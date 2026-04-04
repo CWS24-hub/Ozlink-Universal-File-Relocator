@@ -94,6 +94,11 @@ from ozlink_console.transfer_manifest import (
     write_manifest_json,
     _planned_move_to_step,
 )
+from ozlink_console.plan_execution_duplicate_validation import (
+    duplicate_collision_report_from_moves,
+    duplicate_collision_report_from_transfer_steps,
+    format_execution_duplicate_message,
+)
 from ozlink_console.planning_resolution import find_inherited_planned_move_for_source_path_raw
 from ozlink_console.draft_snapshot.recursive_subtree_expansion import (
     allocation_row_dict_for_expanded_file,
@@ -18398,6 +18403,31 @@ class MainWindow(QMainWindow):
             self._mark_destination_indicator_dirty_paths(paths)
             self._schedule_refresh_destination_tree_indicators(delay_ms=30)
 
+    def _destination_file_key_for_execution_validation(self, move):
+        """Canonical destination file path for a planned move (None for folder moves)."""
+        if not isinstance(move, dict):
+            return None
+        src = move.get("source") or {}
+        if bool(src.get("is_folder", False)):
+            return None
+        proj = self._allocation_projection_path(move)
+        if not proj:
+            return None
+        return self._canonical_destination_projection_path(proj) or self.normalize_memory_path(proj)
+
+    def _planned_moves_duplicate_validation_error(self, moves) -> str:
+        ds, dd = duplicate_collision_report_from_moves(
+            list(moves or []),
+            canonical_source=lambda m: self._canonical_source_projection_path(m.get("source_path", "")),
+            destination_file_key=self._destination_file_key_for_execution_validation,
+        )
+        return format_execution_duplicate_message(ds, dd)
+
+    def _transfer_manifest_duplicate_validation_error(self, manifest: dict) -> str:
+        steps = list((manifest or {}).get("transfer_steps") or [])
+        ds, dd = duplicate_collision_report_from_transfer_steps(steps)
+        return format_execution_duplicate_message(ds, dd)
+
     def _canonical_source_path_for_planning_leaf(self, panel_key, node_data):
         if panel_key == "source":
             return self._canonical_source_projection_path(self._tree_item_path(node_data))
@@ -29419,6 +29449,11 @@ class MainWindow(QMainWindow):
 
         self.ensure_planned_moves_resolved_via_graph(persist=True, quiet=True)
 
+        dup_err = self._planned_moves_duplicate_validation_error(self.planned_moves)
+        if dup_err:
+            QMessageBox.warning(self, "Cannot export manifest", dup_err)
+            return
+
         draft_key = str(self.active_draft_session_id or "").strip()
         if not draft_key and isinstance(self._draft_shell_state, SessionState):
             draft_key = str(self._draft_shell_state.DraftId or "").strip()
@@ -32734,6 +32769,12 @@ class MainWindow(QMainWindow):
         graph_client = self.graph if getattr(self.graph, "token", None) else None
         preflight_transfer_updated, preflight_proposed_updated = self._preflight_enrich_manifest_graph_ids(run_manifest)
         readiness_after = self._manifest_graph_readiness_counts(run_manifest)
+        dup_err = self._transfer_manifest_duplicate_validation_error(run_manifest)
+        if dup_err:
+            QMessageBox.warning(self, "Cannot run manifest", dup_err)
+            if getattr(self, "execution_status_label", None) is not None:
+                self.execution_status_label.setText("Execution blocked: duplicate transfer steps.")
+            return
         # Diagnostic: status-line "Preflight enriched … proposed=N" is N = rows that *gained* Graph
         # ids in preflight, not pilot selected proposed-folder count or manifest proposed row totals.
         _eo_diag = dict(run_manifest.get("execution_options") or {})
@@ -32998,6 +33039,11 @@ class MainWindow(QMainWindow):
         errs = validate_manifest(manifest)
         if errs:
             QMessageBox.warning(self, "Run manifest", "\n".join(errs))
+            return
+
+        dup_err = self._transfer_manifest_duplicate_validation_error(manifest)
+        if dup_err:
+            QMessageBox.warning(self, "Cannot run manifest", dup_err)
             return
 
         summary = manifest_execution_summary(manifest)
