@@ -5,7 +5,7 @@ import time
 import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import msal
@@ -258,6 +258,60 @@ class GraphClient:
             "Accept": "application/json",
         }
 
+    @staticmethod
+    def _graph_retry_after_seconds(response: Optional[requests.Response]) -> Optional[float]:
+        if response is None:
+            return None
+        ra = response.headers.get("Retry-After")
+        if ra is None or str(ra).strip() == "":
+            return None
+        try:
+            return float(ra)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _graph_should_retry_request_failure(exc: BaseException) -> bool:
+        if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+            return True
+        if isinstance(exc, requests.exceptions.ChunkedEncodingError):
+            return True
+        if isinstance(exc, requests.HTTPError):
+            r = exc.response
+            if r is None:
+                return False
+            code = r.status_code
+            if code in (401, 403, 404):
+                return False
+            if code in (408, 429, 500, 502, 503, 504):
+                return True
+        return False
+
+    @staticmethod
+    def _graph_transient_retry_delay_after_failure(
+        failed_attempt_index: int,
+        exc: BaseException,
+        default_backoffs: Tuple[float, float],
+    ) -> float:
+        if isinstance(exc, requests.HTTPError) and exc.response is not None and exc.response.status_code == 429:
+            ra = GraphClient._graph_retry_after_seconds(exc.response)
+            if ra is not None:
+                return min(max(ra, 0.0), 15.0)
+        if failed_attempt_index >= len(default_backoffs):
+            return default_backoffs[-1]
+        return default_backoffs[failed_attempt_index]
+
+    @staticmethod
+    def _graph_transient_retry_allowed(method: str, url: str) -> bool:
+        m = str(method or "").strip().upper()
+        if m in ("GET", "HEAD", "OPTIONS"):
+            return True
+        if m == "POST":
+            base = str(url or "").split("?", 1)[0].rstrip("/")
+            if base.endswith("/me/getMemberGroups"):
+                return True
+        return False
+
     def _request(
         self,
         method: str,
@@ -268,38 +322,74 @@ class GraphClient:
         timeout: int = 60,
         stream: bool = False,
     ) -> requests.Response:
-        retried_401 = False
-        response = requests.request(
-            method,
-            url,
-            headers=self.get_headers(),
-            params=params,
-            json=json_body,
-            timeout=timeout,
-            stream=stream,
-        )
-        if response.status_code == 401 and self._try_acquire_token_silent(force_refresh=True):
-            retried_401 = True
-            response = requests.request(
-                method,
-                url,
-                headers=self.get_headers(),
-                params=params,
-                json=json_body,
-                timeout=timeout,
-                stream=stream,
-            )
-        response.raise_for_status()
-        log_trace(
-            "graph_http",
-            "response_ok",
-            method=method,
-            path_excerpt=_graph_url_excerpt(url),
-            status_code=response.status_code,
-            retried_after_401=retried_401,
-            stream=stream,
-        )
-        return response
+        max_attempts = 3
+        default_backoffs: Tuple[float, float] = (0.22, 0.45)
+        excerpt = _graph_url_excerpt(url)
+        for attempt in range(max_attempts):
+            try:
+                retried_401 = False
+                response = requests.request(
+                    method,
+                    url,
+                    headers=self.get_headers(),
+                    params=params,
+                    json=json_body,
+                    timeout=timeout,
+                    stream=stream,
+                )
+                if response.status_code == 401 and self._try_acquire_token_silent(force_refresh=True):
+                    retried_401 = True
+                    response = requests.request(
+                        method,
+                        url,
+                        headers=self.get_headers(),
+                        params=params,
+                        json=json_body,
+                        timeout=timeout,
+                        stream=stream,
+                    )
+                response.raise_for_status()
+                log_trace(
+                    "graph_http",
+                    "response_ok",
+                    method=method,
+                    path_excerpt=excerpt,
+                    status_code=response.status_code,
+                    retried_after_401=retried_401,
+                    stream=stream,
+                )
+                return response
+            except (
+                requests.HTTPError,
+                requests.ConnectionError,
+                requests.Timeout,
+                requests.exceptions.ChunkedEncodingError,
+            ) as exc:
+                if not self._graph_should_retry_request_failure(exc):
+                    raise
+                if not self._graph_transient_retry_allowed(method, url):
+                    raise
+                if attempt >= max_attempts - 1:
+                    log_warn(
+                        "graph_http_transient_exhausted",
+                        method=method,
+                        path_excerpt=excerpt,
+                        attempts=max_attempts,
+                        error=str(exc)[:300],
+                    )
+                    raise
+                delay_s = self._graph_transient_retry_delay_after_failure(attempt, exc, default_backoffs)
+                log_warn(
+                    "graph_http_transient_retry",
+                    method=method,
+                    path_excerpt=excerpt,
+                    attempt=attempt + 2,
+                    max_attempts=max_attempts,
+                    delay_s=delay_s,
+                    error=str(exc)[:300],
+                )
+                time.sleep(delay_s)
+        raise RuntimeError("graph_http_retry_internal_error")  # pragma: no cover
 
     def get(self, url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         response = self._request("GET", url, params=params, timeout=60)
