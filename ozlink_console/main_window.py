@@ -7057,6 +7057,56 @@ class MainWindow(QMainWindow):
         pending.setdefault("source", set()).clear()
         pending.setdefault("destination", set()).clear()
 
+    def _reset_draft_recover_stale_async_state_if_no_workers(self) -> None:
+        """Clear stuck planning flags when no load workers are running (fixes endless Reset Draft wait)."""
+        if MainWindow._root_load_worker_running(self, "source") or MainWindow._root_load_worker_running(
+            self, "destination"
+        ):
+            return
+        if MainWindow._any_folder_load_worker_running(self):
+            return
+
+        cleared: list[str] = []
+        if getattr(self, "_memory_ui_rebind_in_progress", False):
+            self._memory_ui_rebind_in_progress = False
+            cleared.append("memory_ui_rebind_in_progress")
+        if getattr(self, "_root_tree_bind_in_progress", False):
+            self._root_tree_bind_in_progress = False
+            cleared.append("root_tree_bind_in_progress")
+        if len(getattr(self, "_destination_restore_materialization_queue", []) or []):
+            self._destination_restore_materialization_queue = []
+            cleared.append("destination_restore_materialization_queue")
+        if len(getattr(self, "_source_restore_materialization_queue", []) or []):
+            self._source_restore_materialization_queue = []
+            cleared.append("source_restore_materialization_queue")
+        if getattr(self, "_destination_chunked_bind_state", None) is not None:
+            self._destination_chunked_bind_state = None
+            cleared.append("destination_chunked_bind_state")
+        if getattr(self, "_destination_future_bind_sync_active", False):
+            self._destination_future_bind_sync_active = False
+            cleared.append("destination_future_bind_sync_active")
+        if getattr(self, "_destination_snapshot_chunked_restore_active", False):
+            self._destination_snapshot_chunked_restore_active = False
+            cleared.append("destination_snapshot_chunked_restore_active")
+        ep = getattr(self, "_expand_all_pending", None) or {}
+        if ep.get("source") or ep.get("destination"):
+            self._expand_all_pending["source"] = False
+            self._expand_all_pending["destination"] = False
+            cleared.append("expand_all_pending")
+        if bool(getattr(self, "_lazy_destination_projection_pending_reason", "")):
+            setattr(self, "_lazy_destination_projection_pending_reason", "")
+            cleared.append("lazy_destination_projection_pending_reason")
+        if getattr(self, "_destination_future_projection_async_state", None) is not None:
+            self._cancel_destination_future_async_projection("reset_draft_stale_async_recover")
+            cleared.append("destination_future_projection_async_state")
+
+        if cleared:
+            log_warn(
+                "DRAFTRESET",
+                event="reset_draft_stale_async_flags_cleared",
+                cleared_flags=cleared,
+            )
+
     def _release_stalled_memory_restore_gate_for_reset_draft(self) -> None:
         """Clear bookkeeping flags that kept finalize from running when no async work remains."""
         log_info(
@@ -7077,6 +7127,9 @@ class MainWindow(QMainWindow):
         if getattr(self, "_memory_restore_in_progress", False):
             self._finalize_memory_restore_if_ready("reset_draft_precheck")
         self._clear_stale_pending_folder_loads_if_no_workers()
+        self._reset_draft_recover_stale_async_state_if_no_workers()
+        if getattr(self, "_memory_restore_in_progress", False):
+            self._finalize_memory_restore_if_ready("reset_draft_precheck_after_stale_recover")
         if getattr(self, "_memory_restore_in_progress", False) and self._memory_restore_async_busy_for_reset_draft():
             log_warn(
                 "DRAFTRESET",
@@ -7094,9 +7147,11 @@ class MainWindow(QMainWindow):
                 "Most of the time this finishes within a minute or two after sign-in. "
                 "If you have many planned moves, trees and projections can keep working for several minutes.\n\n"
                 "If the window has looked fully idle (no loading in the trees) for more than about ten minutes "
-                "and you still see this, close and restart the app, then try Reset Draft again.\n\n"
+                "and you still see this, install the latest build (it clears stuck planning flags when no loads "
+                "are running), or close and restart the app.\n\n"
                 "Technical detail is logged under your Ozlink console Logs folder "
-                "(search the newest OzlinkConsole log for DRAFTRESET / reset_draft_blocked_precheck)."
+                "(search the newest OzlinkConsole log for DRAFTRESET / reset_draft_blocked_precheck or "
+                "reset_draft_stale_async_flags_cleared)."
             )
             wait_box.exec()
             return
@@ -7122,6 +7177,9 @@ class MainWindow(QMainWindow):
         if getattr(self, "_memory_restore_in_progress", False):
             self._finalize_memory_restore_if_ready("reset_draft_precheck_post_confirm")
         self._clear_stale_pending_folder_loads_if_no_workers()
+        self._reset_draft_recover_stale_async_state_if_no_workers()
+        if getattr(self, "_memory_restore_in_progress", False):
+            self._finalize_memory_restore_if_ready("reset_draft_precheck_post_confirm_after_recover")
         if getattr(self, "_memory_restore_in_progress", False):
             if self._memory_restore_async_busy_for_reset_draft():
                 QMessageBox.critical(
