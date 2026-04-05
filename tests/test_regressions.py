@@ -30,6 +30,37 @@ class _TreeStub:
     def viewport(self):
         return _ViewportStub()
 
+    def topLevelItemCount(self):
+        return 0
+
+    def topLevelItem(self, _index):
+        return None
+
+
+class _PlannedMovesTableStub:
+    """Minimal QTableWidget stand-in for partial MainWindow tests that call refresh_planned_moves_table."""
+
+    def clearSpans(self):
+        return None
+
+    def clearContents(self):
+        return None
+
+    def setRowCount(self, _n):
+        return None
+
+    def columnCount(self):
+        return 5
+
+    def setItem(self, *_args, **_kwargs):
+        return None
+
+    def setSpan(self, *_args, **_kwargs):
+        return None
+
+    def clearSelection(self):
+        return None
+
 
 class _LabelStub:
     def __init__(self):
@@ -1345,6 +1376,10 @@ class DestinationReplayRegressionTests(unittest.TestCase):
             )
         ]
         window.planned_moves = []
+        window.current_session_context = {"connected": False}
+        window.planned_moves_table = _PlannedMovesTableStub()
+        window.planned_moves_status = _LabelStub()
+        window.source_tree_widget = _TreeStub()
         window.destination_tree_status = _LabelStub()
         window.destination_tree_widget = _ExpandTreeStub()
         window._proposed_branch_contains_submitted_items = lambda path: False
