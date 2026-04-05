@@ -1,4 +1,7 @@
-"""Developer-only toggles. Production launches leave these unset."""
+"""Developer-only toggles. Production launches leave these unset.
+
+``--dev`` also enables persisted MSAL token cache (see :mod:`ozlink_console.graph`).
+"""
 
 from __future__ import annotations
 

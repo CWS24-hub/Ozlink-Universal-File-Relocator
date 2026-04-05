@@ -12,6 +12,7 @@ import msal
 import pyperclip
 import requests
 
+from .dev_mode import is_dev_mode
 from .logger import flush_logger, log_info, log_trace, log_warn
 from .paths import graph_cache_root, msal_token_cache_path
 
@@ -88,6 +89,10 @@ class GraphClient:
 
     def _load_msal_token_cache(self) -> msal.SerializableTokenCache:
         cache = msal.SerializableTokenCache()
+        # Persisted refresh tokens on disk are dev/test only (`--dev` / OZLINK_DEV); production runs
+        # use in-memory MSAL cache only so tokens are not reused across cold starts.
+        if not is_dev_mode():
+            return cache
         path = msal_token_cache_path()
         try:
             if path.is_file():
@@ -101,6 +106,9 @@ class GraphClient:
     def _persist_msal_token_cache(self) -> None:
         cache = self._token_cache
         if cache is None or not getattr(cache, "has_state_changed", False):
+            return
+        if not is_dev_mode():
+            cache.has_state_changed = False
             return
         path = msal_token_cache_path()
         tmp = path.with_suffix(".json.tmp")

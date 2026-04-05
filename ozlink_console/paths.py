@@ -105,7 +105,7 @@ def graph_cache_root() -> Path:
 
 
 def msal_token_cache_path() -> Path:
-    """MSAL delegated-token cache (refresh tokens). Stored under the app cache dir (user-local)."""
+    """MSAL delegated-token cache file path (used only when ``--dev`` / ``OZLINK_DEV`` is set)."""
     return cache_root() / "msal_token_cache.json"
 
 

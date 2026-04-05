@@ -2025,7 +2025,7 @@ class MainWindow(QMainWindow):
             return False
         if env in ("1", "true", "yes"):
             return True
-        return QSettings().value("ui/source_use_qtreeview", False, type=bool)
+        return QSettings().value("ui/source_use_qtreeview", True, type=bool)
 
     @staticmethod
     def _destination_tree_model_view_effective() -> bool:
@@ -2039,7 +2039,7 @@ class MainWindow(QMainWindow):
             return False
         if env in ("1", "true", "yes"):
             return True
-        return QSettings().value("ui/destination_use_qtreeview", False, type=bool)
+        return QSettings().value("ui/destination_use_qtreeview", True, type=bool)
 
     def __init__(self):
         super().__init__()
@@ -2294,9 +2294,18 @@ class MainWindow(QMainWindow):
 
         self.nav_buttons = {}
         self.page_map = {}
+        # "guest" = signed out (sidebar: Dashboard only). "user" = signed-in non-admin.
         self.nav_allowed_by_role = {
-            "user": ["Dashboard", "Planning Workspace", "Settings", "Execution", "Requests"],
-            "admin": ["Dashboard", "Planning Workspace", "Settings", "Audit", "Execution", "Requests"],
+            "guest": ["Dashboard"],
+            "user": ["Dashboard", "Planning Workspace", "Audit"],
+            "admin": [
+                "Dashboard",
+                "Planning Workspace",
+                "Settings",
+                "Audit",
+                "Execution",
+                "Requests",
+            ],
         }
 
         self._apply_theme()
@@ -2326,7 +2335,7 @@ class MainWindow(QMainWindow):
         self._load_saved_window_preferences()
 
         self.switch_page("Dashboard")
-        self.apply_role_visibility("user")
+        self.apply_role_visibility()
         self.update_session_state(False)
         log_info("MainWindow build marker.", build_marker="main_window_refresh_restore_v2")
         self._setup_developer_menu()
@@ -4180,6 +4189,7 @@ class MainWindow(QMainWindow):
         header_layout.setColumnStretch(3, 1)
 
         self._planning_header_collapsed = False
+        self._planning_header_restore_collapsed_after_banner = None
         self._planning_header_expanded_min_height = 0
 
         header_shell_layout.addLayout(header_top_bar)
@@ -10057,7 +10067,8 @@ class MainWindow(QMainWindow):
 
         intro = QLabel(
             "Folder listings are cached on disk so trees stay responsive. Incremental sync uses "
-            "Microsoft Graph delta to clear only the parts of the cache that changed in SharePoint."
+            "Microsoft Graph delta to clear only the parts of the cache that changed in SharePoint. "
+            "The options below are on by default for smoother day-to-day use; turn them off only if you need to."
         )
         intro.setObjectName("CardBody")
         intro.setWordWrap(True)
@@ -10164,7 +10175,7 @@ class MainWindow(QMainWindow):
             "Use faster source tree (restart required)"
         )
         self._settings_source_qtreeview_checkbox.setChecked(
-            QSettings().value("ui/source_use_qtreeview", False, type=bool)
+            QSettings().value("ui/source_use_qtreeview", True, type=bool)
         )
         self._settings_source_qtreeview_checkbox.setEnabled(not env_src_forces)
         if env_src_forces:
@@ -10181,7 +10192,7 @@ class MainWindow(QMainWindow):
             "Use faster destination tree (restart required)"
         )
         self._settings_destination_qtreeview_checkbox.setChecked(
-            QSettings().value("ui/destination_use_qtreeview", False, type=bool)
+            QSettings().value("ui/destination_use_qtreeview", True, type=bool)
         )
         self._settings_destination_qtreeview_checkbox.setEnabled(not env_dest_forces)
         if env_dest_forces:
@@ -10191,7 +10202,7 @@ class MainWindow(QMainWindow):
         self._settings_destination_qtreeview_checkbox.toggled.connect(self._persist_settings_destination_qtreeview)
 
         ui_hint = QLabel(
-            "Off by default. Your choices are saved on this PC. "
+            "On by default for smoother trees in large libraries; restart after changing. Your choices are saved on this PC. "
             "Administrators can force one launch with OZLINK_SOURCE_QTREEVIEW=1 or =0, or "
             "OZLINK_DESTINATION_QTREEVIEW=1 or =0, when each variable is set."
         )
@@ -10392,10 +10403,7 @@ class MainWindow(QMainWindow):
             return
 
         if not self._is_page_allowed(name):
-            allowed_pages = self.nav_allowed_by_role.get(
-                self.current_session_context.get("user_role", "user"),
-                ["Dashboard", "Planning Workspace"],
-            )
+            allowed_pages = self.nav_allowed_by_role.get(self._navigation_role(), self.nav_allowed_by_role["guest"])
             fallback_page = allowed_pages[0] if allowed_pages else "Dashboard"
             name = fallback_page
 
@@ -10424,28 +10432,38 @@ class MainWindow(QMainWindow):
             btn.style().polish(btn)
             btn.update()
 
-    def _is_page_allowed(self, page_name):
+    def _navigation_role(self) -> str:
+        """Sidebar / page access key: ``guest`` when not signed in; else ``user`` or ``admin``."""
+        if not self.current_session_context.get("connected"):
+            return "guest"
         role = self.current_session_context.get("user_role", "user")
-        allowed_pages = self.nav_allowed_by_role.get(role, self.nav_allowed_by_role["user"])
+        if role not in self.nav_allowed_by_role:
+            return "user"
+        return role
+
+    def _is_page_allowed(self, page_name):
+        nav_role = self._navigation_role()
+        allowed_pages = self.nav_allowed_by_role.get(nav_role, self.nav_allowed_by_role["guest"])
         return page_name in allowed_pages
 
-    def apply_role_visibility(self, role):
-        allowed_pages = self.nav_allowed_by_role.get(role, self.nav_allowed_by_role["user"])
+    def apply_role_visibility(self):
+        """Refresh nav and settings visibility from ``current_session_context``."""
+        nav_role = self._navigation_role()
+        allowed_pages = self.nav_allowed_by_role.get(nav_role, self.nav_allowed_by_role["guest"])
 
         for name, btn in self.nav_buttons.items():
             btn.setVisible(name in allowed_pages)
 
         self._update_planning_workspace_access()
+        is_admin = bool(self.current_session_context.get("connected")) and self.current_session_context.get("user_role") == "admin"
         if hasattr(self, "_settings_admin_submissions_card"):
-            is_admin = role == "admin"
             self._settings_admin_submissions_card.setVisible(is_admin)
             if hasattr(self, "test_mode_toggle") and not is_admin:
                 self.test_mode_toggle.setChecked(False)
         if hasattr(self, "requests_delete_test_btn"):
-            self.requests_delete_test_btn.setVisible(role == "admin")
+            self.requests_delete_test_btn.setVisible(is_admin)
             self.requests_delete_test_btn.setEnabled(False)
         if hasattr(self, "_settings_execution_path_toggle"):
-            is_admin = role == "admin"
             self._settings_execution_path_toggle.setVisible(is_admin)
             if hasattr(self, "_settings_execution_path_hint"):
                 self._settings_execution_path_hint.setVisible(is_admin)
@@ -10457,10 +10475,12 @@ class MainWindow(QMainWindow):
         if current_page_name not in allowed_pages:
             self.switch_page(allowed_pages[0])
 
-        if role == "admin":
+        if nav_role == "guest":
+            self.mode_label.setText("Sign in to use Planning and Audit")
+        elif is_admin:
             self.mode_label.setText("Admin planning and operations mode")
         else:
-            self.mode_label.setText("Client-facing planning mode")
+            self.mode_label.setText("Client planning mode")
 
     def _is_valid_work_email(self, email):
         value = str(email or "").strip()
@@ -10776,7 +10796,7 @@ class MainWindow(QMainWindow):
             "discovered_sites": [],
         }
 
-        self.apply_role_visibility("user")
+        self.apply_role_visibility()
         self.switch_page("Dashboard")
         self.update_session_state(False)
         self.reset_planning_selectors()
@@ -10908,6 +10928,14 @@ class MainWindow(QMainWindow):
                 self._materialize_destination_future_model("cache_refresh_restore_complete")
                 self._start_destination_restore_materialization()
                 self.destination_tree_widget.viewport().update()
+
+                def _post_cache_refresh_destination_dedup():
+                    try:
+                        self._reconcile_destination_semantic_duplicates("cache_refresh_destination_dedup")
+                    except Exception as dedup_exc:
+                        self._log_restore_exception("cache_refresh_destination_dedup", dedup_exc)
+
+                QTimer.singleShot(0, _post_cache_refresh_destination_dedup)
         except Exception as exc:
             self._log_restore_exception("cache_refresh_restore.destination_overlay", exc)
         try:
@@ -11011,7 +11039,7 @@ class MainWindow(QMainWindow):
                     "tenant_domain": "",
                     "discovered_sites": [],
                 }
-                self.apply_role_visibility("user")
+                self.apply_role_visibility()
                 self.update_session_state(False)
                 self._set_dashboard_status_message("The Microsoft account did not match the email entered in the app.", loading=False)
                 if hasattr(self, "work_email_input") and self.work_email_input is not None:
@@ -11048,10 +11076,11 @@ class MainWindow(QMainWindow):
             upn = session_context.get("operator_upn", profile.get("userPrincipalName", ""))
             domain = session_context.get("tenant_domain", upn.split("@", 1)[1] if "@" in upn else "Connected")
             role = session_context.get("user_role", "user")
-            if role not in self.nav_allowed_by_role:
+            if role not in ("user", "admin"):
                 role = "user"
+            session_context["user_role"] = role
 
-            self.apply_role_visibility(role)
+            self.apply_role_visibility()
             self._set_planning_workspace_loading_state("Loading SharePoint...")
             self.switch_page("Planning Workspace")
             self._set_dashboard_status_message("Signed in. Loading SharePoint sites and libraries...", loading=True)
@@ -11119,7 +11148,7 @@ class MainWindow(QMainWindow):
             "discovered_sites": [],
         }
         self._stop_session_keepalive()
-        self.apply_role_visibility("user")
+        self.apply_role_visibility()
         self.update_session_state(False)
         if clear_allowed:
             self._log_restore_state_snapshot("login_error_state_cleared", had_restored_state=had_restored_state, login_in_progress=self._login_in_progress, clear_allowed=clear_allowed, reason=classification_reason)
@@ -11701,11 +11730,19 @@ class MainWindow(QMainWindow):
         b = getattr(self, "planning_graph_assurance_banner", None)
         if b is not None:
             b.hide()
+        if getattr(self, "_planning_header_restore_collapsed_after_banner", None):
+            self._apply_planning_header_collapsed_state(True)
+        self._planning_header_restore_collapsed_after_banner = None
 
     def _show_planning_graph_linkage_assurance_banner(self, *, title: str, detail: str) -> None:
         """Visible confirmation after post-restore Microsoft Graph linkage checks (upgrade / legacy drafts)."""
         if getattr(self, "planning_graph_assurance_title", None) is None:
             return
+        as_banner = getattr(self, "planning_graph_assurance_banner", None)
+        if as_banner is not None and not as_banner.isVisible():
+            self._planning_header_restore_collapsed_after_banner = bool(
+                getattr(self, "_planning_header_collapsed", False)
+            )
         if getattr(self, "_planning_header_collapsed", False):
             self._apply_planning_header_collapsed_state(False)
         self.planning_graph_assurance_title.setText(title)
@@ -17535,6 +17572,7 @@ class MainWindow(QMainWindow):
         added_count = 0
         for desc_index, descendant_data in enumerate(descendants):
             if desc_index > 0 and desc_index % 50 == 0:
+                self._reconcile_destination_sibling_folders_during_allocation_apply("model_index_yield")
                 QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
             descendant_source_path = self._canonical_source_projection_path(self._tree_item_path(descendant_data))
             if descendant_source_path == source_root_path:
@@ -17601,6 +17639,8 @@ class MainWindow(QMainWindow):
         self._allocation_apply_flush_all_pending_model(model, child_map_cache, pending_leaf_batches)
         for rp in visibility_targets.values():
             self._refresh_destination_item_visibility_index(rp, expand=True)
+        if added_count > 0:
+            self._reconcile_destination_sibling_folders_during_allocation_apply("model_index_end")
         if added_count > 0 or not descendants:
             self._mark_allocation_descendants_applied_on_allocation_folder_model_index(parent_ix, move)
         return added_count
@@ -17691,6 +17731,7 @@ class MainWindow(QMainWindow):
         for desc_index, descendant_data in enumerate(descendants):
             # Yield for repaints without dispatching user input (avoids re-entrant expand/snapshot work).
             if desc_index > 0 and desc_index % 50 == 0:
+                self._reconcile_destination_sibling_folders_during_allocation_apply("widget_yield")
                 QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
             descendant_source_path = self._canonical_source_projection_path(self._tree_item_path(descendant_data))
             # Only skip when the descendant actually equals the allocation root.
@@ -17785,6 +17826,8 @@ class MainWindow(QMainWindow):
                 added_count=added_count,
                 descendant_count=len(descendants),
             )
+        if added_count > 0:
+            self._reconcile_destination_sibling_folders_during_allocation_apply("widget_end")
         if added_count > 0 or not descendants:
             self._mark_allocation_descendants_applied_on_allocation_folder_widget(parent_item, move)
         return added_count
@@ -18083,6 +18126,60 @@ class MainWindow(QMainWindow):
 
     def _destination_semantic_path(self, node_data):
         return self._canonical_destination_projection_path(self._tree_item_path(node_data))
+
+    def _destination_folder_display_name_for_sibling_dedup(self, node_data):
+        """Extract a comparable folder name token from explorer-style ``base_display_label``."""
+        if not isinstance(node_data, dict):
+            return ""
+        label = str(node_data.get("base_display_label") or "").strip()
+        if not label:
+            return ""
+        low = label.lower()
+        if low.startswith("folder:"):
+            label = label[7:].strip()
+        # Strip trailing chrome: [Allocated], (Proposed), etc.
+        label = re.sub(r"\s*\[[^\]]*\]\s*$", "", label, flags=re.IGNORECASE).strip()
+        label = re.sub(r"\s*\([^)]*\)\s*$", "", label).strip()
+        return label.casefold() if label else ""
+
+    def _destination_sibling_folder_dedup_key(self, node_data):
+        """Case-folded folder name for sibling dedup when canonical paths disagree but labels match."""
+        if not isinstance(node_data, dict) or not node_data.get("is_folder"):
+            return ""
+        for k in ("real_name", "name"):
+            v = str(node_data.get(k) or "").strip()
+            if v:
+                return v.casefold()
+        dn = self._destination_folder_display_name_for_sibling_dedup(node_data)
+        if dn:
+            return dn
+        segs = self._path_segments(self._tree_item_path(node_data))
+        if segs:
+            return str(segs[-1] or "").casefold()
+        return ""
+
+    @staticmethod
+    def _destination_sibling_name_collision_token(name_key: str) -> str:
+        """Map ``Sub`` and ``Sub - via F`` to one token so projection paths match snapshot names."""
+        s = str(name_key or "").strip().casefold()
+        if not s:
+            return ""
+        for ch in ("\u2013", "\u2014", "\u2212"):
+            s = s.replace(ch, "-")
+        if " - " in s:
+            return s.split(" - ", 1)[0].strip()
+        return s
+
+    def _destination_sibling_folder_collision_key(self, node_data):
+        """Weak folder identity under one parent (path segment vs ``Name - suffix``)."""
+        dk = self._destination_sibling_folder_dedup_key(node_data)
+        if not dk:
+            return ""
+        # Some API payloads store a full path in ``name`` / ``real_name`` while a sibling row uses
+        # the leaf only; under one parent we compare by last segment (matches path-tail fallback).
+        if "\\" in dk or "/" in dk:
+            dk = dk.replace("/", "\\").split("\\")[-1].strip()
+        return self._destination_sibling_name_collision_token(dk)
 
     def _destination_expansion_state_key(self, path: str) -> str:
         """Normalize paths for expand/collapse persistence across tree rebuilds.
@@ -20440,6 +20537,7 @@ class MainWindow(QMainWindow):
         else:
             self._hydrate_destination_prefix_chain_for_path_widget(selected_path)
         self._restore_selected_tree_path("destination", selected_path)
+        self._reconcile_destination_semantic_duplicates("destination_bind_post_hydrate_chunked_lazy")
 
     def _capture_workspace_tree_state(self):
         return {
@@ -20917,12 +21015,14 @@ class MainWindow(QMainWindow):
                         model_node_count=node_count,
                     )
                     self._schedule_workspace_ui_persist(panel_key="destination")
+                    self._reconcile_destination_semantic_duplicates("destination_bind_sync_model")
                     return visible_future_branch_count, visible_descendant_count
                 finally:
                     tree.blockSignals(False)
                     self._hydrate_destination_allocations_for_expanded_paths_model(destination_expanded_paths)
                     self._hydrate_destination_prefix_chain_for_path_model(destination_selected_path)
                     self._restore_selected_tree_path("destination", destination_selected_path)
+                    self._reconcile_destination_semantic_duplicates("destination_bind_post_hydrate_sync_model")
             except Exception as exc:
                 self._log_restore_phase(
                     "destination_future_model_bind_failed",
@@ -21000,12 +21100,14 @@ class MainWindow(QMainWindow):
                     model_node_count=node_count,
                 )
                 self._schedule_workspace_ui_persist(panel_key="destination")
+                self._reconcile_destination_semantic_duplicates("destination_bind_sync")
                 return visible_future_branch_count, visible_descendant_count
             finally:
                 tree.blockSignals(False)
                 self._hydrate_destination_allocations_for_expanded_paths_widget(destination_expanded_paths)
                 self._hydrate_destination_prefix_chain_for_path_widget(destination_selected_path)
                 self._restore_selected_tree_path("destination", destination_selected_path)
+                self._reconcile_destination_semantic_duplicates("destination_bind_post_hydrate_sync")
         except Exception as exc:
             self._log_restore_phase(
                 "destination_future_model_bind_failed",
@@ -21392,6 +21494,7 @@ class MainWindow(QMainWindow):
                     bind_generation=st.get("gen"),
                 )
                 self._schedule_workspace_ui_persist(panel_key="destination")
+                self._reconcile_destination_semantic_duplicates("destination_bind_chunked_async")
             except Exception as exc:
                 _fail(exc, phase_name="chunked_destination_bind.finalize")
                 return
@@ -21631,6 +21734,7 @@ class MainWindow(QMainWindow):
                 merge_mode="incremental",
             )
             self._schedule_workspace_ui_persist(panel_key="destination")
+            self._reconcile_destination_semantic_duplicates("destination_incremental_merge_complete")
             return visible_future_branch_count
         finally:
             tree.blockSignals(False)
@@ -21847,6 +21951,10 @@ class MainWindow(QMainWindow):
                     "fast_paint_paths": frozenset(model_fast["nodes"].keys()),
                     "projection_wall_t0": time.perf_counter(),
                 }
+                try:
+                    self._reconcile_destination_sibling_folders_during_allocation_apply("fast_paint_pre_projection")
+                except Exception as dedup_exc:
+                    self._log_restore_exception("destination_fast_paint_pre_projection_dedup", dedup_exc)
                 self._set_tree_status_message(
                     "destination",
                     f"Building destination preview… (1/{max(1, len(self.planned_moves))})",
@@ -22234,8 +22342,7 @@ class MainWindow(QMainWindow):
         if tree is None:
             return
         if self._destination_tree_uses_model_view():
-            # Duplicate merge / detach helpers below are QTreeWidgetItem-oriented; avoid calling
-            # them with QModelIndex until a model-native reconcile exists.
+            # Reconcile runs via :meth:`_reconcile_destination_semantic_duplicates_index`.
             return
         try:
             top_n = tree.topLevelItemCount()
@@ -22310,6 +22417,362 @@ class MainWindow(QMainWindow):
             )
         return moved_count
 
+    def _merge_nested_spec_into_parent_index(self, target_parent_ix: QModelIndex, nested: NestedSpec) -> int:
+        """Merge one nested subtree into an existing same-semantic child under ``target_parent_ix``, else append."""
+        dmodel = getattr(self, "destination_planning_model", None)
+        if dmodel is None or not target_parent_ix.isValid():
+            return 0
+        pl, kid_specs = nested[0], nested[1]
+        child_sem = self._destination_semantic_path(pl)
+        existing = self._find_destination_child_by_semantic_path_index(target_parent_ix, child_sem) if child_sem else None
+        if existing is not None and existing.isValid():
+            self._remove_placeholder_children(existing)
+            moved = 0
+            for sub in kid_specs:
+                moved += self._merge_nested_spec_into_parent_index(existing, sub)
+            return moved
+        new_ix = dmodel.append_nested_child(target_parent_ix, nested)
+        if new_ix.isValid():
+            self._refresh_destination_item_visibility_index(target_parent_ix, expand=True)
+            parent_pl = target_parent_ix.data(Qt.UserRole) or {}
+            self._log_restore_phase(
+                "destination_projected_child_reparented",
+                semantic_path=child_sem or "",
+                projected_tree_path=self._tree_item_path(pl),
+                real_tree_path=self._tree_item_path(parent_pl),
+                child_count_moved=1,
+                node_origin_before=pl.get("node_origin", ""),
+                node_origin_after=parent_pl.get("node_origin", ""),
+            )
+            return 1
+        return 0
+
+    def _merge_destination_projection_children_index(self, source_ix: QModelIndex, target_ix: QModelIndex, semantic_path: str):
+        """QTreeView/model equivalent of :meth:`_merge_destination_projection_children`."""
+        dmodel = getattr(self, "destination_planning_model", None)
+        if dmodel is None or not source_ix.isValid() or not target_ix.isValid():
+            return 0
+        moved_count = 0
+        self._remove_placeholder_children(target_ix)
+        while dmodel.rowCount(source_ix) > 0:
+            child_ix = dmodel.index(0, 0, source_ix)
+            nested = dmodel.remove_node_at(child_ix)
+            if nested is None:
+                break
+            moved_count += self._merge_nested_spec_into_parent_index(target_ix, nested)
+        return moved_count
+
+    def _destination_indices_for_semantic_path(self, semantic_path: str):
+        """Fresh QModelIndex list for rows matching ``semantic_path`` (safe across row removals)."""
+        dmodel = getattr(self, "destination_planning_model", None)
+        if dmodel is None or not semantic_path:
+            return []
+        out = []
+        for ix in dmodel.iter_depth_first():
+            if not ix.isValid():
+                continue
+            node_data = ix.data(Qt.UserRole) or {}
+            if not isinstance(node_data, dict) or node_data.get("placeholder"):
+                continue
+            if self._destination_semantic_path(node_data) == semantic_path:
+                out.append(ix)
+        return out
+
+    def _reconcile_destination_semantic_duplicates_index(self, reason):
+        """Merge duplicate destination rows that share the same semantic path (QTreeView / planning model)."""
+        dmodel = getattr(self, "destination_planning_model", None)
+        tree = getattr(self, "destination_tree_widget", None)
+        if dmodel is None or tree is None:
+            return 0
+
+        semantic_paths = set()
+        for ix in dmodel.iter_depth_first():
+            if not ix.isValid():
+                continue
+            node_data = ix.data(Qt.UserRole) or {}
+            if not isinstance(node_data, dict) or node_data.get("placeholder"):
+                continue
+            sp = self._destination_semantic_path(node_data)
+            if sp:
+                semantic_paths.add(sp)
+
+        total_moved = 0
+        merged_groups = 0
+        for semantic_path in semantic_paths:
+            while True:
+                items = self._destination_indices_for_semantic_path(semantic_path)
+                if len(items) < 2:
+                    break
+                canonical_ix = self._select_canonical_destination_item(items)
+                if canonical_ix is None or not canonical_ix.isValid():
+                    break
+                duplicates = [ix for ix in items if ix != canonical_ix]
+                if not duplicates:
+                    break
+                duplicate_ix = duplicates[0]
+                if not duplicate_ix.isValid():
+                    break
+                canonical_data = canonical_ix.data(Qt.UserRole) or {}
+                canonical_state = self._destination_node_state(canonical_data)
+                dup_labels = "; ".join(
+                    self._tree_item_path(ix.data(Qt.UserRole) or {}) for ix in duplicates if ix.isValid()
+                )
+                self._log_restore_phase(
+                    "destination_semantic_duplicate_detected",
+                    semantic_path=semantic_path,
+                    projected_tree_path=dup_labels,
+                    real_tree_path=self._tree_item_path(canonical_data),
+                    child_count_moved=0,
+                    node_origin_before="duplicate_group",
+                    node_origin_after=canonical_data.get("node_origin", ""),
+                )
+                if canonical_state == "real":
+                    self._log_restore_phase(
+                        "destination_real_parent_promoted_canonical",
+                        semantic_path=semantic_path,
+                        projected_tree_path=dup_labels,
+                        real_tree_path=self._tree_item_path(canonical_data),
+                        child_count_moved=0,
+                        node_origin_before="duplicate_group",
+                        node_origin_after=canonical_data.get("node_origin", ""),
+                    )
+
+                duplicate_data = duplicate_ix.data(Qt.UserRole) or {}
+                self._log_restore_phase(
+                    "destination_projected_parent_merge_started",
+                    semantic_path=semantic_path,
+                    projected_tree_path=self._tree_item_path(duplicate_data),
+                    real_tree_path=self._tree_item_path(canonical_data),
+                    child_count_moved=dmodel.rowCount(duplicate_ix),
+                    node_origin_before=duplicate_data.get("node_origin", ""),
+                    node_origin_after=canonical_data.get("node_origin", ""),
+                )
+                moved_count = self._merge_destination_projection_children_index(
+                    duplicate_ix, canonical_ix, semantic_path
+                )
+                total_moved += moved_count
+                removed = dmodel.remove_node_at(duplicate_ix)
+                if removed is None:
+                    break
+                merged_groups += 1
+                self._log_restore_phase(
+                    "destination_projected_parent_retired",
+                    semantic_path=semantic_path,
+                    projected_tree_path=self._tree_item_path(duplicate_data),
+                    real_tree_path=self._tree_item_path(canonical_data),
+                    child_count_moved=moved_count,
+                    node_origin_before=duplicate_data.get("node_origin", ""),
+                    node_origin_after=canonical_data.get("node_origin", ""),
+                )
+
+        sm, sg = self._reconcile_destination_sibling_folder_name_collisions_index(reason)
+        total_moved += sm
+        merged_groups += sg
+
+        if merged_groups:
+            self._log_restore_phase(
+                "destination_projection_reconciled",
+                reason=reason,
+                merged_group_count=merged_groups,
+                child_count_moved=total_moved,
+            )
+        return total_moved
+
+    def _destination_folder_children_grouped_by_sibling_name_key(self, parent_ix: QModelIndex):
+        dmodel = getattr(self, "destination_planning_model", None)
+        if dmodel is None or not parent_ix.isValid():
+            return {}
+        groups = {}
+        for r in range(dmodel.rowCount(parent_ix)):
+            ix = dmodel.index(r, 0, parent_ix)
+            if not ix.isValid():
+                continue
+            nd = ix.data(Qt.UserRole) or {}
+            if not isinstance(nd, dict) or nd.get("placeholder") or not nd.get("is_folder"):
+                continue
+            ck = self._destination_sibling_folder_collision_key(nd)
+            if not ck:
+                continue
+            groups.setdefault(ck, []).append(ix)
+        return groups
+
+    def _reconcile_destination_sibling_folder_name_collisions_index(self, reason):
+        """Merge same-named folder siblings under one parent when semantic paths differ (projection vs API)."""
+        dmodel = getattr(self, "destination_planning_model", None)
+        if dmodel is None:
+            return 0, 0
+        total_moved = 0
+        merged_groups = 0
+        while True:
+            progressed = False
+            for parent_ix in dmodel.iter_depth_first():
+                if not parent_ix.isValid():
+                    continue
+                pnd = parent_ix.data(Qt.UserRole) or {}
+                if not isinstance(pnd, dict) or not pnd.get("is_folder"):
+                    continue
+                groups = self._destination_folder_children_grouped_by_sibling_name_key(parent_ix)
+                for _name_key, items in groups.items():
+                    if len(items) < 2:
+                        continue
+                    canonical_ix = self._select_canonical_destination_item(items)
+                    if canonical_ix is None or not canonical_ix.isValid():
+                        continue
+                    duplicates = [ix for ix in items if ix != canonical_ix]
+                    if not duplicates:
+                        continue
+                    duplicate_ix = duplicates[0]
+                    if not duplicate_ix.isValid():
+                        continue
+                    canonical_data = canonical_ix.data(Qt.UserRole) or {}
+                    duplicate_data = duplicate_ix.data(Qt.UserRole) or {}
+                    sem_hint = self._destination_semantic_path(canonical_data) or self._destination_semantic_path(
+                        duplicate_data
+                    )
+                    self._log_restore_phase(
+                        "destination_sibling_folder_name_collision",
+                        reason=reason,
+                        parent_path=self._tree_item_path(pnd),
+                        name_key=_name_key,
+                        kept_path=self._tree_item_path(canonical_data),
+                        merged_path=self._tree_item_path(duplicate_data),
+                    )
+                    moved_count = self._merge_destination_projection_children_index(
+                        duplicate_ix, canonical_ix, sem_hint
+                    )
+                    total_moved += moved_count
+                    removed = dmodel.remove_node_at(duplicate_ix)
+                    if removed is None:
+                        continue
+                    merged_groups += 1
+                    progressed = True
+                    break
+                if progressed:
+                    break
+            if not progressed:
+                break
+        return total_moved, merged_groups
+
+    def _reconcile_destination_sibling_folders_during_allocation_apply(self, phase: str) -> None:
+        """Merge same-named folder siblings before UI repaints (allocation apply yields, fast first paint, etc.)."""
+        try:
+            if self._destination_tree_uses_model_view():
+                sm, sg = self._reconcile_destination_sibling_folder_name_collisions_index(f"allocation_apply_{phase}")
+                touched = sm or sg
+            else:
+                sw, sg = self._reconcile_destination_sibling_folder_name_collisions_widget(f"allocation_apply_{phase}")
+                touched = sw or sg
+            if touched:
+                tw = getattr(self, "destination_tree_widget", None)
+                if tw is not None:
+                    tw.viewport().update()
+        except Exception as exc:
+            self._log_restore_exception("allocation_apply_sibling_dedup", exc)
+
+    def _iter_destination_widget_subtree_items(self):
+        tree = getattr(self, "destination_tree_widget", None)
+        if tree is None:
+            return
+        for idx in range(tree.topLevelItemCount()):
+            try:
+                top = tree.topLevelItem(idx)
+            except RuntimeError:
+                continue
+            if top is None or not self._tree_item_is_alive(top):
+                continue
+            for it in self._iter_tree_items(top):
+                yield it
+
+    def _destination_folder_children_grouped_by_sibling_name_key_widget(self, parent_item):
+        groups = {}
+        if parent_item is None:
+            return groups
+        try:
+            n = parent_item.childCount()
+        except RuntimeError:
+            return groups
+        for i in range(n):
+            try:
+                child = parent_item.child(i)
+            except RuntimeError:
+                continue
+            if child is None or not self._tree_item_is_alive(child):
+                continue
+            nd = child.data(0, Qt.UserRole) or {}
+            if not isinstance(nd, dict) or nd.get("placeholder") or not nd.get("is_folder"):
+                continue
+            ck = self._destination_sibling_folder_collision_key(nd)
+            if not ck:
+                continue
+            groups.setdefault(ck, []).append(child)
+        return groups
+
+    def _reconcile_destination_sibling_folder_name_collisions_widget(self, reason):
+        """QTreeWidget path: same as :meth:`_reconcile_destination_sibling_folder_name_collisions_index`."""
+        if self._destination_tree_uses_model_view():
+            return 0, 0
+        tree = getattr(self, "destination_tree_widget", None)
+        if tree is None:
+            return 0, 0
+        total_moved = 0
+        merged_groups = 0
+        while True:
+            progressed = False
+            for parent_item in self._iter_destination_widget_subtree_items():
+                if parent_item is None or not self._tree_item_is_alive(parent_item):
+                    continue
+                try:
+                    pnd = parent_item.data(0, Qt.UserRole) or {}
+                except RuntimeError:
+                    continue
+                if not isinstance(pnd, dict) or not pnd.get("is_folder"):
+                    continue
+                try:
+                    if parent_item.childCount() < 2:
+                        continue
+                except RuntimeError:
+                    continue
+                groups = self._destination_folder_children_grouped_by_sibling_name_key_widget(parent_item)
+                for name_key, items in groups.items():
+                    if len(items) < 2:
+                        continue
+                    canonical = self._select_canonical_destination_item(items)
+                    if canonical is None:
+                        continue
+                    duplicates = [it for it in items if it is not canonical]
+                    if not duplicates:
+                        continue
+                    dup = duplicates[0]
+                    if dup is None or not self._tree_item_is_alive(dup):
+                        continue
+                    try:
+                        canonical_data = canonical.data(0, Qt.UserRole) or {}
+                        dup_data = dup.data(0, Qt.UserRole) or {}
+                    except RuntimeError:
+                        continue
+                    sem_hint = self._destination_semantic_path(canonical_data) or self._destination_semantic_path(
+                        dup_data
+                    )
+                    self._log_restore_phase(
+                        "destination_sibling_folder_name_collision",
+                        reason=reason,
+                        parent_path=self._tree_item_path(pnd),
+                        name_key=name_key,
+                        kept_path=self._tree_item_path(canonical_data),
+                        merged_path=self._tree_item_path(dup_data),
+                    )
+                    moved_count = self._merge_destination_projection_children(dup, canonical, sem_hint)
+                    total_moved += moved_count
+                    self._detach_destination_item(dup)
+                    merged_groups += 1
+                    progressed = True
+                    break
+                if progressed:
+                    break
+            if not progressed:
+                break
+        return total_moved, merged_groups
+
     def _preserve_destination_future_state_children(self, parent_item):
         preserved = []
         if parent_item is None:
@@ -22372,6 +22835,8 @@ class MainWindow(QMainWindow):
         return moved_count
 
     def _reconcile_destination_semantic_duplicates(self, reason):
+        if self._destination_tree_uses_model_view():
+            return self._reconcile_destination_semantic_duplicates_index(reason)
         semantic_groups = {}
         for item in self._iter_destination_items() or []:
             node_data = item.data(0, Qt.UserRole) or {}
@@ -22437,6 +22902,10 @@ class MainWindow(QMainWindow):
                     node_origin_after=canonical_data.get("node_origin", ""),
                 )
 
+        sw, sg_widget = self._reconcile_destination_sibling_folder_name_collisions_widget(reason)
+        total_moved += sw
+        merged_groups += sg_widget
+
         if merged_groups:
             self._log_restore_phase(
                 "destination_projection_reconciled",
@@ -22467,6 +22936,25 @@ class MainWindow(QMainWindow):
             unresolved_allocation=self._unresolved_allocation_queue_size(),
             memory_restore_in_progress=bool(getattr(self, "_memory_restore_in_progress", False)),
         )
+        # Full reconcile stays deferred, but merge same-named folder siblings immediately so the
+        # tree does not show duplicate shells for the whole restore/materialization window.
+        try:
+            if self._destination_tree_uses_model_view():
+                sm, sg = self._reconcile_destination_sibling_folder_name_collisions_index(
+                    f"{reason}_deferred_early_sibling_sync"
+                )
+                touched = sm or sg
+            else:
+                sw, sg = self._reconcile_destination_sibling_folder_name_collisions_widget(
+                    f"{reason}_deferred_early_sibling_sync"
+                )
+                touched = sw or sg
+            if touched:
+                tw = getattr(self, "destination_tree_widget", None)
+                if tw is not None:
+                    tw.viewport().update()
+        except Exception as exc:
+            self._log_restore_exception("destination_deferred_early_sibling_dedup", exc)
         self._schedule_deferred_destination_materialization(
             f"deferred_reconcile_{reason}",
             delay_ms=max(220, int(getattr(self, "_restore_queue_tick_delay_ms", 45) * 4)),
@@ -22678,6 +23166,62 @@ class MainWindow(QMainWindow):
             cache[ck][normalized_target] = found
         return found
 
+    def _destination_find_child_by_last_segment_folder_name(self, parent_item, normalized_target: str):
+        """When path equality fails (snapshot vs projection skew), match folder children by label/name tail."""
+        segs = self._path_segments(normalized_target or "")
+        if not segs:
+            return None
+        want_raw = str(segs[-1] or "").casefold()
+        if not want_raw:
+            return None
+        want_col = self._destination_sibling_name_collision_token(want_raw)
+        folder_siblings = []
+        if isinstance(parent_item, QModelIndex):
+            model = getattr(self, "destination_planning_model", None)
+            if model is None:
+                return None
+            for r in range(model.rowCount(parent_item)):
+                ix = model.index(r, 0, parent_item)
+                try:
+                    if not ix.isValid():
+                        continue
+                except RuntimeError:
+                    continue
+                child_data = self._destination_model_index_user_role_dict(ix)
+                if child_data.get("placeholder"):
+                    continue
+                if not child_data.get("is_folder", False):
+                    continue
+                dk = self._destination_sibling_folder_dedup_key(child_data)
+                ck = self._destination_sibling_folder_collision_key(child_data)
+                if dk == want_raw or ck == want_col:
+                    folder_siblings.append(ix)
+        else:
+            try:
+                n = parent_item.childCount()
+            except RuntimeError:
+                return None
+            for index in range(n):
+                try:
+                    child = parent_item.child(index)
+                except RuntimeError:
+                    continue
+                if child is None or not self._tree_item_is_alive(child):
+                    continue
+                try:
+                    child_data = child.data(0, Qt.UserRole) or {}
+                except RuntimeError:
+                    continue
+                if child_data.get("placeholder"):
+                    continue
+                if not child_data.get("is_folder", False):
+                    continue
+                dk = self._destination_sibling_folder_dedup_key(child_data)
+                ck = self._destination_sibling_folder_collision_key(child_data)
+                if dk == want_raw or ck == want_col:
+                    folder_siblings.append(child)
+        return self._select_canonical_destination_item(folder_siblings)
+
     def _find_destination_child_by_path(self, parent_item, destination_path):
         if parent_item is None:
             return None
@@ -22706,7 +23250,10 @@ class MainWindow(QMainWindow):
                     continue
                 if emit_restore_match_logs:
                     pass
-            return self._select_canonical_destination_item(matches)
+            hit = self._select_canonical_destination_item(matches)
+            if hit is not None:
+                return hit
+            return self._destination_find_child_by_last_segment_folder_name(parent_item, normalized_target)
         normalized_target = self._canonical_destination_projection_path(destination_path) or self.normalize_memory_path(destination_path)
         emit_restore_match_logs = bool(getattr(self, "_verbose_destination_match_logging", False))
         if emit_restore_match_logs:
@@ -22763,7 +23310,10 @@ class MainWindow(QMainWindow):
                     prefix_only_match=False,
                     accepted_or_rejected="rejected",
                 )
-        return self._select_canonical_destination_item(matches)
+        hit = self._select_canonical_destination_item(matches)
+        if hit is not None:
+            return hit
+        return self._destination_find_child_by_last_segment_folder_name(parent_item, normalized_target)
 
     def _projected_destination_folder_core_data(self, folder_name, destination_path, parent_data):
         parent_path = self._tree_item_path(parent_data)
@@ -23565,6 +24115,16 @@ class MainWindow(QMainWindow):
             "root_bind",
             delay_ms=self._restore_queue_initial_delay_ms,
         )
+        # The first queue tick is delayed; reconcile now so same-named folder shells from bind/API
+        # do not flash until the queue drains.
+        try:
+            moved = self._reconcile_destination_semantic_duplicates("destination_restore_queue_bootstrap")
+            if moved:
+                tw = getattr(self, "destination_tree_widget", None)
+                if tw is not None:
+                    tw.viewport().update()
+        except Exception as dedup_exc:
+            self._log_restore_exception("destination_restore_queue_bootstrap_dedup", dedup_exc)
 
     def _rebuild_destination_restore_queue_from_unresolved(self):
         ordered_paths = []
@@ -23615,6 +24175,12 @@ class MainWindow(QMainWindow):
                     applied_count += self._reconcile_destination_semantic_duplicates_maybe_deferred(
                         "destination_restore_complete"
                     )
+                    try:
+                        self._reconcile_destination_semantic_duplicates(
+                            "destination_restore_after_overlay_replay",
+                        )
+                    except Exception as dedup_exc:
+                        self._log_restore_exception("destination_restore_after_overlay_replay_dedup", dedup_exc)
                     if applied_count:
                         self.destination_tree_widget.viewport().update()
                     if self._unresolved_proposed_queue_size() == 0 and self._unresolved_allocation_queue_size() == 0:
@@ -23626,6 +24192,12 @@ class MainWindow(QMainWindow):
                     trigger_path=self.normalize_memory_path(trigger_path),
                     reason=reason,
                 )
+                try:
+                    self._reconcile_destination_semantic_duplicates(
+                        "destination_restore_materialization_complete",
+                    )
+                except Exception as dedup_exc:
+                    self._log_restore_exception("destination_restore_materialization_complete_dedup", dedup_exc)
                 self._finalize_memory_restore_if_ready(f"destination_queue_complete:{reason}")
                 return
 
@@ -23738,6 +24310,12 @@ class MainWindow(QMainWindow):
                 trigger_path=self.normalize_memory_path(trigger_path),
                 reason=reason,
             )
+            try:
+                self._reconcile_destination_semantic_duplicates(
+                    "destination_restore_queue_drained",
+                )
+            except Exception as dedup_exc:
+                self._log_restore_exception("destination_restore_queue_drained_dedup", dedup_exc)
             self._finalize_memory_restore_if_ready(f"destination_queue_complete:{reason}")
         elif made_progress and not load_started:
             self._schedule_destination_restore_materialization_queue(reason, trigger_path=trigger_path)
