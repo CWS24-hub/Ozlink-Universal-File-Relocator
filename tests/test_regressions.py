@@ -9,13 +9,14 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QMessageBox, QTreeWidget, QTreeWidgetItem
+from PySide6.QtCore import QModelIndex, Qt, QTimer
+from PySide6.QtWidgets import QApplication, QMessageBox, QTreeView, QTreeWidget, QTreeWidgetItem
 
 import ozlink_console.logger as logger_module
 from ozlink_console.logger import JsonLineFormatter
 from ozlink_console.main_window import MainWindow
 from ozlink_console.memory import MemoryManager
+from ozlink_console.tree_models.sharepoint_source_model import SharePointSourceTreeModel
 from ozlink_console.graph import GraphClient
 from ozlink_console.models import ProposedFolder, SessionState
 
@@ -28,6 +29,37 @@ class _ViewportStub:
 class _TreeStub:
     def viewport(self):
         return _ViewportStub()
+
+    def topLevelItemCount(self):
+        return 0
+
+    def topLevelItem(self, _index):
+        return None
+
+
+class _PlannedMovesTableStub:
+    """Minimal QTableWidget stand-in for partial MainWindow tests that call refresh_planned_moves_table."""
+
+    def clearSpans(self):
+        return None
+
+    def clearContents(self):
+        return None
+
+    def setRowCount(self, _n):
+        return None
+
+    def columnCount(self):
+        return 5
+
+    def setItem(self, *_args, **_kwargs):
+        return None
+
+    def setSpan(self, *_args, **_kwargs):
+        return None
+
+    def clearSelection(self):
+        return None
 
 
 class _LabelStub:
@@ -115,6 +147,52 @@ class _ExpandTreeStub:
 
     def viewport(self):
         return _ViewportStub()
+
+
+def _main_window_stub_for_source_model_expand_all(tree, model):
+    """Attach minimal state so MainWindow.__new__ can run model-view expand-all paths."""
+    window = MainWindow.__new__(MainWindow)
+    window._source_tree_model_view = True
+    window.source_tree_widget = tree
+    window.source_sharepoint_model = model
+    window.pending_root_drive_ids = {"source": "", "destination": ""}
+    window._expand_all_source_model_queue = deque()
+    window._expand_all_pending = {"source": False, "destination": False}
+    window._expand_all_queue = {"source": deque(), "destination": deque()}
+    window._expand_all_seen = {"source": set(), "destination": set()}
+    window._expand_all_processed_seen = {"source": set(), "destination": set()}
+    window._expand_all_processed = {"source": 0, "destination": 0}
+    window._expand_all_max_per_tick = {"source": 1, "destination": 2}
+    window._expand_all_deferred_refresh = {"source": False, "destination": False}
+    window._expand_all_requeue_attempts = {}
+    window._expand_all_status_last_update_ms = {"source": 0, "destination": 0}
+    window.pending_folder_loads = {"source": set(), "destination": set()}
+    window._pending_workspace_post_expand_selection = {"source": "", "destination": ""}
+    window._workspace_restore_expanded_all_intent = {"source": False, "destination": False}
+    window._workspace_ui_snapshot_dirty_panels = set()
+    window._source_column_refresh_pending = False
+    window._source_restore_materialization_queue = []
+    window._pending_snapshot_branch_refresh = {"source": set(), "destination": set()}
+    window._source_projection_refresh_paths = None
+    window._source_projection_refresh_context = None
+    window.planned_moves = []
+    window.destination_tree_widget = None
+    window._set_expand_all_button_label = lambda *a, **k: None
+    window._set_tree_status_message = lambda *a, **k: None
+    window._update_expand_all_status = lambda *a, **k: None
+    window._refresh_source_projection = lambda *a, **k: None
+    window._refresh_tree_column_width = lambda *a, **k: None
+    window._schedule_deferred_destination_materialization = lambda *a, **k: None
+    window._schedule_source_restore_materialization_queue = lambda *a, **k: None
+    window._schedule_snapshot_branch_refresh = lambda *a, **k: None
+    window._schedule_source_projection_refresh_for_paths = lambda *a, **k: None
+    window._schedule_source_projection_refresh = lambda *a, **k: None
+    window._try_flush_destination_future_model_after_source_restore = lambda *a, **k: None
+    window._sync_expand_all_button_from_tree = lambda *a, **k: None
+    window._refresh_runtime_tree_snapshot = lambda *a, **k: None
+    window._persist_workspace_ui_state_safely = lambda *a, **k: None
+    window._schedule_progress_summary_refresh = lambda *a, **k: None
+    return window
 
 
 class _DeletedTreeItemStub:
@@ -1034,6 +1112,91 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         self.assertEqual(window._expand_label, ("source", True))
         self.assertEqual(window._expand_status, ("source", "All branches expanded.", False))
 
+    def test_begin_source_model_expand_all_seeds_queue(self):
+        model = SharePointSourceTreeModel()
+        model.reset_root_payloads(
+            [
+                {
+                    "name": "Lib",
+                    "is_folder": True,
+                    "id": "item-root",
+                    "library_id": "drive-1",
+                    "children_loaded": False,
+                    "base_display_label": "Folder: Lib",
+                    "tree_role": "source",
+                }
+            ]
+        )
+        tree = QTreeView()
+        tree.setModel(model)
+        window = _main_window_stub_for_source_model_expand_all(tree, model)
+        tick_calls = []
+        window._source_model_expand_all_tick = lambda: tick_calls.append(1)
+
+        window._begin_source_model_expand_all()
+
+        self.assertTrue(window._expand_all_pending["source"])
+        self.assertEqual(tick_calls, [1])
+        self.assertEqual(len(window._expand_all_source_model_queue), 1)
+        self.assertTrue(window._expand_all_source_model_queue[0].isValid())
+        self.assertIn("drive-1:item-root", window._expand_all_seen["source"])
+
+    def test_source_model_expand_all_finishes_without_graph_for_loaded_subtree(self):
+        model = SharePointSourceTreeModel()
+        model.reset_root_payloads(
+            [
+                {
+                    "name": "Root",
+                    "is_folder": True,
+                    "id": "r1",
+                    "library_id": "d1",
+                    "children_loaded": True,
+                    "base_display_label": "Folder: Root",
+                    "tree_role": "source",
+                }
+            ]
+        )
+        root_ix = model.index(0, 0, QModelIndex())
+        model.replace_all_children(
+            root_ix,
+            [
+                {
+                    "name": "Sub",
+                    "is_folder": True,
+                    "id": "s1",
+                    "library_id": "d1",
+                    "children_loaded": True,
+                    "base_display_label": "Folder: Sub",
+                    "tree_role": "source",
+                }
+            ],
+        )
+        sub_ix = model.index(0, 0, root_ix)
+        model.replace_all_children(sub_ix, [])
+        model.update_payload_for_index(sub_ix, lambda p: p.update({"children_loaded": True}))
+
+        tree = QTreeView()
+        tree.setModel(model)
+        window = _main_window_stub_for_source_model_expand_all(tree, model)
+        graph_load_attempts = []
+        window._source_model_request_folder_children_load = (
+            lambda *a, **k: graph_load_attempts.append(1) or "noop"
+        )
+
+        with patch.object(QTimer, "singleShot", lambda _ms, _cb: None):
+            window._begin_source_model_expand_all()
+
+        self.assertEqual(len(window._expand_all_source_model_queue), 1)
+        self.assertTrue(window._expand_all_pending["source"])
+
+        window._source_model_expand_all_tick()
+
+        self.assertFalse(window._expand_all_pending["source"])
+        self.assertEqual(len(window._expand_all_source_model_queue), 0)
+        self.assertEqual(graph_load_attempts, [])
+        self.assertTrue(tree.isExpanded(root_ix))
+        self.assertTrue(tree.isExpanded(sub_ix))
+
     def test_process_expand_all_queue_starts_async_source_loads(self):
         window = MainWindow.__new__(MainWindow)
         tree = _ExpandTreeStub()
@@ -1213,6 +1376,10 @@ class DestinationReplayRegressionTests(unittest.TestCase):
             )
         ]
         window.planned_moves = []
+        window.current_session_context = {"connected": False}
+        window.planned_moves_table = _PlannedMovesTableStub()
+        window.planned_moves_status = _LabelStub()
+        window.source_tree_widget = _TreeStub()
         window.destination_tree_status = _LabelStub()
         window.destination_tree_widget = _ExpandTreeStub()
         window._proposed_branch_contains_submitted_items = lambda path: False
@@ -1290,6 +1457,8 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._is_move_submitted = lambda current_move: False
         window._find_visible_destination_item_by_path = lambda path: None
         window._persist_planning_change = lambda reason: setattr(window, "_persist_reason", reason)
+        window.refresh_planned_moves_table = lambda: None
+        window._schedule_deferred_destination_materialization = lambda *args, **kwargs: None
 
         moved = window._move_planned_destination_node(
             {"name": "Salary Increases.xlsx", "display_path": "Root\\Sales\\Follow Up\\Salary Increases.xlsx"},
@@ -1309,7 +1478,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._rebuild_submission_visual_cache = lambda: setattr(window, "_cache_rebuilt", True)
         window._collect_current_source_projection_paths = lambda: {"FTBMRoot", "FTBMRoot\\Contracts"}
         window._queue_deferred_planning_refresh = (
-            lambda reason, source_projection_paths=None, delay_ms=None: setattr(
+            lambda reason, source_projection_paths=None, delay_ms=None, notify_saved=True: setattr(
                 window,
                 "_queued_refresh",
                 (reason, set(source_projection_paths or set()), delay_ms),
@@ -1355,6 +1524,47 @@ class DestinationReplayRegressionTests(unittest.TestCase):
             ({"FTBMRoot\\Contracts"}, "source_projection_deferred_move_folder", 50),
         )
         self.assertEqual(window._title_status, "")
+
+    def test_deferred_planning_refresh_skips_destination_materialize_for_lightweight_reasons(self):
+        window = MainWindow.__new__(MainWindow)
+        window.destination_tree_widget = _TreeStub()
+        window.source_tree_widget = _TreeStub()
+        window._deferred_planning_refresh_pending = True
+        window._deferred_planning_refresh_reasons = ["planning_change_lightweight"]
+        window._deferred_source_projection_paths = set()
+        materialized = []
+        window._materialize_destination_future_model = lambda reason: materialized.append(reason)
+        window._schedule_source_projection_refresh_for_paths = lambda *a, **k: None
+        window.update_progress_summaries = lambda: None
+        window._set_window_title_status = lambda status_text="": None
+        window._log_restore_exception = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("unexpected exception")
+        )
+
+        window._run_deferred_planning_refresh()
+
+        self.assertFalse(materialized)
+
+    def test_deferred_planning_refresh_materializes_when_reason_not_incremental(self):
+        window = MainWindow.__new__(MainWindow)
+        window.destination_tree_widget = _TreeStub()
+        window.source_tree_widget = _TreeStub()
+        window._deferred_planning_refresh_pending = True
+        window._deferred_planning_refresh_reasons = ["planning_change_lightweight", "planned_item_moved"]
+        window._deferred_source_projection_paths = set()
+        materialized = []
+        window._materialize_destination_future_model = lambda reason: materialized.append(reason)
+        window._schedule_source_projection_refresh_for_paths = lambda *a, **k: None
+        window.update_progress_summaries = lambda: None
+        window._set_window_title_status = lambda status_text="": None
+        window._log_restore_exception = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("unexpected exception")
+        )
+
+        window._run_deferred_planning_refresh()
+
+        self.assertEqual(len(materialized), 1)
+        self.assertIn("planned_item_moved", materialized[0])
 
     def test_finalize_cache_refresh_workspace_restore_reapplies_destination_overlay(self):
         window = MainWindow.__new__(MainWindow)

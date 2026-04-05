@@ -14,6 +14,10 @@ class AllocationRow:
     RequestedBy: str
     RequestedDate: str
     Status: str = "Pending"
+    SourceDriveId: str = ""
+    SourceItemId: str = ""
+    DestinationDriveId: str = ""
+    DestinationParentItemId: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AllocationRow":
@@ -27,6 +31,10 @@ class AllocationRow:
             RequestedBy=str(data.get("RequestedBy", "")),
             RequestedDate=str(data.get("RequestedDate", "")),
             Status=str(data.get("Status", "Pending")),
+            SourceDriveId=str(data.get("SourceDriveId", "")),
+            SourceItemId=str(data.get("SourceItemId", "")),
+            DestinationDriveId=str(data.get("DestinationDriveId", "")),
+            DestinationParentItemId=str(data.get("DestinationParentItemId", "")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -41,6 +49,8 @@ class ProposedFolder:
     FolderName: str
     DestinationPath: str
     DestinationId: str = ""
+    DestinationDriveId: str = ""
+    DestinationParentItemId: str = ""
     ParentPath: str = ""
     IsSelectable: bool = True
     IsProposed: bool = True
@@ -54,6 +64,8 @@ class ProposedFolder:
             DestinationId=str(data.get("DestinationId", "")),
             FolderName=str(data.get("FolderName", "")),
             DestinationPath=str(data.get("DestinationPath", "")),
+            DestinationDriveId=str(data.get("DestinationDriveId", "")),
+            DestinationParentItemId=str(data.get("DestinationParentItemId", "")),
             ParentPath=str(data.get("ParentPath", "")),
             IsSelectable=bool(data.get("IsSelectable", True)),
             IsProposed=bool(data.get("IsProposed", True)),
@@ -91,10 +103,27 @@ class SessionState:
     WorkspacePanelCollapsed: bool = False
     SourceTreeSnapshot: list[dict[str, Any]] = field(default_factory=list)
     DestinationTreeSnapshot: list[dict[str, Any]] = field(default_factory=list)
+    # Canonical source paths (files) excluded from inherited folder allocations; persisted with draft session.
+    PlanLeafExclusions: list[str] = field(default_factory=list)
+    # Source paths for inherited_mapping rows the user dismissed in Needs Review (UI only; does not change the plan).
+    NeedsReviewDismissedInheritedSourcePaths: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SessionState":
-        kwargs = {f: data.get(f, getattr(cls, f, "")) for f in cls.__dataclass_fields__.keys()}  # type: ignore[attr-defined]
+        kwargs: dict[str, Any] = {}
+        for field_name, field_def in cls.__dataclass_fields__.items():  # type: ignore[attr-defined]
+            if field_name in data:
+                kwargs[field_name] = data[field_name]
+            elif field_def.default_factory is not MISSING:
+                kwargs[field_name] = field_def.default_factory()
+            elif field_def.default is not MISSING:
+                kwargs[field_name] = field_def.default
+            else:
+                kwargs[field_name] = None
+        if not isinstance(kwargs.get("PlanLeafExclusions"), list):
+            kwargs["PlanLeafExclusions"] = []
+        if not isinstance(kwargs.get("NeedsReviewDismissedInheritedSourcePaths"), list):
+            kwargs["NeedsReviewDismissedInheritedSourcePaths"] = []
         return cls(**kwargs)
 
     def to_dict(self) -> dict[str, Any]:

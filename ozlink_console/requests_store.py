@@ -9,11 +9,12 @@ from typing import Any
 
 from .logger import log_info, log_trace
 from .models import SubmissionBatch
-from .paths import requests_root, test_requests_root
+from .paths import ensure_app_storage_directories, requests_root, test_requests_root
 
 
 class RequestStore:
     def __init__(self) -> None:
+        ensure_app_storage_directories()
         self.root = requests_root()
         self.test_root = test_requests_root()
 

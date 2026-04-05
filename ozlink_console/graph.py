@@ -1,18 +1,20 @@
 import hashlib
 import json
 import os
+import time
 import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import msal
 import pyperclip
 import requests
 
-from .logger import log_info, log_trace, log_warn
-from .paths import graph_cache_root
+from .dev_mode import is_dev_mode
+from .logger import flush_logger, log_info, log_trace, log_warn
+from .paths import graph_cache_root, msal_token_cache_path
 
 
 def _graph_url_excerpt(url: str, max_len: int = 200) -> str:
@@ -32,6 +34,7 @@ AUTH_CONFIG = {
         "User.Read",
         "Sites.Read.All",
         "Files.Read.All",
+        "Files.ReadWrite.All",
         "Group.Read.All",
         "Directory.Read.All",
     ],
@@ -82,12 +85,66 @@ class GraphClient:
         }
 
         self.app = None
+        self._token_cache: Optional[msal.SerializableTokenCache] = None
+
+    def _load_msal_token_cache(self) -> msal.SerializableTokenCache:
+        cache = msal.SerializableTokenCache()
+        # Persisted refresh tokens on disk are dev/test only (`--dev` / OZLINK_DEV); production runs
+        # use in-memory MSAL cache only so tokens are not reused across cold starts.
+        if not is_dev_mode():
+            return cache
+        path = msal_token_cache_path()
+        try:
+            if path.is_file():
+                raw = path.read_text(encoding="utf-8")
+                if raw.strip():
+                    cache.deserialize(raw)
+        except (OSError, ValueError) as exc:
+            log_warn("msal_token_cache_load_failed", error=str(exc)[:240])
+        return cache
+
+    def _persist_msal_token_cache(self) -> None:
+        cache = self._token_cache
+        if cache is None or not getattr(cache, "has_state_changed", False):
+            return
+        if not is_dev_mode():
+            cache.has_state_changed = False
+            return
+        path = msal_token_cache_path()
+        tmp = path.with_suffix(".json.tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = cache.serialize()
+            tmp.write_text(data, encoding="utf-8")
+            tmp.replace(path)
+        except OSError as exc:
+            log_warn("msal_token_cache_persist_failed", error=str(exc)[:240])
+            try:
+                if tmp.is_file():
+                    tmp.unlink()
+            except OSError:
+                pass
+        finally:
+            cache.has_state_changed = False
+
+    def _clear_persistent_msal_token_cache_file(self) -> None:
+        try:
+            p = msal_token_cache_path()
+            if p.is_file():
+                p.unlink()
+            tmp = p.with_suffix(".json.tmp")
+            if tmp.is_file():
+                tmp.unlink()
+        except OSError as exc:
+            log_warn("msal_token_cache_remove_failed", error=str(exc)[:200])
 
     def _ensure_app(self):
         if self.app is None:
+            self._token_cache = self._load_msal_token_cache()
             self.app = msal.PublicClientApplication(
                 AUTH_CONFIG["client_id"],
                 authority=AUTH_CONFIG["authority"],
+                token_cache=self._token_cache,
             )
         return self.app
 
@@ -120,10 +177,13 @@ class GraphClient:
             "message": message,
         }
 
-    def open_device_login_page(self) -> None:
+    def open_device_login_page(self) -> bool:
         if not self.device_flow:
             raise RuntimeError("Device flow has not been initialized.")
-        webbrowser.open(self.device_flow["verification_uri"])
+        uri = self.device_flow.get("verification_uri")
+        if not uri:
+            return False
+        return bool(webbrowser.open(uri))
 
     def acquire_token(self) -> Dict[str, Any]:
         if not self.device_flow:
@@ -136,6 +196,7 @@ class GraphClient:
 
         self.token = result["access_token"]
         self.session_context["connected"] = True
+        self._persist_msal_token_cache()
         log_trace("graph_auth", "token_acquired_device_flow", connected=True)
         return result
 
@@ -171,6 +232,7 @@ class GraphClient:
 
         self.token = result["access_token"]
         self.session_context["connected"] = True
+        self._persist_msal_token_cache()
         return True
 
     def refresh_access_token_silently(self, *, force_refresh: bool = False) -> bool:
@@ -182,6 +244,9 @@ class GraphClient:
         self.device_flow = None
         self.profile = None
         self._drive_children_cache.clear()
+        self.app = None
+        self._token_cache = None
+        self._clear_persistent_msal_token_cache_file()
         self.session_context = {
             "connected": False,
             "user_role": "user",
@@ -201,6 +266,60 @@ class GraphClient:
             "Accept": "application/json",
         }
 
+    @staticmethod
+    def _graph_retry_after_seconds(response: Optional[requests.Response]) -> Optional[float]:
+        if response is None:
+            return None
+        ra = response.headers.get("Retry-After")
+        if ra is None or str(ra).strip() == "":
+            return None
+        try:
+            return float(ra)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _graph_should_retry_request_failure(exc: BaseException) -> bool:
+        if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+            return True
+        if isinstance(exc, requests.exceptions.ChunkedEncodingError):
+            return True
+        if isinstance(exc, requests.HTTPError):
+            r = exc.response
+            if r is None:
+                return False
+            code = r.status_code
+            if code in (401, 403, 404):
+                return False
+            if code in (408, 429, 500, 502, 503, 504):
+                return True
+        return False
+
+    @staticmethod
+    def _graph_transient_retry_delay_after_failure(
+        failed_attempt_index: int,
+        exc: BaseException,
+        default_backoffs: Tuple[float, float],
+    ) -> float:
+        if isinstance(exc, requests.HTTPError) and exc.response is not None and exc.response.status_code == 429:
+            ra = GraphClient._graph_retry_after_seconds(exc.response)
+            if ra is not None:
+                return min(max(ra, 0.0), 15.0)
+        if failed_attempt_index >= len(default_backoffs):
+            return default_backoffs[-1]
+        return default_backoffs[failed_attempt_index]
+
+    @staticmethod
+    def _graph_transient_retry_allowed(method: str, url: str) -> bool:
+        m = str(method or "").strip().upper()
+        if m in ("GET", "HEAD", "OPTIONS"):
+            return True
+        if m == "POST":
+            base = str(url or "").split("?", 1)[0].rstrip("/")
+            if base.endswith("/me/getMemberGroups"):
+                return True
+        return False
+
     def _request(
         self,
         method: str,
@@ -211,38 +330,74 @@ class GraphClient:
         timeout: int = 60,
         stream: bool = False,
     ) -> requests.Response:
-        retried_401 = False
-        response = requests.request(
-            method,
-            url,
-            headers=self.get_headers(),
-            params=params,
-            json=json_body,
-            timeout=timeout,
-            stream=stream,
-        )
-        if response.status_code == 401 and self._try_acquire_token_silent(force_refresh=True):
-            retried_401 = True
-            response = requests.request(
-                method,
-                url,
-                headers=self.get_headers(),
-                params=params,
-                json=json_body,
-                timeout=timeout,
-                stream=stream,
-            )
-        response.raise_for_status()
-        log_trace(
-            "graph_http",
-            "response_ok",
-            method=method,
-            path_excerpt=_graph_url_excerpt(url),
-            status_code=response.status_code,
-            retried_after_401=retried_401,
-            stream=stream,
-        )
-        return response
+        max_attempts = 3
+        default_backoffs: Tuple[float, float] = (0.22, 0.45)
+        excerpt = _graph_url_excerpt(url)
+        for attempt in range(max_attempts):
+            try:
+                retried_401 = False
+                response = requests.request(
+                    method,
+                    url,
+                    headers=self.get_headers(),
+                    params=params,
+                    json=json_body,
+                    timeout=timeout,
+                    stream=stream,
+                )
+                if response.status_code == 401 and self._try_acquire_token_silent(force_refresh=True):
+                    retried_401 = True
+                    response = requests.request(
+                        method,
+                        url,
+                        headers=self.get_headers(),
+                        params=params,
+                        json=json_body,
+                        timeout=timeout,
+                        stream=stream,
+                    )
+                response.raise_for_status()
+                log_trace(
+                    "graph_http",
+                    "response_ok",
+                    method=method,
+                    path_excerpt=excerpt,
+                    status_code=response.status_code,
+                    retried_after_401=retried_401,
+                    stream=stream,
+                )
+                return response
+            except (
+                requests.HTTPError,
+                requests.ConnectionError,
+                requests.Timeout,
+                requests.exceptions.ChunkedEncodingError,
+            ) as exc:
+                if not self._graph_should_retry_request_failure(exc):
+                    raise
+                if not self._graph_transient_retry_allowed(method, url):
+                    raise
+                if attempt >= max_attempts - 1:
+                    log_warn(
+                        "graph_http_transient_exhausted",
+                        method=method,
+                        path_excerpt=excerpt,
+                        attempts=max_attempts,
+                        error=str(exc)[:300],
+                    )
+                    raise
+                delay_s = self._graph_transient_retry_delay_after_failure(attempt, exc, default_backoffs)
+                log_warn(
+                    "graph_http_transient_retry",
+                    method=method,
+                    path_excerpt=excerpt,
+                    attempt=attempt + 2,
+                    max_attempts=max_attempts,
+                    delay_s=delay_s,
+                    error=str(exc)[:300],
+                )
+                time.sleep(delay_s)
+        raise RuntimeError("graph_http_retry_internal_error")  # pragma: no cover
 
     def get(self, url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         response = self._request("GET", url, params=params, timeout=60)
@@ -729,6 +884,31 @@ class GraphClient:
     def get_drive_item(self, drive_id: str, item_id: str) -> Dict[str, Any]:
         return self.get(f"{AUTH_CONFIG['graph_base']}/drives/{drive_id}/items/{item_id}")
 
+    def get_drive_item_optional(self, drive_id: str, item_id: str) -> Optional[Dict[str, Any]]:
+        """Same as ``get_drive_item`` but returns None on 404 (deleted, wrong drive, or moved beyond this drive)."""
+        drive_id = str(drive_id or "").strip()
+        item_id = str(item_id or "").strip()
+        if not drive_id or not item_id:
+            return None
+        try:
+            return self.get_drive_item(drive_id, item_id)
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                return None
+            raise
+
+    def get_drive_root_item(self, drive_id: str) -> Optional[Dict[str, Any]]:
+        """Return the library root driveItem (used as parent when paths start at first-level folder)."""
+        drive_id = str(drive_id or "").strip()
+        if not drive_id:
+            return None
+        try:
+            return self.get(f"{AUTH_CONFIG['graph_base']}/drives/{drive_id}/root")
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                return None
+            raise
+
     def get_drive_item_by_path(self, drive_id: str, relative_path: str) -> Optional[Dict[str, Any]]:
         """
         Resolve a path relative to the document library root (e.g. FTBMRoot/Admin/Folder) to a driveItem.
@@ -761,6 +941,239 @@ class GraphClient:
                 )
                 return None
             raise
+
+    # -------------------------------------------------------------------------
+    # Drive mutations (copy / create folder) — requires Files.ReadWrite.All consent
+    # -------------------------------------------------------------------------
+    def start_drive_item_copy(
+        self,
+        *,
+        source_drive_id: str,
+        source_item_id: str,
+        dest_drive_id: str,
+        dest_parent_item_id: str,
+        name: Optional[str] = None,
+        conflict_behavior: str = "rename",
+    ) -> str:
+        """POST /copy; returns async monitor URL from the ``Location`` response header."""
+        source_drive_id = str(source_drive_id or "").strip()
+        source_item_id = str(source_item_id or "").strip()
+        dest_drive_id = str(dest_drive_id or "").strip()
+        dest_parent_item_id = str(dest_parent_item_id or "").strip()
+        if not source_drive_id or not source_item_id or not dest_drive_id or not dest_parent_item_id:
+            raise ValueError("start_drive_item_copy requires source/destination drive and item ids.")
+
+        enc_drive = quote(source_drive_id, safe="")
+        enc_item = quote(source_item_id, safe="")
+        url = f"{AUTH_CONFIG['graph_base']}/drives/{enc_drive}/items/{enc_item}/copy"
+        body: Dict[str, Any] = {
+            "parentReference": {"driveId": dest_drive_id, "id": dest_parent_item_id},
+            "@microsoft.graph.conflictBehavior": str(conflict_behavior or "rename"),
+        }
+        if name:
+            body["name"] = str(name).strip()
+
+        headers = dict(self.get_headers())
+        headers["Content-Type"] = "application/json"
+
+        def _post() -> requests.Response:
+            return requests.post(url, headers=headers, json=body, timeout=120)
+
+        response = _post()
+        if response.status_code == 401 and self._try_acquire_token_silent(force_refresh=True):
+            headers = dict(self.get_headers())
+            headers["Content-Type"] = "application/json"
+            response = requests.post(url, headers=headers, json=body, timeout=120)
+        if response.status_code == 429:
+            time.sleep(float(response.headers.get("Retry-After", "10")))
+            headers = dict(self.get_headers())
+            headers["Content-Type"] = "application/json"
+            response = requests.post(url, headers=headers, json=body, timeout=120)
+
+        if response.status_code != 202:
+            response.raise_for_status()
+
+        loc = response.headers.get("Location") or response.headers.get("location")
+        if not loc:
+            raise RuntimeError("Copy returned 202 but no Location header for progress polling.")
+        log_trace(
+            "graph",
+            "drive_item_copy_started",
+            source_drive_suffix=source_drive_id[-12:] if len(source_drive_id) > 12 else source_drive_id,
+            dest_drive_suffix=dest_drive_id[-12:] if len(dest_drive_id) > 12 else dest_drive_id,
+        )
+        loc_s = str(loc).strip()
+        log_info(
+            "graph_async_copy_submitted",
+            phase="copy_post_accepted",
+            monitor_url_excerpt=loc_s[:220],
+            source_item_id_suffix=source_item_id[-16:] if len(source_item_id) > 16 else source_item_id,
+            dest_parent_item_id_suffix=dest_parent_item_id[-16:]
+            if len(dest_parent_item_id) > 16
+            else dest_parent_item_id,
+            copy_target_name=str(name or "")[:200] or None,
+        )
+        flush_logger()
+        return loc_s
+
+    def wait_graph_async_operation(
+        self,
+        monitor_url: str,
+        *,
+        timeout_sec: float = 600.0,
+        poll_interval_sec: float = 1.0,
+    ) -> Dict[str, Any]:
+        """Poll a Graph async monitor URL until completion or failure."""
+        effective_timeout = max(30.0, float(timeout_sec))
+        deadline = time.monotonic() + effective_timeout
+        monitor_url = str(monitor_url or "").strip()
+        if not monitor_url:
+            raise ValueError("monitor_url is required")
+
+        wait_started = time.monotonic()
+        poll_count = 0
+        log_info(
+            "graph_async_wait_started",
+            monitor_url_excerpt=monitor_url[:220],
+            timeout_sec_config=float(timeout_sec),
+            effective_timeout_sec=float(effective_timeout),
+            poll_interval_sec=float(poll_interval_sec),
+        )
+        flush_logger()
+
+        last_payload: Dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            poll_count += 1
+            headers = dict(self.get_headers())
+            response = requests.get(monitor_url, headers=headers, timeout=120)
+            retried_monitor_401 = False
+            if response.status_code == 401 and self._try_acquire_token_silent(force_refresh=True):
+                retried_monitor_401 = True
+                headers = dict(self.get_headers())
+                response = requests.get(monitor_url, headers=headers, timeout=120)
+            if response.status_code == 401:
+                log_info(
+                    "graph_async_monitor_poll_401",
+                    poll_count=poll_count,
+                    elapsed_sec=round(time.monotonic() - wait_started, 3),
+                    retried_token_refresh=bool(retried_monitor_401),
+                    monitor_url_excerpt=monitor_url[:220],
+                    http_status=401,
+                )
+                flush_logger()
+            if response.status_code == 429:
+                log_info(
+                    "graph_async_wait_poll",
+                    poll_count=poll_count,
+                    elapsed_sec=round(time.monotonic() - wait_started, 3),
+                    http_status=429,
+                    note="retry_after_sleep",
+                )
+                flush_logger()
+                time.sleep(float(response.headers.get("Retry-After", "5")))
+                continue
+            response.raise_for_status()
+            try:
+                last_payload = response.json()
+            except Exception:
+                last_payload = {}
+
+            status = str(last_payload.get("status", "") or "").lower()
+            op_id = str(last_payload.get("id", "") or "").strip()
+            log_info(
+                "graph_async_wait_poll",
+                poll_count=poll_count,
+                elapsed_sec=round(time.monotonic() - wait_started, 3),
+                graph_status=status or None,
+                operation_id=op_id or None,
+                http_status=int(response.status_code),
+            )
+            flush_logger()
+            if status in ("completed", "completedwithwarnings"):
+                log_trace("graph", "async_operation_done", status=status)
+                log_info(
+                    "graph_async_wait_completed",
+                    poll_count=poll_count,
+                    elapsed_sec=round(time.monotonic() - wait_started, 3),
+                    graph_status=status,
+                    operation_id=op_id or None,
+                )
+                flush_logger()
+                return last_payload
+            if status in ("failed",):
+                err = last_payload.get("error") or last_payload
+                log_info(
+                    "graph_async_wait_failed",
+                    poll_count=poll_count,
+                    elapsed_sec=round(time.monotonic() - wait_started, 3),
+                    graph_status=status,
+                    operation_id=op_id or None,
+                    error_excerpt=repr(err)[:500],
+                )
+                flush_logger()
+                raise RuntimeError(f"Graph async operation failed: {err!r}")
+            time.sleep(max(0.2, float(poll_interval_sec)))
+
+        elapsed = time.monotonic() - wait_started
+        log_info(
+            "graph_async_wait_timeout",
+            poll_count=poll_count,
+            elapsed_sec=round(elapsed, 3),
+            effective_timeout_sec=float(effective_timeout),
+            timeout_sec_config=float(timeout_sec),
+            monitor_url_excerpt=monitor_url[:220],
+            last_graph_status=str(last_payload.get("status", "") or "") or None,
+            last_operation_id=str(last_payload.get("id", "") or "").strip() or None,
+        )
+        flush_logger()
+        raise TimeoutError(f"Graph async operation timed out after {timeout_sec}s: {monitor_url[:120]!r}…")
+
+    def create_child_folder(
+        self,
+        drive_id: str,
+        parent_item_id: str,
+        name: str,
+        *,
+        conflict_behavior: str = "fail",
+    ) -> Dict[str, Any]:
+        """Create a folder under a parent driveItem (synchronous)."""
+        drive_id = str(drive_id or "").strip()
+        parent_item_id = str(parent_item_id or "").strip()
+        name = str(name or "").strip()
+        if not drive_id or not parent_item_id or not name:
+            raise ValueError("create_child_folder requires drive_id, parent_item_id, and name.")
+
+        enc_drive = quote(drive_id, safe="")
+        enc_parent = quote(parent_item_id, safe="")
+        url = f"{AUTH_CONFIG['graph_base']}/drives/{enc_drive}/items/{enc_parent}/children"
+        body: Dict[str, Any] = {
+            "name": name,
+            "folder": {},
+            "@microsoft.graph.conflictBehavior": str(conflict_behavior or "fail"),
+        }
+        headers = dict(self.get_headers())
+        headers["Content-Type"] = "application/json"
+
+        response = requests.post(url, headers=headers, json=body, timeout=120)
+        if response.status_code == 401 and self._try_acquire_token_silent(force_refresh=True):
+            headers = dict(self.get_headers())
+            headers["Content-Type"] = "application/json"
+            response = requests.post(url, headers=headers, json=body, timeout=120)
+        if response.status_code == 429:
+            time.sleep(float(response.headers.get("Retry-After", "10")))
+            headers = dict(self.get_headers())
+            headers["Content-Type"] = "application/json"
+            response = requests.post(url, headers=headers, json=body, timeout=120)
+
+        response.raise_for_status()
+        payload = response.json()
+        log_trace(
+            "graph",
+            "create_child_folder_ok",
+            drive_id_suffix=drive_id[-12:] if len(drive_id) > 12 else drive_id,
+            name_excerpt=name[:80],
+        )
+        return payload
 
     def count_drive_items_recursive_split(self, drive_id: str) -> tuple[int, int]:
         """Return ``(file_count, folder_count)`` under the library root (recursive, paged).
@@ -915,6 +1328,28 @@ class GraphClient:
     # -------------------------------------------------------------------------
     # Composite helpers - these are what the UI should use next
     # -------------------------------------------------------------------------
+    def discover_sites_for_planning_workspace(self) -> List[Dict[str, Any]]:
+        """Return sites the user can access. Libraries are loaded lazily per site (see MainWindow)."""
+        log_trace("graph", "discover_sites_for_planning_workspace_start")
+        sites = self.list_sites()
+        results: List[Dict[str, Any]] = []
+        for site in sites:
+            normalized_site = self.normalize_site(site)
+            site_id = normalized_site.get("id", "")
+            if not site_id:
+                continue
+            normalized_site["libraries"] = []
+            normalized_site["site_key"] = normalized_site.get("web_url") or site_id
+            results.append(normalized_site)
+
+        log_trace(
+            "graph",
+            "discover_sites_for_planning_workspace_done",
+            raw_site_count=len(sites),
+            site_row_count=len(results),
+        )
+        return results
+
     def discover_sites_with_libraries(self) -> List[Dict[str, Any]]:
         log_trace("graph", "discover_sites_with_libraries_start")
         sites = self.list_sites()
@@ -940,6 +1375,7 @@ class GraphClient:
                 continue
 
             normalized_site["libraries"] = normalized_drives
+            normalized_site.setdefault("site_key", normalized_site.get("web_url") or site_id)
             results.append(normalized_site)
 
         log_trace(
@@ -1007,6 +1443,65 @@ class GraphClient:
             for item in items
             if item.get("id")
         ]
+
+    def list_drive_folder_descendant_files_normalized(
+        self,
+        drive_id: str,
+        folder_item_id: str,
+        *,
+        site_id: str = "",
+        site_name: str = "",
+        library_id: str = "",
+        library_name: str = "",
+        tree_role: str = "",
+        folder_item_path: str = "",
+        max_files: int = 5000,
+    ) -> List[Dict[str, Any]]:
+        """
+        Walk a folder tree via Graph children calls and return normalized **file** rows only.
+
+        Used to turn one folder selection into many per-file planned moves (separate Graph copy steps).
+        """
+        drive_id = str(drive_id or "").strip()
+        folder_item_id = str(folder_item_id or "").strip()
+        if not drive_id or not folder_item_id:
+            return []
+
+        files: List[Dict[str, Any]] = []
+        stack: List[tuple[str, str]] = [(folder_item_id, str(folder_item_path or "").strip() or "/")]
+        seen_folders: set[str] = {folder_item_id}
+        lib_id = library_id or drive_id
+
+        while stack:
+            cur_id, cur_path = stack.pop()
+            children = self.list_drive_item_children_normalized(
+                drive_id,
+                cur_id,
+                site_id=site_id,
+                site_name=site_name,
+                library_id=lib_id,
+                library_name=library_name,
+                tree_role=tree_role,
+                parent_item_path=cur_path,
+            )
+            for ch in children:
+                cid = str(ch.get("id") or "").strip()
+                if not cid:
+                    continue
+                if ch.get("is_folder"):
+                    if cid not in seen_folders:
+                        seen_folders.add(cid)
+                        stack.append((cid, str(ch.get("item_path") or "").strip() or "/"))
+                else:
+                    files.append(ch)
+                    if len(files) >= max(1, int(max_files)):
+                        log_info(
+                            "graph_folder_descendant_files_cap",
+                            cap=int(max_files),
+                            drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+                        )
+                        return files
+        return files
 
     def list_drive_all_items_normalized(
         self,

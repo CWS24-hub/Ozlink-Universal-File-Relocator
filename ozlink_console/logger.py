@@ -1,8 +1,17 @@
 from __future__ import annotations
 
+"""JSON line logs under ``logs_root()``.
+
+SharePoint Graph sync uses structured ``message`` keys such as ``graph_resolve_*`` and
+``graph_refresh_*`` (fields: ``phase``, ``reason``, ``move_index``, ``candidates_tried``, etc.).
+Set environment variable ``OZLINK_FULL_TRACE=1`` for per-candidate path-miss traces during
+resolution (can be large).
+"""
+
 import json
 import logging
 import os
+
 from datetime import datetime
 from pathlib import Path
 from .paths import logs_root
@@ -80,6 +89,17 @@ def log_warn(message: str, **data) -> None:
 
 def log_error(message: str, **data) -> None:
     get_logger().error(message, extra={"data": data or None})
+
+
+def flush_logger() -> None:
+    """Force handlers to sync to disk (diagnostics during long Graph async waits)."""
+    if _LOGGER is None:
+        return
+    for h in _LOGGER.handlers:
+        try:
+            h.flush()
+        except Exception:
+            pass
 
 
 def trace_enabled() -> bool:
