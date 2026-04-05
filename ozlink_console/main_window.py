@@ -2221,6 +2221,7 @@ class MainWindow(QMainWindow):
         self._workflow_not_planned_rows = []
         self._workflow_suggestion_rows = []
         self._workflow_needs_review_rows = []
+        self._needs_review_dismissed_inherited_paths: set[str] = set()
         self._submission_test_mode = False
         self._pending_login_email = ""
         self._pending_login_restore_args = None
@@ -4599,6 +4600,20 @@ class MainWindow(QMainWindow):
         title = QLabel("Needs Review")
         title.setObjectName("SectionTitle")
 
+        hint = QLabel(
+            "Use this list to resolve overlaps and confirm how items are mapped. "
+            "Select a row, then use the actions below."
+        )
+        hint.setObjectName("MutedText")
+        hint.setWordWrap(True)
+
+        show_inherited_cb = QCheckBox("Show informational inherited mappings")
+        show_inherited_cb.setChecked(False)
+        show_inherited_cb.setToolTip(
+            "Inherited mappings are usually fine; turn this on to see them in the table."
+        )
+        show_inherited_cb.toggled.connect(self._on_needs_review_show_inherited_toggled)
+
         table = self.build_workflow_table([
             "Item",
             "Source Path",
@@ -4608,15 +4623,183 @@ class MainWindow(QMainWindow):
         table.itemDoubleClicked.connect(
             lambda item: self.handle_workflow_source_row_activated(item, "needs_review")
         )
+        table.itemSelectionChanged.connect(self._on_needs_review_selection_changed)
+
+        actions_row = QWidget()
+        actions_layout = QHBoxLayout(actions_row)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        actions_layout.setSpacing(8)
+        go_btn = QPushButton("Go to item")
+        go_btn.setToolTip("Select the source tree row for this item.")
+        go_btn.clicked.connect(self._on_needs_review_go_to_item)
+        confirm_btn = QPushButton("Mark as confirmed")
+        confirm_btn.setToolTip(
+            "Hide this inherited mapping from Needs Review for this draft (does not change the plan)."
+        )
+        confirm_btn.clicked.connect(self._on_needs_review_mark_inherited_confirmed)
+        dup_btn = QPushButton("Open duplicate file review…")
+        dup_btn.setToolTip("Open the duplicate destination file review dialog.")
+        dup_btn.clicked.connect(self._on_needs_review_open_duplicate_file_review)
+        actions_layout.addWidget(go_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        actions_layout.addWidget(confirm_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        actions_layout.addWidget(dup_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        actions_layout.addStretch(1)
+        for b in (go_btn, confirm_btn, dup_btn):
+            b.setEnabled(False)
 
         status = QLabel("Planning items that need review will appear here.")
         status.setObjectName("MutedText")
         status.setWordWrap(True)
 
         layout.addWidget(title)
+        layout.addWidget(hint)
+        layout.addWidget(show_inherited_cb)
         layout.addWidget(table, 1)
+        layout.addWidget(actions_row)
         layout.addWidget(status)
+
+        self.needs_review_show_inherited_checkbox = show_inherited_cb
+        self.needs_review_go_btn = go_btn
+        self.needs_review_confirm_btn = confirm_btn
+        self.needs_review_dup_dialog_btn = dup_btn
         return box, table, status
+
+    def _needs_review_rows_for_display(self) -> list:
+        rows = list(getattr(self, "_workflow_needs_review_rows", None) or [])
+        dismissed = getattr(self, "_needs_review_dismissed_inherited_paths", None) or set()
+        cb = getattr(self, "needs_review_show_inherited_checkbox", None)
+        show_inherited = bool(cb is not None and cb.isChecked())
+        out = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            rt = str(r.get("review_type", "") or "").strip()
+            sp = self.normalize_memory_path(str(r.get("source_path", "") or ""))
+            if rt == "inherited_mapping":
+                if sp in dismissed:
+                    continue
+                if not show_inherited:
+                    continue
+            out.append(r)
+        return out
+
+    def _needs_review_status_line(self, all_rows: list, display_rows: list) -> str:
+        if not all_rows:
+            return "No review issues detected from the current planning state."
+        cb = getattr(self, "needs_review_show_inherited_checkbox", None)
+        show_inherited = bool(cb is not None and cb.isChecked())
+        dismissed = getattr(self, "_needs_review_dismissed_inherited_paths", None) or set()
+        conflict_types = {"duplicate_destination_projection", "proposed_branch_dependency", "weak_suggestion"}
+        n_inherited_not_dismissed = 0
+        for r in all_rows:
+            if not isinstance(r, dict) or str(r.get("review_type", "") or "").strip() != "inherited_mapping":
+                continue
+            sp = self.normalize_memory_path(str(r.get("source_path", "") or ""))
+            if sp not in dismissed:
+                n_inherited_not_dismissed += 1
+        n_hidden = 0 if show_inherited else n_inherited_not_dismissed
+        n_actionable_shown = sum(
+            1
+            for r in display_rows
+            if isinstance(r, dict) and str(r.get("review_type", "") or "").strip() in conflict_types
+        )
+        n_inherited_shown = sum(
+            1
+            for r in display_rows
+            if isinstance(r, dict) and str(r.get("review_type", "") or "").strip() == "inherited_mapping"
+        )
+        parts = []
+        if n_actionable_shown and n_hidden:
+            parts.append(
+                f"{n_actionable_shown} actionable item(s). "
+                f"{n_hidden} inherited mapping(s) hidden (likely OK)."
+            )
+        elif n_actionable_shown:
+            parts.append(f"{n_actionable_shown} actionable item(s) in this list.")
+        elif n_hidden:
+            parts.append(
+                f"No conflicts or low-confidence suggestions need action. "
+                f"{n_hidden} inherited mapping(s) hidden (likely OK)."
+            )
+        elif show_inherited and n_inherited_shown:
+            parts.append(
+                f"No conflicts or low-confidence suggestions in this list. "
+                f"{n_inherited_shown} inherited mapping(s) listed for your information."
+            )
+        else:
+            parts.append("No conflicts or low-confidence suggestions need review right now.")
+        if show_inherited and n_inherited_shown and n_actionable_shown:
+            parts.append(f"{n_inherited_shown} inherited mapping(s) listed for your information.")
+        return " ".join(parts)
+
+    def _apply_needs_review_table_view(self) -> None:
+        table = getattr(self, "needs_review_table", None)
+        if table is None:
+            return
+        all_rows = list(getattr(self, "_workflow_needs_review_rows", None) or [])
+        display_rows = self._needs_review_rows_for_display()
+        self._set_workflow_table_rows(
+            table,
+            display_rows,
+            ["item_name", "source_path", "reason", "action"],
+        )
+        if hasattr(self, "needs_review_status"):
+            self.needs_review_status.setText(self._needs_review_status_line(all_rows, display_rows))
+        self._sync_needs_review_action_buttons()
+
+    def _needs_review_selected_row_data(self) -> dict:
+        table = getattr(self, "needs_review_table", None)
+        if table is None:
+            return {}
+        selected = table.selectedItems()
+        if not selected:
+            return {}
+        row = selected[0].row()
+        it = table.item(row, 0)
+        if it is None:
+            return {}
+        data = it.data(Qt.UserRole)
+        return data if isinstance(data, dict) else {}
+
+    def _sync_needs_review_action_buttons(self) -> None:
+        rd = self._needs_review_selected_row_data()
+        rt = str(rd.get("review_type", "") or "").strip()
+        sp = str(rd.get("source_path", "") or "").strip()
+        go_btn = getattr(self, "needs_review_go_btn", None)
+        confirm_btn = getattr(self, "needs_review_confirm_btn", None)
+        dup_btn = getattr(self, "needs_review_dup_dialog_btn", None)
+        if go_btn is not None:
+            go_btn.setEnabled(bool(sp))
+        if confirm_btn is not None:
+            confirm_btn.setEnabled(rt == "inherited_mapping" and bool(sp))
+        if dup_btn is not None:
+            dup_btn.setEnabled(rt == "duplicate_destination_projection")
+
+    def _on_needs_review_selection_changed(self) -> None:
+        self._sync_needs_review_action_buttons()
+
+    def _on_needs_review_show_inherited_toggled(self, _checked: bool) -> None:
+        self._apply_needs_review_table_view()
+
+    def _on_needs_review_go_to_item(self) -> None:
+        rd = self._needs_review_selected_row_data()
+        if not rd:
+            return
+        self._activate_workflow_source_row(rd)
+
+    def _on_needs_review_mark_inherited_confirmed(self) -> None:
+        rd = self._needs_review_selected_row_data()
+        if str(rd.get("review_type", "") or "").strip() != "inherited_mapping":
+            return
+        sp = self.normalize_memory_path(str(rd.get("source_path", "") or ""))
+        if not sp:
+            return
+        self._needs_review_dismissed_inherited_paths.add(sp)
+        self._apply_needs_review_table_view()
+        self._save_draft_shell()
+
+    def _on_needs_review_open_duplicate_file_review(self) -> None:
+        self._show_duplicate_destination_file_review_dialog()
 
     def refresh_requests_page(self):
         if not hasattr(self, "requests_table"):
@@ -6028,6 +6211,7 @@ class MainWindow(QMainWindow):
         self._restore_destination_overlay_pending = False
         self._restored_allocation_count = 0
         self._restored_proposed_count = 0
+        self._needs_review_dismissed_inherited_paths = set()
         self._reset_unresolved_proposed_queue()
         self._reset_unresolved_allocation_queue()
         if refresh_ui:
@@ -6131,6 +6315,9 @@ class MainWindow(QMainWindow):
             operator_display = self.current_session_context.get("operator_display_name", "") or "Planning Session"
             state.DraftName = f"{operator_display} Draft"
         state.PlanLeafExclusions = sorted(getattr(self, "_plan_leaf_exclusions", set()) or [])
+        state.NeedsReviewDismissedInheritedSourcePaths = sorted(
+            getattr(self, "_needs_review_dismissed_inherited_paths", set()) or set()
+        )
         return state
 
     def _create_new_draft_session_id(self):
@@ -6786,6 +6973,10 @@ class MainWindow(QMainWindow):
                 cp = self._canonical_source_projection_path(p)
                 if cp:
                     self._plan_leaf_exclusions.add(cp)
+        self._needs_review_dismissed_inherited_paths = set()
+        for p in getattr(session_state, "NeedsReviewDismissedInheritedSourcePaths", None) or []:
+            if isinstance(p, str) and p.strip():
+                self._needs_review_dismissed_inherited_paths.add(self.normalize_memory_path(p))
         self._clear_source_projection_descendants_cache()
         self.proposed_folders = list(proposed)
         self._reset_unresolved_proposed_queue()
@@ -8461,6 +8652,38 @@ class MainWindow(QMainWindow):
         proposed_table.setMinimumHeight(72)
         self.proposed_folders_table = proposed_table
 
+        dup_banner_row = QWidget()
+        dup_banner_layout = QHBoxLayout(dup_banner_row)
+        dup_banner_layout.setContentsMargins(0, 0, 0, 0)
+        dup_banner_layout.setSpacing(8)
+        dup_banner_label = QLabel("⚠ Duplicate destination files detected")
+        dup_banner_label.setObjectName("MutedText")
+        dup_banner_label.setStyleSheet("color: #FFC14D;")
+        dup_banner_btn = QPushButton("Review…")
+        dup_banner_btn.setToolTip("Open the duplicate destination file review dialog.")
+        dup_banner_btn.clicked.connect(self._show_duplicate_destination_file_review_dialog)
+        dup_banner_layout.addWidget(dup_banner_label, 0, Qt.AlignmentFlag.AlignLeft)
+        dup_banner_layout.addStretch(1)
+        dup_banner_layout.addWidget(dup_banner_btn, 0, Qt.AlignmentFlag.AlignRight)
+        dup_banner_row.hide()
+        self.planned_moves_duplicate_banner = dup_banner_row
+
+        proj_review_row = QWidget()
+        proj_review_layout = QHBoxLayout(proj_review_row)
+        proj_review_layout.setContentsMargins(0, 0, 0, 0)
+        proj_review_layout.setSpacing(8)
+        proj_review_label = QLabel("⚠ Some planned mappings need review")
+        proj_review_label.setObjectName("MutedText")
+        proj_review_label.setStyleSheet("color: #FFC14D;")
+        proj_review_btn = QPushButton("Open Needs Review")
+        proj_review_btn.setToolTip("Switch to the Needs Review tab for projection and overlap details.")
+        proj_review_btn.clicked.connect(self._on_planned_moves_projection_review_banner_open)
+        proj_review_layout.addWidget(proj_review_label, 0, Qt.AlignmentFlag.AlignLeft)
+        proj_review_layout.addStretch(1)
+        proj_review_layout.addWidget(proj_review_btn, 0, Qt.AlignmentFlag.AlignRight)
+        proj_review_row.hide()
+        self.planned_moves_projection_review_banner = proj_review_row
+
         layout.addWidget(loading_banner)
         layout.addWidget(plan_review_summary)
         layout.addWidget(export_hint)
@@ -8468,9 +8691,47 @@ class MainWindow(QMainWindow):
         layout.addWidget(table, 1)
         layout.addWidget(proposed_heading)
         layout.addWidget(proposed_table, 0)
+        layout.addWidget(dup_banner_row)
+        layout.addWidget(proj_review_row)
         layout.addWidget(status)
 
         return box, table, status
+
+    def _update_planned_moves_duplicate_destination_banner(self) -> None:
+        row = getattr(self, "planned_moves_duplicate_banner", None)
+        if row is None:
+            return
+        groups = grouped_duplicate_destination_moves(
+            list(self.planned_moves or []),
+            destination_file_key=self._destination_file_key_for_execution_validation,
+        )
+        row.setVisible(bool(groups))
+
+    def _update_planned_moves_projection_review_banner(self) -> None:
+        row = getattr(self, "planned_moves_projection_review_banner", None)
+        if row is None:
+            return
+        projection_types = {
+            "duplicate_destination_projection",
+            "proposed_branch_dependency",
+            "inherited_mapping",
+        }
+        review_rows = getattr(self, "_workflow_needs_review_rows", None) or []
+        show = any(
+            isinstance(r, dict) and str(r.get("review_type", "") or "").strip() in projection_types
+            for r in review_rows
+        )
+        row.setVisible(bool(show))
+
+    def _on_planned_moves_projection_review_banner_open(self) -> None:
+        tabs = getattr(self, "workspace_tabs", None)
+        box = getattr(self, "needs_review_box", None)
+        table = getattr(self, "needs_review_table", None)
+        if tabs is None or box is None:
+            return
+        tabs.setCurrentWidget(box)
+        if table is not None:
+            table.setFocus()
 
     def _planning_selector_still_on_login_placeholder(self) -> bool:
         """True only for known pre-populate combo placeholders (not real sites/libraries named 'Loading…')."""
@@ -9629,7 +9890,7 @@ class MainWindow(QMainWindow):
                     review_seen,
                     item_name=source_name,
                     source_path=source_path,
-                    reason="Inherited mapping from a parent folder should be confirmed.",
+                    reason="This item currently inherits its destination from a parent mapping.",
                     action=relationship.get("suffix", ""),
                     review_type="inherited_mapping",
                 )
@@ -9717,11 +9978,7 @@ class MainWindow(QMainWindow):
             ],
             ["source_name", "source_path", "destination_path", "confidence_reason"],
         )
-        self._set_workflow_table_rows(
-            getattr(self, "needs_review_table", None),
-            workflow_state["needs_review_rows"],
-            ["item_name", "source_path", "reason", "action"],
-        )
+        self._apply_needs_review_table_view()
 
         if hasattr(self, "not_planned_status"):
             self.not_planned_status.setText(
@@ -9735,18 +9992,16 @@ class MainWindow(QMainWindow):
                 if not workflow_state["suggestion_rows"]
                 else f"{len(workflow_state['suggestion_rows'])} suggested mapping(s) are ready for review."
             )
-        if hasattr(self, "needs_review_status"):
-            self.needs_review_status.setText(
-                "No review issues detected from the current planning state."
-                if not workflow_state["needs_review_rows"]
-                else f"{len(workflow_state['needs_review_rows'])} planning item(s) need review."
-            )
         self._refresh_tree_visual_states("source")
         self._refresh_tree_visual_states("destination")
+        self._update_planned_moves_projection_review_banner()
 
     def handle_workflow_source_row_activated(self, item, workflow_name):
         row_data = item.data(Qt.UserRole) or {}
-        source_path = row_data.get("source_path", "")
+        self._activate_workflow_source_row(row_data if isinstance(row_data, dict) else {})
+
+    def _activate_workflow_source_row(self, row_data: dict) -> None:
+        source_path = row_data.get("source_path", "") if isinstance(row_data, dict) else ""
         source_item = self._find_visible_source_item_by_path(source_path)
         if source_item is None:
             QMessageBox.information(
@@ -35833,6 +36088,7 @@ class MainWindow(QMainWindow):
             self.planned_moves_table.clearSelection()
             self._refresh_proposed_folders_table()
             self._update_plan_review_summary()
+            self._update_planned_moves_duplicate_destination_banner()
             return
 
         self.planned_moves_table.clearSpans()
@@ -35882,6 +36138,7 @@ class MainWindow(QMainWindow):
             self.source_tree_widget.viewport().update()
         self._refresh_planning_loading_banner()
         self._schedule_progress_summary_refresh()
+        self._update_planned_moves_duplicate_destination_banner()
 
     def _queue_expand_all_item(self, panel_key, item):
         if item is None:

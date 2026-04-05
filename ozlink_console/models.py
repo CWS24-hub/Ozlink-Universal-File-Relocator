@@ -105,6 +105,8 @@ class SessionState:
     DestinationTreeSnapshot: list[dict[str, Any]] = field(default_factory=list)
     # Canonical source paths (files) excluded from inherited folder allocations; persisted with draft session.
     PlanLeafExclusions: list[str] = field(default_factory=list)
+    # Source paths for inherited_mapping rows the user dismissed in Needs Review (UI only; does not change the plan).
+    NeedsReviewDismissedInheritedSourcePaths: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SessionState":
@@ -120,6 +122,8 @@ class SessionState:
                 kwargs[field_name] = None
         if not isinstance(kwargs.get("PlanLeafExclusions"), list):
             kwargs["PlanLeafExclusions"] = []
+        if not isinstance(kwargs.get("NeedsReviewDismissedInheritedSourcePaths"), list):
+            kwargs["NeedsReviewDismissedInheritedSourcePaths"] = []
         return cls(**kwargs)
 
     def to_dict(self) -> dict[str, Any]:
