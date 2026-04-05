@@ -18997,9 +18997,15 @@ class MainWindow(QMainWindow):
             n = 2 if n is None else n + 1
         return None
 
-    def _build_duplicate_group_unique_name_preview_rows(self, group_indices: list[int]) -> list[dict] | None:
-        """Preview-only: proposed unique target_name values; does not mutate planned_moves."""
-        moves = list(self.planned_moves or [])
+    def _build_duplicate_group_unique_name_preview_rows(
+        self, group_indices: list[int], *, moves_for_context: list[dict] | None = None
+    ) -> list[dict] | None:
+        """Preview-only: proposed unique target_name values; does not mutate planned_moves.
+
+        When ``moves_for_context`` is set, suggestions use that list for occupancy (e.g. chained bulk preview)
+        without changing ``self.planned_moves``.
+        """
+        moves = list(moves_for_context if moves_for_context is not None else (self.planned_moves or []))
         ntot = len(moves)
         idxs = sorted({int(i) for i in group_indices if int(i) >= 0})
         if len(idxs) < 2:
@@ -19085,6 +19091,53 @@ class MainWindow(QMainWindow):
                 )
             nk_to_index[nk] = j
         return None
+
+    def _validate_duplicate_bulk_apply_preview_rows(self, rows: list[dict]) -> str | None:
+        """All-or-none for bulk unique-name apply; duplicate index entries are rejected."""
+        if not rows:
+            return "No suggested name rows to apply."
+        seen: set[int] = set()
+        for r in rows:
+            try:
+                idx = int(r["index"])
+            except (KeyError, TypeError, ValueError):
+                return "Could not read planned move indices for this suggestion set."
+            if idx in seen:
+                return "Invalid bulk suggestion set (duplicate planned move index)."
+            seen.add(idx)
+        return self._validate_duplicate_group_apply_preview_rows(rows)
+
+    def _build_all_duplicate_groups_unique_name_preview_rows(self) -> list[dict] | None:
+        """Preview rows for every duplicate destination file group; chains naming across groups via a scratch plan."""
+        moves_live = list(self.planned_moves or [])
+        grouped = grouped_duplicate_destination_moves(
+            moves_live,
+            destination_file_key=self._destination_file_key_for_execution_validation,
+        )
+        if not grouped:
+            return None
+        working: list[dict] = []
+        for m in moves_live:
+            working.append(dict(m) if isinstance(m, dict) else {})
+        out: list[dict] = []
+        for _nk, members in sorted(
+            grouped.items(),
+            key=lambda kv: (str(kv[1][0].get("destination", "") or "").lower(), kv[0]),
+        ):
+            indices = sorted({int(r["index"]) for r in members if int(r.get("index", -1)) >= 0})
+            if len(indices) < 2:
+                continue
+            sub = self._build_duplicate_group_unique_name_preview_rows(indices, moves_for_context=working)
+            if sub is None:
+                return None
+            dest_lbl = str(members[0].get("destination", "") or "").strip() or "(unknown)"
+            for row in sub:
+                out.append({**row, "group_destination": dest_lbl})
+            for row in sub:
+                ix = int(row["index"])
+                if 0 <= ix < len(working):
+                    working[ix]["target_name"] = str(row.get("suggested_leaf", "") or "").strip()
+        return out or None
 
     def _show_duplicate_destination_file_review_dialog(self) -> None:
         grouped = grouped_duplicate_destination_moves(
@@ -19365,6 +19418,427 @@ class MainWindow(QMainWindow):
                 )
                 dlg.accept()
 
+        def on_retarget_selected() -> None:
+            it = tree.currentItem()
+            if it is None:
+                QMessageBox.information(
+                    dlg,
+                    "Retarget mapping",
+                    "Select a source row under a destination group.",
+                )
+                return
+            if it.parent() is None:
+                QMessageBox.information(
+                    dlg,
+                    "Retarget mapping",
+                    "Select a specific source row (child under a destination), not the destination group header.",
+                )
+                return
+            raw_idx = it.data(0, Qt.UserRole)
+            if raw_idx is None:
+                QMessageBox.information(
+                    dlg,
+                    "Retarget mapping",
+                    "Select a specific source row under a destination group.",
+                )
+                return
+            try:
+                idx = int(raw_idx)
+            except (TypeError, ValueError):
+                QMessageBox.warning(dlg, "Retarget mapping", "Could not read the planned move index for this row.")
+                return
+            n = len(self.planned_moves or [])
+            if idx < 0 or idx >= n:
+                QMessageBox.warning(
+                    dlg,
+                    "Retarget mapping",
+                    "The plan changed; the tree will refresh.",
+                )
+                if not rebuild_tree():
+                    QMessageBox.information(
+                        dlg,
+                        "Duplicate destination files",
+                        "No duplicate destination files remain.",
+                    )
+                    dlg.accept()
+                return
+            move = self.planned_moves[idx]
+            src_obj = move.get("source") or {}
+            if bool(src_obj.get("is_folder", False)):
+                QMessageBox.information(
+                    dlg,
+                    "Retarget mapping",
+                    "Folder moves cannot be retargeted from this dialog.",
+                )
+                return
+            if self._is_move_submitted(move):
+                self._show_submitted_item_locked_message(
+                    "Retarget mapping",
+                    f"'{move.get('source_name', 'This item')}'",
+                    self._submitted_batch_id_for_move(move),
+                )
+                return
+
+            QMessageBox.information(
+                dlg,
+                "Retarget mapping",
+                "You will enter a new destination folder path for this planned file.\n\n"
+                "This changes the planned destination location only.\n"
+                "It does not move source files now.\n"
+                "It does not change existing SharePoint content now.\n"
+                "This is a planning change only.\n\n"
+                "Use the same path format as the Planning Workspace destination tree. "
+                "The folder must already be visible there (expand parent folders if needed).",
+            )
+            default_parent = self.normalize_memory_path(str(move.get("destination_path", "") or "").strip())
+            new_parent, accepted = QInputDialog.getText(
+                dlg,
+                "Retarget mapping",
+                "New destination folder path:",
+                text=default_parent or "",
+            )
+            new_parent = str(new_parent or "").strip()
+            if not accepted:
+                return
+            if not new_parent:
+                QMessageBox.warning(dlg, "Retarget mapping", "The folder path cannot be empty.")
+                return
+            if self._destination_paths_match_exact(new_parent, move.get("destination_path", "")):
+                return
+
+            target_ref = self._find_visible_destination_item_by_path(new_parent)
+            if target_ref is None:
+                QMessageBox.warning(
+                    dlg,
+                    "Retarget mapping",
+                    "That folder path is not visible in the destination tree.\n\n"
+                    "Expand folders until the folder appears, then try again.",
+                )
+                return
+            target_nd = self.get_tree_item_node_data(target_ref) or {}
+            if not self.node_is_manual_drag_destination_folder(target_nd):
+                QMessageBox.warning(
+                    dlg,
+                    "Retarget mapping",
+                    "The resolved row is not a valid destination folder for planning.",
+                )
+                return
+            target_path = self._destination_row_semantic_path(target_nd)
+            if not target_path:
+                QMessageBox.warning(
+                    dlg,
+                    "Retarget mapping",
+                    "Could not resolve the selected destination folder path.",
+                )
+                return
+
+            dest_snap = self._destination_target_snapshot(target_nd, target_path)
+            trial = dict(move)
+            trial["destination_path"] = target_path
+            trial["destination_id"] = dest_snap.get("id", "")
+            trial["destination_name"] = dest_snap.get("name", "")
+            trial["destination"] = dict(dest_snap)
+            trial["target_name"] = self._move_target_name(move)
+            new_dk = self._destination_file_key_for_execution_validation(trial)
+            if not new_dk:
+                QMessageBox.warning(
+                    dlg,
+                    "Retarget mapping",
+                    "Could not resolve a destination file path after retarget; check the folder path and file name.",
+                )
+                return
+            new_nk = norm_execution_key(new_dk)
+            for j, other in enumerate(self.planned_moves or []):
+                if j == idx:
+                    continue
+                ok = self._destination_file_key_for_execution_validation(other)
+                if not ok:
+                    continue
+                if norm_execution_key(ok) == new_nk:
+                    QMessageBox.warning(
+                        dlg,
+                        "Retarget mapping",
+                        "That destination folder would still collide with another planned file move.\n\n"
+                        f"Conflicting destination file:\n{new_dk}\n\n"
+                        "Choose a different folder or rename the file first.",
+                    )
+                    return
+
+            if (
+                QMessageBox.question(
+                    dlg,
+                    "Retarget mapping",
+                    "Apply this retarget?\n\n"
+                    "• The planned destination folder for this mapping will change.\n"
+                    "• This is a planning change only.\n"
+                    "• It does not move source files now.\n"
+                    "• It does not change existing SharePoint content now.\n",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                != QMessageBox.Yes
+            ):
+                return
+
+            if idx < 0 or idx >= len(self.planned_moves or []):
+                QMessageBox.warning(dlg, "Retarget mapping", "The plan changed; the tree will refresh.")
+                if not rebuild_tree():
+                    QMessageBox.information(
+                        dlg,
+                        "Duplicate destination files",
+                        "No duplicate destination files remain.",
+                    )
+                    dlg.accept()
+                return
+            move_after = self.planned_moves[idx]
+            if self._is_move_submitted(move_after):
+                self._show_submitted_item_locked_message(
+                    "Retarget mapping",
+                    f"'{move_after.get('source_name', 'This item')}'",
+                    self._submitted_batch_id_for_move(move_after),
+                )
+                return
+            if bool(((move_after.get("source") or {}).get("is_folder"))):
+                QMessageBox.information(
+                    dlg,
+                    "Retarget mapping",
+                    "Folder moves cannot be retargeted from this dialog.",
+                )
+                return
+
+            trial2 = dict(move_after)
+            trial2["destination_path"] = target_path
+            trial2["destination_id"] = dest_snap.get("id", "")
+            trial2["destination_name"] = dest_snap.get("name", "")
+            trial2["destination"] = dict(dest_snap)
+            trial2["target_name"] = self._move_target_name(move_after)
+            new_dk2 = self._destination_file_key_for_execution_validation(trial2)
+            if not new_dk2:
+                QMessageBox.warning(
+                    dlg,
+                    "Retarget mapping",
+                    "Could not resolve destination after retarget (plan may have changed).",
+                )
+                return
+            new_nk2 = norm_execution_key(new_dk2)
+            for j, other in enumerate(self.planned_moves or []):
+                if j == idx:
+                    continue
+                ok = self._destination_file_key_for_execution_validation(other)
+                if not ok:
+                    continue
+                if norm_execution_key(ok) == new_nk2:
+                    QMessageBox.warning(
+                        dlg,
+                        "Retarget mapping",
+                        "That destination would still collide with another planned file move. The plan was not changed.",
+                    )
+                    return
+
+            leaf_sn = str(self._move_target_name(move_after) or "").strip()
+            alloc_proj_sn = self._allocation_projection_path(move_after)
+            alloc_canon_sn = self._canonical_destination_projection_path(alloc_proj_sn) or self.normalize_memory_path(
+                str(alloc_proj_sn or "").strip()
+            )
+            if not leaf_sn or not alloc_canon_sn:
+                QMessageBox.warning(
+                    dlg,
+                    "Retarget mapping",
+                    "Could not resolve the current planned destination file path for this mapping.",
+                )
+                return
+            dest_meta_sn = (
+                move_after.get("destination") if isinstance(move_after.get("destination"), dict) else {}
+            )
+            source_node: dict = {
+                "name": leaf_sn,
+                "real_name": leaf_sn,
+                "display_path": alloc_canon_sn,
+                "item_path": alloc_canon_sn,
+                "destination_path": alloc_canon_sn,
+                "tree_role": "destination",
+                "is_folder": False,
+                "node_origin": str(dest_meta_sn.get("node_origin", "") or "Real"),
+            }
+            eid_sn = str(dest_meta_sn.get("id", "") or "").strip()
+            if eid_sn:
+                source_node["id"] = eid_sn
+            for _k in ("drive_id", "library_id", "site_id", "site_name", "library_name"):
+                if dest_meta_sn.get(_k):
+                    source_node[_k] = dest_meta_sn[_k]
+
+            if not self._move_planned_destination_node(
+                source_node,
+                target_nd,
+                planned_move_index=idx,
+            ):
+                return
+            if not rebuild_tree():
+                QMessageBox.information(
+                    dlg,
+                    "Duplicate destination files",
+                    "No duplicate destination files remain.",
+                )
+                dlg.accept()
+
+        def on_review_all_duplicate_groups_suggested_names() -> None:
+            rows = self._build_all_duplicate_groups_unique_name_preview_rows()
+            if rows is None:
+                QMessageBox.warning(
+                    dlg,
+                    "Review all groups",
+                    "Could not build suggestions for all duplicate groups (invalid rows, folder moves, or could not find unique names).",
+                )
+                return
+
+            preview = QDialog(dlg)
+            preview.setWindowTitle("Suggested names — all duplicate groups (preview)")
+            preview.resize(1100, 520)
+            pv = QVBoxLayout(preview)
+            info = QLabel(
+                "Preview only until you click Apply all suggested names.\n"
+                "Planned destination file names only.\n"
+                "Does not rename source files.\n"
+                "Does not rename existing SharePoint content.\n"
+                "This is a planning change only."
+            )
+            info.setWordWrap(True)
+            pv.addWidget(info)
+            tbl = QTableWidget(len(rows), 5)
+            tbl.setHorizontalHeaderLabels(
+                [
+                    "Duplicate destination (group)",
+                    "Planned move index",
+                    "Source path",
+                    "Current planned file name",
+                    "Suggested file name",
+                ]
+            )
+            tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
+            tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
+            for r, row in enumerate(rows):
+                tbl.setItem(r, 0, QTableWidgetItem(str(row.get("group_destination", "") or "")))
+                tbl.setItem(r, 1, QTableWidgetItem(str(row.get("index", ""))))
+                tbl.setItem(r, 2, QTableWidgetItem(str(row.get("source_path", "") or "")))
+                tbl.setItem(r, 3, QTableWidgetItem(str(row.get("current_leaf", "") or "")))
+                tbl.setItem(r, 4, QTableWidgetItem(str(row.get("suggested_leaf", "") or "")))
+            th = tbl.horizontalHeader()
+            th.setSectionResizeMode(0, QHeaderView.Stretch)
+            th.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+            th.setSectionResizeMode(2, QHeaderView.Stretch)
+            th.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+            th.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+            pv.addWidget(tbl)
+
+            def _bulk_apply_failed(msg: str, *, stale: bool) -> None:
+                QMessageBox.warning(preview, "Apply all suggested names", msg)
+                if stale:
+                    preview.reject()
+                    if not rebuild_tree():
+                        QMessageBox.information(
+                            dlg,
+                            "Duplicate destination files",
+                            "No duplicate destination files remain.",
+                        )
+                        dlg.accept()
+
+            def on_apply_all_bulk_suggested_names() -> None:
+                fresh = self._build_all_duplicate_groups_unique_name_preview_rows()
+                if fresh is None:
+                    QMessageBox.warning(
+                        preview,
+                        "Apply all suggested names",
+                        "Could not rebuild suggestions for all groups. The plan may have changed.",
+                    )
+                    return
+                v_err = self._validate_duplicate_bulk_apply_preview_rows(fresh)
+                if v_err == "__stale_plan__":
+                    _bulk_apply_failed("The plan changed; the duplicate list will refresh.", stale=True)
+                    return
+                if v_err:
+                    _bulk_apply_failed(v_err, stale=False)
+                    return
+                for r in fresh:
+                    move = self.planned_moves[int(r["index"])]
+                    if self._is_move_submitted(move):
+                        self._show_submitted_item_locked_message(
+                            "Apply all suggested names",
+                            f"'{move.get('source_name', 'This item')}'",
+                            self._submitted_batch_id_for_move(move),
+                        )
+                        return
+
+                n_apply = len(fresh)
+                if (
+                    QMessageBox.question(
+                        preview,
+                        "Apply all suggested names",
+                        f"Apply all {n_apply} suggested unique names across every duplicate group?\n\n"
+                        "• Planned destination file names in your plan will change.\n"
+                        "• This is a planning change only.\n"
+                        "• It does not rename source files.\n"
+                        "• It does not rename existing SharePoint content.\n",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.No,
+                    )
+                    != QMessageBox.Yes
+                ):
+                    return
+
+                fresh2 = self._build_all_duplicate_groups_unique_name_preview_rows()
+                if fresh2 is None:
+                    _bulk_apply_failed(
+                        "Could not rebuild suggestions before apply. The plan may have changed.",
+                        stale=False,
+                    )
+                    return
+                v_err2 = self._validate_duplicate_bulk_apply_preview_rows(fresh2)
+                if v_err2 == "__stale_plan__":
+                    _bulk_apply_failed("The plan changed before apply; the duplicate list will refresh.", stale=True)
+                    return
+                if v_err2:
+                    _bulk_apply_failed(v_err2, stale=False)
+                    return
+                for r in fresh2:
+                    move = self.planned_moves[int(r["index"])]
+                    if self._is_move_submitted(move):
+                        self._show_submitted_item_locked_message(
+                            "Apply all suggested names",
+                            f"'{move.get('source_name', 'This item')}'",
+                            self._submitted_batch_id_for_move(move),
+                        )
+                        return
+
+                for r in fresh2:
+                    idx = int(r["index"])
+                    self.planned_moves[idx]["target_name"] = str(r.get("suggested_leaf", "") or "").strip()
+                self.planned_moves_status.setText("Applied suggested planned destination file names (all duplicate groups).")
+                self.refresh_planned_moves_table()
+                self._persist_planning_change("duplicate_bulk_unique_names_applied")
+                preview.accept()
+                if not rebuild_tree():
+                    QMessageBox.information(
+                        dlg,
+                        "Duplicate destination files",
+                        "No duplicate destination files remain.",
+                    )
+                    dlg.accept()
+
+            apply_all_row = QHBoxLayout()
+            apply_all_pb = QPushButton("Apply all suggested names")
+            apply_all_pb.setToolTip(
+                "Apply every previewed suggestion in one planning-only update. "
+                "Does not rename source files or SharePoint content."
+            )
+            apply_all_pb.clicked.connect(on_apply_all_bulk_suggested_names)
+            close_pb = QPushButton("Close")
+            close_pb.clicked.connect(preview.reject)
+            apply_all_row.addWidget(apply_all_pb)
+            apply_all_row.addStretch()
+            apply_all_row.addWidget(close_pb)
+            pv.addLayout(apply_all_row)
+            preview.exec()
+
         def on_suggest_unique_names() -> None:
             indices = selected_duplicate_group_member_indices(message_title="Suggest unique names")
             if indices is None:
@@ -19512,6 +19986,12 @@ class MainWindow(QMainWindow):
             "Change the destination file name in the plan only. Does not rename the source file."
         )
         rename_btn.clicked.connect(on_rename_selected)
+        retarget_btn = QPushButton("Retarget selected mapping…")
+        retarget_btn.setToolTip(
+            "Change the planned destination folder for one file mapping. Planning change only; "
+            "does not move source files or SharePoint content."
+        )
+        retarget_btn.clicked.connect(on_retarget_selected)
         suggest_btn = QPushButton("Suggest unique names…")
         suggest_btn.setToolTip(
             "Preview suggested unique destination file names for one duplicate group. Does not change the plan."
@@ -19523,13 +20003,24 @@ class MainWindow(QMainWindow):
             "Planning change only; does not rename source files or SharePoint content."
         )
         apply_suggest_btn.clicked.connect(on_apply_suggested_unique_names)
+        review_all_groups_btn = QPushButton("Review suggested unique names for all groups…")
+        review_all_groups_btn.setToolTip(
+            "Preview and optionally apply suggested unique file names for every duplicate destination group. "
+            "Planning change only."
+        )
+        review_all_groups_btn.clicked.connect(on_review_all_duplicate_groups_suggested_names)
         btn_row = QHBoxLayout()
         btn_row.addWidget(remove_btn)
         btn_row.addWidget(rename_btn)
+        btn_row.addWidget(retarget_btn)
         btn_row.addWidget(suggest_btn)
         btn_row.addWidget(apply_suggest_btn)
         btn_row.addStretch()
         v.addLayout(btn_row)
+        btn_row2 = QHBoxLayout()
+        btn_row2.addWidget(review_all_groups_btn)
+        btn_row2.addStretch()
+        v.addLayout(btn_row2)
         bb = QDialogButtonBox(QDialogButtonBox.Close)
         bb.rejected.connect(dlg.reject)
         v.addWidget(bb)
@@ -29749,9 +30240,27 @@ class MainWindow(QMainWindow):
         }
 
     def _move_planned_destination_node(
-        self, source_node, target_node, *, from_paste_here=False, from_manual_planning_drag=False
+        self,
+        source_node,
+        target_node,
+        *,
+        from_paste_here=False,
+        from_manual_planning_drag=False,
+        planned_move_index: int | None = None,
     ):
-        move_index, move, inherited_move = self._resolve_planned_move_for_destination_node(source_node)
+        if planned_move_index is not None:
+            try:
+                pi = int(planned_move_index)
+            except (TypeError, ValueError):
+                self.destination_tree_status.setText("Could not resolve the planned move for this retarget.")
+                return False
+            moves = list(self.planned_moves or [])
+            if pi < 0 or pi >= len(moves):
+                self.destination_tree_status.setText("The planned move index is no longer valid.")
+                return False
+            move_index, move, inherited_move = pi, moves[pi], None
+        else:
+            move_index, move, inherited_move = self._resolve_planned_move_for_destination_node(source_node)
         if move is None and inherited_move is None:
             self.destination_tree_status.setText("No planned allocation exists for the selected destination item.")
             return False
