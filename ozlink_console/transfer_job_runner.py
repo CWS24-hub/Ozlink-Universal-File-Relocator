@@ -13,6 +13,7 @@ from typing import Any, Callable
 import requests
 
 from ozlink_console.audit_log import append_audit_event
+from ozlink_console.dev_mode import is_dev_mode
 from ozlink_console.integrity import verify_copied_file, verify_copied_tree
 from ozlink_console.graph_folder_execution_safety import (
     GRAPH_DIRTY_FOLDER_COPY_BLOCKED,
@@ -21,6 +22,65 @@ from ozlink_console.graph_folder_execution_safety import (
 from ozlink_console.logger import flush_logger, log_error, log_info
 
 SUPPORTED_MANIFEST_VERSIONS = frozenset({1, 2})
+
+
+def _nonempty_snapshot_scoped_request_ids(raw: Any) -> bool:
+    return any(str(x).strip() for x in (raw or []) if x is not None)
+
+
+def _manifest_has_runtime_synthetic_transfer_steps(manifest: dict[str, Any]) -> bool:
+    """True when transfer_steps include rows appended after static manifest build (e.g. recursive Graph expansion)."""
+    for st in manifest.get("transfer_steps") or []:
+        if not isinstance(st, dict):
+            continue
+        rid = str(st.get("request_id", "") or "").strip()
+        if rid.startswith("recsub-"):
+            return True
+    return False
+
+
+def _effective_graph_expanded_transfer_steps(
+    manifest: dict[str, Any],
+    opts: dict[str, Any],
+    graph_expanded_raw: list[Any],
+    *,
+    graph_client: Any | None,
+) -> list[Any]:
+    """Use embedded graph expansion only for a full static plan (same context expansion was built for)."""
+    if not graph_expanded_raw or graph_client is None:
+        return []
+
+    subset_active = _nonempty_snapshot_scoped_request_ids(opts.get("snapshot_scoped_request_ids"))
+    recursive_active = bool(opts.get("snapshot_recursive_subtree"))
+    browsed_active = bool(opts.get("snapshot_browsed_recursive"))
+    runtime_synthetic = _manifest_has_runtime_synthetic_transfer_steps(manifest)
+
+    if (
+        not subset_active
+        and not recursive_active
+        and not browsed_active
+        and not runtime_synthetic
+    ):
+        return list(graph_expanded_raw)
+
+    reasons: list[str] = []
+    if subset_active:
+        reasons.append("subset_scoped")
+    if recursive_active:
+        reasons.append("recursive_subtree")
+    if browsed_active:
+        reasons.append("browsed_recursive")
+    if runtime_synthetic:
+        reasons.append("runtime_synthetic_transfer_steps")
+    reason = ",".join(reasons)
+    if is_dev_mode():
+        log_info(
+            "graph_expansion_disabled_due_to_context",
+            subset_active=subset_active,
+            recursive_active=bool(recursive_active or browsed_active),
+            reason=reason,
+        )
+    return []
 
 
 def is_absolute_local_path(path: str) -> bool:
@@ -369,7 +429,10 @@ def run_manifest_local_filesystem(
         if str(x).strip()
     )
     plan_leaf_exclusions = list(opts.get("plan_leaf_exclusions") or [])
-    graph_expanded_steps = list(opts.get("graph_expanded_transfer_steps") or [])
+    graph_expanded_raw = list(opts.get("graph_expanded_transfer_steps") or [])
+    graph_expanded_steps = _effective_graph_expanded_transfer_steps(
+        manifest, opts, graph_expanded_raw, graph_client=graph_client
+    )
     graph_unsafe_embedded_key_present = "graph_unsafe_folder_step_indices" in opts
     graph_unsafe_folder_indices: set[int] = set()
     if graph_unsafe_embedded_key_present:

@@ -1233,6 +1233,400 @@ class TransferJobRunnerTests(unittest.TestCase):
             self.assertTrue((dst_alt / "direct.txt").exists())
             self.assertEqual((dst_alt / "direct.txt").read_text(encoding="utf-8"), "direct")
 
+    def test_graph_expansion_ignored_when_subset_scoped(self):
+        """graph_expanded_transfer_steps must not run under snapshot subset (stale vs scoped manifest)."""
+        from unittest.mock import MagicMock
+
+        mock_g = MagicMock()
+        mock_g.start_drive_item_copy.return_value = "https://monitor"
+        mock_g.wait_graph_async_operation.return_value = None
+
+        manifest = {
+            "manifest_version": 2,
+            "proposed_folder_steps": [],
+            "execution_options": {
+                "snapshot_scoped_request_ids": ["REQ-1"],
+                "graph_unsafe_folder_step_indices": [0],
+                "graph_expanded_transfer_steps": [
+                    {
+                        "index": 0,
+                        "operation": "copy",
+                        "source_path": "Lib\\Folder\\a.txt",
+                        "destination_path": "Root\\Dest",
+                        "source_name": "a.txt",
+                        "destination_name": "a.txt",
+                        "is_source_folder": False,
+                        "request_id": "REQ",
+                        "status": "Draft",
+                        "allocation_method": "",
+                        "step_uid": "REQ::1",
+                        "planned_move_index": 1,
+                        "source_drive_id": "d1",
+                        "source_item_id": "i1",
+                        "destination_drive_id": "d2",
+                        "destination_item_id": "parent1",
+                    }
+                ],
+            },
+            "transfer_steps": [
+                {
+                    "index": 0,
+                    "operation": "copy",
+                    "source_path": "Lib\\Folder",
+                    "destination_path": "Root\\Folder",
+                    "source_name": "Folder",
+                    "destination_name": "Folder",
+                    "is_source_folder": True,
+                    "request_id": "",
+                    "status": "Draft",
+                    "allocation_method": "",
+                    "source_drive_id": "d1",
+                    "source_item_id": "fold1",
+                    "destination_drive_id": "d2",
+                    "destination_item_id": "parent1",
+                },
+            ],
+        }
+        r = run_manifest_local_filesystem(manifest, dry_run=False, graph_client=mock_g)
+        mock_g.start_drive_item_copy.assert_not_called()
+        folder_rec = next(x for x in r.records if x.phase == "transfer" and x.step_index == 0)
+        self.assertEqual(folder_rec.status, "skipped")
+        self.assertIn("Graph folder copy blocked", folder_rec.detail)
+
+    def test_full_static_plan_still_runs_graph_expanded_transfer_steps(self):
+        """Embedded expansion runs when execution context is full static (no subset/recursive/browse/recsub)."""
+        from unittest.mock import MagicMock
+
+        mock_g = MagicMock()
+        mock_g.start_drive_item_copy.return_value = "https://monitor"
+        mock_g.wait_graph_async_operation.return_value = None
+
+        manifest = {
+            "manifest_version": 2,
+            "proposed_folder_steps": [],
+            "execution_options": {
+                "graph_unsafe_folder_step_indices": [0],
+                "graph_expanded_transfer_steps": [
+                    {
+                        "index": 0,
+                        "operation": "copy",
+                        "source_path": "Lib\\Folder\\a.txt",
+                        "destination_path": "Root\\Dest",
+                        "source_name": "a.txt",
+                        "destination_name": "a.txt",
+                        "is_source_folder": False,
+                        "request_id": "REQ",
+                        "status": "Draft",
+                        "allocation_method": "",
+                        "step_uid": "REQ::1",
+                        "planned_move_index": 1,
+                        "source_drive_id": "d1",
+                        "source_item_id": "i1",
+                        "destination_drive_id": "d2",
+                        "destination_item_id": "parent1",
+                    }
+                ],
+            },
+            "transfer_steps": [
+                {
+                    "index": 0,
+                    "operation": "copy",
+                    "source_path": "Lib\\Folder",
+                    "destination_path": "Root\\Folder",
+                    "source_name": "Folder",
+                    "destination_name": "Folder",
+                    "is_source_folder": True,
+                    "request_id": "",
+                    "status": "Draft",
+                    "allocation_method": "",
+                    "source_drive_id": "d1",
+                    "source_item_id": "fold1",
+                    "destination_drive_id": "d2",
+                    "destination_item_id": "parent1",
+                },
+            ],
+        }
+        eo = manifest["execution_options"]
+        self.assertNotIn("snapshot_scoped_request_ids", eo)
+        self.assertNotIn("snapshot_recursive_subtree", eo)
+        self.assertNotIn("snapshot_browsed_recursive", eo)
+
+        run_manifest_local_filesystem(manifest, dry_run=False, graph_client=mock_g)
+        mock_g.start_drive_item_copy.assert_called_once()
+
+    def test_graph_expansion_ignored_when_snapshot_recursive_subtree(self):
+        """graph_expanded_transfer_steps must not run when snapshot_recursive_subtree is set."""
+        from unittest.mock import MagicMock
+
+        mock_g = MagicMock()
+        mock_g.start_drive_item_copy.return_value = "https://monitor"
+        mock_g.wait_graph_async_operation.return_value = None
+
+        manifest = {
+            "manifest_version": 2,
+            "proposed_folder_steps": [],
+            "execution_options": {
+                "snapshot_recursive_subtree": True,
+                "graph_unsafe_folder_step_indices": [0],
+                "graph_expanded_transfer_steps": [
+                    {
+                        "index": 0,
+                        "operation": "copy",
+                        "source_path": "Lib\\Folder\\a.txt",
+                        "destination_path": "Root\\Dest",
+                        "source_name": "a.txt",
+                        "destination_name": "a.txt",
+                        "is_source_folder": False,
+                        "request_id": "REQ",
+                        "status": "Draft",
+                        "allocation_method": "",
+                        "step_uid": "REQ::1",
+                        "planned_move_index": 1,
+                        "source_drive_id": "d1",
+                        "source_item_id": "i1",
+                        "destination_drive_id": "d2",
+                        "destination_item_id": "parent1",
+                    }
+                ],
+            },
+            "transfer_steps": [
+                {
+                    "index": 0,
+                    "operation": "copy",
+                    "source_path": "Lib\\Folder",
+                    "destination_path": "Root\\Folder",
+                    "source_name": "Folder",
+                    "destination_name": "Folder",
+                    "is_source_folder": True,
+                    "request_id": "",
+                    "status": "Draft",
+                    "allocation_method": "",
+                    "source_drive_id": "d1",
+                    "source_item_id": "fold1",
+                    "destination_drive_id": "d2",
+                    "destination_item_id": "parent1",
+                },
+            ],
+        }
+        r = run_manifest_local_filesystem(manifest, dry_run=False, graph_client=mock_g)
+        mock_g.start_drive_item_copy.assert_not_called()
+        folder_rec = next(x for x in r.records if x.phase == "transfer" and x.step_index == 0)
+        self.assertEqual(folder_rec.status, "skipped")
+        self.assertIn("Graph folder copy blocked", folder_rec.detail)
+
+    def test_graph_expansion_ignored_when_snapshot_browsed_recursive(self):
+        """graph_expanded_transfer_steps must not run when snapshot_browsed_recursive is set."""
+        from unittest.mock import MagicMock
+
+        mock_g = MagicMock()
+        mock_g.start_drive_item_copy.return_value = "https://monitor"
+        mock_g.wait_graph_async_operation.return_value = None
+
+        manifest = {
+            "manifest_version": 2,
+            "proposed_folder_steps": [],
+            "execution_options": {
+                "snapshot_browsed_recursive": True,
+                "graph_unsafe_folder_step_indices": [0],
+                "graph_expanded_transfer_steps": [
+                    {
+                        "index": 0,
+                        "operation": "copy",
+                        "source_path": "Lib\\Folder\\a.txt",
+                        "destination_path": "Root\\Dest",
+                        "source_name": "a.txt",
+                        "destination_name": "a.txt",
+                        "is_source_folder": False,
+                        "request_id": "REQ",
+                        "status": "Draft",
+                        "allocation_method": "",
+                        "step_uid": "REQ::1",
+                        "planned_move_index": 1,
+                        "source_drive_id": "d1",
+                        "source_item_id": "i1",
+                        "destination_drive_id": "d2",
+                        "destination_item_id": "parent1",
+                    }
+                ],
+            },
+            "transfer_steps": [
+                {
+                    "index": 0,
+                    "operation": "copy",
+                    "source_path": "Lib\\Folder",
+                    "destination_path": "Root\\Folder",
+                    "source_name": "Folder",
+                    "destination_name": "Folder",
+                    "is_source_folder": True,
+                    "request_id": "",
+                    "status": "Draft",
+                    "allocation_method": "",
+                    "source_drive_id": "d1",
+                    "source_item_id": "fold1",
+                    "destination_drive_id": "d2",
+                    "destination_item_id": "parent1",
+                },
+            ],
+        }
+        r = run_manifest_local_filesystem(manifest, dry_run=False, graph_client=mock_g)
+        mock_g.start_drive_item_copy.assert_not_called()
+        folder_rec = next(x for x in r.records if x.phase == "transfer" and x.step_index == 0)
+        self.assertEqual(folder_rec.status, "skipped")
+        self.assertIn("Graph folder copy blocked", folder_rec.detail)
+
+    def test_expansion_disabled_legacy_fallback_blocks_folder_without_unsafe_indices(self):
+        """When expansion is off, runner_should_block_graph_folder_copy_fallback still blocks dirty folders."""
+        from unittest.mock import MagicMock
+
+        mock_g = MagicMock()
+        mock_g.start_drive_item_copy.return_value = "https://monitor"
+        mock_g.wait_graph_async_operation.return_value = None
+
+        manifest = {
+            "manifest_version": 2,
+            "proposed_folder_steps": [],
+            "execution_options": {
+                "snapshot_recursive_subtree": True,
+                "graph_expanded_transfer_steps": [
+                    {
+                        "index": 0,
+                        "operation": "copy",
+                        "source_path": "Lib\\Folder\\a.txt",
+                        "destination_path": "Root\\Dest",
+                        "source_name": "a.txt",
+                        "destination_name": "a.txt",
+                        "is_source_folder": False,
+                        "request_id": "REQ",
+                        "status": "Draft",
+                        "allocation_method": "",
+                        "step_uid": "REQ::1",
+                        "planned_move_index": 1,
+                        "source_drive_id": "d1",
+                        "source_item_id": "i1",
+                        "destination_drive_id": "d2",
+                        "destination_item_id": "parent1",
+                    }
+                ],
+            },
+            "transfer_steps": [
+                {
+                    "index": 0,
+                    "operation": "copy",
+                    "source_path": "Lib\\Folder",
+                    "destination_path": "Root\\Folder",
+                    "source_name": "Folder",
+                    "destination_name": "Folder",
+                    "is_source_folder": True,
+                    "request_id": "",
+                    "status": "Draft",
+                    "allocation_method": "",
+                    "source_drive_id": "d1",
+                    "source_item_id": "fold1",
+                    "destination_drive_id": "d2",
+                    "destination_item_id": "parent1",
+                },
+                {
+                    "index": 1,
+                    "operation": "copy",
+                    "source_path": "Lib\\Folder\\a.txt",
+                    "destination_path": "Root\\Folder",
+                    "source_name": "a.txt",
+                    "destination_name": "a.txt",
+                    "is_source_folder": False,
+                    "request_id": "",
+                    "status": "Draft",
+                    "allocation_method": "",
+                    "source_drive_id": "d1",
+                    "source_item_id": "file1",
+                    "destination_drive_id": "d2",
+                    "destination_item_id": "parent2",
+                },
+            ],
+        }
+        self.assertNotIn("graph_unsafe_folder_step_indices", manifest["execution_options"])
+
+        r = run_manifest_local_filesystem(manifest, dry_run=False, graph_client=mock_g)
+        mock_g.start_drive_item_copy.assert_called_once()
+        folder_rec = next(x for x in r.records if x.phase == "transfer" and x.step_index == 0)
+        self.assertEqual(folder_rec.status, "skipped")
+        self.assertIn("Graph folder copy blocked", folder_rec.detail)
+        file_rec = next(x for x in r.records if x.phase == "transfer" and x.step_index == 1)
+        self.assertEqual(file_rec.status, "ok")
+
+    def test_graph_expansion_ignored_when_recsub_runtime_step_present(self):
+        """recsub-* request_id rows imply manifest was extended after static expansion was built."""
+        from unittest.mock import MagicMock
+
+        mock_g = MagicMock()
+        mock_g.start_drive_item_copy.return_value = "https://monitor"
+        mock_g.wait_graph_async_operation.return_value = None
+
+        manifest = {
+            "manifest_version": 2,
+            "proposed_folder_steps": [],
+            "execution_options": {
+                "graph_unsafe_folder_step_indices": [0],
+                "graph_expanded_transfer_steps": [
+                    {
+                        "index": 0,
+                        "operation": "copy",
+                        "source_path": "Lib\\Folder\\a.txt",
+                        "destination_path": "Root\\Dest",
+                        "source_name": "a.txt",
+                        "destination_name": "a.txt",
+                        "is_source_folder": False,
+                        "request_id": "REQ",
+                        "status": "Draft",
+                        "allocation_method": "",
+                        "step_uid": "REQ::1",
+                        "planned_move_index": 1,
+                        "source_drive_id": "d1",
+                        "source_item_id": "i1",
+                        "destination_drive_id": "d2",
+                        "destination_item_id": "parent1",
+                    }
+                ],
+            },
+            "transfer_steps": [
+                {
+                    "index": 0,
+                    "operation": "copy",
+                    "source_path": "Lib\\Folder",
+                    "destination_path": "Root\\Folder",
+                    "source_name": "Folder",
+                    "destination_name": "Folder",
+                    "is_source_folder": True,
+                    "request_id": "",
+                    "status": "Draft",
+                    "allocation_method": "",
+                    "source_drive_id": "d1",
+                    "source_item_id": "fold1",
+                    "destination_drive_id": "d2",
+                    "destination_item_id": "parent1",
+                },
+                {
+                    "index": 1,
+                    "operation": "copy",
+                    "source_path": "Lib\\Folder\\from-graph.txt",
+                    "destination_path": "Root\\Dest",
+                    "source_name": "from-graph.txt",
+                    "destination_name": "from-graph.txt",
+                    "is_source_folder": False,
+                    "request_id": "recsub-deadbeef",
+                    "status": "Draft",
+                    "allocation_method": "",
+                    "source_drive_id": "d1",
+                    "source_item_id": "g1",
+                    "destination_drive_id": "d2",
+                    "destination_item_id": "parent1",
+                },
+            ],
+        }
+        r = run_manifest_local_filesystem(manifest, dry_run=False, graph_client=mock_g)
+        self.assertEqual(mock_g.start_drive_item_copy.call_count, 1)
+        calls = [x for x in r.records if x.phase == "transfer" and x.status == "ok" and x.step_index == 1]
+        self.assertTrue(calls)
+
     def test_round_trip_load_json(self):
         import tempfile
 

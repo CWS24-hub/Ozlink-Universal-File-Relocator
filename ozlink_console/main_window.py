@@ -18,7 +18,8 @@ import math
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, List
+from dataclasses import dataclass
+from typing import Any, List, Literal
 import xml.etree.ElementTree as ET
 
 from PySide6.QtWidgets import (
@@ -2013,6 +2014,21 @@ class FramelessTitleBar(QWidget):
         super().mouseDoubleClickEvent(event)
 
 
+@dataclass(frozen=True)
+class PlanningDerivedState:
+    """Planning-only cached snapshot for workspace readiness (no manifest / Graph)."""
+
+    duplicate_group_count: int
+    duplicate_item_count: int
+    has_duplicate_conflicts: bool
+    needs_review_total: int
+    needs_review_actionable_total: int
+    has_needs_review_conflicts: bool
+    runtime_check_recommended: bool
+    readiness_state: Literal["ready", "needs_attention", "runtime_check_recommended"]
+    readiness_label: str
+
+
 class MainWindow(QMainWindow):
     @staticmethod
     def _source_tree_model_view_effective() -> bool:
@@ -2233,6 +2249,18 @@ class MainWindow(QMainWindow):
         self.discovered_sites = []
         self.planned_moves = []
         self._plan_leaf_exclusions = set()
+        self._cached_duplicate_destination_groups: dict[str, list] = {}
+        self._planning_derived_state = PlanningDerivedState(
+            duplicate_group_count=0,
+            duplicate_item_count=0,
+            has_duplicate_conflicts=False,
+            needs_review_total=0,
+            needs_review_actionable_total=0,
+            has_needs_review_conflicts=False,
+            runtime_check_recommended=False,
+            readiness_state="ready",
+            readiness_label="Ready for execution",
+        )
         self._source_projection_descendants_cache = OrderedDict()
         self._source_projection_descendants_cache_limit = 96
         self._destination_indicator_dirty_semantic_paths = set()
@@ -4126,7 +4154,7 @@ class MainWindow(QMainWindow):
         _act_imp.triggered.connect(self._handle_import_draft)
         _act_exp = _draft_menu.addAction("Export Draft")
         _act_exp.triggered.connect(self._handle_export_draft)
-        _act_dup_dest = _draft_menu.addAction("Review duplicate destination files…")
+        _act_dup_dest = _draft_menu.addAction("Duplicate destination hub…")
         _act_dup_dest.triggered.connect(self._show_duplicate_destination_file_review_dialog)
         _act_open_bak = _draft_menu.addAction("Open Workspace Reset Backups Folder")
         _act_open_bak.triggered.connect(self._handle_open_memory_backups_folder)
@@ -4636,8 +4664,8 @@ class MainWindow(QMainWindow):
             "Hide this inherited mapping from Needs Review for this draft (does not change the plan)."
         )
         confirm_btn.clicked.connect(self._on_needs_review_mark_inherited_confirmed)
-        dup_btn = QPushButton("Open duplicate file review…")
-        dup_btn.setToolTip("Open the duplicate destination file review dialog.")
+        dup_btn = QPushButton("Open duplicate hub…")
+        dup_btn.setToolTip("Open the Planning Workspace duplicate destination hub (same as the Planned Moves banner).")
         dup_btn.clicked.connect(self._on_needs_review_open_duplicate_file_review)
         actions_layout.addWidget(go_btn, 0, Qt.AlignmentFlag.AlignLeft)
         actions_layout.addWidget(confirm_btn, 0, Qt.AlignmentFlag.AlignLeft)
@@ -4796,6 +4824,7 @@ class MainWindow(QMainWindow):
         self._needs_review_dismissed_inherited_paths.add(sp)
         self._apply_needs_review_table_view()
         self._save_draft_shell()
+        self._refresh_planning_derived_state("needs_review_inherited_dismiss")
 
     def _on_needs_review_open_duplicate_file_review(self) -> None:
         self._show_duplicate_destination_file_review_dialog()
@@ -8583,6 +8612,12 @@ class MainWindow(QMainWindow):
         plan_review_summary.setWordWrap(True)
         self.plan_review_summary_label = plan_review_summary
 
+        plan_readiness_summary = QLabel("Ready for execution")
+        plan_readiness_summary.setObjectName("MutedText")
+        plan_readiness_summary.setWordWrap(True)
+        plan_readiness_summary.setStyleSheet("color: #8FA3B8;")
+        self.planning_readiness_summary_label = plan_readiness_summary
+
         table = QTableWidget(0, 5)
         table.setHorizontalHeaderLabels([
             "Source Name",
@@ -8651,21 +8686,45 @@ class MainWindow(QMainWindow):
         proposed_table.setMinimumHeight(72)
         self.proposed_folders_table = proposed_table
 
-        dup_banner_row = QWidget()
-        dup_banner_layout = QHBoxLayout(dup_banner_row)
-        dup_banner_layout.setContentsMargins(0, 0, 0, 0)
-        dup_banner_layout.setSpacing(8)
-        dup_banner_label = QLabel("⚠ Duplicate destination files detected")
-        dup_banner_label.setObjectName("MutedText")
-        dup_banner_label.setStyleSheet("color: #FFC14D;")
-        dup_banner_btn = QPushButton("Review…")
-        dup_banner_btn.setToolTip("Open the duplicate destination file review dialog.")
+        dup_banner_row = QFrame()
+        dup_banner_row.setObjectName("SoftBanner")
+        dup_banner_outer = QVBoxLayout(dup_banner_row)
+        dup_banner_outer.setContentsMargins(12, 10, 12, 10)
+        dup_banner_outer.setSpacing(6)
+        dup_banner_title = QLabel("Duplicate destination hub")
+        dup_banner_title.setObjectName("SectionTitle")
+        dup_banner_hint = QLabel(
+            "Recommended: use Apply suggested names for a quick planning-only fix (unique destination file names). "
+            "Use Review & fix for remove, retarget, or per-group control."
+        )
+        dup_banner_hint.setObjectName("MutedText")
+        dup_banner_hint.setWordWrap(True)
+        dup_banner_actions = QWidget()
+        dup_banner_actions_layout = QHBoxLayout(dup_banner_actions)
+        dup_banner_actions_layout.setContentsMargins(0, 0, 0, 0)
+        dup_banner_actions_layout.setSpacing(8)
+        dup_banner_apply_btn = QPushButton("Apply suggested names")
+        dup_banner_apply_btn.setToolTip(
+            "Apply auto-generated unique destination file names for every duplicate group in one step. "
+            "Planning only—does not rename source files or existing SharePoint files."
+        )
+        dup_banner_apply_btn.clicked.connect(self._on_planned_moves_duplicate_hub_apply_suggested)
+        dup_banner_btn = QPushButton("Review & fix…")
+        dup_banner_btn.setToolTip(
+            "Open the duplicate hub dialog: browse groups, remove or retarget mappings, preview or apply per group."
+        )
         dup_banner_btn.clicked.connect(self._show_duplicate_destination_file_review_dialog)
-        dup_banner_layout.addWidget(dup_banner_label, 0, Qt.AlignmentFlag.AlignLeft)
-        dup_banner_layout.addStretch(1)
-        dup_banner_layout.addWidget(dup_banner_btn, 0, Qt.AlignmentFlag.AlignRight)
+        dup_banner_actions_layout.addWidget(dup_banner_apply_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        dup_banner_actions_layout.addWidget(dup_banner_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        dup_banner_actions_layout.addStretch(1)
+        dup_banner_outer.addWidget(dup_banner_title)
+        dup_banner_outer.addWidget(dup_banner_hint)
+        dup_banner_outer.addWidget(dup_banner_actions)
         dup_banner_row.hide()
         self.planned_moves_duplicate_banner = dup_banner_row
+        self.planned_moves_duplicate_banner_title = dup_banner_title
+        self.planned_moves_duplicate_banner_hint = dup_banner_hint
+        self.planned_moves_duplicate_banner_apply_btn = dup_banner_apply_btn
 
         proj_review_row = QWidget()
         proj_review_layout = QHBoxLayout(proj_review_row)
@@ -8685,6 +8744,7 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(loading_banner)
         layout.addWidget(plan_review_summary)
+        layout.addWidget(plan_readiness_summary)
         layout.addWidget(export_hint)
         layout.addLayout(simulate_row)
         layout.addWidget(table, 1)
@@ -8696,6 +8756,11 @@ class MainWindow(QMainWindow):
 
         return box, table, status
 
+    def _on_planned_moves_duplicate_hub_apply_suggested(self) -> None:
+        self._planning_bulk_apply_duplicate_suggested_names(parent=self, quiet_success=False)
+        self._update_planned_moves_duplicate_destination_banner()
+        self._update_planned_moves_projection_review_banner()
+
     def _update_planned_moves_duplicate_destination_banner(self) -> None:
         row = getattr(self, "planned_moves_duplicate_banner", None)
         if row is None:
@@ -8704,7 +8769,99 @@ class MainWindow(QMainWindow):
             list(self.planned_moves or []),
             destination_file_key=self._destination_file_key_for_execution_validation,
         )
+        self._cached_duplicate_destination_groups = {k: list(v) for k, v in groups.items()}
         row.setVisible(bool(groups))
+        title = getattr(self, "planned_moves_duplicate_banner_title", None)
+        if title is not None and groups:
+            n_groups = len(groups)
+            n_files = sum(len(m) for m in groups.values())
+            title.setText(
+                f"⚠ Duplicate destination hub — {n_groups} group(s), {n_files} planned file mapping(s)"
+            )
+
+    def _refresh_planning_derived_state(self, reason: str = "") -> None:
+        """Recompute planning-only readiness from cached duplicate groups and workflow rows (no manifest / Graph)."""
+        _ = reason
+        groups = getattr(self, "_cached_duplicate_destination_groups", None)
+        if not isinstance(groups, dict):
+            groups = {}
+        dgc = len(groups)
+        dic = sum(len(m) for m in groups.values()) if groups else 0
+        has_dup = dgc > 0
+
+        rows = list(getattr(self, "_workflow_needs_review_rows", None) or [])
+        nrt = len(rows)
+        actionable_types = {
+            "duplicate_destination_projection",
+            "proposed_branch_dependency",
+            "weak_suggestion",
+        }
+        nra = sum(
+            1
+            for r in rows
+            if isinstance(r, dict) and str(r.get("review_type", "") or "").strip() in actionable_types
+        )
+        has_nr = nra > 0
+
+        dismissed = getattr(self, "_needs_review_dismissed_inherited_paths", None) or set()
+        has_inherited_signal = any(
+            isinstance(r, dict)
+            and str(r.get("review_type", "") or "").strip() == "inherited_mapping"
+            and self.normalize_memory_path(str(r.get("source_path", "") or "")) not in dismissed
+            for r in rows
+        )
+        has_folder_move = any(
+            bool((m.get("source") or {}).get("is_folder"))
+            for m in (self.planned_moves or [])
+            if isinstance(m, dict)
+        )
+        has_exclusions = bool(getattr(self, "_plan_leaf_exclusions", None))
+
+        blockers = has_dup or has_nr
+        want_runtime_hint = (not blockers) and (has_folder_move or has_inherited_signal or has_exclusions)
+
+        if has_dup:
+            state: Literal["ready", "needs_attention", "runtime_check_recommended"] = "needs_attention"
+            label = "Duplicate file targets need resolution"
+            rtc_flag = False
+        elif has_nr:
+            state = "needs_attention"
+            label = "Planning overlaps need review"
+            rtc_flag = False
+        elif want_runtime_hint:
+            state = "runtime_check_recommended"
+            label = "Runtime check may still be required"
+            rtc_flag = True
+        else:
+            state = "ready"
+            label = "Ready for execution"
+            rtc_flag = False
+
+        self._planning_derived_state = PlanningDerivedState(
+            duplicate_group_count=dgc,
+            duplicate_item_count=dic,
+            has_duplicate_conflicts=has_dup,
+            needs_review_total=nrt,
+            needs_review_actionable_total=nra,
+            has_needs_review_conflicts=has_nr,
+            runtime_check_recommended=rtc_flag,
+            readiness_state=state,
+            readiness_label=label,
+        )
+        self._apply_planning_derived_state_to_ui()
+
+    def _apply_planning_derived_state_to_ui(self) -> None:
+        lbl = getattr(self, "planning_readiness_summary_label", None)
+        if lbl is None:
+            return
+        st = getattr(self, "_planning_derived_state", None)
+        if st is None:
+            return
+        lbl.setText(st.readiness_label)
+        lbl.setToolTip(
+            "This summary reflects planning-visible issues only. "
+            "Recursive or subset execution may still require runtime validation."
+        )
 
     def _update_planned_moves_projection_review_banner(self) -> None:
         row = getattr(self, "planned_moves_projection_review_banner", None)
@@ -9513,6 +9670,8 @@ class MainWindow(QMainWindow):
                     label.setText(str(existing_needs_review))
             if self._planning_workspace_is_busy():
                 self._schedule_progress_summary_refresh(2500)
+            self._update_planned_moves_duplicate_destination_banner()
+            self._refresh_planning_derived_state("progress_summary_lazy")
             return
 
         workflow_state = self._compute_planning_workflow_state()
@@ -9545,6 +9704,9 @@ class MainWindow(QMainWindow):
             if label is not None:
                 label.setText(str(needs_review_items))
 
+        self._update_planned_moves_duplicate_destination_banner()
+        self._refresh_planning_derived_state("progress_summary")
+
     def _refresh_workflow_state_on_demand(self):
         workflow_state = self._compute_planning_workflow_state()
         self._apply_planning_workflow_state(workflow_state)
@@ -9565,6 +9727,9 @@ class MainWindow(QMainWindow):
         ]:
             if label is not None:
                 label.setText(str(needs_review_items))
+
+        self._update_planned_moves_duplicate_destination_banner()
+        self._refresh_planning_derived_state("workflow_on_demand")
 
     def on_workspace_tab_changed(self, index):
         if not getattr(self, "_sharepoint_lazy_mode", False):
@@ -19393,6 +19558,123 @@ class MainWindow(QMainWindow):
                     working[ix]["target_name"] = str(row.get("suggested_leaf", "") or "").strip()
         return out or None
 
+    def _planning_bulk_apply_duplicate_suggested_names(
+        self, *, parent: QWidget, quiet_success: bool = False
+    ) -> Literal["applied", "applied_no_dupes_left", "cancelled", "failed", "stale"]:
+        """One-click apply: all auto-suggested unique destination file names across duplicate groups.
+
+        Same planning-only semantics as the duplicate review dialog's bulk apply. Shows message boxes
+        for errors, stale plan, and confirmation. When ``quiet_success`` is True, skips success info popups
+        (for use from the review dialog preview).
+        """
+        grouped = grouped_duplicate_destination_moves(
+            list(self.planned_moves or []),
+            destination_file_key=self._destination_file_key_for_execution_validation,
+        )
+        if not grouped:
+            QMessageBox.information(
+                parent,
+                "Duplicate destination files",
+                "No duplicate destination files found.",
+            )
+            return "failed"
+        fresh = self._build_all_duplicate_groups_unique_name_preview_rows()
+        if fresh is None:
+            QMessageBox.warning(
+                parent,
+                "Apply suggested names",
+                "Could not build suggestions for all duplicate groups (invalid rows, folder moves, or could not find unique names).",
+            )
+            return "failed"
+        v_err = self._validate_duplicate_bulk_apply_preview_rows(fresh)
+        if v_err == "__stale_plan__":
+            QMessageBox.warning(parent, "Apply suggested names", "The plan changed; refresh duplicate groups and try again.")
+            return "stale"
+        if v_err:
+            QMessageBox.warning(parent, "Apply suggested names", v_err)
+            return "failed"
+        for r in fresh:
+            move = self.planned_moves[int(r["index"])]
+            if self._is_move_submitted(move):
+                self._show_submitted_item_locked_message(
+                    "Apply suggested names",
+                    f"'{move.get('source_name', 'This item')}'",
+                    self._submitted_batch_id_for_move(move),
+                )
+                return "failed"
+
+        n_apply = len(fresh)
+        if (
+            QMessageBox.question(
+                parent,
+                "Apply suggested names",
+                f"Apply all {n_apply} suggested unique names across every duplicate destination group?\n\n"
+                "• Planned destination file names in your plan will change.\n"
+                "• This is a planning change only.\n"
+                "• It does not rename source files.\n"
+                "• It does not rename existing SharePoint content.\n",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            != QMessageBox.Yes
+        ):
+            return "cancelled"
+
+        fresh2 = self._build_all_duplicate_groups_unique_name_preview_rows()
+        if fresh2 is None:
+            QMessageBox.warning(
+                parent,
+                "Apply suggested names",
+                "Could not rebuild suggestions before apply. The plan may have changed.",
+            )
+            return "failed"
+        v_err2 = self._validate_duplicate_bulk_apply_preview_rows(fresh2)
+        if v_err2 == "__stale_plan__":
+            QMessageBox.warning(
+                parent,
+                "Apply suggested names",
+                "The plan changed before apply; refresh duplicate groups and try again.",
+            )
+            return "stale"
+        if v_err2:
+            QMessageBox.warning(parent, "Apply suggested names", v_err2)
+            return "failed"
+        for r in fresh2:
+            move = self.planned_moves[int(r["index"])]
+            if self._is_move_submitted(move):
+                self._show_submitted_item_locked_message(
+                    "Apply suggested names",
+                    f"'{move.get('source_name', 'This item')}'",
+                    self._submitted_batch_id_for_move(move),
+                )
+                return "failed"
+
+        for r in fresh2:
+            idx = int(r["index"])
+            self.planned_moves[idx]["target_name"] = str(r.get("suggested_leaf", "") or "").strip()
+        self.planned_moves_status.setText("Applied suggested planned destination file names (all duplicate groups).")
+        self.refresh_planned_moves_table()
+        self._persist_planning_change("duplicate_bulk_unique_names_applied")
+        still = grouped_duplicate_destination_moves(
+            list(self.planned_moves or []),
+            destination_file_key=self._destination_file_key_for_execution_validation,
+        )
+        if not still:
+            if not quiet_success:
+                QMessageBox.information(
+                    parent,
+                    "Duplicates resolved",
+                    "Suggested names were applied. No duplicate destination files remain in this plan.",
+                )
+            return "applied_no_dupes_left"
+        if not quiet_success:
+            QMessageBox.information(
+                parent,
+                "Suggested names applied",
+                "Suggested names were applied. Some duplicate destination files may still need review—open Duplicate hub for details.",
+            )
+        return "applied"
+
     def _show_duplicate_destination_file_review_dialog(self) -> None:
         grouped = grouped_duplicate_destination_moves(
             list(self.planned_moves or []),
@@ -19406,9 +19688,16 @@ class MainWindow(QMainWindow):
             )
             return
         dlg = QDialog(self)
-        dlg.setWindowTitle("Duplicate destination files")
-        dlg.resize(720, 480)
+        dlg.setWindowTitle("Duplicate destination hub")
+        dlg.resize(720, 520)
         v = QVBoxLayout(dlg)
+        hub_intro = QLabel(
+            "Recommended: preview or apply suggested unique file names (planning-only—does not rename source or "
+            "SharePoint files). Use remove or retarget when a mapping should not land in the same folder."
+        )
+        hub_intro.setObjectName("MutedText")
+        hub_intro.setWordWrap(True)
+        v.addWidget(hub_intro)
         tree = QTreeWidget()
         tree.setHeaderHidden(True)
         tree.setColumnCount(1)
@@ -19984,9 +20273,11 @@ class MainWindow(QMainWindow):
             th.setSectionResizeMode(4, QHeaderView.ResizeToContents)
             pv.addWidget(tbl)
 
-            def _bulk_apply_failed(msg: str, *, stale: bool) -> None:
-                QMessageBox.warning(preview, "Apply all suggested names", msg)
-                if stale:
+            def on_apply_all_bulk_suggested_names() -> None:
+                out = self._planning_bulk_apply_duplicate_suggested_names(
+                    parent=preview, quiet_success=True
+                )
+                if out == "stale":
                     preview.reject()
                     if not rebuild_tree():
                         QMessageBox.information(
@@ -19995,80 +20286,9 @@ class MainWindow(QMainWindow):
                             "No duplicate destination files remain.",
                         )
                         dlg.accept()
-
-            def on_apply_all_bulk_suggested_names() -> None:
-                fresh = self._build_all_duplicate_groups_unique_name_preview_rows()
-                if fresh is None:
-                    QMessageBox.warning(
-                        preview,
-                        "Apply all suggested names",
-                        "Could not rebuild suggestions for all groups. The plan may have changed.",
-                    )
                     return
-                v_err = self._validate_duplicate_bulk_apply_preview_rows(fresh)
-                if v_err == "__stale_plan__":
-                    _bulk_apply_failed("The plan changed; the duplicate list will refresh.", stale=True)
+                if out not in ("applied", "applied_no_dupes_left"):
                     return
-                if v_err:
-                    _bulk_apply_failed(v_err, stale=False)
-                    return
-                for r in fresh:
-                    move = self.planned_moves[int(r["index"])]
-                    if self._is_move_submitted(move):
-                        self._show_submitted_item_locked_message(
-                            "Apply all suggested names",
-                            f"'{move.get('source_name', 'This item')}'",
-                            self._submitted_batch_id_for_move(move),
-                        )
-                        return
-
-                n_apply = len(fresh)
-                if (
-                    QMessageBox.question(
-                        preview,
-                        "Apply all suggested names",
-                        f"Apply all {n_apply} suggested unique names across every duplicate group?\n\n"
-                        "• Planned destination file names in your plan will change.\n"
-                        "• This is a planning change only.\n"
-                        "• It does not rename source files.\n"
-                        "• It does not rename existing SharePoint content.\n",
-                        QMessageBox.Yes | QMessageBox.No,
-                        QMessageBox.No,
-                    )
-                    != QMessageBox.Yes
-                ):
-                    return
-
-                fresh2 = self._build_all_duplicate_groups_unique_name_preview_rows()
-                if fresh2 is None:
-                    _bulk_apply_failed(
-                        "Could not rebuild suggestions before apply. The plan may have changed.",
-                        stale=False,
-                    )
-                    return
-                v_err2 = self._validate_duplicate_bulk_apply_preview_rows(fresh2)
-                if v_err2 == "__stale_plan__":
-                    _bulk_apply_failed("The plan changed before apply; the duplicate list will refresh.", stale=True)
-                    return
-                if v_err2:
-                    _bulk_apply_failed(v_err2, stale=False)
-                    return
-                for r in fresh2:
-                    move = self.planned_moves[int(r["index"])]
-                    if self._is_move_submitted(move):
-                        self._show_submitted_item_locked_message(
-                            "Apply all suggested names",
-                            f"'{move.get('source_name', 'This item')}'",
-                            self._submitted_batch_id_for_move(move),
-                        )
-                        return
-
-                for r in fresh2:
-                    idx = int(r["index"])
-                    self.planned_moves[idx]["target_name"] = str(r.get("suggested_leaf", "") or "").strip()
-                self.planned_moves_status.setText("Applied suggested planned destination file names (all duplicate groups).")
-                self.refresh_planned_moves_table()
-                self._persist_planning_change("duplicate_bulk_unique_names_applied")
                 preview.accept()
                 if not rebuild_tree():
                     QMessageBox.information(
@@ -20968,7 +21188,7 @@ class MainWindow(QMainWindow):
         rename_btn = QPushButton("Rename planned destination file…")
         retarget_btn = QPushButton("Retarget planned destination…")
         dup_review_btn.setToolTip(
-            "Open the planning duplicate destination file review dialog (same as Planned Moves banner)."
+            "Open the planning duplicate destination hub (same as the Planned Moves banner)."
         )
         for b in (
             go_btn,
