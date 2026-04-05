@@ -90,9 +90,6 @@ from ozlink_console.models import AllocationRow, ProposedFolder, SessionState, S
 from ozlink_console.requests_store import RequestStore
 from ozlink_console.graph_folder_execution_safety import compute_graph_unsafe_folder_step_indices
 from ozlink_console.graph_folder_execution_expansion import expand_graph_transfer_steps
-from ozlink_console.plan_execution_duplicate_validation import (
-    duplicate_collision_report_from_transfer_steps,
-)
 from ozlink_console.transfer_manifest import (
     build_simulation_manifest,
     expanded_graph_steps_to_transfer_step_json_dicts,
@@ -103,6 +100,8 @@ from ozlink_console.transfer_manifest import (
 from ozlink_console.plan_execution_duplicate_validation import (
     duplicate_collision_report_from_moves,
     duplicate_collision_report_from_transfer_steps,
+    duplicate_transfer_step_groups_by_destination,
+    duplicate_transfer_step_groups_by_source,
     format_execution_duplicate_message,
     grouped_duplicate_destination_moves,
     norm_execution_key,
@@ -20287,6 +20286,239 @@ class MainWindow(QMainWindow):
         ds, dd = duplicate_collision_report_from_transfer_steps(steps)
         return format_execution_duplicate_message(ds, dd)
 
+    def _planned_move_table_row_for_transfer_request_id(self, request_id: str) -> int | None:
+        rid = str(request_id or "").strip()
+        if not rid or rid.startswith("recsub-"):
+            return None
+        moves = getattr(self, "planned_moves", None) or []
+        for i, m in enumerate(moves):
+            if self._mapping_id_for_planned_move_at_index(m, i) == rid:
+                return i
+        return None
+
+    def _duplicate_inspector_recursive_folder_hint(self, step_source_path: str) -> str:
+        sp = self.normalize_memory_path(str(step_source_path or ""))
+        if not sp:
+            return ""
+        moves = getattr(self, "planned_moves", None) or []
+        best_path = ""
+        best_len = -1
+        for m in moves:
+            if self._planned_move_is_file_allocation(m):
+                continue
+            fp = self.normalize_memory_path(str(m.get("source_path", "") or ""))
+            if not fp:
+                continue
+            if self.source_item_path_is_descendant_of(sp, fp):
+                if len(fp) > best_len:
+                    best_len = len(fp)
+                    best_path = fp
+        return best_path
+
+    def _show_execution_duplicate_collision_inspector(self, manifest: dict) -> None:
+        steps = list((manifest or {}).get("transfer_steps") or [])
+        eo = dict((manifest or {}).get("execution_options") or {})
+        scoped_raw = eo.get("snapshot_scoped_request_ids") or []
+        scoped_ids = {str(x).strip() for x in scoped_raw if str(x).strip()}
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Duplicate transfer steps — review")
+        dlg.setMinimumSize(920, 520)
+        outer = QVBoxLayout(dlg)
+
+        intro = QLabel(
+            "Execution is blocked because the manifest contains duplicate file copy targets and/or duplicate "
+            "source assignments. The tables below list every colliding transfer step."
+        )
+        intro.setObjectName("MutedText")
+        intro.setWordWrap(True)
+        outer.addWidget(intro)
+
+        if scoped_ids:
+            subset_note = QLabel(
+                "Subset mode is active: execution_options.snapshot_scoped_request_ids is set. "
+                "Steps with “In run subset” = False are still in this manifest and can collide with rows you "
+                "intend to run (including Graph-expanded recsub- file rows)."
+            )
+        else:
+            subset_note = QLabel(
+                "Duplicate checks apply to every file transfer step in this manifest (before any run subset is applied)."
+            )
+        subset_note.setObjectName("MutedText")
+        subset_note.setWordWrap(True)
+        outer.addWidget(subset_note)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        host = QWidget()
+        host_layout = QVBoxLayout(host)
+        host_layout.setSpacing(12)
+
+        dest_groups = duplicate_transfer_step_groups_by_destination(steps)
+        src_groups = duplicate_transfer_step_groups_by_source(steps)
+        tables_with_steps: list = []
+
+        def fill_table(table: QTableWidget, member_steps: list) -> None:
+            table.setRowCount(0)
+            for st in member_steps:
+                if not isinstance(st, dict):
+                    continue
+                r = table.rowCount()
+                table.insertRow(r)
+                idx = int(st.get("index", -1))
+                rid = str(st.get("request_id", "") or "").strip()
+                in_sub = "True" if rid in scoped_ids else "False"
+                prov = "Recursive (from folder)" if rid.startswith("recsub-") else "Planned mapping"
+                dsp = str(st.get("destination_name", "") or st.get("source_name", "") or "").strip()
+                vals = [
+                    str(idx),
+                    str(st.get("source_path", "") or ""),
+                    str(st.get("destination_path", "") or ""),
+                    dsp,
+                    rid,
+                    prov,
+                    in_sub,
+                ]
+                for c, val in enumerate(vals):
+                    it = QTableWidgetItem(val)
+                    it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                    if c == 0:
+                        it.setData(Qt.UserRole, st)
+                    table.setItem(r, c, it)
+
+        col_labels = [
+            "Step index",
+            "Source path",
+            "Destination path",
+            "Destination name",
+            "Request ID",
+            "Provenance",
+            "In run subset",
+        ]
+
+        def add_grouped_section(title: str, groups: list, kind: str) -> None:
+            if not groups:
+                return
+            sec_title = QLabel(title)
+            sec_title.setObjectName("SectionTitle")
+            host_layout.addWidget(sec_title)
+            for _nk, display_key, members in groups:
+                grp = QFrame()
+                grp.setObjectName("SectionBox")
+                gl = QVBoxLayout(grp)
+                label_text = f"Destination: {display_key}" if kind == "dest" else f"Source: {display_key}"
+                gh = QLabel(label_text)
+                gh.setObjectName("SectionTitle")
+                gl.addWidget(gh)
+                tbl = QTableWidget(0, 7)
+                tbl.setHorizontalHeaderLabels(col_labels)
+                tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
+                tbl.setSelectionMode(QAbstractItemView.SingleSelection)
+                tbl.verticalHeader().setVisible(False)
+                tbl.horizontalHeader().setStretchLastSection(True)
+                tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
+                tbl.setMinimumHeight(min(220, 48 + 22 * max(3, len(members))))
+                fill_table(tbl, members)
+                gl.addWidget(tbl)
+                tables_with_steps.append(tbl)
+                host_layout.addWidget(grp)
+
+        add_grouped_section("Duplicate destination file targets", dest_groups, "dest")
+        add_grouped_section("Duplicate source assignments", src_groups, "source")
+
+        if not dest_groups and not src_groups:
+            empty = QLabel(
+                "No duplicate groups could be built from transfer_steps (unexpected if validation failed)."
+            )
+            empty.setObjectName("MutedText")
+            empty.setWordWrap(True)
+            host_layout.addWidget(empty)
+
+        host_layout.addStretch(1)
+        scroll.setWidget(host)
+        outer.addWidget(scroll, 1)
+
+        hint = QLabel("")
+        hint.setObjectName("MutedText")
+        hint.setWordWrap(True)
+        outer.addWidget(hint)
+
+        sel_step_holder: dict = {"step": None}
+        go_btn = QPushButton("Go to item")
+        go_btn.setToolTip("Switch to Planned Moves and select the matching row (draft mappings only).")
+        go_btn.setEnabled(False)
+
+        def sync_from_table(tbl: QTableWidget) -> None:
+            if tbl is None:
+                return
+            items = tbl.selectedItems()
+            if not items:
+                sel_step_holder["step"] = None
+                hint.setText("")
+                go_btn.setEnabled(False)
+                return
+            row = items[0].row()
+            it0 = tbl.item(row, 0)
+            st = it0.data(Qt.UserRole) if it0 else None
+            sel_step_holder["step"] = st if isinstance(st, dict) else None
+            st = sel_step_holder["step"]
+            if not st:
+                hint.setText("")
+                go_btn.setEnabled(False)
+                return
+            rid = str(st.get("request_id", "") or "").strip()
+            pr = self._planned_move_table_row_for_transfer_request_id(rid)
+            go_btn.setEnabled(pr is not None)
+            if rid.startswith("recsub-"):
+                hh = self._duplicate_inspector_recursive_folder_hint(str(st.get("source_path", "") or ""))
+                hint.setText(
+                    f"Recursive expansion row ({rid}). Best-effort parent folder in plan: {hh or '—'}"
+                )
+            elif pr is not None:
+                hint.setText("Draft planned mapping — use “Go to item” to open the Planned Moves tab.")
+            else:
+                hint.setText(
+                    "Planned-style request id, but no matching row in the current Planned Moves list (draft may differ)."
+                )
+
+        def on_go() -> None:
+            st = sel_step_holder["step"]
+            if not isinstance(st, dict):
+                return
+            row = self._planned_move_table_row_for_transfer_request_id(str(st.get("request_id", "") or ""))
+            if row is None:
+                return
+            tabs = getattr(self, "workspace_tabs", None)
+            box = getattr(self, "planned_moves_box", None)
+            tbl_pm = getattr(self, "planned_moves_table", None)
+            if tabs is not None and box is not None:
+                tabs.setCurrentWidget(box)
+            if tbl_pm is not None:
+                tbl_pm.clearSelection()
+                tbl_pm.selectRow(int(row))
+                tbl_pm.setFocus()
+                it0 = tbl_pm.item(int(row), 0)
+                if it0 is not None:
+                    tbl_pm.scrollToItem(it0)
+            dlg.accept()
+
+        go_btn.clicked.connect(on_go)
+
+        for t in tables_with_steps:
+            t.itemSelectionChanged.connect(lambda _t=t: sync_from_table(_t))
+
+        footer = QHBoxLayout()
+        footer.addWidget(go_btn)
+        footer.addStretch()
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        bb.rejected.connect(dlg.reject)
+        footer.addWidget(bb)
+        outer.addLayout(footer)
+
+        dlg.exec()
+
     def _canonical_source_path_for_planning_leaf(self, panel_key, node_data):
         if panel_key == "source":
             return self._canonical_source_projection_path(self._tree_item_path(node_data))
@@ -35507,7 +35739,7 @@ class MainWindow(QMainWindow):
         readiness_after = self._manifest_graph_readiness_counts(run_manifest)
         dup_err = self._transfer_manifest_duplicate_validation_error(run_manifest)
         if dup_err:
-            QMessageBox.warning(self, "Cannot run manifest", dup_err)
+            self._show_execution_duplicate_collision_inspector(run_manifest)
             if getattr(self, "execution_status_label", None) is not None:
                 self.execution_status_label.setText("Execution blocked: duplicate transfer steps.")
             return
@@ -35779,7 +36011,7 @@ class MainWindow(QMainWindow):
 
         dup_err = self._transfer_manifest_duplicate_validation_error(manifest)
         if dup_err:
-            QMessageBox.warning(self, "Cannot run manifest", dup_err)
+            self._show_execution_duplicate_collision_inspector(manifest)
             return
 
         summary = manifest_execution_summary(manifest)

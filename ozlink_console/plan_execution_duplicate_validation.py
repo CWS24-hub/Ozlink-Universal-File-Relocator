@@ -70,6 +70,68 @@ def duplicate_collision_report_from_transfer_steps(steps: list[StepDict]) -> tup
     return dup_src, dup_dst
 
 
+def duplicate_transfer_step_groups_by_destination(
+    steps: list[StepDict],
+) -> list[tuple[str, str, list[StepDict]]]:
+    """
+    File copy steps that share the same normalized destination file key.
+
+    Returns tuples ``(norm_dest_key, display_destination, colliding_steps)``, sorted by display
+    string (case-insensitive). Mirrors :func:`duplicate_collision_report_from_transfer_steps`
+    eligibility (``operation`` copy, non-folder file destination key only).
+    """
+    norm_to_display: dict[str, str] = {}
+    buckets: dict[str, list[StepDict]] = {}
+    for st in steps or []:
+        if not isinstance(st, dict):
+            continue
+        if str(st.get("operation", "copy") or "").lower() != "copy":
+            continue
+        dk = transfer_step_file_destination_key(st)
+        if not dk:
+            continue
+        nk = norm_execution_key(dk)
+        norm_to_display.setdefault(nk, str(dk).strip())
+        buckets.setdefault(nk, []).append(st)
+    out = [
+        (nk, norm_to_display[nk], members)
+        for nk, members in buckets.items()
+        if len(members) > 1
+    ]
+    out.sort(key=lambda t: t[1].lower())
+    return out
+
+
+def duplicate_transfer_step_groups_by_source(
+    steps: list[StepDict],
+) -> list[tuple[str, str, list[StepDict]]]:
+    """
+    File copy steps that share the same normalized source path (duplicate source assignment).
+
+    Returns ``(norm_source_key, display_source, colliding_steps)``, sorted by display source.
+    """
+    norm_to_display: dict[str, str] = {}
+    buckets: dict[str, list[StepDict]] = {}
+    for st in steps or []:
+        if not isinstance(st, dict):
+            continue
+        if str(st.get("operation", "copy") or "").lower() != "copy":
+            continue
+        sp = str(st.get("source_path", "") or "").strip()
+        if not sp:
+            continue
+        nk = norm_execution_key(sp)
+        norm_to_display.setdefault(nk, sp)
+        buckets.setdefault(nk, []).append(st)
+    out = [
+        (nk, norm_to_display[nk], members)
+        for nk, members in buckets.items()
+        if len(members) > 1
+    ]
+    out.sort(key=lambda t: t[1].lower())
+    return out
+
+
 def duplicate_collision_report_from_moves(
     moves: list[MoveDict],
     *,
