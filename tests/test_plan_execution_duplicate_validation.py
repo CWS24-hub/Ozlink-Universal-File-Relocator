@@ -8,6 +8,7 @@ from ozlink_console.plan_execution_duplicate_validation import (
     duplicate_collision_report_from_moves,
     duplicate_collision_report_from_transfer_steps,
     format_execution_duplicate_message,
+    grouped_duplicate_destination_moves,
 )
 
 
@@ -45,6 +46,23 @@ class PlanExecutionDuplicateValidationTests(unittest.TestCase):
 
     def test_format_message_empty(self):
         self.assertEqual(format_execution_duplicate_message([], []), "")
+
+    def test_grouped_duplicate_destination_moves(self):
+        def dest_key(m):
+            if m.get("source", {}).get("is_folder"):
+                return None
+            return f"{m['destination_path']}\\{m.get('target_name', '')}"
+
+        moves = [
+            {"source_path": r"S:\a\1.txt", "source": {"is_folder": False}, "destination_path": r"D:\out", "target_name": "f.txt"},
+            {"source_path": r"S:\b\2.txt", "source": {"is_folder": False}, "destination_path": r"D:\out", "target_name": "f.txt"},
+            {"source_path": r"S:\c", "source": {"is_folder": True}, "destination_path": r"D:\out", "target_name": "fold"},
+        ]
+        g = grouped_duplicate_destination_moves(moves, destination_file_key=dest_key)
+        self.assertEqual(len(g), 1)
+        only = next(iter(g.values()))
+        self.assertEqual(len(only), 2)
+        self.assertEqual({r["index"] for r in only}, {0, 1})
 
 
 if __name__ == "__main__":

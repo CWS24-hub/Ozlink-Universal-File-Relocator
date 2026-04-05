@@ -109,6 +109,37 @@ def duplicate_collision_report_from_moves(
     return dup_src, dup_dst
 
 
+def grouped_duplicate_destination_moves(
+    moves: list[MoveDict],
+    *,
+    destination_file_key: Callable[[MoveDict], str | None],
+) -> dict[str, list[dict[str, Any]]]:
+    """
+    Group *file* planned moves by normalized destination file key (same semantics as
+    duplicate_collision_report_from_moves / transfer steps). Folder moves are skipped.
+    Returns only groups with 2+ members; keys are norm_execution_key strings.
+    """
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    norm_to_display: dict[str, str] = {}
+
+    for i, m in enumerate(moves or []):
+        if not isinstance(m, dict):
+            continue
+        dk = destination_file_key(m)
+        if not dk:
+            continue
+        nk = norm_execution_key(dk)
+        if nk not in norm_to_display:
+            norm_to_display[nk] = str(dk).strip()
+        display_dest = norm_to_display[nk]
+        src = str(m.get("source_path", "") or "").strip()
+        buckets.setdefault(nk, []).append(
+            {"index": i, "source": src, "destination": display_dest}
+        )
+
+    return {k: v for k, v in buckets.items() if len(v) >= 2}
+
+
 def format_execution_duplicate_message(dup_sources: list[str], dup_destinations: list[str]) -> str:
     if not dup_sources and not dup_destinations:
         return ""
