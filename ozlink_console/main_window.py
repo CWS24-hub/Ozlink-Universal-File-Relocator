@@ -20281,6 +20281,345 @@ class MainWindow(QMainWindow):
         rebuild_tree()
         dlg.exec()
 
+    def _planned_move_row_for_folder_source_path(self, folder_src_path: str) -> int | None:
+        target = self.normalize_memory_path(str(folder_src_path or ""))
+        if not target:
+            return None
+        moves = getattr(self, "planned_moves", None) or []
+        for i, m in enumerate(moves):
+            if self._planned_move_is_file_allocation(m):
+                continue
+            fp = self.normalize_memory_path(str(m.get("source_path", "") or ""))
+            if fp and norm_execution_key(fp) == norm_execution_key(target):
+                return i
+        return None
+
+    def _inspector_close_after_plan_mutation(self, inspector_dlg: QDialog) -> None:
+        QMessageBox.information(
+            inspector_dlg,
+            "Plan updated",
+            "The plan changed. Close this inspector and retry the run so the execution manifest reflects the current draft.",
+        )
+        inspector_dlg.accept()
+
+    def _planning_remove_planned_move_with_confirm(self, parent: QWidget, idx: int) -> bool:
+        n = len(self.planned_moves or [])
+        if idx < 0 or idx >= n:
+            QMessageBox.warning(parent, "Remove from plan", "The plan changed; try again.")
+            return False
+        move = self.planned_moves[idx]
+        src_path = str(move.get("source_path", "") or "").strip() or "(unknown)"
+        dest_path = (
+            self._destination_file_key_for_execution_validation(move)
+            or self._allocation_projection_path(move)
+            or str(move.get("destination_path", "") or "").strip()
+            or "(unknown)"
+        )
+        if (
+            QMessageBox.question(
+                parent,
+                "Remove from plan",
+                "Remove this entry from your plan only?\n\n"
+                "This does not delete the source file and does not delete anything already in SharePoint. "
+                "It only removes this planned mapping (unassign).\n\n"
+                f"Source:\n{src_path}\n\n"
+                f"Planned destination file:\n{dest_path}",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            != QMessageBox.Yes
+        ):
+            return False
+        if idx >= len(self.planned_moves or []):
+            QMessageBox.warning(parent, "Remove from plan", "The plan changed; try again.")
+            return False
+        return bool(self._remove_planned_move_at_index(idx))
+
+    def _planning_rename_planned_file_with_dialog(self, parent: QWidget, idx: int) -> bool:
+        n = len(self.planned_moves or [])
+        if idx < 0 or idx >= n:
+            QMessageBox.warning(parent, "Rename mapping", "The plan changed; try again.")
+            return False
+        move = self.planned_moves[idx]
+        src_obj = move.get("source") or {}
+        if bool(src_obj.get("is_folder", False)):
+            QMessageBox.information(
+                parent,
+                "Rename mapping",
+                "Folder moves cannot be renamed from this dialog.",
+            )
+            return False
+        if self._is_move_submitted(move):
+            self._show_submitted_item_locked_message(
+                "Rename mapping",
+                f"'{move.get('source_name', 'This item')}'",
+                self._submitted_batch_id_for_move(move),
+            )
+            return False
+        current_name = str(self._move_target_name(move) or "").strip()
+        new_name, accepted = QInputDialog.getText(
+            parent,
+            "Rename planned destination file name",
+            "Enter the new file name as it should appear under the destination folder.\n"
+            "This changes the planned destination name only; it does not rename the source file.",
+            text=current_name or "",
+        )
+        new_name = new_name.strip()
+        if not accepted:
+            return False
+        if not new_name:
+            QMessageBox.warning(parent, "Rename mapping", "The new name cannot be empty.")
+            return False
+        if new_name == current_name:
+            return False
+        if idx >= len(self.planned_moves or []):
+            QMessageBox.warning(parent, "Rename mapping", "The plan changed; try again.")
+            return False
+        move = self.planned_moves[idx]
+        trial = dict(move)
+        trial["target_name"] = new_name
+        new_dk = self._destination_file_key_for_execution_validation(trial)
+        if not new_dk:
+            QMessageBox.warning(
+                parent,
+                "Rename mapping",
+                "Could not resolve a destination file path after rename; check destination folder and name.",
+            )
+            return False
+        new_nk = norm_execution_key(new_dk)
+        for j, other in enumerate(self.planned_moves or []):
+            if j == idx:
+                continue
+            ok = self._destination_file_key_for_execution_validation(other)
+            if not ok:
+                continue
+            if norm_execution_key(ok) == new_nk:
+                QMessageBox.warning(
+                    parent,
+                    "Rename mapping",
+                    "That name still matches another planned file move’s destination.\n\n"
+                    f"Conflicting destination file:\n{new_dk}\n\n"
+                    "Choose a different name.",
+                )
+                return False
+        move["target_name"] = new_name
+        if hasattr(self, "planned_moves_status"):
+            self.planned_moves_status.setText("Planned item renamed.")
+        self.refresh_planned_moves_table()
+        self._persist_planning_change("planned_item_renamed")
+        return True
+
+    def _planning_retarget_planned_file_with_dialog(self, parent: QWidget, idx: int) -> bool:
+        n = len(self.planned_moves or [])
+        if idx < 0 or idx >= n:
+            QMessageBox.warning(parent, "Retarget mapping", "The plan changed; try again.")
+            return False
+        move = self.planned_moves[idx]
+        src_obj = move.get("source") or {}
+        if bool(src_obj.get("is_folder", False)):
+            QMessageBox.information(
+                parent,
+                "Retarget mapping",
+                "Folder moves cannot be retargeted from this dialog.",
+            )
+            return False
+        if self._is_move_submitted(move):
+            self._show_submitted_item_locked_message(
+                "Retarget mapping",
+                f"'{move.get('source_name', 'This item')}'",
+                self._submitted_batch_id_for_move(move),
+            )
+            return False
+
+        QMessageBox.information(
+            parent,
+            "Retarget mapping",
+            "You will enter a new destination folder path for this planned file.\n\n"
+            "This changes the planned destination location only.\n"
+            "It does not move source files now.\n"
+            "It does not change existing SharePoint content now.\n"
+            "This is a planning change only.\n\n"
+            "Use the same path format as the Planning Workspace destination tree. "
+            "The folder must already be visible there (expand parent folders if needed).",
+        )
+        default_parent = self.normalize_memory_path(str(move.get("destination_path", "") or "").strip())
+        new_parent, accepted = QInputDialog.getText(
+            parent,
+            "Retarget mapping",
+            "New destination folder path:",
+            text=default_parent or "",
+        )
+        new_parent = str(new_parent or "").strip()
+        if not accepted:
+            return False
+        if not new_parent:
+            QMessageBox.warning(parent, "Retarget mapping", "The folder path cannot be empty.")
+            return False
+        if self._destination_paths_match_exact(new_parent, move.get("destination_path", "")):
+            return False
+
+        target_ref = self._find_visible_destination_item_by_path(new_parent)
+        if target_ref is None:
+            QMessageBox.warning(
+                parent,
+                "Retarget mapping",
+                "That folder path is not visible in the destination tree.\n\n"
+                "Expand folders until the folder appears, then try again.",
+            )
+            return False
+        target_nd = self.get_tree_item_node_data(target_ref) or {}
+        if not self.node_is_manual_drag_destination_folder(target_nd):
+            QMessageBox.warning(
+                parent,
+                "Retarget mapping",
+                "The resolved row is not a valid destination folder for planning.",
+            )
+            return False
+        target_path = self._destination_row_semantic_path(target_nd)
+        if not target_path:
+            QMessageBox.warning(
+                parent,
+                "Retarget mapping",
+                "Could not resolve the selected destination folder path.",
+            )
+            return False
+
+        dest_snap = self._destination_target_snapshot(target_nd, target_path)
+        trial = dict(move)
+        trial["destination_path"] = target_path
+        trial["destination_id"] = dest_snap.get("id", "")
+        trial["destination_name"] = dest_snap.get("name", "")
+        trial["destination"] = dict(dest_snap)
+        trial["target_name"] = self._move_target_name(move)
+        new_dk = self._destination_file_key_for_execution_validation(trial)
+        if not new_dk:
+            QMessageBox.warning(
+                parent,
+                "Retarget mapping",
+                "Could not resolve a destination file path after retarget; check the folder path and file name.",
+            )
+            return False
+        new_nk = norm_execution_key(new_dk)
+        for j, other in enumerate(self.planned_moves or []):
+            if j == idx:
+                continue
+            ok = self._destination_file_key_for_execution_validation(other)
+            if not ok:
+                continue
+            if norm_execution_key(ok) == new_nk:
+                QMessageBox.warning(
+                    parent,
+                    "Retarget mapping",
+                    "That destination folder would still collide with another planned file move.\n\n"
+                    f"Conflicting destination file:\n{new_dk}\n\n"
+                    "Choose a different folder or rename the file first.",
+                )
+                return False
+
+        if (
+            QMessageBox.question(
+                parent,
+                "Retarget mapping",
+                "Apply this retarget?\n\n"
+                "• The planned destination folder for this mapping will change.\n"
+                "• This is a planning change only.\n"
+                "• It does not move source files now.\n"
+                "• It does not change existing SharePoint content now.\n",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            != QMessageBox.Yes
+        ):
+            return False
+
+        if idx < 0 or idx >= len(self.planned_moves or []):
+            QMessageBox.warning(parent, "Retarget mapping", "The plan changed; try again.")
+            return False
+        move_after = self.planned_moves[idx]
+        if self._is_move_submitted(move_after):
+            self._show_submitted_item_locked_message(
+                "Retarget mapping",
+                f"'{move_after.get('source_name', 'This item')}'",
+                self._submitted_batch_id_for_move(move_after),
+            )
+            return False
+        if bool(((move_after.get("source") or {}).get("is_folder"))):
+            QMessageBox.information(
+                parent,
+                "Retarget mapping",
+                "Folder moves cannot be retargeted from this dialog.",
+            )
+            return False
+
+        trial2 = dict(move_after)
+        trial2["destination_path"] = target_path
+        trial2["destination_id"] = dest_snap.get("id", "")
+        trial2["destination_name"] = dest_snap.get("name", "")
+        trial2["destination"] = dict(dest_snap)
+        trial2["target_name"] = self._move_target_name(move_after)
+        new_dk2 = self._destination_file_key_for_execution_validation(trial2)
+        if not new_dk2:
+            QMessageBox.warning(
+                parent,
+                "Retarget mapping",
+                "Could not resolve destination after retarget (plan may have changed).",
+            )
+            return False
+        new_nk2 = norm_execution_key(new_dk2)
+        for j, other in enumerate(self.planned_moves or []):
+            if j == idx:
+                continue
+            ok = self._destination_file_key_for_execution_validation(other)
+            if not ok:
+                continue
+            if norm_execution_key(ok) == new_nk2:
+                QMessageBox.warning(
+                    parent,
+                    "Retarget mapping",
+                    "That destination would still collide with another planned file move. The plan was not changed.",
+                )
+                return False
+
+        leaf_sn = str(self._move_target_name(move_after) or "").strip()
+        alloc_proj_sn = self._allocation_projection_path(move_after)
+        alloc_canon_sn = self._canonical_destination_projection_path(alloc_proj_sn) or self.normalize_memory_path(
+            str(alloc_proj_sn or "").strip()
+        )
+        if not leaf_sn or not alloc_canon_sn:
+            QMessageBox.warning(
+                parent,
+                "Retarget mapping",
+                "Could not resolve the current planned destination file path for this mapping.",
+            )
+            return False
+        dest_meta_sn = (
+            move_after.get("destination") if isinstance(move_after.get("destination"), dict) else {}
+        )
+        source_node: dict = {
+            "name": leaf_sn,
+            "real_name": leaf_sn,
+            "display_path": alloc_canon_sn,
+            "item_path": alloc_canon_sn,
+            "destination_path": alloc_canon_sn,
+            "tree_role": "destination",
+            "is_folder": False,
+            "node_origin": str(dest_meta_sn.get("node_origin", "") or "Real"),
+        }
+        eid_sn = str(dest_meta_sn.get("id", "") or "").strip()
+        if eid_sn:
+            source_node["id"] = eid_sn
+        for _k in ("drive_id", "library_id", "site_id", "site_name", "library_name"):
+            if dest_meta_sn.get(_k):
+                source_node[_k] = dest_meta_sn[_k]
+
+        if not self._move_planned_destination_node(
+            source_node,
+            target_nd,
+            planned_move_index=idx,
+        ):
+            return False
+        return True
+
     def _transfer_manifest_duplicate_validation_error(self, manifest: dict) -> str:
         steps = list((manifest or {}).get("transfer_steps") or [])
         ds, dd = duplicate_collision_report_from_transfer_steps(steps)
@@ -20447,8 +20786,36 @@ class MainWindow(QMainWindow):
 
         sel_step_holder: dict = {"step": None}
         go_btn = QPushButton("Go to item")
-        go_btn.setToolTip("Switch to Planned Moves and select the matching row (draft mappings only).")
-        go_btn.setEnabled(False)
+        go_parent_btn = QPushButton("Go to parent folder mapping")
+        dup_review_btn = QPushButton("Open duplicate file review…")
+        remove_btn = QPushButton("Remove mapping from plan")
+        rename_btn = QPushButton("Rename planned destination file…")
+        retarget_btn = QPushButton("Retarget planned destination…")
+        dup_review_btn.setToolTip(
+            "Open the planning duplicate destination file review dialog (same as Planned Moves banner)."
+        )
+        for b in (
+            go_btn,
+            go_parent_btn,
+            remove_btn,
+            rename_btn,
+            retarget_btn,
+        ):
+            b.setEnabled(False)
+
+        def _navigate_planned_moves_row(move_row: int) -> None:
+            tabs = getattr(self, "workspace_tabs", None)
+            box = getattr(self, "planned_moves_box", None)
+            tbl_pm = getattr(self, "planned_moves_table", None)
+            if tabs is not None and box is not None:
+                tabs.setCurrentWidget(box)
+            if tbl_pm is not None:
+                tbl_pm.clearSelection()
+                tbl_pm.selectRow(int(move_row))
+                tbl_pm.setFocus()
+                it0 = tbl_pm.item(int(move_row), 0)
+                if it0 is not None:
+                    tbl_pm.scrollToItem(it0)
 
         def sync_from_table(tbl: QTableWidget) -> None:
             if tbl is None:
@@ -20458,6 +20825,10 @@ class MainWindow(QMainWindow):
                 sel_step_holder["step"] = None
                 hint.setText("")
                 go_btn.setEnabled(False)
+                go_parent_btn.setEnabled(False)
+                remove_btn.setEnabled(False)
+                rename_btn.setEnabled(False)
+                retarget_btn.setEnabled(False)
                 return
             row = items[0].row()
             it0 = tbl.item(row, 0)
@@ -20467,51 +20838,162 @@ class MainWindow(QMainWindow):
             if not st:
                 hint.setText("")
                 go_btn.setEnabled(False)
+                go_parent_btn.setEnabled(False)
+                remove_btn.setEnabled(False)
+                rename_btn.setEnabled(False)
+                retarget_btn.setEnabled(False)
                 return
             rid = str(st.get("request_id", "") or "").strip()
+            src_path_step = str(st.get("source_path", "") or "").strip()
             pr = self._planned_move_table_row_for_transfer_request_id(rid)
-            go_btn.setEnabled(pr is not None)
-            if rid.startswith("recsub-"):
-                hh = self._duplicate_inspector_recursive_folder_hint(str(st.get("source_path", "") or ""))
+            is_rec = rid.startswith("recsub-")
+            hh = (
+                self._duplicate_inspector_recursive_folder_hint(src_path_step)
+                if is_rec
+                else ""
+            )
+            parent_pr = self._planned_move_row_for_folder_source_path(hh) if hh else None
+
+            go_btn.setEnabled(bool(pr is not None or src_path_step))
+            if pr is not None:
+                go_btn.setToolTip("Open Planned Moves and select this draft mapping row.")
+            elif is_rec:
+                go_btn.setToolTip(
+                    "Jump to this file in the source tree (recursive expansion row; not a standalone planned move)."
+                )
+            else:
+                go_btn.setToolTip(
+                    "Jump to this source path in the source tree (no matching Planned Moves row for this request id)."
+                )
+
+            go_parent_btn.setEnabled(bool(is_rec and parent_pr is not None))
+            go_parent_btn.setToolTip(
+                "Open Planned Moves and select the folder mapping that produced this recsub- row."
+                if parent_pr is not None
+                else "No parent folder mapping matched this recursive row."
+            )
+
+            move = self.planned_moves[pr] if pr is not None and pr < len(self.planned_moves or []) else None
+            submitted = bool(move and self._is_move_submitted(move))
+            is_file = bool(move and self._planned_move_is_file_allocation(move))
+
+            remove_btn.setEnabled(bool(pr is not None and not submitted))
+            remove_btn.setToolTip(
+                "Remove this planned mapping from the draft (same flow as duplicate file review)."
+                if pr is not None and not submitted
+                else "Select a draft planned row (not a recsub- synthetic file row)."
+            )
+            rename_btn.setEnabled(bool(pr is not None and is_file and not submitted))
+            rename_btn.setToolTip(
+                "Rename the planned destination file name (file mappings only)."
+                if pr is not None and is_file and not submitted
+                else "Only available for non-submitted file mappings."
+            )
+            retarget_btn.setEnabled(bool(pr is not None and is_file and not submitted))
+            retarget_btn.setToolTip(
+                "Change the planned destination folder (file mappings only)."
+                if pr is not None and is_file and not submitted
+                else "Only available for non-submitted file mappings."
+            )
+
+            if is_rec:
                 hint.setText(
-                    f"Recursive expansion row ({rid}). Best-effort parent folder in plan: {hh or '—'}"
+                    f"Recursive expansion row ({rid}). Parent folder in plan: {hh or '—'}. "
+                    "Remove / rename / retarget apply to draft mappings only — use parent folder or duplicate review."
                 )
             elif pr is not None:
-                hint.setText("Draft planned mapping — use “Go to item” to open the Planned Moves tab.")
+                hint.setText("Draft planned mapping — mutation actions use the same flows as Duplicate destination files.")
             else:
                 hint.setText(
-                    "Planned-style request id, but no matching row in the current Planned Moves list (draft may differ)."
+                    "This transfer step does not match a current Planned Moves row; use Go to item on the source tree "
+                    "or adjust the draft, then retry the run."
                 )
 
         def on_go() -> None:
             st = sel_step_holder["step"]
             if not isinstance(st, dict):
                 return
-            row = self._planned_move_table_row_for_transfer_request_id(str(st.get("request_id", "") or ""))
-            if row is None:
+            rid = str(st.get("request_id", "") or "").strip()
+            pr = self._planned_move_table_row_for_transfer_request_id(rid)
+            if pr is not None:
+                _navigate_planned_moves_row(pr)
                 return
-            tabs = getattr(self, "workspace_tabs", None)
-            box = getattr(self, "planned_moves_box", None)
-            tbl_pm = getattr(self, "planned_moves_table", None)
-            if tabs is not None and box is not None:
-                tabs.setCurrentWidget(box)
-            if tbl_pm is not None:
-                tbl_pm.clearSelection()
-                tbl_pm.selectRow(int(row))
-                tbl_pm.setFocus()
-                it0 = tbl_pm.item(int(row), 0)
-                if it0 is not None:
-                    tbl_pm.scrollToItem(it0)
-            dlg.accept()
+            src_path_step = str(st.get("source_path", "") or "").strip()
+            if src_path_step:
+                self._activate_workflow_source_row({"source_path": src_path_step})
+
+        def on_go_parent() -> None:
+            st = sel_step_holder["step"]
+            if not isinstance(st, dict):
+                return
+            hh = self._duplicate_inspector_recursive_folder_hint(str(st.get("source_path", "") or ""))
+            prow = self._planned_move_row_for_folder_source_path(hh)
+            if prow is None:
+                return
+            _navigate_planned_moves_row(prow)
+
+        def on_dup_review() -> None:
+            self._show_duplicate_destination_file_review_dialog()
+
+        def on_remove() -> None:
+            st = sel_step_holder["step"]
+            if not isinstance(st, dict):
+                return
+            pr = self._planned_move_table_row_for_transfer_request_id(str(st.get("request_id", "") or ""))
+            if pr is None:
+                return
+            if self._planning_remove_planned_move_with_confirm(dlg, pr):
+                self._inspector_close_after_plan_mutation(dlg)
+
+        def on_rename() -> None:
+            st = sel_step_holder["step"]
+            if not isinstance(st, dict):
+                return
+            pr = self._planned_move_table_row_for_transfer_request_id(str(st.get("request_id", "") or ""))
+            if pr is None:
+                return
+            if self._planning_rename_planned_file_with_dialog(dlg, pr):
+                self._inspector_close_after_plan_mutation(dlg)
+
+        def on_retarget() -> None:
+            st = sel_step_holder["step"]
+            if not isinstance(st, dict):
+                return
+            pr = self._planned_move_table_row_for_transfer_request_id(str(st.get("request_id", "") or ""))
+            if pr is None:
+                return
+            if self._planning_retarget_planned_file_with_dialog(dlg, pr):
+                self._inspector_close_after_plan_mutation(dlg)
 
         go_btn.clicked.connect(on_go)
+        go_parent_btn.clicked.connect(on_go_parent)
+        dup_review_btn.clicked.connect(on_dup_review)
+        remove_btn.clicked.connect(on_remove)
+        rename_btn.clicked.connect(on_rename)
+        retarget_btn.clicked.connect(on_retarget)
 
         for t in tables_with_steps:
             t.itemSelectionChanged.connect(lambda _t=t: sync_from_table(_t))
 
+        actions = QWidget()
+        av = QVBoxLayout(actions)
+        av.setContentsMargins(0, 0, 0, 0)
+        row1 = QHBoxLayout()
+        row1.addWidget(go_btn)
+        row1.addWidget(go_parent_btn)
+        row1.addWidget(dup_review_btn)
+        row1.addStretch(1)
+        av.addLayout(row1)
+        row2 = QHBoxLayout()
+        row2.addWidget(remove_btn)
+        row2.addWidget(rename_btn)
+        row2.addWidget(retarget_btn)
+        row2.addStretch(1)
+        av.addLayout(row2)
+        outer.addWidget(actions)
+
         footer = QHBoxLayout()
-        footer.addWidget(go_btn)
-        footer.addStretch()
+        footer.addStretch(1)
         bb = QDialogButtonBox(QDialogButtonBox.Close)
         bb.rejected.connect(dlg.reject)
         footer.addWidget(bb)
