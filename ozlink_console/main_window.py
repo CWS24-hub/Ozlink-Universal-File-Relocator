@@ -20677,6 +20677,98 @@ class MainWindow(QMainWindow):
                 return False
         return True
 
+    def _inspector_append_recursive_transfer_steps(self, rm: dict, moves: list[dict]) -> None:
+        if not moves:
+            return
+        steps = list(rm.get("transfer_steps") or [])
+        max_i = max((int(s.get("index", -1)) for s in steps if isinstance(s, dict)), default=-1)
+        for j, mv in enumerate(moves):
+            steps.append(_planned_move_to_step(max_i + 1 + j, mv).to_json_dict())
+        rm["transfer_steps"] = steps
+        fixed_manifest, _ = upconvert_manifest_v1_to_v2(rm)
+        rm.clear()
+        rm.update(fixed_manifest)
+
+    def _inspector_capture_duplicate_inspector_refresh_context(
+        self, run_manifest: dict, browsed_recursive_context: dict | None
+    ) -> dict | None:
+        """Context to rebuild the duplicate inspector view after plan edits (subset/recursive only).
+
+        Returns None when in-place rebuild would not match the blocked run (pilot, browse-recursive, etc.).
+        """
+        eo = dict((run_manifest or {}).get("execution_options") or {})
+        if int(eo.get("pilot_max_graph_operations") or 0) > 0:
+            return None
+        for k in (
+            "pilot_transfer_step_indices",
+            "pilot_transfer_step_uids",
+            "pilot_transfer_destination_keys",
+            "pilot_transfer_destination_paths",
+            "pilot_proposed_folder_destination_paths",
+            "pilot_proposed_folder_name",
+        ):
+            if eo.get(k):
+                return None
+        if bool(eo.get("snapshot_browsed_recursive")) or browsed_recursive_context is not None:
+            return None
+        if not self._draft_pipeline_execution_enabled():
+            return {"kind": "none"}
+        if not list(eo.get("snapshot_scoped_request_ids") or []):
+            return {"kind": "none"}
+        return {
+            "kind": "snapshot_subset",
+            "selected_rows": list(self._planned_moves_selected_row_indices()),
+            "use_recursive_subtree": bool(eo.get("snapshot_recursive_subtree")),
+            "scoped_mode": str(eo.get("snapshot_scoped_mode") or "strict").strip() or "strict",
+        }
+
+    def _rebuild_inspector_run_manifest_from_refresh_context(self, ctx: dict) -> dict | None:
+        """Rebuild manifest like _start_manifest_run_worker subset/recursive prep + preflight (draft pipeline only)."""
+        kind = str(ctx.get("kind") or "")
+        if kind == "none":
+            return self._inspector_build_fresh_simulation_manifest_snapshot()
+        if kind != "snapshot_subset":
+            return None
+        if not self._draft_pipeline_execution_enabled():
+            return self._inspector_build_fresh_simulation_manifest_snapshot()
+        selected_rows = list(ctx.get("selected_rows") or [])
+        if not selected_rows:
+            return None
+        base = self._inspector_build_fresh_simulation_manifest_snapshot()
+        if not base:
+            return None
+        run_manifest = copy.deepcopy(base)
+        use_rec = bool(ctx.get("use_recursive_subtree"))
+        scoped_mode = str(ctx.get("scoped_mode") or "strict").strip() or "strict"
+        if scoped_mode not in ("strict", "dependency_closure"):
+            scoped_mode = "strict"
+        if use_rec:
+            if not getattr(self.graph, "token", None):
+                return None
+            scoped_ids, _alloc_app, mv_app, exp_count, err = self._expand_snapshot_scoped_recursive_subtree(
+                selected_rows
+            )
+            if err or not scoped_ids:
+                return None
+            eo = dict(run_manifest.get("execution_options") or {})
+            eo["snapshot_scoped_request_ids"] = list(scoped_ids)
+            eo["snapshot_scoped_mode"] = scoped_mode
+            eo["snapshot_recursive_subtree"] = True
+            eo["snapshot_recursive_subtree_expanded_file_count"] = int(exp_count or 0)
+            run_manifest["execution_options"] = eo
+            if mv_app:
+                self._inspector_append_recursive_transfer_steps(run_manifest, list(mv_app))
+        else:
+            scoped_ids = self._derive_snapshot_scoped_file_seed_mapping_ids(selected_rows)
+            if not scoped_ids:
+                return None
+            eo = dict(run_manifest.get("execution_options") or {})
+            eo["snapshot_scoped_request_ids"] = list(scoped_ids)
+            eo["snapshot_scoped_mode"] = scoped_mode
+            run_manifest["execution_options"] = eo
+        self._preflight_enrich_manifest_graph_ids(run_manifest)
+        return run_manifest
+
     def _inspector_build_fresh_simulation_manifest_snapshot(self) -> dict | None:
         try:
             ctx = getattr(self, "current_session_context", None) or {}
@@ -20775,8 +20867,11 @@ class MainWindow(QMainWindow):
             return
         self._inspector_focus_planned_moves_row(prow)
 
-    def _show_execution_duplicate_collision_inspector(self, manifest: dict) -> None:
+    def _show_execution_duplicate_collision_inspector(
+        self, manifest: dict, *, refresh_context: dict | None = None
+    ) -> None:
         manifest_holder: dict = {"m": copy.deepcopy(manifest)}
+        refresh_context_holder: dict = {"ctx": refresh_context}
         tables_with_steps: list = []
 
         dlg = QDialog(self)
@@ -20975,36 +21070,59 @@ class MainWindow(QMainWindow):
                 )
 
         def handle_post_mutation() -> None:
-            eo = dict((manifest_holder.get("m") or {}).get("execution_options") or {})
-            if self._inspector_execution_options_allow_draft_manifest_refresh(eo):
-                new_m = self._inspector_build_fresh_simulation_manifest_snapshot()
-                if new_m:
-                    dup_err = self._transfer_manifest_duplicate_validation_error(new_m)
-                    manifest_holder["m"] = new_m
-                    if not dup_err:
+            ctx = refresh_context_holder.get("ctx")
+            new_m = None
+            if ctx is not None:
+                if ctx.get("kind") == "snapshot_subset":
+                    new_m = self._rebuild_inspector_run_manifest_from_refresh_context(ctx)
+                    if new_m is None:
                         QMessageBox.information(
                             dlg,
-                            "Duplicates resolved",
-                            "A fresh manifest from your current draft has no duplicate transfer steps.\n\n"
-                            "Close and run again to export or execute with an updated manifest.",
+                            "Plan updated",
+                            "The plan changed but the subset/recursive collision view could not be rebuilt automatically "
+                            "(Microsoft 365 sign-in, Graph folder expansion, or the original Planned Moves selection). "
+                            "Close this inspector and retry the run.",
                         )
                         dlg.accept()
                         return
-                    rebuild_collision_tables()
-                    sel_step_holder["step"] = None
-                    hint.setText("")
-                    for b in (go_btn, go_parent_btn, remove_btn, rename_btn, retarget_btn):
-                        b.setEnabled(False)
-                    if tables_with_steps:
-                        sync_from_table(tables_with_steps[0])
-                    QMessageBox.information(
-                        dlg,
-                        "Refreshed",
-                        "Collision groups were rebuilt from your current draft. "
-                        "Subset, pilot, or recursive run context is not preserved in this preview.",
-                    )
-                    return
-            self._inspector_close_after_plan_mutation(dlg)
+                elif ctx.get("kind") == "none":
+                    new_m = self._inspector_build_fresh_simulation_manifest_snapshot()
+            if new_m is None:
+                eo = dict((manifest_holder.get("m") or {}).get("execution_options") or {})
+                if self._inspector_execution_options_allow_draft_manifest_refresh(eo):
+                    new_m = self._inspector_build_fresh_simulation_manifest_snapshot()
+            if new_m is None:
+                self._inspector_close_after_plan_mutation(dlg)
+                return
+            dup_err = self._transfer_manifest_duplicate_validation_error(new_m)
+            manifest_holder["m"] = new_m
+            if not dup_err:
+                QMessageBox.information(
+                    dlg,
+                    "Collisions resolved",
+                    "Duplicate collisions for this run context are resolved. You can retry the run.",
+                )
+                dlg.accept()
+                return
+            rebuild_collision_tables()
+            sel_step_holder["step"] = None
+            hint.setText("")
+            for b in (go_btn, go_parent_btn, remove_btn, rename_btn, retarget_btn):
+                b.setEnabled(False)
+            if tables_with_steps:
+                sync_from_table(tables_with_steps[0])
+            if ctx is not None and ctx.get("kind") == "snapshot_subset":
+                refresh_msg = (
+                    "Collision groups were refreshed for the same subset/recursive options and your current draft."
+                )
+            elif ctx is not None and ctx.get("kind") == "none":
+                refresh_msg = "Collision groups were rebuilt from your current draft."
+            else:
+                refresh_msg = (
+                    "Collision groups were rebuilt from your current draft. "
+                    "Subset, pilot, or recursive run context is not preserved in this preview."
+                )
+            QMessageBox.information(dlg, "Refreshed", refresh_msg)
 
         def wire_inspector_table(tbl: QTableWidget) -> None:
             def on_context_menu(pos) -> None:
@@ -36414,7 +36532,10 @@ class MainWindow(QMainWindow):
         readiness_after = self._manifest_graph_readiness_counts(run_manifest)
         dup_err = self._transfer_manifest_duplicate_validation_error(run_manifest)
         if dup_err:
-            self._show_execution_duplicate_collision_inspector(run_manifest)
+            ref_ctx = self._inspector_capture_duplicate_inspector_refresh_context(
+                run_manifest, browsed_recursive_context
+            )
+            self._show_execution_duplicate_collision_inspector(run_manifest, refresh_context=ref_ctx)
             if getattr(self, "execution_status_label", None) is not None:
                 self.execution_status_label.setText("Execution blocked: duplicate transfer steps.")
             return
