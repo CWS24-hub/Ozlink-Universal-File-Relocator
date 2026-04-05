@@ -64,6 +64,7 @@ from PySide6.QtGui import (
     QBrush,
     QColor,
     QCursor,
+    QMouseEvent,
     QDesktopServices,
     QFont,
     QGuiApplication,
@@ -2031,6 +2032,436 @@ class PlanningDerivedState:
     readiness_label: str
 
 
+class InlineReasonBlock(QFrame):
+    """Inline duplicate-inspector failure strip (presentation only)."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("InlineReasonBlock")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(8, 6, 8, 6)
+        lay.setSpacing(8)
+        self.reason_icon = QLabel()
+        self.reason_icon.setFixedSize(22, 22)
+        self.reason_icon.setScaledContents(True)
+        self.reason_text_block = QWidget()
+        rtl = QVBoxLayout(self.reason_text_block)
+        rtl.setContentsMargins(0, 0, 0, 0)
+        rtl.setSpacing(2)
+        self.reason_title_label = QLabel()
+        self.reason_title_label.setObjectName("InlineReasonTitle")
+        self.reason_title_label.setWordWrap(True)
+        _tfont = QFont(self.reason_title_label.font())
+        _tfont.setBold(True)
+        self.reason_title_label.setFont(_tfont)
+        self.reason_detail_label = QLabel()
+        self.reason_detail_label.setObjectName("InlineReasonDetail")
+        self.reason_detail_label.setWordWrap(True)
+        rtl.addWidget(self.reason_title_label)
+        rtl.addWidget(self.reason_detail_label)
+        self.inline_rename_btn = QPushButton("Rename…")
+        self.inline_rename_btn.setMinimumHeight(28)
+        self.inline_retarget_btn = QPushButton("Retarget…")
+        self.inline_retarget_btn.setMinimumHeight(28)
+        self.inline_remove_btn = QPushButton("Remove")
+        self.inline_remove_btn.setMinimumHeight(28)
+        lay.addWidget(self.reason_icon)
+        lay.addWidget(self.reason_text_block, 1)
+        lay.addWidget(self.inline_rename_btn)
+        lay.addWidget(self.inline_retarget_btn)
+        lay.addWidget(self.inline_remove_btn)
+        self._inline_action_layout = lay
+
+    @staticmethod
+    def _apply_dup_button_role(btn: QPushButton, role: str) -> None:
+        if role == "hidden":
+            btn.setVisible(False)
+            return
+        btn.setVisible(True)
+        btn.setProperty("dupPrimary", role == "primary")
+        btn.setProperty("dupTertiary", role == "tertiary")
+        st = btn.style()
+        if st is not None:
+            st.unpolish(btn)
+            st.polish(btn)
+
+    def _reorder_inline_action_buttons(self, order: list[str]) -> None:
+        lay = self._inline_action_layout
+        if lay is None:
+            return
+        for b in (self.inline_rename_btn, self.inline_retarget_btn, self.inline_remove_btn):
+            lay.removeWidget(b)
+        for key in order:
+            if key == "rename":
+                lay.addWidget(self.inline_rename_btn)
+            elif key == "retarget":
+                lay.addWidget(self.inline_retarget_btn)
+            elif key == "remove":
+                lay.addWidget(self.inline_remove_btn)
+
+    def set_content(
+        self,
+        *,
+        visible: bool,
+        title: str = "",
+        detail: str = "",
+        show_rename: bool = True,
+        show_retarget: bool = True,
+        show_remove: bool = True,
+        rename_button_label: str | None = None,
+        rename_button_tooltip: str = "",
+        button_order: list[str] | None = None,
+        rename_button_role: str = "primary",
+        retarget_button_role: str = "secondary",
+        remove_button_role: str = "tertiary",
+    ) -> None:
+        self.setVisible(visible)
+        if not visible:
+            return
+        sty = self.style() or QApplication.style()
+        wpix = sty.standardPixmap(QStyle.StandardPixmap.SP_MessageBoxWarning)
+        self.reason_icon.setPixmap(
+            wpix.scaled(20, 20, Qt.AspectRatioMode.KeepAspectRatio, Qt.SmoothTransformation)
+        )
+        self.reason_title_label.setText(title)
+        d = str(detail or "").strip()
+        self.reason_detail_label.setText(d)
+        self.reason_detail_label.setVisible(bool(d))
+        cap = rename_button_label if rename_button_label is not None else "Rename…"
+        self.inline_rename_btn.setText(cap)
+        self.inline_rename_btn.setToolTip(rename_button_tooltip or "")
+        order = list(button_order or ["rename", "retarget", "remove"])
+        self._reorder_inline_action_buttons(order)
+        eff_rn = "hidden" if not show_rename else rename_button_role
+        eff_rt = "hidden" if not show_retarget else retarget_button_role
+        eff_rm = "hidden" if not show_remove else remove_button_role
+        self._apply_dup_button_role(self.inline_rename_btn, eff_rn)
+        self._apply_dup_button_role(self.inline_retarget_btn, eff_rt)
+        self._apply_dup_button_role(self.inline_remove_btn, eff_rm)
+
+
+class ConflictRowWidget(QWidget):
+    """One transfer-step row in the duplicate collision inspector (card UX)."""
+
+    row_clicked = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.planned_row_index: int | None = None
+        self.transfer_step: dict = {}
+        self.dup_group_prs: list[int] = []
+        self.group_kind: str = ""
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(8)
+        self.main_row = QWidget()
+        self.main_row.setMinimumHeight(44)
+        mrl = QHBoxLayout(self.main_row)
+        mrl.setContentsMargins(0, 0, 0, 0)
+        mrl.setSpacing(8)
+        self.file_icon = QLabel()
+        self.file_icon.setFixedWidth(22)
+        self.file_icon.setScaledContents(True)
+        self.text_block = QWidget()
+        tbl = QVBoxLayout(self.text_block)
+        tbl.setContentsMargins(0, 0, 0, 0)
+        tbl.setSpacing(2)
+        self.file_name_label = QLabel()
+        self.file_name_label.setObjectName("ConflictRowFileName")
+        self.destination_preview_label = QLabel()
+        self.destination_preview_label.setObjectName("ConflictRowSubtext")
+        tbl.addWidget(self.file_name_label)
+        tbl.addWidget(self.destination_preview_label)
+        self.row_state_badge = QLabel()
+        self.row_state_badge.setObjectName("DuplicateStatusBadge")
+        self.rename_btn = QPushButton("Rename…")
+        self.rename_btn.setMinimumHeight(28)
+        self.rename_btn.setProperty("dupPrimary", True)
+        self.more_btn = QToolButton()
+        self.more_btn.setText("More")
+        self.more_btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        mrl.addWidget(self.file_icon)
+        mrl.addWidget(self.text_block, 1)
+        mrl.addWidget(self.row_state_badge)
+        mrl.addWidget(self.rename_btn)
+        mrl.addWidget(self.more_btn)
+        self.inline_reason_block = InlineReasonBlock(self)
+        self.inline_reason_block.setVisible(False)
+        self.separator_line = QFrame()
+        self.separator_line.setObjectName("DupInspRowSeparator")
+        self.separator_line.setFrameShape(QFrame.Shape.HLine)
+        self.separator_line.setFixedHeight(1)
+        root.addWidget(self.main_row)
+        root.addWidget(self.inline_reason_block)
+        root.addWidget(self.separator_line)
+        self._selected = False
+        self._retarget_active = False
+
+    def set_last_in_group(self, is_last: bool) -> None:
+        self.separator_line.setVisible(not is_last)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            w = self.childAt(event.pos())
+            while w is not None and w is not self:
+                if isinstance(w, (QPushButton, QToolButton)):
+                    super().mousePressEvent(event)
+                    return
+                w = w.parentWidget()
+            self.row_clicked.emit()
+        super().mousePressEvent(event)
+
+    def set_selected(self, on: bool) -> None:
+        self._selected = on
+        self._refresh_main_row_chrome()
+
+    def set_retarget_highlight(self, on: bool) -> None:
+        self._retarget_active = bool(on)
+        self._refresh_main_row_chrome()
+
+    def _refresh_main_row_chrome(self) -> None:
+        if self._retarget_active:
+            self.main_row.setStyleSheet(
+                "background-color: rgba(0, 120, 215, 0.14);"
+                "border: 2px solid rgba(0, 120, 212, 0.92);"
+                "border-radius: 4px;"
+            )
+            return
+        if self._selected:
+            self.main_row.setStyleSheet(
+                "background-color: rgba(255, 193, 7, 0.10);"
+                "border: 1px solid rgba(255, 193, 7, 0.42);"
+                "border-radius: 4px;"
+            )
+        else:
+            self.main_row.setStyleSheet("")
+
+    def clear_failure(self) -> None:
+        self.inline_reason_block.set_content(visible=False)
+
+    def set_failure_ui(
+        self,
+        *,
+        title: str,
+        detail: str,
+        show_inline_rename: bool,
+        show_retarget: bool,
+        show_remove: bool,
+        rename_button_label: str | None = None,
+        rename_button_tooltip: str = "",
+        button_order: list[str] | None = None,
+        rename_button_role: str = "primary",
+        retarget_button_role: str = "secondary",
+        remove_button_role: str = "tertiary",
+    ) -> None:
+        self.inline_reason_block.set_content(
+            visible=True,
+            title=title,
+            detail=detail,
+            show_rename=show_inline_rename,
+            show_retarget=show_retarget,
+            show_remove=show_remove,
+            rename_button_label=rename_button_label,
+            rename_button_tooltip=rename_button_tooltip,
+            button_order=button_order,
+            rename_button_role=rename_button_role,
+            retarget_button_role=retarget_button_role,
+            remove_button_role=remove_button_role,
+        )
+
+    def apply_file_icon(self, style: QStyle) -> None:
+        pix = style.standardPixmap(QStyle.StandardPixmap.SP_FileIcon)
+        self.file_icon.setPixmap(pix.scaled(20, 20, Qt.AspectRatioMode.KeepAspectRatio))
+
+
+class DuplicateGroupCard(QFrame):
+    """Destination/source duplicate group card."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("DuplicateGroupCard")
+        self.dup_dest_prs: list[int] = []
+        card_layout = QVBoxLayout(self)
+        card_layout.setContentsMargins(12, 12, 12, 12)
+        card_layout.setSpacing(10)
+        self.header_row = QWidget()
+        header_layout = QHBoxLayout(self.header_row)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(8)
+        self.icon_label = QLabel()
+        self.icon_label.setFixedWidth(20)
+        self.header_text_block = QWidget()
+        htb = QVBoxLayout(self.header_text_block)
+        htb.setContentsMargins(0, 0, 0, 0)
+        self.destination_path_label = QLabel()
+        self.destination_path_label.setObjectName("DuplicateGroupHeaderPath")
+        f = QFont(self.destination_path_label.font())
+        f.setBold(True)
+        self.destination_path_label.setFont(f)
+        self.group_meta_label = QLabel()
+        self.group_meta_label.setObjectName("DuplicateGroupMeta")
+        htb.addWidget(self.destination_path_label)
+        htb.addWidget(self.group_meta_label)
+        self.group_status_badge = QLabel()
+        self.group_status_badge.setObjectName("DuplicateStatusBadge")
+        self.group_auto_fix_btn = QPushButton("Auto-fix group")
+        header_layout.addWidget(self.icon_label)
+        header_layout.addWidget(self.header_text_block, 1)
+        header_layout.addWidget(self.group_status_badge)
+        header_layout.addWidget(self.group_auto_fix_btn)
+        self.rows_container = QWidget()
+        self.rows_layout = QVBoxLayout(self.rows_container)
+        self.rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.rows_layout.setSpacing(8)
+        card_layout.addWidget(self.header_row)
+        card_layout.addWidget(self.rows_container)
+
+
+_DUPLICATE_COLLISION_INSPECTOR_QSS = """
+QDialog {
+    background-color: #121212;
+}
+QScrollArea {
+    background-color: #121212;
+    border: none;
+}
+QScrollArea > QWidget > QWidget {
+    background-color: #121212;
+}
+#DuplicateInspectorSummaryBar {
+    background-color: #252526;
+    border: 1px solid #3f3f46;
+    border-radius: 8px;
+}
+#DupInspDivider {
+    background-color: #3f3f46;
+    max-height: 1px;
+    min-height: 1px;
+    border: none;
+}
+#DuplicateInspectorStatusBanner {
+    border-radius: 6px;
+}
+#DuplicateInspectorBannerText {
+    color: #eeeeee;
+}
+#SectionTitle {
+    color: #f3f3f3;
+    font-weight: 600;
+}
+QLabel#MutedText {
+    color: #adadad;
+}
+#DuplicateGroupCard {
+    background-color: #1e1e1e;
+    border: 1px solid #3f3f46;
+    border-radius: 8px;
+}
+#DuplicateGroupHeaderPath {
+    color: #f5f5f5;
+    font-weight: 600;
+}
+#DuplicateGroupMeta {
+    color: #9ca3af;
+}
+#ConflictRowFileName {
+    color: #f5f5f5;
+    font-weight: 600;
+}
+#ConflictRowSubtext {
+    color: #a3a3a3;
+}
+#DuplicateStatusBadge {
+    color: #e5e5e5;
+    background-color: #2a2a2a;
+    padding: 3px 8px;
+    border-radius: 4px;
+    border: 1px solid #454545;
+}
+#InlineReasonBlock {
+    background-color: #252118;
+    border: 1px solid rgba(255, 193, 7, 0.45);
+    border-radius: 6px;
+}
+#InlineReasonTitle {
+    color: #ffd54f;
+    font-weight: 700;
+}
+#InlineReasonDetail {
+    color: #d1d5db;
+}
+#DupInspRowSeparator {
+    background-color: #404040;
+    border: none;
+    max-height: 1px;
+}
+QDialog QPushButton {
+    background-color: #2d2d30;
+    color: #f0f0f0;
+    border: 1px solid #505050;
+    border-radius: 4px;
+    padding: 4px 12px;
+    min-height: 28px;
+}
+QDialog QPushButton:hover {
+    background-color: #3d3d42;
+    border-color: #606060;
+}
+QDialog QPushButton:pressed {
+    background-color: #252528;
+}
+QDialog QPushButton:disabled {
+    background-color: #2a2a2a;
+    color: #777777;
+    border-color: #3a3a3a;
+}
+QDialog QPushButton[dupPrimary="true"] {
+    background-color: #0078d4;
+    color: #ffffff;
+    border: 1px solid #0078d4;
+    font-weight: 600;
+}
+QDialog QPushButton[dupPrimary="true"]:hover {
+    background-color: #1084d8;
+    border-color: #1084d8;
+}
+QDialog QPushButton[dupPrimary="true"]:pressed {
+    background-color: #006cbd;
+    border-color: #006cbd;
+}
+QDialog QPushButton[dupPrimary="true"]:disabled {
+    background-color: #3a3a3a;
+    color: #888888;
+    border-color: #3a3a3a;
+}
+QDialog QPushButton[dupTertiary="true"] {
+    background-color: #2a2a2a;
+    color: #8a8a8a;
+    border: 1px solid #404040;
+    font-weight: normal;
+}
+QDialog QPushButton[dupTertiary="true"]:hover {
+    background-color: #333333;
+    border-color: #505050;
+    color: #b0b0b0;
+}
+QDialog QToolButton {
+    background-color: #2d2d30;
+    color: #f0f0f0;
+    border: 1px solid #505050;
+    border-radius: 4px;
+    padding: 4px 10px;
+    min-height: 28px;
+}
+QDialog QToolButton:hover {
+    background-color: #3d3d42;
+}
+QDialog QDialogButtonBox QPushButton {
+    padding: 6px 18px;
+}
+"""
+
+
 class MainWindow(QMainWindow):
     @staticmethod
     def _source_tree_model_view_effective() -> bool:
@@ -2250,6 +2681,8 @@ class MainWindow(QMainWindow):
         self.current_profile = None
         self.discovered_sites = []
         self.planned_moves = []
+        self._retarget_mode_active = False
+        self._retarget_row_index = None
         self._plan_leaf_exclusions = set()
         self._cached_duplicate_destination_groups: dict[str, list] = {}
         self._planning_derived_state = PlanningDerivedState(
@@ -19748,6 +20181,101 @@ class MainWindow(QMainWindow):
             "suggested_fix": fix_hints.get(reason, fix_hints["unknown"]),
         }
 
+    def _dup_insp_inline_failure_headline_detail(
+        self, failure_struct: dict, *, planned_row_index: int
+    ) -> tuple[str, str, str]:
+        """Short, action-oriented copy for duplicate inspector inline blocks (presentation only)."""
+        code = str(failure_struct.get("reason") or "unknown")
+        leaves = dict(failure_struct.get("suggested_leaf_by_index") or {})
+        suggested_name = str(leaves.get(int(planned_row_index), "") or "").strip()
+        rows: dict[str, tuple[str, str]] = {
+            "destination_conflict": (
+                "Name conflict",
+                "A file with this name already exists at the destination.",
+            ),
+            "destination_unresolved": (
+                "Destination not available",
+                "Choose a valid destination folder or fix the allocation.",
+            ),
+            "folder_conflict": (
+                "Folder mapping conflict",
+                "Use Retarget or Remove on folder rows, or open duplicate review.",
+            ),
+            "invalid_name": (
+                "Invalid file name",
+                "Enter a valid destination file name.",
+            ),
+            "stale_plan": (
+                "Plan changed",
+                "Refresh from the workspace and try again.",
+            ),
+            "no_rows": (
+                "No suggested name",
+                "Use Rename, Retarget, or Remove.",
+            ),
+            "bad_indices": (
+                "Plan out of date",
+                "Refresh and try again.",
+            ),
+            "bulk_invalid": (
+                "Could not apply names",
+                "Try Auto-fix again or fix rows manually.",
+            ),
+            "submitted_locked": (
+                "Submitted (locked)",
+                "This mapping can't be edited here.",
+            ),
+            "unknown": (
+                "Can't auto-fix",
+                "Use Retarget or Remove, or open duplicate review.",
+            ),
+        }
+        headline, sentence = rows.get(code, rows["unknown"])
+        return headline, sentence, suggested_name
+
+    @staticmethod
+    def _dup_insp_inline_rename_button_label(suggested_name: str, *, max_chars: int = 40) -> str:
+        if not str(suggested_name or "").strip():
+            return "Rename…"
+        sn = str(suggested_name).strip()
+        if len(sn) > max_chars:
+            sn = sn[: max_chars - 1] + "…"
+        return f'Rename to "{sn}"'
+
+    def _dup_insp_inline_action_priorities(
+        self, reason: str
+    ) -> tuple[list[str], str, str, str]:
+        """Duplicate-inspector inline failure: button order (left→right) and dupPrimary/dupTertiary roles."""
+        code = str(reason or "unknown")
+        default_order = ["rename", "retarget", "remove"]
+        if code == "destination_unresolved":
+            return (
+                ["retarget", "rename", "remove"],
+                "secondary",
+                "primary",
+                "tertiary",
+            )
+        if code == "invalid_name":
+            return (
+                default_order,
+                "primary",
+                "hidden",
+                "hidden",
+            )
+        if code == "destination_conflict":
+            return (
+                default_order,
+                "primary",
+                "secondary",
+                "tertiary",
+            )
+        return (
+            default_order,
+            "primary",
+            "secondary",
+            "tertiary",
+        )
+
     def _build_all_duplicate_groups_unique_name_preview_rows(self) -> list[dict] | None:
         """Preview rows for every duplicate destination file group; chains naming across groups via a scratch plan."""
         moves_live = list(self.planned_moves or [])
@@ -19931,12 +20459,18 @@ class MainWindow(QMainWindow):
         )
 
     def _planning_apply_duplicate_preview_rows(
-        self, rows: list[dict], parent: QWidget, *, change_note: str
+        self,
+        rows: list[dict],
+        parent: QWidget,
+        *,
+        change_note: str,
+        suppress_submitted_lock_modal: bool = False,
     ) -> tuple[bool, str | None, dict | None]:
         """Apply suggested_leaf values after the same validation used by duplicate hub bulk apply.
 
         Returns ``(ok, err_message, structured_failure)`` where ``structured_failure`` is set for
-        validation failures (for inline inspector UX); ``None`` on success or submitted lock.
+        validation failures (for inline inspector UX). When ``suppress_submitted_lock_modal`` is True
+        (duplicate inspector only), submitted-lock returns a structured payload instead of a modal.
         """
         bulk = len(rows) > 1
         if not rows:
@@ -19967,6 +20501,19 @@ class MainWindow(QMainWindow):
                 return False, "The plan changed; refresh and try again.", st
             move = self.planned_moves[idx]
             if self._is_move_submitted(move):
+                if suppress_submitted_lock_modal:
+                    batch = self._submitted_batch_id_for_move(move)
+                    lock_msg = (
+                        f"This item has already been submitted and is locked."
+                        + (f" Submitted batch: {batch}." if batch else "")
+                    )
+                    st_lock = self._duplicate_apply_structured_failure(
+                        [{"index": idx, "suggested_leaf": str(r.get("suggested_leaf", "") or "")}],
+                        lock_msg,
+                        bulk=bulk,
+                    )
+                    st_lock["reason"] = "submitted_locked"
+                    return False, "locked", st_lock
                 self._show_submitted_item_locked_message(
                     "Apply suggested names",
                     f"'{move.get('source_name', 'This item')}'",
@@ -20941,7 +21488,15 @@ class MainWindow(QMainWindow):
         self._persist_planning_change("planned_item_renamed")
         return True
 
-    def _planning_retarget_planned_file_with_dialog(self, parent: QWidget, idx: int) -> bool:
+    def _planning_retarget_planned_file_to_folder_node(
+        self,
+        parent: QWidget,
+        idx: int,
+        target_nd: dict,
+        *,
+        interactive_confirm: bool = True,
+    ) -> bool:
+        """Apply retarget for a draft file row using a resolved destination folder node (planning tree)."""
         n = len(self.planned_moves or [])
         if idx < 0 or idx >= n:
             QMessageBox.warning(parent, "Retarget mapping", "The plan changed; try again.")
@@ -20963,43 +21518,7 @@ class MainWindow(QMainWindow):
             )
             return False
 
-        QMessageBox.information(
-            parent,
-            "Retarget mapping",
-            "You will enter a new destination folder path for this planned file.\n\n"
-            "This changes the planned destination location only.\n"
-            "It does not move source files now.\n"
-            "It does not change existing SharePoint content now.\n"
-            "This is a planning change only.\n\n"
-            "Use the same path format as the Planning Workspace destination tree. "
-            "The folder must already be visible there (expand parent folders if needed).",
-        )
-        default_parent = self.normalize_memory_path(str(move.get("destination_path", "") or "").strip())
-        new_parent, accepted = QInputDialog.getText(
-            parent,
-            "Retarget mapping",
-            "New destination folder path:",
-            text=default_parent or "",
-        )
-        new_parent = str(new_parent or "").strip()
-        if not accepted:
-            return False
-        if not new_parent:
-            QMessageBox.warning(parent, "Retarget mapping", "The folder path cannot be empty.")
-            return False
-        if self._destination_paths_match_exact(new_parent, move.get("destination_path", "")):
-            return False
-
-        target_ref = self._find_visible_destination_item_by_path(new_parent)
-        if target_ref is None:
-            QMessageBox.warning(
-                parent,
-                "Retarget mapping",
-                "That folder path is not visible in the destination tree.\n\n"
-                "Expand folders until the folder appears, then try again.",
-            )
-            return False
-        target_nd = self.get_tree_item_node_data(target_ref) or {}
+        target_nd = dict(target_nd or {})
         if not self.node_is_manual_drag_destination_folder(target_nd):
             QMessageBox.warning(
                 parent,
@@ -21048,21 +21567,22 @@ class MainWindow(QMainWindow):
                 )
                 return False
 
-        if (
-            QMessageBox.question(
-                parent,
-                "Retarget mapping",
-                "Apply this retarget?\n\n"
-                "• The planned destination folder for this mapping will change.\n"
-                "• This is a planning change only.\n"
-                "• It does not move source files now.\n"
-                "• It does not change existing SharePoint content now.\n",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            != QMessageBox.Yes
-        ):
-            return False
+        if interactive_confirm:
+            if (
+                QMessageBox.question(
+                    parent,
+                    "Retarget mapping",
+                    "Apply this retarget?\n\n"
+                    "• The planned destination folder for this mapping will change.\n"
+                    "• This is a planning change only.\n"
+                    "• It does not move source files now.\n"
+                    "• It does not change existing SharePoint content now.\n",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                != QMessageBox.Yes
+            ):
+                return False
 
         if idx < 0 or idx >= len(self.planned_moves or []):
             QMessageBox.warning(parent, "Retarget mapping", "The plan changed; try again.")
@@ -21404,50 +21924,66 @@ class MainWindow(QMainWindow):
     ) -> None:
         manifest_holder: dict = {"m": copy.deepcopy(manifest)}
         refresh_context_holder: dict = {"ctx": refresh_context}
-        tables_with_steps: list = []
+        inspector_conflict_rows: list[ConflictRowWidget] = []
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Duplicate transfer steps — review")
-        dlg.setMinimumSize(920, 520)
+        dlg.setMinimumSize(1180, 560)
         outer = QVBoxLayout(dlg)
+        outer.setContentsMargins(16, 16, 16, 16)
+        outer.setSpacing(12)
 
-        intro = QLabel(
-            "Execution is blocked because the manifest contains duplicate file copy targets and/or duplicate "
-            "source assignments. The tables below list every colliding transfer step."
+        summary_bar = QFrame()
+        summary_bar.setObjectName("DuplicateInspectorSummaryBar")
+        summary_bar.setMinimumHeight(64)
+        summary_bar_layout = QHBoxLayout(summary_bar)
+        summary_bar_layout.setContentsMargins(12, 10, 12, 10)
+        summary_bar_layout.setSpacing(12)
+        summary_text_block = QWidget()
+        summary_text_layout = QVBoxLayout(summary_text_block)
+        summary_text_layout.setContentsMargins(0, 0, 0, 0)
+        title_label = QLabel("Duplicate collisions")
+        title_label.setObjectName("SectionTitle")
+        subtitle_label = QLabel("")
+        subtitle_label.setObjectName("MutedText")
+        subtitle_label.setWordWrap(True)
+        summary_text_layout.addWidget(title_label)
+        summary_text_layout.addWidget(subtitle_label)
+        summary_bar_layout.addWidget(summary_text_block, 1)
+        summary_auto_fix_all_btn = QPushButton("Auto-fix all")
+        summary_auto_fix_all_btn.setToolTip(
+            "Apply stem.ext / stem (2).ext / … for every duplicate destination group that has two or more draft file rows."
         )
-        intro.setObjectName("MutedText")
-        intro.setWordWrap(True)
-        outer.addWidget(intro)
+        summary_auto_fix_all_btn.setProperty("dupPrimary", True)
+        summary_bar_layout.addWidget(summary_auto_fix_all_btn)
 
-        subset_note = QLabel("")
-        subset_note.setObjectName("MutedText")
-        subset_note.setWordWrap(True)
-        outer.addWidget(subset_note)
+        divider_line = QFrame()
+        divider_line.setObjectName("DupInspDivider")
+        divider_line.setFrameShape(QFrame.Shape.HLine)
+        divider_line.setFixedHeight(1)
 
-        inspector_feedback = QLabel("")
-        inspector_feedback.setObjectName("MutedText")
-        inspector_feedback.setWordWrap(True)
-        outer.addWidget(inspector_feedback)
+        status_banner = QFrame()
+        status_banner.setObjectName("DuplicateInspectorStatusBanner")
+        status_banner.setVisible(False)
+        status_banner_layout = QVBoxLayout(status_banner)
+        status_banner_layout.setContentsMargins(10, 8, 10, 8)
+        status_banner_row = QHBoxLayout()
+        status_banner_row.setContentsMargins(0, 0, 0, 0)
+        status_banner_row.setSpacing(10)
+        status_banner_text = QLabel("")
+        status_banner_text.setObjectName("DuplicateInspectorBannerText")
+        status_banner_text.setWordWrap(True)
+        cancel_retarget_btn = QPushButton("Cancel retarget")
+        cancel_retarget_btn.setVisible(False)
+        status_banner_row.addWidget(status_banner_text, 1)
+        status_banner_row.addWidget(cancel_retarget_btn, 0, Qt.AlignmentFlag.AlignTop)
+        status_banner_layout.addLayout(status_banner_row)
+        inspector_retarget_snapshot: dict[str, Any] = {"text": "", "flavor": "info"}
+        last_inspector_banner_flavor = {"v": "info"}
 
         pending_inspector_auto_fix: dict[str, Any] = {}
         inspector_guidance_highlight_pr: set[int] = set()
-
-        guidance_frame = QFrame()
-        guidance_frame.setObjectName("SectionBox")
-        guidance_frame.setVisible(False)
-        gv = QVBoxLayout(guidance_frame)
-        guidance_title = QLabel("")
-        guidance_title.setObjectName("SectionTitle")
-        guidance_body = QLabel("")
-        guidance_body.setObjectName("MutedText")
-        guidance_body.setWordWrap(True)
-        guidance_rows = QWidget()
-        guidance_rows_layout = QVBoxLayout(guidance_rows)
-        guidance_rows_layout.setContentsMargins(0, 0, 0, 0)
-        gv.addWidget(guidance_title)
-        gv.addWidget(guidance_body)
-        gv.addWidget(guidance_rows)
-        outer.addWidget(guidance_frame)
+        sel_row_widget: dict[str, Any] = {"rw": None}
 
         inspector_dest_suffix_groups: list[list[int]] = []
 
@@ -21457,7 +21993,8 @@ class MainWindow(QMainWindow):
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         host = QWidget()
         host_layout = QVBoxLayout(host)
-        host_layout.setSpacing(12)
+        host_layout.setContentsMargins(0, 4, 0, 0)
+        host_layout.setSpacing(10)
 
         def _current_scoped_ids() -> set[str]:
             eo = dict((manifest_holder.get("m") or {}).get("execution_options") or {})
@@ -21465,55 +22002,50 @@ class MainWindow(QMainWindow):
             return {str(x).strip() for x in scoped_raw if str(x).strip()}
 
         def _update_subset_note_text() -> None:
+            base = (
+                "Execution is blocked: duplicate destination targets and/or duplicate source assignments. "
+                "Repair groups below with Rename, Retarget, or Remove — stay on this screen."
+            )
             if _current_scoped_ids():
-                subset_note.setText(
-                    "Subset mode is active: execution_options.snapshot_scoped_request_ids is set. "
-                    "Steps with “In run subset” = False are still in this manifest and can collide with rows you "
-                    "intend to run (including Graph-expanded recsub- file rows)."
+                extra = (
+                    " Subset mode is on: rows outside the run subset can still collide with what you intend to run "
+                    "(including Graph-expanded recsub- file rows)."
                 )
             else:
-                subset_note.setText(
-                    "Duplicate checks apply to every file transfer step in this manifest (before any run subset is applied)."
+                extra = " Checks apply to every file transfer step in this manifest."
+            subtitle_label.setText(base + extra)
+
+        def _dup_insp_hide_banner() -> None:
+            status_banner.setVisible(False)
+            status_banner_text.setText("")
+
+        def _set_inspector_banner(text: str, flavor: str = "info") -> None:
+            """Single inspector-level message surface (info / success / warning)."""
+            t = str(text or "").strip()
+            if not t:
+                _dup_insp_hide_banner()
+                return
+            last_inspector_banner_flavor["v"] = flavor
+            status_banner_text.setText(t)
+            if flavor == "success":
+                status_banner.setStyleSheet(
+                    "#DuplicateInspectorStatusBanner { background-color: #1b3d2d; "
+                    "border: 1px solid #2d6b4f; border-radius: 6px; }"
+                    "#DuplicateInspectorBannerText { color: #e8f5ec; }"
                 )
-
-        col_labels = [
-            "Step index",
-            "Source path",
-            "Destination path",
-            "Destination name",
-            "Request ID",
-            "Provenance",
-            "In run subset",
-        ]
-
-        def fill_table(table: QTableWidget, member_steps: list) -> None:
-            scoped_ids = _current_scoped_ids()
-            table.setRowCount(0)
-            for st in member_steps:
-                if not isinstance(st, dict):
-                    continue
-                r = table.rowCount()
-                table.insertRow(r)
-                idx = int(st.get("index", -1))
-                rid = str(st.get("request_id", "") or "").strip()
-                in_sub = "True" if rid in scoped_ids else "False"
-                prov = "Recursive (from folder)" if rid.startswith("recsub-") else "Planned mapping"
-                dsp = str(st.get("destination_name", "") or st.get("source_name", "") or "").strip()
-                vals = [
-                    str(idx),
-                    str(st.get("source_path", "") or ""),
-                    str(st.get("destination_path", "") or ""),
-                    dsp,
-                    rid,
-                    prov,
-                    in_sub,
-                ]
-                for c, val in enumerate(vals):
-                    it = QTableWidgetItem(val)
-                    it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                    if c == 0:
-                        it.setData(Qt.UserRole, st)
-                    table.setItem(r, c, it)
+            elif flavor == "warning":
+                status_banner.setStyleSheet(
+                    "#DuplicateInspectorStatusBanner { background-color: #3d3518; "
+                    "border: 1px solid #8a7a30; border-radius: 6px; }"
+                    "#DuplicateInspectorBannerText { color: #fff8e0; }"
+                )
+            else:
+                status_banner.setStyleSheet(
+                    "#DuplicateInspectorStatusBanner { background-color: #1a2d40; "
+                    "border: 1px solid #3a5a78; border-radius: 6px; }"
+                    "#DuplicateInspectorBannerText { color: #e3eef8; }"
+                )
+            status_banner.setVisible(True)
 
         hint = QLabel("")
         hint.setObjectName("MutedText")
@@ -21538,8 +22070,14 @@ class MainWindow(QMainWindow):
         ):
             b.setEnabled(False)
 
-        def sync_from_table(tbl: QTableWidget | None) -> None:
-            if tbl is None:
+        def _deselect_other_rows(keep: ConflictRowWidget | None) -> None:
+            for rw in inspector_conflict_rows:
+                if rw is not keep:
+                    rw.set_selected(False)
+            sel_row_widget["rw"] = keep
+
+        def sync_from_conflict_row(rw: ConflictRowWidget | None) -> None:
+            if rw is None:
                 sel_step_holder["step"] = None
                 hint.setText("")
                 go_btn.setEnabled(False)
@@ -21548,21 +22086,8 @@ class MainWindow(QMainWindow):
                 rename_btn.setEnabled(False)
                 retarget_btn.setEnabled(False)
                 return
-            items = tbl.selectedItems()
-            if not items:
-                sel_step_holder["step"] = None
-                hint.setText("")
-                go_btn.setEnabled(False)
-                go_parent_btn.setEnabled(False)
-                remove_btn.setEnabled(False)
-                rename_btn.setEnabled(False)
-                retarget_btn.setEnabled(False)
-                return
-            row = items[0].row()
-            it0 = tbl.item(row, 0)
-            st = it0.data(Qt.UserRole) if it0 else None
-            sel_step_holder["step"] = st if isinstance(st, dict) else None
-            st = sel_step_holder["step"]
+            st = rw.transfer_step if isinstance(rw.transfer_step, dict) else {}
+            sel_step_holder["step"] = st
             if not st:
                 hint.setText("")
                 go_btn.setEnabled(False)
@@ -21610,7 +22135,7 @@ class MainWindow(QMainWindow):
             )
             retarget_btn.setEnabled(cap["can_retarget"])
             retarget_btn.setToolTip(
-                "Change the planned destination folder (file mappings only)."
+                "Choose a folder in the destination tree on the right (file mappings only)."
                 if cap["can_retarget"]
                 else "Only available for non-submitted file mappings."
             )
@@ -21628,91 +22153,170 @@ class MainWindow(QMainWindow):
                     "or adjust the draft, then retry the run."
                 )
 
-        def clear_inspector_guidance() -> None:
-            inspector_guidance_highlight_pr.clear()
-            guidance_frame.setVisible(False)
-            guidance_title.setText("")
-            guidance_body.setText("")
-            while guidance_rows_layout.count():
-                item = guidance_rows_layout.takeAt(0)
-                w = item.widget()
-                if w is not None:
-                    w.deleteLater()
-            _clear_inspector_table_highlight_styles()
+        inspector_retarget_tree_hooks: list[tuple[Any, Any]] = []
 
-        def _clear_inspector_table_highlight_styles() -> None:
-            empty = QBrush()
-            for tbl in tables_with_steps:
-                for r in range(tbl.rowCount()):
-                    for c in range(tbl.columnCount()):
-                        it = tbl.item(r, c)
-                        if it is not None:
-                            it.setBackground(empty)
+        def _disconnect_inspector_retarget_tree() -> None:
+            for sig, slot in list(inspector_retarget_tree_hooks):
+                try:
+                    sig.disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass
+            inspector_retarget_tree_hooks.clear()
+
+        def _exit_inspector_retarget_mode(*, restore_prior_banner: bool = False) -> None:
+            was = bool(getattr(self, "_retarget_mode_active", False))
+            self._retarget_mode_active = False
+            self._retarget_row_index = None
+            cancel_retarget_btn.setVisible(False)
+            for rw in inspector_conflict_rows:
+                rw.set_retarget_highlight(False)
+            _disconnect_inspector_retarget_tree()
+            if not was:
+                return
+            if restore_prior_banner and str(inspector_retarget_snapshot.get("text") or "").strip():
+                _set_inspector_banner(
+                    str(inspector_retarget_snapshot["text"]),
+                    str(inspector_retarget_snapshot.get("flavor") or "info"),
+                )
+            elif restore_prior_banner:
+                _dup_insp_hide_banner()
+
+        def _on_dest_pick_for_retarget(item_ref) -> None:
+            if not self._retarget_mode_active or self._retarget_row_index is None:
+                return
+            if self._planning_browse_mode("destination") == "local":
+                _set_inspector_banner(
+                    "Switch the destination panel to SharePoint (site/library tree), then pick a folder.",
+                    "warning",
+                )
+                return
+            pr = int(self._retarget_row_index)
+            nd = self.get_tree_item_node_data(item_ref) or {}
+            if not self.node_is_manual_drag_destination_folder(nd):
+                _set_inspector_banner(
+                    "That row is not a valid destination folder — choose another folder.",
+                    "warning",
+                )
+                return
+            tp = self._destination_row_semantic_path(nd)
+            if 0 <= pr < len(self.planned_moves or []):
+                cur = self.planned_moves[pr]
+                if tp and self._destination_paths_match_exact(tp, cur.get("destination_path", "")):
+                    _set_inspector_banner(
+                        "Choose a different folder than the current destination.",
+                        "warning",
+                    )
+                    return
+            ok = self._planning_retarget_planned_file_to_folder_node(
+                dlg, pr, nd, interactive_confirm=False
+            )
+            if ok:
+                _exit_inspector_retarget_mode(restore_prior_banner=False)
+                handle_post_mutation(feedback="Destination retargeted.")
+
+        def _connect_inspector_retarget_tree() -> None:
+            _disconnect_inspector_retarget_tree()
+            tw = self.destination_tree_widget
+            if isinstance(tw, QTreeView):
+
+                def _slot(ix: QModelIndex) -> None:
+                    _on_dest_pick_for_retarget(ix)
+
+                tw.clicked.connect(_slot)
+                inspector_retarget_tree_hooks.append((tw.clicked, _slot))
+            else:
+
+                def _slot2(it: QTreeWidgetItem, _col: int) -> None:
+                    _on_dest_pick_for_retarget(it)
+
+                tw.itemClicked.connect(_slot2)
+                inspector_retarget_tree_hooks.append((tw.itemClicked, _slot2))
+
+        def _start_inspector_retarget_mode(pr: int) -> None:
+            if self._planning_browse_mode("destination") == "local":
+                _set_inspector_banner(
+                    "Switch the destination panel to SharePoint (site/library tree), then pick a folder.",
+                    "warning",
+                )
+                return
+            inspector_retarget_snapshot["text"] = (
+                status_banner_text.text() if status_banner.isVisible() else ""
+            )
+            inspector_retarget_snapshot["flavor"] = str(last_inspector_banner_flavor.get("v") or "info")
+            self._retarget_mode_active = True
+            self._retarget_row_index = int(pr)
+            cancel_retarget_btn.setVisible(True)
+            _set_inspector_banner(
+                "Select a destination folder to retarget this item",
+                "info",
+            )
+            _clear_inspector_row_highlights()
+            for rw in inspector_conflict_rows:
+                match = rw.planned_row_index is not None and int(rw.planned_row_index) == int(pr)
+                rw.set_retarget_highlight(bool(match))
+                if match:
+                    _deselect_other_rows(rw)
+                    sync_from_conflict_row(rw)
+            _connect_inspector_retarget_tree()
+
+        def _dup_insp_clear_failure_state() -> None:
+            """Clear row inline failures, selection highlights, and the inspector banner."""
+            _exit_inspector_retarget_mode(restore_prior_banner=False)
+            inspector_guidance_highlight_pr.clear()
+            _dup_insp_hide_banner()
+            for rw in inspector_conflict_rows:
+                rw.clear_failure()
+            _clear_inspector_row_highlights()
+
+        def _clear_inspector_row_highlights() -> None:
+            for rw in inspector_conflict_rows:
+                rw.set_retarget_highlight(False)
+                rw.set_selected(False)
 
         def _apply_inspector_guidance_highlights() -> None:
-            _clear_inspector_table_highlight_styles()
+            _clear_inspector_row_highlights()
             if not inspector_guidance_highlight_pr:
                 return
-            hi = QColor(255, 243, 205)
-            for tbl in tables_with_steps:
-                for r in range(tbl.rowCount()):
-                    it0 = tbl.item(r, 0)
-                    st = it0.data(Qt.UserRole) if it0 else None
-                    if not isinstance(st, dict):
-                        continue
-                    cap = self._inspector_capabilities_for_transfer_step(st)
-                    pr = cap.get("pr")
-                    if pr is None or int(pr) not in inspector_guidance_highlight_pr:
-                        continue
-                    for c in range(tbl.columnCount()):
-                        it = tbl.item(r, c)
-                        if it is not None:
-                            it.setBackground(hi)
+            for rw in inspector_conflict_rows:
+                pr = rw.planned_row_index
+                if pr is not None and int(pr) in inspector_guidance_highlight_pr:
+                    rw.set_selected(True)
+                else:
+                    rw.set_selected(False)
 
         def _scroll_inspector_to_affected_pr(affected: set[int]) -> None:
             if not affected:
                 return
-            for tbl in tables_with_steps:
-                prs = getattr(tbl, "_oz_dup_dest_prs", None) or []
-                if not (set(prs) & affected):
+            for rw in inspector_conflict_rows:
+                pr = rw.planned_row_index
+                if pr is None or int(pr) not in affected:
                     continue
-                w: QWidget | None = tbl
-                for _ in range(8):
+                w: QWidget | None = rw
+                for _ in range(12):
                     if w is None:
                         break
-                    p = w.parentWidget()
-                    if p is None:
-                        break
-                    if isinstance(p, QFrame) and p.objectName() == "SectionBox":
-                        scroll.ensureWidgetVisible(p)
+                    if isinstance(w, DuplicateGroupCard):
+                        scroll.ensureWidgetVisible(w)
                         return
-                    w = p
-                scroll.ensureWidgetVisible(tbl)
+                    w = w.parentWidget()
+                scroll.ensureWidgetVisible(rw)
                 return
 
         def _focus_inspector_affected_row(affected: set[int]) -> None:
             if not affected:
                 return
-            for tbl in tables_with_steps:
-                prs = getattr(tbl, "_oz_dup_dest_prs", None) or []
-                if not (set(prs) & affected):
-                    continue
-                for r in range(tbl.rowCount()):
-                    it0 = tbl.item(r, 0)
-                    st = it0.data(Qt.UserRole) if it0 else None
-                    if not isinstance(st, dict):
-                        continue
-                    cap = self._inspector_capabilities_for_transfer_step(st)
-                    pr = cap.get("pr")
-                    if pr is not None and int(pr) in affected:
-                        tbl.selectRow(r)
-                        tbl.setCurrentCell(r, 0)
-                        sync_from_table(tbl)
-                        tbl.setFocus(Qt.FocusReason.OtherFocusReason)
-                        return
-                return
+            for rw in inspector_conflict_rows:
+                pr = rw.planned_row_index
+                if pr is not None and int(pr) in affected:
+                    _deselect_other_rows(rw)
+                    sync_from_conflict_row(rw)
+                    rw.setFocus(Qt.FocusReason.OtherFocusReason)
+                    return
 
-        def handle_post_mutation(*, feedback: str | None = None) -> None:
+        def handle_post_mutation(
+            *, feedback: str | None = None, banner_flavor: str = "info"
+        ) -> None:
+            _exit_inspector_retarget_mode(restore_prior_banner=False)
             ctx = refresh_context_holder.get("ctx")
             saved_rid = ""
             st_sel = sel_step_holder.get("step")
@@ -21723,14 +22327,12 @@ class MainWindow(QMainWindow):
                 if ctx.get("kind") == "snapshot_subset":
                     new_m = self._rebuild_inspector_run_manifest_from_refresh_context(ctx)
                     if new_m is None:
-                        QMessageBox.information(
-                            dlg,
-                            "Plan updated",
-                            "The plan changed but the subset/recursive collision view could not be rebuilt automatically "
-                            "(Microsoft 365 sign-in, Graph folder expansion, or the original Planned Moves selection). "
-                            "Close this inspector and retry the run.",
+                        _set_inspector_banner(
+                            "Could not refresh this collision view automatically (subset/recursive context, sign-in, "
+                            "Graph expansion, or Planned Moves selection). Close this panel when ready and retry the run "
+                            "from the workspace.",
+                            "warning",
                         )
-                        dlg.accept()
                         return
                 elif ctx.get("kind") == "none":
                     new_m = self._inspector_build_fresh_simulation_manifest_snapshot()
@@ -21744,12 +22346,35 @@ class MainWindow(QMainWindow):
             dup_err = self._transfer_manifest_duplicate_validation_error(new_m)
             manifest_holder["m"] = new_m
             if not dup_err:
-                QMessageBox.information(
-                    dlg,
-                    "Collisions resolved",
-                    "Duplicate collisions for this run context are resolved. You can retry the run.",
+                inspector_guidance_highlight_pr.clear()
+                pending_inspector_auto_fix.clear()
+                while host_layout.count():
+                    item = host_layout.takeAt(0)
+                    w = item.widget()
+                    if w is not None:
+                        w.deleteLater()
+                inspector_conflict_rows.clear()
+                inspector_dest_suffix_groups.clear()
+                done_lbl = QLabel(
+                    "This manifest no longer reports duplicate collisions for the current run context. "
+                    "Close when you are ready, then retry the run from the workspace."
                 )
-                dlg.accept()
+                done_lbl.setObjectName("MutedText")
+                done_lbl.setWordWrap(True)
+                host_layout.addWidget(done_lbl)
+                host_layout.addStretch(1)
+                scroll.setWidget(host)
+                title_label.setText("Collisions resolved")
+                subtitle_label.setText("No further repair steps are required here.")
+                summary_auto_fix_all_btn.setEnabled(False)
+                _set_inspector_banner(
+                    "Duplicates are cleared for this run — you can close this panel and retry execution.",
+                    "success",
+                )
+                sel_step_holder["step"] = None
+                hint.setText("")
+                for b in (go_btn, go_parent_btn, remove_btn, rename_btn, retarget_btn):
+                    b.setEnabled(False)
                 return
             rebuild_collision_tables()
             sel_step_holder["step"] = None
@@ -21758,35 +22383,29 @@ class MainWindow(QMainWindow):
                 b.setEnabled(False)
             restored = False
             if saved_rid:
-                for tbl in tables_with_steps:
-                    for r in range(tbl.rowCount()):
-                        it0 = tbl.item(r, 0)
-                        st2 = it0.data(Qt.UserRole) if it0 else None
-                        if (
-                            isinstance(st2, dict)
-                            and str(st2.get("request_id", "") or "").strip() == saved_rid
-                        ):
-                            tbl.selectRow(r)
-                            tbl.setCurrentCell(r, 0)
-                            sync_from_table(tbl)
-                            restored = True
-                            break
-                    if restored:
+                for rw in inspector_conflict_rows:
+                    st2 = rw.transfer_step if isinstance(rw.transfer_step, dict) else {}
+                    if str(st2.get("request_id", "") or "").strip() == saved_rid:
+                        _deselect_other_rows(rw)
+                        sync_from_conflict_row(rw)
+                        restored = True
                         break
-            if not restored and tables_with_steps:
-                sync_from_table(tables_with_steps[0])
+            if not restored and inspector_conflict_rows:
+                _deselect_other_rows(inspector_conflict_rows[0])
+                sync_from_conflict_row(inspector_conflict_rows[0])
             if feedback:
-                inspector_feedback.setText(feedback)
+                _set_inspector_banner(feedback, banner_flavor)
             elif ctx is not None and ctx.get("kind") == "snapshot_subset":
-                inspector_feedback.setText(
-                    "Collision groups refreshed — same subset/recursive options and current draft."
+                _set_inspector_banner(
+                    "Collision groups refreshed — same subset/recursive options and current draft.",
+                    "info",
                 )
             elif ctx is not None and ctx.get("kind") == "none":
-                inspector_feedback.setText("Collision groups refreshed.")
+                _set_inspector_banner("Collision groups refreshed.", "info")
             else:
-                inspector_feedback.setText(
-                    "Collision groups refreshed. "
-                    "Subset, pilot, or recursive run context is not preserved in this preview."
+                _set_inspector_banner(
+                    "Collision groups refreshed. Subset, pilot, or recursive run context may not match this preview.",
+                    "info",
                 )
             _apply_inspector_guidance_highlights()
             _retry_pending_inspector_auto_fix()
@@ -21853,17 +22472,20 @@ class MainWindow(QMainWindow):
                     rows,
                     dlg,
                     change_note="execution_inspector_dest_suffix_all_retry",
+                    suppress_submitted_lock_modal=True,
                 )
                 if ok:
                     _clear_inspector_auto_pending()
-                    clear_inspector_guidance()
+                    _dup_insp_clear_failure_state()
                     handle_post_mutation(
                         feedback=f"Suggested names applied to {len(rows)} items (auto-retry)."
                     )
                 elif err == "locked":
                     _clear_inspector_auto_pending()
+                    if st:
+                        _dup_insp_apply_failure_state(st, register_pending="all")
                 elif st:
-                    show_inspector_guidance(
+                    _dup_insp_apply_failure_state(
                         st,
                         register_pending="all",
                     )
@@ -21884,151 +22506,174 @@ class MainWindow(QMainWindow):
                     rows,
                     dlg,
                     change_note="execution_inspector_dest_suffix_group_retry",
+                    suppress_submitted_lock_modal=True,
                 )
                 if ok:
                     _clear_inspector_auto_pending()
-                    clear_inspector_guidance()
+                    _dup_insp_clear_failure_state()
                     handle_post_mutation(
                         feedback=f"Suggested names applied to {len(rows)} items (auto-retry)."
                     )
                 elif err == "locked":
                     _clear_inspector_auto_pending()
+                    if st:
+                        _dup_insp_apply_failure_state(
+                            st,
+                            register_pending="group",
+                            pending_rows=rows,
+                        )
                 elif st:
-                    show_inspector_guidance(
+                    _dup_insp_apply_failure_state(
                         st,
                         register_pending="group",
                         pending_rows=rows,
                     )
 
-        def show_inspector_guidance(
+        def _inspector_inline_retarget(p: int) -> None:
+            _start_inspector_retarget_mode(int(p))
+
+        def _inspector_inline_remove(p: int) -> None:
+            if self._planning_remove_planned_move_with_confirm(dlg, p):
+                handle_post_mutation(feedback="Mapping removed from plan.")
+
+        def _inspector_inline_rename_planned(pidx: int) -> None:
+            if self._planning_rename_planned_file_with_dialog(dlg, pidx):
+                handle_post_mutation(feedback="1 rename applied.")
+
+        def apply_suggested_rename_for_planned_index(pidx: int) -> None:
+            group_prs = None
+            for gg in inspector_dest_suffix_groups:
+                if pidx in gg:
+                    group_prs = gg
+                    break
+            rows_f = self._build_execution_inspector_dest_suffix_preview_rows_for_moves(
+                sorted(group_prs or [pidx])
+            )
+            row_one = next(
+                (r for r in (rows_f or []) if int(r["index"]) == int(pidx)),
+                None,
+            )
+            if not row_one or not str(row_one.get("suggested_leaf", "") or "").strip():
+                st2 = self._duplicate_apply_structured_failure(
+                    [{"index": pidx, "suggested_leaf": ""}],
+                    "Could not build a suggested name for this row.",
+                    bulk=False,
+                )
+                st2["reason"] = "no_rows"
+                _dup_insp_apply_failure_state(
+                    st2,
+                    register_pending="group" if group_prs and len(group_prs) >= 2 else None,
+                    pending_rows=rows_f,
+                )
+                return
+            ve = self._validate_duplicate_group_apply_preview_rows([row_one])
+            if ve:
+                st3 = self._duplicate_apply_structured_failure([row_one], ve, bulk=False)
+                _dup_insp_apply_failure_state(
+                    st3,
+                    register_pending="group"
+                    if group_prs and len(group_prs) >= 2
+                    else None,
+                    pending_rows=rows_f or [row_one],
+                )
+                return
+            ok2, err2, st4 = self._planning_apply_duplicate_preview_rows(
+                [row_one],
+                dlg,
+                change_note="execution_inspector_dest_suffix_one",
+                suppress_submitted_lock_modal=True,
+            )
+            if ok2:
+                _dup_insp_clear_failure_state()
+                _clear_inspector_auto_pending()
+                handle_post_mutation(feedback="1 rename applied.")
+            elif st4:
+                _dup_insp_apply_failure_state(
+                    st4,
+                    register_pending="group"
+                    if group_prs and len(group_prs) >= 2
+                    else None,
+                    pending_rows=rows_f or [row_one],
+                )
+
+        def _dup_insp_apply_failure_state(
             struct: dict,
             *,
             register_pending: str | None = None,
             pending_rows: list[dict] | None = None,
         ) -> None:
+            """Coordinator: maps structured apply failures to row inline UI + inspector banner + focus."""
             affected = {int(x) for x in (struct.get("affected_indices") or []) if x is not None}
             inspector_guidance_highlight_pr.clear()
             inspector_guidance_highlight_pr.update(affected)
-            guidance_title.setText("Auto-fix could not complete")
-            body = str(struct.get("suggested_fix", "") or "").strip()
-            detail = str(struct.get("message", "") or "").strip()
-            if detail and detail.lower() not in body.lower():
-                guidance_body.setText(f"{body}\n\n{detail}")
-            else:
-                guidance_body.setText(body)
-            while guidance_rows_layout.count():
-                item = guidance_rows_layout.takeAt(0)
-                w = item.widget()
-                if w is not None:
-                    w.deleteLater()
-            leaves = dict(struct.get("suggested_leaf_by_index") or {})
+            banner = "Some automatic renames could not be applied — details are on each row below."
+            if not affected:
+                banner = (
+                    str(struct.get("message") or struct.get("suggested_fix") or "").strip() or banner
+                )
+            _set_inspector_banner(banner, "warning" if affected else "info")
+            for rw in inspector_conflict_rows:
+                rw.clear_failure()
             pm = self.planned_moves or []
-            for pr in sorted(affected):
+
+            def _disconnect_btn(btn: QPushButton) -> None:
                 try:
-                    pri = int(pr)
-                except (TypeError, ValueError):
+                    btn.clicked.disconnect()
+                except (RuntimeError, TypeError):
+                    pass
+
+            for rw in inspector_conflict_rows:
+                pr = rw.planned_row_index
+                if pr is None:
+                    continue
+                pri = int(pr)
+                if pri not in affected:
                     continue
                 if pri < 0 or pri >= len(pm):
                     continue
                 mv = pm[pri]
-                row_w = QWidget()
-                rh = QHBoxLayout(row_w)
-                rh.setContentsMargins(0, 4, 0, 4)
-                nm = str(mv.get("source_name", "") or mv.get("source_path", "") or "").strip()
-                if len(nm) > 140:
-                    nm = nm[:137] + "…"
-                rh.addWidget(QLabel(nm), 1)
-                sug = str(leaves.get(pri, "") or "").strip()
-                if sug:
-                    rh.addWidget(QLabel(f"→ {sug}"))
                 src = mv.get("source") if isinstance(mv.get("source"), dict) else {}
                 is_folder = bool((src or {}).get("is_folder"))
                 submitted = self._is_move_submitted(mv)
                 file_row = not is_folder and not submitted
-                btn_rename = QPushButton("Rename…")
-                btn_rt = QPushButton("Retarget…")
-                btn_rm = QPushButton("Remove…")
-                btn_rename.setEnabled(file_row and bool(sug))
-                btn_rt.setEnabled(file_row)
-                btn_rm.setEnabled(file_row)
-                btn_rename.setToolTip("Apply the suggested destination file name for this row when valid.")
-                btn_rt.setToolTip("Change the destination folder for this mapping.")
-                btn_rm.setToolTip("Remove this mapping from the draft plan.")
-
-                def _wire_row_actions(pidx: int) -> None:
-                    def do_rename() -> None:
-                        group_prs = None
-                        for gg in inspector_dest_suffix_groups:
-                            if pidx in gg:
-                                group_prs = gg
-                                break
-                        rows_f = self._build_execution_inspector_dest_suffix_preview_rows_for_moves(
-                            sorted(group_prs or [pidx])
-                        )
-                        row_one = next(
-                            (r for r in (rows_f or []) if int(r["index"]) == int(pidx)),
-                            None,
-                        )
-                        if not row_one or not str(row_one.get("suggested_leaf", "") or "").strip():
-                            st2 = self._duplicate_apply_structured_failure(
-                                [{"index": pidx, "suggested_leaf": ""}],
-                                "Could not build a suggested name for this row.",
-                                bulk=False,
-                            )
-                            st2["reason"] = "no_rows"
-                            show_inspector_guidance(
-                                st2,
-                                register_pending="group" if group_prs and len(group_prs) >= 2 else None,
-                                pending_rows=rows_f,
-                            )
-                            return
-                        ve = self._validate_duplicate_group_apply_preview_rows([row_one])
-                        if ve:
-                            st3 = self._duplicate_apply_structured_failure([row_one], ve, bulk=False)
-                            show_inspector_guidance(
-                                st3,
-                                register_pending="group"
-                                if group_prs and len(group_prs) >= 2
-                                else None,
-                                pending_rows=rows_f or [row_one],
-                            )
-                            return
-                        ok2, err2, st4 = self._planning_apply_duplicate_preview_rows(
-                            [row_one],
-                            dlg,
-                            change_note="execution_inspector_dest_suffix_one",
-                        )
-                        if ok2:
-                            clear_inspector_guidance()
-                            _clear_inspector_auto_pending()
-                            handle_post_mutation(feedback="1 rename applied.")
-                        elif err2 != "locked" and st4:
-                            show_inspector_guidance(
-                                st4,
-                                register_pending="group"
-                                if group_prs and len(group_prs) >= 2
-                                else None,
-                                pending_rows=rows_f or [row_one],
-                            )
-
-                    def do_rt() -> None:
-                        if self._planning_retarget_planned_file_with_dialog(dlg, pidx):
-                            handle_post_mutation(feedback="Destination retargeted.")
-
-                    def do_rm() -> None:
-                        if self._planning_remove_planned_move_with_confirm(dlg, pidx):
-                            handle_post_mutation(feedback="Mapping removed from plan.")
-
-                    btn_rename.clicked.connect(do_rename)
-                    btn_rt.clicked.connect(do_rt)
-                    btn_rm.clicked.connect(do_rm)
-
-                _wire_row_actions(pri)
-                rh.addWidget(btn_rename)
-                rh.addWidget(btn_rt)
-                rh.addWidget(btn_rm)
-                guidance_rows_layout.addWidget(row_w)
-            guidance_frame.setVisible(True)
+                title, sentence, sug = self._dup_insp_inline_failure_headline_detail(
+                    struct, planned_row_index=pri
+                )
+                rename_label = self._dup_insp_inline_rename_button_label(sug)
+                rename_tt = sug if sug and "…" in rename_label else ""
+                fail_reason = str(struct.get("reason") or "unknown")
+                bo, rn_rl, rt_rl, rm_rl = self._dup_insp_inline_action_priorities(fail_reason)
+                rw.set_failure_ui(
+                    title=title,
+                    detail=sentence,
+                    show_inline_rename=file_row,
+                    show_retarget=file_row,
+                    show_remove=file_row,
+                    rename_button_label=rename_label,
+                    rename_button_tooltip=rename_tt,
+                    button_order=bo,
+                    rename_button_role=rn_rl,
+                    retarget_button_role=rt_rl,
+                    remove_button_role=rm_rl,
+                )
+                ir = rw.inline_reason_block
+                _disconnect_btn(ir.inline_rename_btn)
+                _disconnect_btn(ir.inline_retarget_btn)
+                _disconnect_btn(ir.inline_remove_btn)
+                if sug:
+                    ir.inline_rename_btn.clicked.connect(
+                        lambda checked=False, p=pri: apply_suggested_rename_for_planned_index(p)
+                    )
+                else:
+                    ir.inline_rename_btn.clicked.connect(
+                        lambda checked=False, p=pri: _inspector_inline_rename_planned(p)
+                    )
+                ir.inline_retarget_btn.clicked.connect(
+                    lambda checked=False, p=pri: _inspector_inline_retarget(p)
+                )
+                ir.inline_remove_btn.clicked.connect(
+                    lambda checked=False, p=pri: _inspector_inline_remove(p)
+                )
             if register_pending == "group" and pending_rows:
                 _register_pending_inspector_group_retry(pending_rows)
             elif register_pending == "all":
@@ -22037,19 +22682,20 @@ class MainWindow(QMainWindow):
             _focus_inspector_affected_row(affected)
             _apply_inspector_guidance_highlights()
 
-        def wire_inspector_table(tbl: QTableWidget, *, kind: str) -> None:
+        def wire_conflict_row(
+            rw: ConflictRowWidget,
+            *,
+            kind: str,
+            group_prs: list[int],
+        ) -> None:
             def on_context_menu(pos) -> None:
-                row = tbl.rowAt(int(pos.y()))
-                if row < 0:
-                    return
-                tbl.selectRow(row)
-                tbl.setCurrentCell(row, 0)
-                it0 = tbl.item(row, 0)
-                st = it0.data(Qt.UserRole) if it0 else None
+                st = rw.transfer_step
                 if not isinstance(st, dict):
                     return
+                _deselect_other_rows(rw)
+                sync_from_conflict_row(rw)
                 cap = self._inspector_capabilities_for_transfer_step(st)
-                menu = QMenu(tbl)
+                menu = QMenu(rw)
                 if kind == "dest":
                     m_manual = menu.addMenu("Manual edits")
                     a_go = m_manual.addAction("Go to item")
@@ -22079,17 +22725,20 @@ class MainWindow(QMainWindow):
                     a_rt.setEnabled(cap["can_retarget"])
                 a_one_suffix = None
                 a_grp_suffix = None
+                a_all_suffix = None
                 if kind == "dest":
                     m_auto = menu.addMenu("Automated fixes")
                     a_one_suffix = m_auto.addAction("Rename…")
                     a_grp_suffix = m_auto.addAction("Auto-fix group")
-                    gprs = getattr(tbl, "_oz_dup_dest_prs", None)
+                    gprs = group_prs
                     a_grp_suffix.setEnabled(bool(gprs) and len(gprs) >= 2)
                     a_one_suffix.setEnabled(bool(cap.get("can_rename")) and bool(gprs) and len(gprs) >= 2)
-                picked = menu.exec(tbl.viewport().mapToGlobal(pos))
+                    menu.addSeparator()
+                    a_all_suffix = menu.addAction("Auto-fix all")
+                picked = menu.exec(rw.mapToGlobal(pos))
                 if picked == a_go and cap["can_go"]:
                     self._inspector_run_go_from_step(st)
-                    sync_from_table(tbl)
+                    sync_from_conflict_row(rw)
                 elif picked == a_par and cap["can_go_parent"]:
                     self._inspector_run_go_parent_from_step(st)
                 elif picked == a_dup:
@@ -22101,15 +22750,14 @@ class MainWindow(QMainWindow):
                     if self._planning_rename_planned_file_with_dialog(dlg, cap["pr"]):
                         handle_post_mutation(feedback="1 rename applied.")
                 elif picked == a_rt and cap["can_retarget"] and cap["pr"] is not None:
-                    if self._planning_retarget_planned_file_with_dialog(dlg, cap["pr"]):
-                        handle_post_mutation(feedback="Destination retargeted.")
+                    _start_inspector_retarget_mode(int(cap["pr"]))
                 elif (
                     picked == a_one_suffix
                     and a_one_suffix is not None
                     and cap["can_rename"]
                     and cap["pr"] is not None
                 ):
-                    gprs = getattr(tbl, "_oz_dup_dest_prs", None)
+                    gprs = group_prs
                     if gprs and len(gprs) >= 2:
                         rows_full = self._build_execution_inspector_dest_suffix_preview_rows_for_moves(
                             sorted(gprs)
@@ -22126,7 +22774,7 @@ class MainWindow(QMainWindow):
                             )
                             st_nf["reason"] = "no_rows"
                             pr_stub = [{"index": int(i), "suggested_leaf": ""} for i in sorted(gprs)]
-                            show_inspector_guidance(
+                            _dup_insp_apply_failure_state(
                                 st_nf,
                                 register_pending="group",
                                 pending_rows=pr_stub,
@@ -22137,29 +22785,34 @@ class MainWindow(QMainWindow):
                                 st_ve = self._duplicate_apply_structured_failure(
                                     [row_one], v_err_one, bulk=False
                                 )
-                                show_inspector_guidance(
+                                _dup_insp_apply_failure_state(
                                     st_ve,
                                     register_pending="group",
                                     pending_rows=rows_full or [row_one],
                                 )
                             else:
                                 ok, err, st_apply = self._planning_apply_duplicate_preview_rows(
-                                    [row_one], dlg, change_note="execution_inspector_dest_suffix_one"
+                                    [row_one],
+                                    dlg,
+                                    change_note="execution_inspector_dest_suffix_one",
+                                    suppress_submitted_lock_modal=True,
                                 )
-                                if not ok and err and err != "locked" and st_apply:
-                                    show_inspector_guidance(
+                                if not ok and st_apply:
+                                    _dup_insp_apply_failure_state(
                                         st_apply,
                                         register_pending="group",
                                         pending_rows=rows_full or [row_one],
                                     )
                                 elif ok:
-                                    clear_inspector_guidance()
+                                    _dup_insp_clear_failure_state()
                                     _clear_inspector_auto_pending()
                                     handle_post_mutation(feedback="1 rename applied.")
                 elif picked == a_grp_suffix and a_grp_suffix is not None:
-                    gprs = getattr(tbl, "_oz_dup_dest_prs", None)
+                    gprs = group_prs
                     if gprs and len(gprs) >= 2:
-                        rows = self._build_execution_inspector_dest_suffix_preview_rows_for_moves(sorted(gprs))
+                        rows = self._build_execution_inspector_dest_suffix_preview_rows_for_moves(
+                            sorted(gprs)
+                        )
                         pr_stub = [{"index": int(i), "suggested_leaf": ""} for i in sorted(gprs)]
                         if not rows:
                             st_b = self._duplicate_apply_structured_failure(
@@ -22168,22 +22821,12 @@ class MainWindow(QMainWindow):
                                 bulk=True,
                             )
                             st_b["reason"] = "no_rows"
-                            show_inspector_guidance(
+                            _dup_insp_apply_failure_state(
                                 st_b,
                                 register_pending="group",
                                 pending_rows=pr_stub,
                             )
-                        elif (
-                            QMessageBox.question(
-                                dlg,
-                                "Auto-fix group",
-                                f"Assign {len(rows)} unique destination file names in this group "
-                                "(stem.ext, stem (2).ext, …)?",
-                                QMessageBox.Yes | QMessageBox.No,
-                                QMessageBox.No,
-                            )
-                            == QMessageBox.Yes
-                        ):
+                        else:
                             rows2 = self._build_execution_inspector_dest_suffix_preview_rows_for_moves(
                                 sorted(gprs)
                             )
@@ -22193,42 +22836,62 @@ class MainWindow(QMainWindow):
                                     "Suggestions changed before apply; try again.",
                                     bulk=True,
                                 )
-                                show_inspector_guidance(
+                                _dup_insp_apply_failure_state(
                                     st_ch,
                                     register_pending="group",
                                     pending_rows=rows,
                                 )
                             else:
                                 ok, err, st_apply = self._planning_apply_duplicate_preview_rows(
-                                    rows2, dlg, change_note="execution_inspector_dest_suffix_group"
+                                    rows2,
+                                    dlg,
+                                    change_note="execution_inspector_dest_suffix_group",
+                                    suppress_submitted_lock_modal=True,
                                 )
-                                if not ok and err and err != "locked" and st_apply:
-                                    show_inspector_guidance(
+                                if not ok and st_apply:
+                                    _dup_insp_apply_failure_state(
                                         st_apply,
                                         register_pending="group",
                                         pending_rows=rows2,
                                     )
                                 elif ok:
-                                    clear_inspector_guidance()
+                                    _dup_insp_clear_failure_state()
                                     _clear_inspector_auto_pending()
                                     handle_post_mutation(
                                         feedback=f"Suggested names applied to {len(rows2)} items."
                                     )
+                elif picked == a_all_suffix and a_all_suffix is not None:
+                    on_apply_all_dest_suffix_groups()
 
-            tbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-            tbl.customContextMenuRequested.connect(on_context_menu)
-            tbl.itemSelectionChanged.connect(lambda _t=tbl: sync_from_table(_t))
+            rw.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            rw.customContextMenuRequested.connect(on_context_menu)
+
+            def _on_row_clicked() -> None:
+                _deselect_other_rows(rw)
+                rw.set_selected(True)
+                sync_from_conflict_row(rw)
+
+            rw.row_clicked.connect(_on_row_clicked)
 
         def rebuild_collision_tables() -> None:
-            nonlocal tables_with_steps
+            nonlocal inspector_conflict_rows
             inspector_dest_suffix_groups.clear()
             _update_subset_note_text()
+            scroll_y = scroll.verticalScrollBar().value()
             while host_layout.count():
                 item = host_layout.takeAt(0)
                 w = item.widget()
                 if w is not None:
                     w.deleteLater()
-            tables_with_steps = []
+            inspector_conflict_rows = []
+
+            def _elide_middle(text: str, max_len: int = 72) -> str:
+                t = str(text or "")
+                if len(t) <= max_len:
+                    return t
+                half = (max_len - 3) // 2
+                return t[:half] + "…" + t[-(max_len - half - 3) :]
+
             m = manifest_holder.get("m") or {}
             steps = list(m.get("transfer_steps") or [])
             dest_groups = duplicate_transfer_step_groups_by_destination(steps)
@@ -22241,24 +22904,18 @@ class MainWindow(QMainWindow):
                 sec_title.setObjectName("SectionTitle")
                 host_layout.addWidget(sec_title)
                 for _nk, display_key, members in groups:
-                    grp = QFrame()
-                    grp.setObjectName("SectionBox")
-                    gl = QVBoxLayout(grp)
-                    label_text = f"Destination: {display_key}" if kind == "dest" else f"Source: {display_key}"
-                    gh = QLabel(label_text)
-                    gh.setObjectName("SectionTitle")
-                    gl.addWidget(gh)
-                    tbl = QTableWidget(0, 7)
-                    tbl.setHorizontalHeaderLabels(col_labels)
-                    tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
-                    tbl.setSelectionMode(QAbstractItemView.SingleSelection)
-                    tbl.verticalHeader().setVisible(False)
-                    tbl.horizontalHeader().setStretchLastSection(True)
-                    tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
-                    tbl.setMinimumHeight(min(220, 48 + 22 * max(3, len(members))))
-                    fill_table(tbl, members)
+                    card = DuplicateGroupCard()
+                    display_s = str(display_key or "").strip() or "(unknown)"
+                    card.destination_path_label.setText(_elide_middle(display_s, 80))
+                    card.destination_path_label.setToolTip(display_s)
+                    if kind == "dest":
+                        pix = card.style().standardPixmap(QStyle.StandardPixmap.SP_DirIcon)
+                    else:
+                        pix = card.style().standardPixmap(QStyle.StandardPixmap.SP_FileIcon)
+                    card.icon_label.setPixmap(pix.scaled(18, 18, Qt.AspectRatioMode.KeepAspectRatio))
 
                     pr_row_indices: list[int] = []
+                    preview_by_pr: dict[int, str] = {}
                     if kind == "dest":
                         for st in members:
                             if not isinstance(st, dict):
@@ -22280,12 +22937,21 @@ class MainWindow(QMainWindow):
                         pr_row_indices = sorted(set(pr_row_indices))
                         if len(pr_row_indices) >= 2:
                             inspector_dest_suffix_groups.append(pr_row_indices)
-                        setattr(tbl, "_oz_dup_dest_prs", pr_row_indices)
+                            prev_rows = self._build_execution_inspector_dest_suffix_preview_rows_for_moves(
+                                sorted(pr_row_indices)
+                            )
+                            for rpv in pr_row_indices:
+                                row_m = next(
+                                    (r for r in (prev_rows or []) if int(r["index"]) == int(rpv)),
+                                    None,
+                                )
+                                if row_m:
+                                    preview_by_pr[rpv] = str(row_m.get("suggested_leaf", "") or "").strip()
+                    card.dup_dest_prs = list(pr_row_indices)
 
-                    wire_inspector_table(tbl, kind=kind)
-                    gl.addWidget(tbl)
-
-                    if kind == "dest":
+                    if kind != "dest":
+                        card.group_auto_fix_btn.setVisible(False)
+                    else:
 
                         def _make_group_apply(prs: list[int]):
                             def on_group_apply() -> None:
@@ -22302,23 +22968,11 @@ class MainWindow(QMainWindow):
                                         bulk=True,
                                     )
                                     st_b["reason"] = "no_rows"
-                                    show_inspector_guidance(
+                                    _dup_insp_apply_failure_state(
                                         st_b,
                                         register_pending="group",
                                         pending_rows=pr_stub,
                                     )
-                                    return
-                                if (
-                                    QMessageBox.question(
-                                        dlg,
-                                        "Auto-fix group",
-                                        f"Assign {len(rows)} unique destination file names in this group "
-                                        "(stem.ext, stem (2).ext, …)?",
-                                        QMessageBox.Yes | QMessageBox.No,
-                                        QMessageBox.No,
-                                    )
-                                    != QMessageBox.Yes
-                                ):
                                     return
                                 rows2 = self._build_execution_inspector_dest_suffix_preview_rows_for_moves(
                                     sorted(prs)
@@ -22329,23 +22983,26 @@ class MainWindow(QMainWindow):
                                         "Suggestions changed before apply; try again.",
                                         bulk=True,
                                     )
-                                    show_inspector_guidance(
+                                    _dup_insp_apply_failure_state(
                                         st_ch,
                                         register_pending="group",
                                         pending_rows=rows,
                                     )
                                     return
                                 ok, err, st_apply = self._planning_apply_duplicate_preview_rows(
-                                    rows2, dlg, change_note="execution_inspector_dest_suffix_group"
+                                    rows2,
+                                    dlg,
+                                    change_note="execution_inspector_dest_suffix_group",
+                                    suppress_submitted_lock_modal=True,
                                 )
-                                if not ok and err and err != "locked" and st_apply:
-                                    show_inspector_guidance(
+                                if not ok and st_apply:
+                                    _dup_insp_apply_failure_state(
                                         st_apply,
                                         register_pending="group",
                                         pending_rows=rows2,
                                     )
                                 elif ok:
-                                    clear_inspector_guidance()
+                                    _dup_insp_clear_failure_state()
                                     _clear_inspector_auto_pending()
                                     handle_post_mutation(
                                         feedback=f"Suggested names applied to {len(rows2)} items."
@@ -22353,18 +23010,195 @@ class MainWindow(QMainWindow):
 
                             return on_group_apply
 
-                        grp_apply_btn = QPushButton("Auto-fix group")
-                        grp_apply_btn.setEnabled(len(pr_row_indices) >= 2)
-                        grp_apply_btn.setToolTip(
+                        card.group_auto_fix_btn.setEnabled(len(pr_row_indices) >= 2)
+                        card.group_auto_fix_btn.setToolTip(
                             "Assign stem.ext, stem (2).ext, ... using the first row's base name (planning-only)."
                             if len(pr_row_indices) >= 2
                             else "At least two draft file mappings are required in this group.",
                         )
-                        grp_apply_btn.clicked.connect(_make_group_apply(list(pr_row_indices)))
-                        gl.addWidget(grp_apply_btn)
+                        card.group_auto_fix_btn.clicked.connect(_make_group_apply(list(pr_row_indices)))
 
-                    tables_with_steps.append(tbl)
-                    host_layout.addWidget(grp)
+                    scoped_ids = _current_scoped_ids()
+                    row_widgets: list[ConflictRowWidget] = []
+                    for st in members:
+                        if not isinstance(st, dict):
+                            continue
+                        rw = ConflictRowWidget()
+                        rw.apply_file_icon(rw.style())
+                        rw.transfer_step = st
+                        rw.group_kind = kind
+                        rid = str(st.get("request_id", "") or "").strip()
+                        pr = self._planned_move_table_row_for_transfer_request_id(rid)
+                        rw.planned_row_index = int(pr) if pr is not None else None
+                        rw.dup_group_prs = list(pr_row_indices) if kind == "dest" else []
+                        cap = self._inspector_capabilities_for_transfer_step(st)
+                        dsp = str(st.get("destination_name", "") or st.get("source_name", "") or "").strip()
+                        rw.file_name_label.setText(dsp or "(unnamed)")
+                        dest_p = str(st.get("destination_path", "") or "").strip()
+                        idx = int(st.get("index", -1))
+                        in_sub = "Yes" if rid in scoped_ids else "No"
+                        prov = "Recursive" if rid.startswith("recsub-") else "Planned"
+                        path_line = _elide_middle(dest_p, 96)
+                        pidx = rw.planned_row_index
+                        sug = ""
+                        if pidx is not None:
+                            sug = preview_by_pr.get(int(pidx), "")
+                        can_suffix = (
+                            bool(kind == "dest")
+                            and bool(cap.get("can_rename"))
+                            and len(pr_row_indices) >= 2
+                            and pidx is not None
+                        )
+                        if sug:
+                            lines = [f'Will rename to "{sug}"', path_line]
+                        else:
+                            lines = [f"Step {idx} · {prov} · In run subset: {in_sub}", path_line]
+                        if can_suffix and sug:
+                            lines.append(
+                                "Suggested rename available — Rename applies the planner suggestion in one step."
+                            )
+                        elif can_suffix and not sug and cap.get("can_rename"):
+                            lines.append(
+                                "Duplicate group — waiting for a suggested unique name from the planner."
+                            )
+                        elif cap.get("can_rename") and pidx is not None:
+                            lines.append(
+                                "Manual rename required — Rename opens the destination file name editor."
+                            )
+                        else:
+                            lines.append("Rename is not available for this row.")
+                        rw.destination_preview_label.setText("\n".join(lines))
+                        rw.row_state_badge.setText(
+                            "Conflict" if kind == "dest" else "Duplicate source"
+                        )
+                        if cap.get("can_rename") and sug and len(sug) < 32:
+                            rw.rename_btn.setText(f'Rename to "{sug}"')
+                        else:
+                            rw.rename_btn.setText("Rename…")
+                        if can_suffix and sug:
+                            rw.rename_btn.setToolTip(
+                                f"Apply the planner's suggested destination file name: {sug}"
+                            )
+                        elif cap.get("can_rename") and pidx is not None:
+                            rw.rename_btn.setToolTip(
+                                "Open the rename dialog to edit the planned destination file name."
+                            )
+                        else:
+                            rw.rename_btn.setToolTip("")
+                        rw.rename_btn.setEnabled(
+                            can_suffix or bool(cap.get("can_rename") and pidx is not None)
+                        )
+
+                        def _row_rename_clicked(
+                            rww: ConflictRowWidget = rw,
+                            cap_f: dict = cap,
+                        ) -> None:
+                            pi = rww.planned_row_index
+                            if pi is None:
+                                return
+                            if (
+                                kind == "dest"
+                                and len(pr_row_indices) >= 2
+                                and cap_f.get("can_rename")
+                            ):
+                                apply_suggested_rename_for_planned_index(int(pi))
+                            elif cap_f.get("can_rename"):
+                                if self._planning_rename_planned_file_with_dialog(dlg, int(pi)):
+                                    handle_post_mutation(feedback="1 rename applied.")
+
+                        rw.rename_btn.clicked.connect(_row_rename_clicked)
+
+                        more_m = QMenu(rw)
+                        a_rt = more_m.addAction("Retarget…")
+                        a_rm = more_m.addAction("Remove")
+                        more_m.addSeparator()
+                        a_go = more_m.addAction("Go to item")
+                        a_par = more_m.addAction("Go to parent folder mapping")
+                        a_dup = more_m.addAction("Open duplicate file review…")
+                        a_go.setEnabled(cap["can_go"])
+                        a_par.setEnabled(cap["can_go_parent"])
+                        if cap["is_rec"]:
+                            a_rm.setVisible(False)
+                            a_rt.setVisible(False)
+                        else:
+                            a_rm.setEnabled(cap["can_remove"])
+                            a_rt.setEnabled(cap["can_retarget"])
+
+                        def _bind_more(
+                            act: QAction,
+                            fn,
+                            *,
+                            rww: ConflictRowWidget = rw,
+                        ) -> None:
+                            act.triggered.connect(lambda *a: fn(rww))
+
+                        _bind_more(
+                            a_rt,
+                            lambda rww: (
+                                _inspector_inline_retarget(int(rww.planned_row_index))
+                                if rww.planned_row_index is not None
+                                else None
+                            ),
+                        )
+                        _bind_more(
+                            a_rm,
+                            lambda rww: (
+                                _inspector_inline_remove(int(rww.planned_row_index))
+                                if rww.planned_row_index is not None
+                                else None
+                            ),
+                        )
+                        _bind_more(
+                            a_go,
+                            lambda rww: (
+                                self._inspector_run_go_from_step(rww.transfer_step)
+                                if isinstance(rww.transfer_step, dict)
+                                else None
+                            ),
+                        )
+                        _bind_more(
+                            a_par,
+                            lambda rww: (
+                                self._inspector_run_go_parent_from_step(rww.transfer_step)
+                                if isinstance(rww.transfer_step, dict)
+                                else None
+                            ),
+                        )
+                        a_dup.triggered.connect(self._show_duplicate_destination_file_review_dialog)
+                        rw.more_btn.setMenu(more_m)
+
+                        wire_conflict_row(rw, kind=kind, group_prs=list(pr_row_indices))
+                        inspector_conflict_rows.append(rw)
+                        row_widgets.append(rw)
+                        card.rows_layout.addWidget(rw)
+
+                    for j, rwj in enumerate(row_widgets):
+                        rwj.set_last_in_group(j == len(row_widgets) - 1)
+
+                    nconf = len(row_widgets)
+                    need = sum(
+                        1
+                        for rw in row_widgets
+                        if rw.planned_row_index is not None
+                        and int(rw.planned_row_index) in inspector_guidance_highlight_pr
+                    )
+                    meta_parts = [f"{nconf} conflict" + ("s" if nconf != 1 else "")]
+                    if need > 0:
+                        meta_parts.append(
+                            "1 needs attention" if need == 1 else f"{need} need attention"
+                        )
+                    card.group_meta_label.setText(" • ".join(meta_parts))
+                    n_plan = sum(1 for rw in row_widgets if rw.planned_row_index is not None)
+                    if need > 0 and n_plan > 0 and need < n_plan:
+                        card.group_status_badge.setText("Partially fixed")
+                    elif need > 0:
+                        card.group_status_badge.setText("Needs attention")
+                    elif kind == "dest" and len(pr_row_indices) >= 2:
+                        card.group_status_badge.setText("Auto-fix available")
+                    else:
+                        card.group_status_badge.setText("Review")
+
+                    host_layout.addWidget(card)
 
             add_grouped_section("Duplicate destination file targets", dest_groups, "dest")
             add_grouped_section("Duplicate source assignments", src_groups, "source")
@@ -22379,7 +23213,15 @@ class MainWindow(QMainWindow):
 
             host_layout.addStretch(1)
             scroll.setWidget(host)
+            scroll.verticalScrollBar().setValue(min(scroll_y, scroll.verticalScrollBar().maximum()))
             _apply_inspector_guidance_highlights()
+            if inspector_guidance_highlight_pr:
+                _focus_inspector_affected_row(inspector_guidance_highlight_pr)
+            elif inspector_conflict_rows:
+                first_rw = inspector_conflict_rows[0]
+                _deselect_other_rows(first_rw)
+                first_rw.set_selected(True)
+                sync_from_conflict_row(first_rw)
 
         def on_go() -> None:
             st = sel_step_holder["step"]
@@ -22421,24 +23263,21 @@ class MainWindow(QMainWindow):
             pr = self._planned_move_table_row_for_transfer_request_id(str(st.get("request_id", "") or ""))
             if pr is None:
                 return
-            if self._planning_retarget_planned_file_with_dialog(dlg, pr):
-                handle_post_mutation(feedback="Destination retargeted.")
+            _start_inspector_retarget_mode(int(pr))
 
         def on_apply_selected_dest_suffix() -> None:
             st = sel_step_holder["step"]
             if not isinstance(st, dict):
-                QMessageBox.information(
-                    dlg,
-                    "Apply suggested rename",
-                    "Select a row in a duplicate destination file group first.",
+                _set_inspector_banner(
+                    "Select a row first, then use Rename… (or click a row in a group).",
+                    "warning",
                 )
                 return
             rid = str(st.get("request_id", "") or "").strip()
             if rid.startswith("recsub-"):
-                QMessageBox.information(
-                    dlg,
-                    "Apply suggested rename",
-                    "Recursive expansion rows must be fixed via the parent folder mapping or duplicate file review.",
+                _set_inspector_banner(
+                    "Recursive rows: fix via parent folder mapping or Open duplicate file review (More menu).",
+                    "warning",
                 )
                 return
             pr = self._planned_move_table_row_for_transfer_request_id(rid)
@@ -22446,10 +23285,9 @@ class MainWindow(QMainWindow):
                 return
             cap = self._inspector_capabilities_for_transfer_step(st)
             if not cap.get("can_rename"):
-                QMessageBox.information(
-                    dlg,
-                    "Apply suggested rename",
-                    "This row cannot be renamed from here (submitted or non-file mapping).",
+                _set_inspector_banner(
+                    "This row cannot be auto-renamed here (submitted or non-file mapping).",
+                    "warning",
                 )
                 return
             group_prs = None
@@ -22458,10 +23296,9 @@ class MainWindow(QMainWindow):
                     group_prs = g
                     break
             if not group_prs or len(group_prs) < 2:
-                QMessageBox.information(
-                    dlg,
-                    "Apply suggested rename",
-                    "Selected row is not in a duplicate destination file group with another draft file mapping.",
+                _set_inspector_banner(
+                    "This row is not in a duplicate destination group with another draft file mapping.",
+                    "warning",
                 )
                 return
             rows_full = self._build_execution_inspector_dest_suffix_preview_rows_for_moves(sorted(group_prs))
@@ -22474,7 +23311,7 @@ class MainWindow(QMainWindow):
                 )
                 st_nf["reason"] = "no_rows"
                 pr_stub = [{"index": int(i), "suggested_leaf": ""} for i in sorted(group_prs)]
-                show_inspector_guidance(
+                _dup_insp_apply_failure_state(
                     st_nf,
                     register_pending="group",
                     pending_rows=pr_stub,
@@ -22483,32 +23320,34 @@ class MainWindow(QMainWindow):
             v_err_one = self._validate_duplicate_group_apply_preview_rows([row_one])
             if v_err_one:
                 st_ve = self._duplicate_apply_structured_failure([row_one], v_err_one, bulk=False)
-                show_inspector_guidance(
+                _dup_insp_apply_failure_state(
                     st_ve,
                     register_pending="group",
                     pending_rows=rows_full or [row_one],
                 )
                 return
             ok, err, st_apply = self._planning_apply_duplicate_preview_rows(
-                [row_one], dlg, change_note="execution_inspector_dest_suffix_one"
+                [row_one],
+                dlg,
+                change_note="execution_inspector_dest_suffix_one",
+                suppress_submitted_lock_modal=True,
             )
-            if not ok and err and err != "locked" and st_apply:
-                show_inspector_guidance(
+            if not ok and st_apply:
+                _dup_insp_apply_failure_state(
                     st_apply,
                     register_pending="group",
                     pending_rows=rows_full or [row_one],
                 )
             elif ok:
-                clear_inspector_guidance()
+                _dup_insp_clear_failure_state()
                 _clear_inspector_auto_pending()
                 handle_post_mutation(feedback="1 rename applied.")
 
         def on_apply_all_dest_suffix_groups() -> None:
             if not inspector_dest_suffix_groups:
-                QMessageBox.information(
-                    dlg,
-                    "Apply suggested names",
-                    "No duplicate destination file groups with two or more draft file rows.",
+                _set_inspector_banner(
+                    "No duplicate destination groups with two or more draft file rows.",
+                    "info",
                 )
                 return
             rows = self._build_execution_inspector_chained_dest_suffix_preview_rows(
@@ -22525,25 +23364,11 @@ class MainWindow(QMainWindow):
                     bulk=True,
                 )
                 st_all["reason"] = "no_rows"
-                show_inspector_guidance(
+                _dup_insp_apply_failure_state(
                     st_all,
                     register_pending="all",
                     pending_rows=rows,
                 )
-                return
-            if (
-                QMessageBox.question(
-                    dlg,
-                    "Auto-fix all",
-                    f"Assign {len(rows)} unique destination file names across every duplicate destination group "
-                    "that has two or more draft file mappings?\n\n"
-                    "• Planned destination file names in your plan will change.\n"
-                    "• Planning-only — does not rename source files or existing SharePoint files.",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No,
-                )
-                != QMessageBox.Yes
-            ):
                 return
             rows2 = self._build_execution_inspector_chained_dest_suffix_preview_rows(
                 list(inspector_dest_suffix_groups)
@@ -22554,29 +23379,35 @@ class MainWindow(QMainWindow):
                     "Suggestions changed before apply; try again.",
                     bulk=True,
                 )
-                show_inspector_guidance(
+                _dup_insp_apply_failure_state(
                     st_ch,
                     register_pending="all",
                     pending_rows=rows,
                 )
                 return
             ok, err, st_apply = self._planning_apply_duplicate_preview_rows(
-                rows2, dlg, change_note="execution_inspector_dest_suffix_all"
+                rows2,
+                dlg,
+                change_note="execution_inspector_dest_suffix_all",
+                suppress_submitted_lock_modal=True,
             )
-            if not ok and err and err != "locked" and st_apply:
-                show_inspector_guidance(
+            if not ok and st_apply:
+                _dup_insp_apply_failure_state(
                     st_apply,
                     register_pending="all",
                     pending_rows=rows2,
                 )
             elif ok:
-                clear_inspector_guidance()
                 _clear_inspector_auto_pending()
-                handle_post_mutation(feedback=f"Suggested names applied to {len(rows2)} items.")
-
-        rebuild_collision_tables()
-        outer.addWidget(scroll, 1)
-        outer.addWidget(hint)
+                n_ok = len(rows2)
+                _dup_insp_clear_failure_state()
+                handle_post_mutation(
+                    feedback=(
+                        f"Applied suggested names to {n_ok} item(s). "
+                        "If anything still needs attention, it will show on the affected rows."
+                    ),
+                    banner_flavor="success",
+                )
 
         go_btn.clicked.connect(on_go)
         go_parent_btn.clicked.connect(on_go_parent)
@@ -22601,22 +23432,80 @@ class MainWindow(QMainWindow):
         row2.addStretch(1)
         av.addLayout(row2)
         apply_sel_suffix_btn = QPushButton("Rename…")
-        apply_all_suffix_btn = QPushButton("Auto-fix all")
         apply_sel_suffix_btn.setToolTip(
             "If the selected draft row is in a duplicate destination file group, apply one safe rename when that alone is valid; "
             "otherwise use the per-group or all-groups action."
         )
-        apply_all_suffix_btn.setToolTip(
-            "Apply stem.ext / stem (2).ext / … for every duplicate destination group that has two or more draft file rows."
-        )
+        apply_sel_suffix_btn.setProperty("dupPrimary", True)
         row3 = QHBoxLayout()
         row3.addWidget(apply_sel_suffix_btn)
-        row3.addWidget(apply_all_suffix_btn)
         row3.addStretch(1)
         av.addLayout(row3)
         apply_sel_suffix_btn.clicked.connect(on_apply_selected_dest_suffix)
-        apply_all_suffix_btn.clicked.connect(on_apply_all_dest_suffix_groups)
-        outer.addWidget(actions)
+        summary_auto_fix_all_btn.clicked.connect(on_apply_all_dest_suffix_groups)
+
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(12)
+        left_layout.addWidget(summary_bar)
+        left_layout.addWidget(divider_line)
+        left_layout.addWidget(status_banner)
+        rebuild_collision_tables()
+        left_layout.addWidget(scroll, 1)
+        left_layout.addWidget(hint)
+        left_layout.addWidget(actions)
+
+        tree_column = QWidget()
+        tree_column_layout = QVBoxLayout(tree_column)
+        tree_column_layout.setContentsMargins(0, 0, 0, 0)
+        tree_column_layout.setSpacing(8)
+        tree_hint = QLabel(
+            "Destination tree — click a folder while retargeting (SharePoint view)."
+        )
+        tree_hint.setObjectName("MutedText")
+        tree_hint.setWordWrap(True)
+        tree_host = QWidget()
+        thlay = QVBoxLayout(tree_host)
+        thlay.setContentsMargins(0, 0, 0, 0)
+        tree_column_layout.addWidget(tree_hint)
+        tree_column_layout.addWidget(tree_host, 1)
+
+        insp_split = QSplitter(Qt.Orientation.Horizontal)
+        insp_split.addWidget(left_panel)
+        insp_split.addWidget(tree_column)
+        insp_split.setStretchFactor(0, 5)
+        insp_split.setStretchFactor(1, 3)
+
+        dest_tree_box = self.destination_tree_box
+        dest_tree_old_parent = dest_tree_box.parentWidget()
+        dest_tree_splitter_index: int | None = None
+        if isinstance(dest_tree_old_parent, QSplitter):
+            for _ii in range(dest_tree_old_parent.count()):
+                if dest_tree_old_parent.widget(_ii) is dest_tree_box:
+                    dest_tree_splitter_index = _ii
+                    break
+        thlay.addWidget(dest_tree_box, 1)
+
+        def _restore_inspector_destination_tree() -> None:
+            box = self.destination_tree_box
+            if dest_tree_old_parent is None:
+                return
+            if dest_tree_splitter_index is not None:
+                dest_tree_old_parent.insertWidget(int(dest_tree_splitter_index), box)
+            box.show()
+
+        cancel_retarget_btn.clicked.connect(
+            lambda checked=False: _exit_inspector_retarget_mode(restore_prior_banner=True)
+        )
+
+        def _on_inspector_dialog_finished(_result: int = 0) -> None:
+            _restore_inspector_destination_tree()
+            _exit_inspector_retarget_mode(restore_prior_banner=False)
+
+        dlg.finished.connect(_on_inspector_dialog_finished)
+
+        outer.addWidget(insp_split, 1)
 
         footer = QHBoxLayout()
         footer.addStretch(1)
@@ -22625,6 +23514,7 @@ class MainWindow(QMainWindow):
         footer.addWidget(bb)
         outer.addLayout(footer)
 
+        dlg.setStyleSheet(_DUPLICATE_COLLISION_INSPECTOR_QSS)
         dlg.exec()
 
     def _canonical_source_path_for_planning_leaf(self, panel_key, node_data):
