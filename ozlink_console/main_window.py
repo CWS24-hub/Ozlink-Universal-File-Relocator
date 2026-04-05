@@ -2153,24 +2153,28 @@ class ConflictRowWidget(QWidget):
         self.group_kind: str = ""
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(8)
+        root.setSpacing(10)
         self.main_row = QWidget()
-        self.main_row.setMinimumHeight(44)
+        self.main_row.setMinimumHeight(48)
         mrl = QHBoxLayout(self.main_row)
-        mrl.setContentsMargins(0, 0, 0, 0)
-        mrl.setSpacing(8)
+        mrl.setContentsMargins(0, 4, 0, 4)
+        mrl.setSpacing(10)
         self.file_icon = QLabel()
         self.file_icon.setFixedWidth(22)
         self.file_icon.setScaledContents(True)
         self.text_block = QWidget()
         tbl = QVBoxLayout(self.text_block)
         tbl.setContentsMargins(0, 0, 0, 0)
-        tbl.setSpacing(2)
+        tbl.setSpacing(4)
         self.file_name_label = QLabel()
         self.file_name_label.setObjectName("ConflictRowFileName")
+        self.row_problem_label = QLabel()
+        self.row_problem_label.setObjectName("ConflictRowProblemLine")
+        self.row_problem_label.setWordWrap(True)
         self.destination_preview_label = QLabel()
         self.destination_preview_label.setObjectName("ConflictRowSubtext")
         tbl.addWidget(self.file_name_label)
+        tbl.addWidget(self.row_problem_label)
         tbl.addWidget(self.destination_preview_label)
         self.row_state_badge = QLabel()
         self.row_state_badge.setObjectName("DuplicateStatusBadge")
@@ -2282,8 +2286,8 @@ class DuplicateGroupCard(QFrame):
         self.setObjectName("DuplicateGroupCard")
         self.dup_dest_prs: list[int] = []
         card_layout = QVBoxLayout(self)
-        card_layout.setContentsMargins(12, 12, 12, 12)
-        card_layout.setSpacing(10)
+        card_layout.setContentsMargins(14, 14, 14, 14)
+        card_layout.setSpacing(12)
         self.header_row = QWidget()
         header_layout = QHBoxLayout(self.header_row)
         header_layout.setContentsMargins(0, 0, 0, 0)
@@ -2312,7 +2316,7 @@ class DuplicateGroupCard(QFrame):
         self.rows_container = QWidget()
         self.rows_layout = QVBoxLayout(self.rows_container)
         self.rows_layout.setContentsMargins(0, 0, 0, 0)
-        self.rows_layout.setSpacing(8)
+        self.rows_layout.setSpacing(10)
         card_layout.addWidget(self.header_row)
         card_layout.addWidget(self.rows_container)
 
@@ -2370,6 +2374,10 @@ QLabel#MutedText {
 }
 #ConflictRowSubtext {
     color: #a3a3a3;
+}
+#ConflictRowProblemLine {
+    color: #e8b86a;
+    font-weight: 600;
 }
 #DuplicateStatusBadge {
     color: #e5e5e5;
@@ -20534,17 +20542,27 @@ class MainWindow(QMainWindow):
         self._persist_planning_change(change_note)
         return True, None, None
 
-    def _show_duplicate_destination_file_review_dialog(self) -> None:
+    def _show_duplicate_destination_file_review_dialog(
+        self, *, launched_from_execution_duplicate_inspector: bool = False
+    ) -> None:
         grouped = grouped_duplicate_destination_moves(
             list(self.planned_moves or []),
             destination_file_key=self._destination_file_key_for_execution_validation,
         )
         if not grouped:
-            QMessageBox.information(
-                self,
-                "Duplicate destination files",
-                "No duplicate destination files found.",
-            )
+            if launched_from_execution_duplicate_inspector:
+                QMessageBox.information(
+                    self,
+                    "Duplicate destination files",
+                    "No multi-file duplicate groups in the draft plan.\n\n"
+                    "Use this inspector to resolve execution collisions.",
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    "Duplicate destination files",
+                    "No duplicate destination files found.",
+                )
             return
         dlg = QDialog(self)
         dlg.setWindowTitle("Duplicate destination hub")
@@ -21870,6 +21888,7 @@ class MainWindow(QMainWindow):
         move = self.planned_moves[pr] if pr is not None and pr < len(self.planned_moves or []) else None
         submitted = bool(move and self._is_move_submitted(move))
         is_file = bool(move and self._planned_move_is_file_allocation(move))
+        dest_path_step = str(st.get("destination_path", "") or "").strip()
         return {
             "rid": rid,
             "src_path_step": src_path_step,
@@ -21877,7 +21896,7 @@ class MainWindow(QMainWindow):
             "is_rec": is_rec,
             "hh": hh,
             "parent_pr": parent_pr,
-            "can_go": bool(pr is not None or bool(src_path_step)),
+            "can_go": bool(pr is not None or bool(dest_path_step) or bool(src_path_step)),
             "can_go_parent": bool(is_rec and parent_pr is not None),
             "can_remove": bool(pr is not None and not submitted),
             "can_rename": bool(pr is not None and is_file and not submitted),
@@ -21909,6 +21928,49 @@ class MainWindow(QMainWindow):
         src_path_step = str(st.get("source_path", "") or "").strip()
         if src_path_step:
             self._activate_workflow_source_row({"source_path": src_path_step})
+
+    def _inspector_go_to_destination_from_step(
+        self,
+        st: dict,
+        *,
+        on_banner: Any | None = None,
+    ) -> None:
+        """Duplicate inspector: jump the destination tree to this step's planned destination (embedded split view)."""
+        if not isinstance(st, dict):
+            return
+
+        def _fail() -> None:
+            if on_banner is not None:
+                on_banner("This item could not be located in the destination tree.")
+
+        target_path = ""
+        rid = str(st.get("request_id", "") or "").strip()
+        pr = self._planned_move_table_row_for_transfer_request_id(rid)
+        pm = self.planned_moves or []
+        if pr is not None and 0 <= int(pr) < len(pm):
+            move = pm[int(pr)]
+            target_path = (
+                self._allocation_projection_path(move)
+                or self._move_destination_target_path(move)
+                or ""
+            )
+        if not str(target_path or "").strip():
+            target_path = str(st.get("destination_path", "") or "").strip()
+        canon = self._canonical_destination_projection_path(target_path) or self.normalize_memory_path(
+            str(target_path or "").strip()
+        )
+        if not canon:
+            _fail()
+            return
+        navigated = self._select_destination_item_by_path(canon)
+        if not navigated:
+            navigated = self._start_destination_navigation(canon)
+        tw = getattr(self, "destination_tree_widget", None)
+        if navigated and tw is not None:
+            tw.setFocus(Qt.FocusReason.OtherFocusReason)
+            tw.activateWindow()
+            return
+        _fail()
 
     def _inspector_run_go_parent_from_step(self, st: dict) -> None:
         if not isinstance(st, dict):
@@ -21993,8 +22055,8 @@ class MainWindow(QMainWindow):
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         host = QWidget()
         host_layout = QVBoxLayout(host)
-        host_layout.setContentsMargins(0, 4, 0, 0)
-        host_layout.setSpacing(10)
+        host_layout.setContentsMargins(0, 6, 0, 0)
+        host_layout.setSpacing(12)
 
         def _current_scoped_ids() -> set[str]:
             eo = dict((manifest_holder.get("m") or {}).get("execution_options") or {})
@@ -22103,16 +22165,11 @@ class MainWindow(QMainWindow):
             hh = cap["hh"]
 
             go_btn.setEnabled(cap["can_go"])
-            if pr is not None:
-                go_btn.setToolTip("Open Planned Moves and select this draft mapping row.")
-            elif is_rec:
-                go_btn.setToolTip(
-                    "Jump to this file in the source tree (recursive expansion row; not a standalone planned move)."
-                )
-            else:
-                go_btn.setToolTip(
-                    "Jump to this source path in the source tree (no matching Planned Moves row for this request id)."
-                )
+            go_btn.setToolTip(
+                "Show this item in the destination tree on the right (expand and select)."
+                if cap["can_go"]
+                else ""
+            )
 
             go_parent_btn.setEnabled(cap["can_go_parent"])
             go_parent_btn.setToolTip(
@@ -22149,8 +22206,8 @@ class MainWindow(QMainWindow):
                 hint.setText("Draft planned mapping — mutation actions use the same flows as Duplicate destination files.")
             else:
                 hint.setText(
-                    "This transfer step does not match a current Planned Moves row; use Go to item on the source tree "
-                    "or adjust the draft, then retry the run."
+                    "This transfer step does not match a current Planned Moves row; use Go to item on the destination "
+                    "tree or adjust the draft, then retry the run."
                 )
 
         inspector_retarget_tree_hooks: list[tuple[Any, Any]] = []
@@ -22737,12 +22794,17 @@ class MainWindow(QMainWindow):
                     a_all_suffix = menu.addAction("Auto-fix all")
                 picked = menu.exec(rw.mapToGlobal(pos))
                 if picked == a_go and cap["can_go"]:
-                    self._inspector_run_go_from_step(st)
+                    self._inspector_go_to_destination_from_step(
+                        st,
+                        on_banner=lambda m: _set_inspector_banner(m, "warning"),
+                    )
                     sync_from_conflict_row(rw)
                 elif picked == a_par and cap["can_go_parent"]:
                     self._inspector_run_go_parent_from_step(st)
                 elif picked == a_dup:
-                    self._show_duplicate_destination_file_review_dialog()
+                    self._show_duplicate_destination_file_review_dialog(
+                        launched_from_execution_duplicate_inspector=True
+                    )
                 elif picked == a_rm and cap["can_remove"] and cap["pr"] is not None:
                     if self._planning_remove_planned_move_with_confirm(dlg, cap["pr"]):
                         handle_post_mutation(feedback="Mapping removed from plan.")
@@ -22954,7 +23016,8 @@ class MainWindow(QMainWindow):
                     else:
 
                         def _make_group_apply(prs: list[int]):
-                            def on_group_apply() -> None:
+                            def on_group_apply(_checked: bool = False) -> None:
+                                _ = _checked
                                 if len(prs) < 2:
                                     return
                                 rows = self._build_execution_inspector_dest_suffix_preview_rows_for_moves(
@@ -23035,6 +23098,12 @@ class MainWindow(QMainWindow):
                         dsp = str(st.get("destination_name", "") or st.get("source_name", "") or "").strip()
                         rw.file_name_label.setText(dsp or "(unnamed)")
                         dest_p = str(st.get("destination_path", "") or "").strip()
+                        if kind == "source":
+                            rw.row_problem_label.setText("This file is assigned to multiple destinations.")
+                        elif not dest_p.strip():
+                            rw.row_problem_label.setText("This destination folder is not available.")
+                        else:
+                            rw.row_problem_label.setText("A file with this name already exists here.")
                         idx = int(st.get("index", -1))
                         in_sub = "Yes" if rid in scoped_ids else "No"
                         prov = "Recursive" if rid.startswith("recsub-") else "Planned"
@@ -23089,20 +23158,28 @@ class MainWindow(QMainWindow):
                             can_suffix or bool(cap.get("can_rename") and pidx is not None)
                         )
 
-                        def _row_rename_clicked(
-                            rww: ConflictRowWidget = rw,
-                            cap_f: dict = cap,
-                        ) -> None:
-                            pi = rww.planned_row_index
+                        def _row_rename_clicked(_checked: bool = False) -> None:
+                            _ = _checked
+                            if not isinstance(rw, ConflictRowWidget):
+                                log_warn(
+                                    "duplicate_inspector_row_rename",
+                                    event="invalid_row_widget",
+                                )
+                                return
+                            pi = rw.planned_row_index
                             if pi is None:
+                                log_warn(
+                                    "duplicate_inspector_row_rename",
+                                    event="missing_planned_row_index",
+                                )
                                 return
                             if (
                                 kind == "dest"
                                 and len(pr_row_indices) >= 2
-                                and cap_f.get("can_rename")
+                                and cap.get("can_rename")
                             ):
                                 apply_suggested_rename_for_planned_index(int(pi))
-                            elif cap_f.get("can_rename"):
+                            elif cap.get("can_rename"):
                                 if self._planning_rename_planned_file_with_dialog(dlg, int(pi)):
                                     handle_post_mutation(feedback="1 rename applied.")
 
@@ -23151,7 +23228,10 @@ class MainWindow(QMainWindow):
                         _bind_more(
                             a_go,
                             lambda rww: (
-                                self._inspector_run_go_from_step(rww.transfer_step)
+                                self._inspector_go_to_destination_from_step(
+                                    rww.transfer_step,
+                                    on_banner=lambda m: _set_inspector_banner(m, "warning"),
+                                )
                                 if isinstance(rww.transfer_step, dict)
                                 else None
                             ),
@@ -23164,7 +23244,11 @@ class MainWindow(QMainWindow):
                                 else None
                             ),
                         )
-                        a_dup.triggered.connect(self._show_duplicate_destination_file_review_dialog)
+                        a_dup.triggered.connect(
+                            lambda: self._show_duplicate_destination_file_review_dialog(
+                                launched_from_execution_duplicate_inspector=True
+                            )
+                        )
                         rw.more_btn.setMenu(more_m)
 
                         wire_conflict_row(rw, kind=kind, group_prs=list(pr_row_indices))
@@ -23226,7 +23310,10 @@ class MainWindow(QMainWindow):
         def on_go() -> None:
             st = sel_step_holder["step"]
             if isinstance(st, dict):
-                self._inspector_run_go_from_step(st)
+                self._inspector_go_to_destination_from_step(
+                    st,
+                    on_banner=lambda m: _set_inspector_banner(m, "warning"),
+                )
 
         def on_go_parent() -> None:
             st = sel_step_holder["step"]
@@ -23234,7 +23321,9 @@ class MainWindow(QMainWindow):
                 self._inspector_run_go_parent_from_step(st)
 
         def on_dup_review() -> None:
-            self._show_duplicate_destination_file_review_dialog()
+            self._show_duplicate_destination_file_review_dialog(
+                launched_from_execution_duplicate_inspector=True
+            )
 
         def on_remove() -> None:
             st = sel_step_holder["step"]
