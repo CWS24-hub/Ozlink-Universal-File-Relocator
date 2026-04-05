@@ -2748,6 +2748,18 @@ class MainWindow(QMainWindow):
                 border-radius: 12px;
             }
 
+            QFrame#PlanningWarningBanner {
+                background-color: rgba(255, 193, 77, 0.10);
+                border: 1px solid rgba(255, 193, 77, 0.24);
+                border-radius: 12px;
+            }
+
+            QFrame#PlanningIssueStrip {
+                background-color: rgba(255, 193, 77, 0.06);
+                border: 1px solid rgba(255, 193, 77, 0.14);
+                border-radius: 8px;
+            }
+
             QFrame#TreeSurface {
                 background-color: #0A0A10;
                 border: none;
@@ -4258,6 +4270,14 @@ class MainWindow(QMainWindow):
             self.not_planned_status,
         ) = self.build_suggestions_panel()
         self.needs_review_box, self.needs_review_table, self.needs_review_status = self.build_needs_review_panel()
+        self.review_fix_box = self._build_review_fix_tab_panel()
+        self.workspace_execution_tab = self._build_workspace_execution_tab_panel()
+
+        self._suggestions_panel_holder = QWidget()
+        self._suggestions_panel_holder.setVisible(False)
+        _sph_layout = QVBoxLayout(self._suggestions_panel_holder)
+        _sph_layout.setContentsMargins(0, 0, 0, 0)
+        _sph_layout.addWidget(self.suggestions_box)
 
         if getattr(self, "_source_tree_model_view", False):
             self.source_tree_widget.expanded.connect(self._on_source_sharepoint_model_expanded)
@@ -4349,11 +4369,11 @@ class MainWindow(QMainWindow):
         middle_wrap.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         self.workspace_tabs = QTabWidget()
-        self.workspace_tabs.addTab(self.details_box, "Selection Details")
-        self.workspace_tabs.addTab(self.planned_moves_box, "Planned Moves")
-        self.workspace_tabs.addTab(self.suggestions_box, "Suggestions")
-        self.workspace_tabs.addTab(self.needs_review_box, "Needs Review")
+        self.workspace_tabs.addTab(self.details_box, "Selection")
+        self.workspace_tabs.addTab(self.planned_moves_box, "Planning Workspace")
+        self.workspace_tabs.addTab(self.review_fix_box, "Review & Fix")
         self.workspace_tabs.addTab(self.preview_tab_box, "Preview")
+        self.workspace_tabs.addTab(self.workspace_execution_tab, "Execution")
         self._workspace_tabs_expanded_min_height = 268
         self._workspace_tabs_expanded_max_height = 380
         self._workspace_tabs_collapsed = False
@@ -4369,10 +4389,12 @@ class MainWindow(QMainWindow):
         self.workspace_tabs.currentChanged.connect(self.on_workspace_tab_changed)
         outer.addWidget(middle_wrap, 1)
         outer.addWidget(self.workspace_tabs, 0)
+        outer.addWidget(self._suggestions_panel_holder, 0)
 
         outer.setStretch(0, 0)
         outer.setStretch(1, 3)
         outer.setStretch(2, 3)
+        outer.setStretch(3, 0)
 
         return page
 
@@ -4626,7 +4648,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
 
-        title = QLabel("Needs Review")
+        title = QLabel("Review items")
         title.setObjectName("SectionTitle")
 
         hint = QLabel(
@@ -4667,7 +4689,9 @@ class MainWindow(QMainWindow):
         )
         confirm_btn.clicked.connect(self._on_needs_review_mark_inherited_confirmed)
         dup_btn = QPushButton("Open duplicate hub…")
-        dup_btn.setToolTip("Open the Planning Workspace duplicate destination hub (same as the Planned Moves banner).")
+        dup_btn.setToolTip(
+            "Open the duplicate destination hub (same as Review & Fix and Planning Workspace shortcuts)."
+        )
         dup_btn.clicked.connect(self._on_needs_review_open_duplicate_file_review)
         actions_layout.addWidget(go_btn, 0, Qt.AlignmentFlag.AlignLeft)
         actions_layout.addWidget(confirm_btn, 0, Qt.AlignmentFlag.AlignLeft)
@@ -4692,6 +4716,78 @@ class MainWindow(QMainWindow):
         self.needs_review_confirm_btn = confirm_btn
         self.needs_review_dup_dialog_btn = dup_btn
         return box, table, status
+
+    def _build_review_fix_tab_panel(self) -> QFrame:
+        """Workspace tab: duplicate shortcuts + needs-review queue (no logic changes)."""
+        box = QFrame()
+        box.setObjectName("TabSurface")
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
+
+        title = QLabel("Review & Fix")
+        title.setObjectName("SectionTitle")
+        intro = QLabel(
+            "Resolve duplicate destination files, projection overlaps, inherited mappings, and weak suggestions. "
+            "Use the shortcuts below or the review table."
+        )
+        intro.setObjectName("MutedText")
+        intro.setWordWrap(True)
+
+        dup_row = QFrame()
+        dup_row.setObjectName("SoftBanner")
+        dr = QHBoxLayout(dup_row)
+        dr.setContentsMargins(10, 7, 10, 7)
+        dr.setSpacing(10)
+        dup_lbl = QLabel("Duplicate file targets:")
+        dup_lbl.setObjectName("MutedText")
+        rf_dup_apply = QPushButton("Apply suggested names")
+        rf_dup_apply.setToolTip(
+            "Apply auto-generated unique destination file names for every duplicate group in one step. "
+            "Planning only—does not rename source files or existing SharePoint files."
+        )
+        rf_dup_apply.clicked.connect(self._on_planned_moves_duplicate_hub_apply_suggested)
+        rf_dup_open = QPushButton("Open duplicate hub…")
+        rf_dup_open.setToolTip(
+            "Open the duplicate hub dialog: browse groups, remove or retarget mappings, preview or apply per group."
+        )
+        rf_dup_open.clicked.connect(self._show_duplicate_destination_file_review_dialog)
+        dr.addWidget(dup_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
+        dr.addWidget(rf_dup_apply, 0, Qt.AlignmentFlag.AlignVCenter)
+        dr.addWidget(rf_dup_open, 0, Qt.AlignmentFlag.AlignVCenter)
+        dr.addStretch(1)
+
+        layout.addWidget(title)
+        layout.addWidget(intro)
+        layout.addWidget(dup_row)
+        layout.addWidget(self.needs_review_box, 1)
+        return box
+
+    def _build_workspace_execution_tab_panel(self) -> QFrame:
+        """Compact entry to the full Execution page (same handlers; widget lives on main stack)."""
+        box = QFrame()
+        box.setObjectName("TabSurface")
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(10)
+
+        title = QLabel("Execution")
+        title.setObjectName("SectionTitle")
+        body = QLabel(
+            "Manifests, dry-run preview, scoped runs, and copy execution use the full Execution page. "
+            "Open it here when you are ready to run without leaving the app shell."
+        )
+        body.setObjectName("MutedText")
+        body.setWordWrap(True)
+        open_btn = QPushButton("Open Execution page")
+        open_btn.setObjectName("PrimaryButton")
+        open_btn.setToolTip("Switch to the Execution page (manifest, preview, run).")
+        open_btn.clicked.connect(partial(self.switch_page, "Execution"))
+        layout.addWidget(title)
+        layout.addWidget(body)
+        layout.addWidget(open_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        layout.addStretch(1)
+        return box
 
     def _needs_review_rows_for_display(self) -> list:
         rows = list(getattr(self, "_workflow_needs_review_rows", None) or [])
@@ -8340,7 +8436,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(12, 10, 12, 10)
         layout.setSpacing(10)
 
-        title = QLabel("Selection Details")
+        title = QLabel("Selection")
         title.setObjectName("SectionTitle")
 
         self.details_fields = {}
@@ -8588,17 +8684,17 @@ class MainWindow(QMainWindow):
 
     def build_planned_moves_panel(self):
         box = QFrame()
-        box.setObjectName("SectionBox")
+        box.setObjectName("TabSurface")
         layout = QVBoxLayout(box)
-        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setContentsMargins(12, 12, 12, 10)
         layout.setSpacing(8)
 
         loading_banner = QFrame()
         loading_banner.setObjectName("SoftBanner")
         loading_banner.hide()
         loading_layout = QVBoxLayout(loading_banner)
-        loading_layout.setContentsMargins(12, 10, 12, 10)
-        loading_layout.setSpacing(2)
+        loading_layout.setContentsMargins(10, 8, 10, 8)
+        loading_layout.setSpacing(4)
 
         loading_title = QLabel("Please wait while we load your SharePoint sites.")
         loading_title.setObjectName("SectionTitle")
@@ -8611,13 +8707,14 @@ class MainWindow(QMainWindow):
 
         plan_review_summary = QLabel("Plan review: 0 planned move(s), 0 proposed folder(s) in draft.")
         plan_review_summary.setObjectName("MutedText")
-        plan_review_summary.setWordWrap(True)
+        plan_review_summary.setWordWrap(False)
         self.plan_review_summary_label = plan_review_summary
 
         plan_readiness_summary = QLabel("Ready for execution")
         plan_readiness_summary.setObjectName("MutedText")
         plan_readiness_summary.setWordWrap(True)
         plan_readiness_summary.setStyleSheet("color: #8FA3B8;")
+        plan_readiness_summary.setMinimumWidth(160)
         self.planning_readiness_summary_label = plan_readiness_summary
 
         table = QTableWidget(0, 5)
@@ -8632,6 +8729,7 @@ class MainWindow(QMainWindow):
         table.setSelectionMode(QAbstractItemView.SingleSelection)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(28)
         table.horizontalHeader().setStretchLastSection(True)
         table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
@@ -8647,7 +8745,13 @@ class MainWindow(QMainWindow):
         self.planned_moves_loading_title = loading_title
         self.planned_moves_loading_detail = loading_detail
 
-        simulate_row = QHBoxLayout()
+        export_hint = QLabel(
+            "Export a JSON manifest (for your records or dry-run / run on the Execution page). "
+            "This is separate from Submit Request to Ozlink IT."
+        )
+        export_hint.setObjectName("MutedText")
+        export_hint.setWordWrap(True)
+
         self.simulate_run_manifest_button = QPushButton("Simulate run (save manifest)…")
         self.simulate_run_manifest_button.setToolTip(
             "Save a JSON file listing planned file steps and proposed folders. "
@@ -8660,19 +8764,21 @@ class MainWindow(QMainWindow):
             "or Microsoft Graph copies when signed in and the manifest includes drive/item ids."
         )
         self.run_manifest_button.clicked.connect(self._on_run_transfer_manifest)
-        simulate_row.addWidget(self.simulate_run_manifest_button)
-        simulate_row.addWidget(self.run_manifest_button)
-        simulate_row.addStretch(1)
 
-        export_hint = QLabel(
-            "Export a JSON manifest (for your records or dry-run / run on the Execution page). "
-            "This is separate from Submit Request to Ozlink IT."
-        )
-        export_hint.setObjectName("MutedText")
-        export_hint.setWordWrap(True)
+        top_bar = QFrame()
+        top_bar.setObjectName("PlanningContextBar")
+        top_bar_layout = QVBoxLayout(top_bar)
+        top_bar_layout.setContentsMargins(10, 8, 10, 8)
+        top_bar_layout.setSpacing(4)
 
-        proposed_heading = QLabel("Proposed folders (draft)")
-        proposed_heading.setObjectName("SectionTitle")
+        summary_row = QHBoxLayout()
+        summary_row.setSpacing(10)
+        summary_row.addWidget(plan_review_summary, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        summary_row.addWidget(plan_readiness_summary, 1, Qt.AlignmentFlag.AlignVCenter)
+        summary_row.addWidget(self.simulate_run_manifest_button, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        summary_row.addWidget(self.run_manifest_button, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        top_bar_layout.addLayout(summary_row)
+        top_bar_layout.addWidget(export_hint)
 
         proposed_table = QTableWidget(0, 3)
         proposed_table.setHorizontalHeaderLabels(["Name", "Parent path", "Status"])
@@ -8680,6 +8786,7 @@ class MainWindow(QMainWindow):
         proposed_table.setSelectionMode(QAbstractItemView.SingleSelection)
         proposed_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         proposed_table.verticalHeader().setVisible(False)
+        proposed_table.verticalHeader().setDefaultSectionSize(26)
         proposed_table.horizontalHeader().setStretchLastSection(True)
         proposed_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         proposed_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
@@ -8688,75 +8795,133 @@ class MainWindow(QMainWindow):
         proposed_table.setMinimumHeight(72)
         self.proposed_folders_table = proposed_table
 
-        dup_banner_row = QFrame()
-        dup_banner_row.setObjectName("SoftBanner")
-        dup_banner_outer = QVBoxLayout(dup_banner_row)
-        dup_banner_outer.setContentsMargins(12, 10, 12, 10)
-        dup_banner_outer.setSpacing(6)
-        dup_banner_title = QLabel("Duplicate destination hub")
-        dup_banner_title.setObjectName("SectionTitle")
         dup_banner_hint = QLabel(
             "Recommended: use Apply suggested names for a quick planning-only fix (unique destination file names). "
             "Use Review & fix for remove, retarget, or per-group control."
         )
         dup_banner_hint.setObjectName("MutedText")
-        dup_banner_hint.setWordWrap(True)
-        dup_banner_actions = QWidget()
-        dup_banner_actions_layout = QHBoxLayout(dup_banner_actions)
-        dup_banner_actions_layout.setContentsMargins(0, 0, 0, 0)
-        dup_banner_actions_layout.setSpacing(8)
+        dup_banner_hint.hide()
+
+        dup_banner_title = QLabel("Duplicate targets")
+        dup_banner_title.setObjectName("MutedText")
+        dup_banner_title.setWordWrap(False)
         dup_banner_apply_btn = QPushButton("Apply suggested names")
         dup_banner_apply_btn.setToolTip(
             "Apply auto-generated unique destination file names for every duplicate group in one step. "
-            "Planning only—does not rename source files or existing SharePoint files."
+            "Planning only—does not rename source files or existing SharePoint files.\n\n"
+            + dup_banner_hint.text()
         )
         dup_banner_apply_btn.clicked.connect(self._on_planned_moves_duplicate_hub_apply_suggested)
-        dup_banner_btn = QPushButton("Review & fix…")
+        dup_banner_btn = QPushButton("Review…")
         dup_banner_btn.setToolTip(
-            "Open the duplicate hub dialog: browse groups, remove or retarget mappings, preview or apply per group."
+            "Open the duplicate hub dialog: browse groups, remove or retarget mappings, preview or apply per group.\n\n"
+            + dup_banner_hint.text()
         )
         dup_banner_btn.clicked.connect(self._show_duplicate_destination_file_review_dialog)
-        dup_banner_actions_layout.addWidget(dup_banner_apply_btn, 0, Qt.AlignmentFlag.AlignLeft)
-        dup_banner_actions_layout.addWidget(dup_banner_btn, 0, Qt.AlignmentFlag.AlignLeft)
-        dup_banner_actions_layout.addStretch(1)
-        dup_banner_outer.addWidget(dup_banner_title)
-        dup_banner_outer.addWidget(dup_banner_hint)
-        dup_banner_outer.addWidget(dup_banner_actions)
-        dup_banner_row.hide()
-        self.planned_moves_duplicate_banner = dup_banner_row
+
+        dup_slot = QWidget()
+        dup_slot_layout = QHBoxLayout(dup_slot)
+        dup_slot_layout.setContentsMargins(0, 0, 0, 0)
+        dup_slot_layout.setSpacing(8)
+        dup_slot_layout.addWidget(dup_banner_title, 0, Qt.AlignmentFlag.AlignVCenter)
+        dup_slot_layout.addWidget(dup_banner_apply_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        dup_slot_layout.addWidget(dup_banner_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        dup_slot.setToolTip(dup_banner_hint.text())
+        dup_slot.hide()
+        self.planned_moves_duplicate_banner = dup_slot
         self.planned_moves_duplicate_banner_title = dup_banner_title
         self.planned_moves_duplicate_banner_hint = dup_banner_hint
         self.planned_moves_duplicate_banner_apply_btn = dup_banner_apply_btn
 
-        proj_review_row = QWidget()
-        proj_review_layout = QHBoxLayout(proj_review_row)
-        proj_review_layout.setContentsMargins(0, 0, 0, 0)
-        proj_review_layout.setSpacing(8)
-        proj_review_label = QLabel("⚠ Some planned mappings need review")
+        proj_review_label = QLabel("Needs review")
         proj_review_label.setObjectName("MutedText")
-        proj_review_label.setStyleSheet("color: #FFC14D;")
-        proj_review_btn = QPushButton("Open Needs Review")
-        proj_review_btn.setToolTip("Switch to the Needs Review tab for projection and overlap details.")
+        proj_review_label.setWordWrap(False)
+        proj_review_label.setToolTip(
+            "Some planned mappings need projection or overlap review. Open the Review & Fix tab for details."
+        )
+        proj_review_btn = QPushButton("Open")
+        proj_review_btn.setToolTip("Switch to the Review & Fix tab for projection and overlap details.")
         proj_review_btn.clicked.connect(self._on_planned_moves_projection_review_banner_open)
-        proj_review_layout.addWidget(proj_review_label, 0, Qt.AlignmentFlag.AlignLeft)
-        proj_review_layout.addStretch(1)
-        proj_review_layout.addWidget(proj_review_btn, 0, Qt.AlignmentFlag.AlignRight)
-        proj_review_row.hide()
-        self.planned_moves_projection_review_banner = proj_review_row
+
+        proj_slot = QWidget()
+        proj_slot_layout = QHBoxLayout(proj_slot)
+        proj_slot_layout.setContentsMargins(0, 0, 0, 0)
+        proj_slot_layout.setSpacing(8)
+        proj_slot_layout.addWidget(proj_review_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        proj_slot_layout.addWidget(proj_review_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        proj_slot.hide()
+        self.planned_moves_projection_review_banner = proj_slot
+
+        issue_sep = QFrame()
+        issue_sep.setFrameShape(QFrame.Shape.VLine)
+        issue_sep.setFrameShadow(QFrame.Shadow.Plain)
+        issue_sep.setFixedWidth(1)
+        issue_sep.setStyleSheet("background-color: rgba(255, 193, 77, 0.35); max-width: 1px; min-height: 18px;")
+        issue_sep.hide()
+        self.planned_moves_issue_separator = issue_sep
+
+        issue_strip = QFrame()
+        issue_strip.setObjectName("PlanningIssueStrip")
+        issue_layout = QHBoxLayout(issue_strip)
+        issue_layout.setContentsMargins(8, 5, 8, 5)
+        issue_layout.setSpacing(10)
+        issue_layout.addWidget(proj_slot, 0)
+        issue_layout.addWidget(issue_sep, 0, Qt.AlignmentFlag.AlignVCenter)
+        issue_layout.addWidget(dup_slot, 0)
+        issue_layout.addStretch(1)
+        issue_strip.hide()
+        self.planned_moves_issue_strip = issue_strip
+
+        proposed_toggle = QToolButton()
+        proposed_toggle.setText("Proposed folders (draft)")
+        proposed_toggle.setCheckable(True)
+        proposed_toggle.setChecked(False)
+        proposed_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        proposed_toggle.setArrowType(Qt.ArrowType.RightArrow)
+        proposed_toggle.setAutoRaise(True)
+        proposed_toggle.setToolTip("Show or hide the proposed folders table.")
+
+        proposed_inner = QWidget()
+        proposed_inner_layout = QVBoxLayout(proposed_inner)
+        proposed_inner_layout.setContentsMargins(12, 2, 0, 0)
+        proposed_inner_layout.setSpacing(4)
+        proposed_inner_layout.addWidget(proposed_table, 0)
+        proposed_inner.hide()
+
+        def _on_proposed_toggled(checked: bool) -> None:
+            proposed_inner.setVisible(checked)
+            proposed_toggle.setArrowType(Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow)
+
+        proposed_toggle.toggled.connect(_on_proposed_toggled)
+
+        proposed_section = QWidget()
+        proposed_section_layout = QVBoxLayout(proposed_section)
+        proposed_section_layout.setContentsMargins(0, 0, 0, 0)
+        proposed_section_layout.setSpacing(2)
+        proposed_section_layout.addWidget(proposed_toggle, 0)
+        proposed_section_layout.addWidget(proposed_inner, 0)
 
         layout.addWidget(loading_banner)
-        layout.addWidget(plan_review_summary)
-        layout.addWidget(plan_readiness_summary)
-        layout.addWidget(export_hint)
-        layout.addLayout(simulate_row)
+        layout.addWidget(top_bar)
+        layout.addWidget(issue_strip)
         layout.addWidget(table, 1)
-        layout.addWidget(proposed_heading)
-        layout.addWidget(proposed_table, 0)
-        layout.addWidget(dup_banner_row)
-        layout.addWidget(proj_review_row)
+        layout.addWidget(proposed_section, 0)
         layout.addWidget(status)
 
         return box, table, status
+
+    def _sync_planned_moves_issue_strip_visibility(self) -> None:
+        strip = getattr(self, "planned_moves_issue_strip", None)
+        sep = getattr(self, "planned_moves_issue_separator", None)
+        proj = getattr(self, "planned_moves_projection_review_banner", None)
+        dup = getattr(self, "planned_moves_duplicate_banner", None)
+        if strip is None:
+            return
+        pv = proj.isVisible() if proj is not None else False
+        dv = dup.isVisible() if dup is not None else False
+        strip.setVisible(pv or dv)
+        if sep is not None:
+            sep.setVisible(pv and dv)
 
     def _on_planned_moves_duplicate_hub_apply_suggested(self) -> None:
         self._planning_bulk_apply_duplicate_suggested_names(parent=self, quiet_success=False)
@@ -8777,9 +8942,8 @@ class MainWindow(QMainWindow):
         if title is not None and groups:
             n_groups = len(groups)
             n_files = sum(len(m) for m in groups.values())
-            title.setText(
-                f"⚠ Duplicate destination hub — {n_groups} group(s), {n_files} planned file mapping(s)"
-            )
+            title.setText(f"Duplicate targets: {n_groups} group(s), {n_files} file(s)")
+        self._sync_planned_moves_issue_strip_visibility()
 
     def _refresh_planning_derived_state(self, reason: str = "") -> None:
         """Recompute planning-only readiness from cached duplicate groups and workflow rows (no manifest / Graph)."""
@@ -8880,10 +9044,11 @@ class MainWindow(QMainWindow):
             for r in review_rows
         )
         row.setVisible(bool(show))
+        self._sync_planned_moves_issue_strip_visibility()
 
     def _on_planned_moves_projection_review_banner_open(self) -> None:
         tabs = getattr(self, "workspace_tabs", None)
-        box = getattr(self, "needs_review_box", None)
+        box = getattr(self, "review_fix_box", None)
         table = getattr(self, "needs_review_table", None)
         if tabs is None or box is None:
             return
@@ -9743,7 +9908,10 @@ class MainWindow(QMainWindow):
         if getattr(self, "_workspace_tabs_collapsed", False):
             self._apply_workspace_tabs_collapsed_state(False)
         widget = self.workspace_tabs.widget(index)
-        if widget in {getattr(self, "suggestions_box", None), getattr(self, "needs_review_box", None)}:
+        if widget in (
+            getattr(self, "planned_moves_box", None),
+            getattr(self, "review_fix_box", None),
+        ):
             self._schedule_safe_timer(0, "workspace_tab_workflow_refresh", self._refresh_workflow_state_on_demand)
 
     def _planning_header_collapsed_height(self):
@@ -19528,6 +19696,58 @@ class MainWindow(QMainWindow):
             seen.add(idx)
         return self._validate_duplicate_group_apply_preview_rows(rows)
 
+    def _duplicate_apply_structured_failure(
+        self, rows: list[dict], v_err: str | None, *, bulk: bool
+    ) -> dict[str, Any]:
+        """Map validator/user messages to a stable reason code for inline UX (no validation logic change)."""
+        affected: list[int] = []
+        leaves: dict[int, str] = {}
+        for r in rows or []:
+            try:
+                ix = int(r["index"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            affected.append(ix)
+            leaves[ix] = str(r.get("suggested_leaf", "") or "").strip()
+        msg = str(v_err or "").strip() or "Auto-fix could not be applied."
+        reason = "unknown"
+        ml = msg.lower()
+        if v_err == "__stale_plan__" or "plan changed" in ml:
+            reason = "stale_plan"
+        elif "no renames" in ml or "no suggested name" in ml:
+            reason = "no_rows"
+        elif "could not read planned move indices" in msg:
+            reason = "bad_indices"
+        elif "empty" in ml and "name" in ml:
+            reason = "invalid_name"
+        elif "folder move" in ml:
+            reason = "folder_conflict"
+        elif "resolvable" in ml or "destination file path" in ml:
+            reason = "destination_unresolved"
+        elif "still produce a duplicate" in ml:
+            reason = "destination_conflict"
+        elif "duplicate planned move index" in ml:
+            reason = "bulk_invalid"
+        fix_hints = {
+            "stale_plan": "The draft changed. Close this dialog and retry the run, or refresh the plan and open the inspector again.",
+            "no_rows": "Nothing to apply. Rebuild suggestions from the Planning Workspace or Review & Fix tab.",
+            "bad_indices": "Suggestion data no longer matches the plan. Refresh and try again.",
+            "invalid_name": "One or more suggested file names are empty. Rename manually or use Retarget.",
+            "folder_conflict": "This group includes a folder mapping — use Retarget or Remove on those rows, or the duplicate hub.",
+            "destination_unresolved": "A destination path cannot be resolved. Retarget the row to a valid folder or fix the allocation.",
+            "destination_conflict": "These names still collide with another planned file. Use Retarget, Remove, or rename manually.",
+            "bulk_invalid": "Internal suggestion set was inconsistent. Try Auto-fix group again.",
+            "unknown": "Adjust the highlighted rows manually, then retry auto-fix or continue with Rename / Retarget / Remove.",
+        }
+        return {
+            "reason": reason,
+            "message": msg,
+            "affected_indices": affected,
+            "suggested_leaf_by_index": leaves,
+            "bulk": bool(bulk),
+            "suggested_fix": fix_hints.get(reason, fix_hints["unknown"]),
+        }
+
     def _build_all_duplicate_groups_unique_name_preview_rows(self) -> list[dict] | None:
         """Preview rows for every duplicate destination file group; chains naming across groups via a scratch plan."""
         moves_live = list(self.planned_moves or [])
@@ -19712,25 +19932,39 @@ class MainWindow(QMainWindow):
 
     def _planning_apply_duplicate_preview_rows(
         self, rows: list[dict], parent: QWidget, *, change_note: str
-    ) -> tuple[bool, str | None]:
-        """Apply suggested_leaf values after the same validation used by duplicate hub bulk apply."""
+    ) -> tuple[bool, str | None, dict | None]:
+        """Apply suggested_leaf values after the same validation used by duplicate hub bulk apply.
+
+        Returns ``(ok, err_message, structured_failure)`` where ``structured_failure`` is set for
+        validation failures (for inline inspector UX); ``None`` on success or submitted lock.
+        """
+        bulk = len(rows) > 1
         if not rows:
-            return False, "No renames to apply."
+            st = self._duplicate_apply_structured_failure([], "No renames to apply.", bulk=False)
+            st["reason"] = "no_rows"
+            return False, "No renames to apply.", st
         if len(rows) == 1:
             v_err = self._validate_duplicate_group_apply_preview_rows(rows)
         else:
             v_err = self._validate_duplicate_bulk_apply_preview_rows(rows)
         if v_err == "__stale_plan__":
-            return False, "The plan changed; refresh and try again."
+            st = self._duplicate_apply_structured_failure(rows, v_err, bulk=bulk)
+            return False, "The plan changed; refresh and try again.", st
         if v_err:
-            return False, v_err
+            st = self._duplicate_apply_structured_failure(rows, v_err, bulk=bulk)
+            return False, v_err, st
         for r in rows:
             try:
                 idx = int(r["index"])
             except (KeyError, TypeError, ValueError):
-                return False, "Invalid suggestion row."
+                st = self._duplicate_apply_structured_failure(
+                    rows, "Invalid suggestion row.", bulk=bulk
+                )
+                st["reason"] = "bad_indices"
+                return False, "Invalid suggestion row.", st
             if idx < 0 or idx >= len(self.planned_moves or []):
-                return False, "The plan changed; refresh and try again."
+                st = self._duplicate_apply_structured_failure(rows, "__stale_plan__", bulk=bulk)
+                return False, "The plan changed; refresh and try again.", st
             move = self.planned_moves[idx]
             if self._is_move_submitted(move):
                 self._show_submitted_item_locked_message(
@@ -19738,7 +19972,7 @@ class MainWindow(QMainWindow):
                     f"'{move.get('source_name', 'This item')}'",
                     self._submitted_batch_id_for_move(move),
                 )
-                return False, "locked"
+                return False, "locked", None
         for r in rows:
             idx = int(r["index"])
             self.planned_moves[idx]["target_name"] = str(r.get("suggested_leaf", "") or "").strip()
@@ -19751,7 +19985,7 @@ class MainWindow(QMainWindow):
             )
         self.refresh_planned_moves_table()
         self._persist_planning_change(change_note)
-        return True, None
+        return True, None, None
 
     def _show_duplicate_destination_file_review_dialog(self) -> None:
         grouped = grouped_duplicate_destination_moves(
@@ -21195,6 +21429,26 @@ class MainWindow(QMainWindow):
         inspector_feedback.setWordWrap(True)
         outer.addWidget(inspector_feedback)
 
+        pending_inspector_auto_fix: dict[str, Any] = {}
+        inspector_guidance_highlight_pr: set[int] = set()
+
+        guidance_frame = QFrame()
+        guidance_frame.setObjectName("SectionBox")
+        guidance_frame.setVisible(False)
+        gv = QVBoxLayout(guidance_frame)
+        guidance_title = QLabel("")
+        guidance_title.setObjectName("SectionTitle")
+        guidance_body = QLabel("")
+        guidance_body.setObjectName("MutedText")
+        guidance_body.setWordWrap(True)
+        guidance_rows = QWidget()
+        guidance_rows_layout = QVBoxLayout(guidance_rows)
+        guidance_rows_layout.setContentsMargins(0, 0, 0, 0)
+        gv.addWidget(guidance_title)
+        gv.addWidget(guidance_body)
+        gv.addWidget(guidance_rows)
+        outer.addWidget(guidance_frame)
+
         inspector_dest_suffix_groups: list[list[int]] = []
 
         scroll = QScrollArea()
@@ -21374,6 +21628,90 @@ class MainWindow(QMainWindow):
                     "or adjust the draft, then retry the run."
                 )
 
+        def clear_inspector_guidance() -> None:
+            inspector_guidance_highlight_pr.clear()
+            guidance_frame.setVisible(False)
+            guidance_title.setText("")
+            guidance_body.setText("")
+            while guidance_rows_layout.count():
+                item = guidance_rows_layout.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    w.deleteLater()
+            _clear_inspector_table_highlight_styles()
+
+        def _clear_inspector_table_highlight_styles() -> None:
+            empty = QBrush()
+            for tbl in tables_with_steps:
+                for r in range(tbl.rowCount()):
+                    for c in range(tbl.columnCount()):
+                        it = tbl.item(r, c)
+                        if it is not None:
+                            it.setBackground(empty)
+
+        def _apply_inspector_guidance_highlights() -> None:
+            _clear_inspector_table_highlight_styles()
+            if not inspector_guidance_highlight_pr:
+                return
+            hi = QColor(255, 243, 205)
+            for tbl in tables_with_steps:
+                for r in range(tbl.rowCount()):
+                    it0 = tbl.item(r, 0)
+                    st = it0.data(Qt.UserRole) if it0 else None
+                    if not isinstance(st, dict):
+                        continue
+                    cap = self._inspector_capabilities_for_transfer_step(st)
+                    pr = cap.get("pr")
+                    if pr is None or int(pr) not in inspector_guidance_highlight_pr:
+                        continue
+                    for c in range(tbl.columnCount()):
+                        it = tbl.item(r, c)
+                        if it is not None:
+                            it.setBackground(hi)
+
+        def _scroll_inspector_to_affected_pr(affected: set[int]) -> None:
+            if not affected:
+                return
+            for tbl in tables_with_steps:
+                prs = getattr(tbl, "_oz_dup_dest_prs", None) or []
+                if not (set(prs) & affected):
+                    continue
+                w: QWidget | None = tbl
+                for _ in range(8):
+                    if w is None:
+                        break
+                    p = w.parentWidget()
+                    if p is None:
+                        break
+                    if isinstance(p, QFrame) and p.objectName() == "SectionBox":
+                        scroll.ensureWidgetVisible(p)
+                        return
+                    w = p
+                scroll.ensureWidgetVisible(tbl)
+                return
+
+        def _focus_inspector_affected_row(affected: set[int]) -> None:
+            if not affected:
+                return
+            for tbl in tables_with_steps:
+                prs = getattr(tbl, "_oz_dup_dest_prs", None) or []
+                if not (set(prs) & affected):
+                    continue
+                for r in range(tbl.rowCount()):
+                    it0 = tbl.item(r, 0)
+                    st = it0.data(Qt.UserRole) if it0 else None
+                    if not isinstance(st, dict):
+                        continue
+                    cap = self._inspector_capabilities_for_transfer_step(st)
+                    pr = cap.get("pr")
+                    if pr is not None and int(pr) in affected:
+                        tbl.selectRow(r)
+                        tbl.setCurrentCell(r, 0)
+                        sync_from_table(tbl)
+                        tbl.setFocus(Qt.FocusReason.OtherFocusReason)
+                        return
+                return
+
         def handle_post_mutation(*, feedback: str | None = None) -> None:
             ctx = refresh_context_holder.get("ctx")
             saved_rid = ""
@@ -21450,6 +21788,254 @@ class MainWindow(QMainWindow):
                     "Collision groups refreshed. "
                     "Subset, pilot, or recursive run context is not preserved in this preview."
                 )
+            _apply_inspector_guidance_highlights()
+            _retry_pending_inspector_auto_fix()
+
+        def _pr_rids_from_inspector_indices(idxs: list[int]) -> frozenset[str]:
+            pm = self.planned_moves or []
+            out: list[str] = []
+            for i in idxs:
+                try:
+                    ii = int(i)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= ii < len(pm):
+                    rid = str((pm[ii] or {}).get("request_id", "") or "").strip()
+                    if rid:
+                        out.append(rid)
+            return frozenset(out)
+
+        def _find_inspector_retry_dest_group_for_rids(target_rids: frozenset[str]) -> list[int] | None:
+            if len(target_rids) < 2:
+                return None
+            best: list[int] | None = None
+            score = 0
+            for g in inspector_dest_suffix_groups:
+                g_rids = _pr_rids_from_inspector_indices(list(g))
+                inter = len(target_rids & g_rids)
+                if inter >= 2 and inter > score:
+                    score = inter
+                    best = list(g)
+            return best
+
+        def _register_pending_inspector_group_retry(rows_snapshot: list[dict]) -> None:
+            pending_inspector_auto_fix.clear()
+            idxs = []
+            for r in rows_snapshot or []:
+                try:
+                    idxs.append(int(r["index"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            pending_inspector_auto_fix["kind"] = "group"
+            pending_inspector_auto_fix["rids"] = _pr_rids_from_inspector_indices(idxs)
+
+        def _register_pending_inspector_all_retry() -> None:
+            pending_inspector_auto_fix.clear()
+            pending_inspector_auto_fix["kind"] = "all"
+
+        def _clear_inspector_auto_pending() -> None:
+            pending_inspector_auto_fix.clear()
+
+        def _retry_pending_inspector_auto_fix() -> None:
+            if not pending_inspector_auto_fix:
+                return
+            kind = pending_inspector_auto_fix.get("kind")
+            if kind == "all":
+                groups = list(inspector_dest_suffix_groups)
+                if not groups:
+                    _clear_inspector_auto_pending()
+                    return
+                rows = self._build_execution_inspector_chained_dest_suffix_preview_rows(groups)
+                if not rows:
+                    _clear_inspector_auto_pending()
+                    return
+                ok, err, st = self._planning_apply_duplicate_preview_rows(
+                    rows,
+                    dlg,
+                    change_note="execution_inspector_dest_suffix_all_retry",
+                )
+                if ok:
+                    _clear_inspector_auto_pending()
+                    clear_inspector_guidance()
+                    handle_post_mutation(
+                        feedback=f"Suggested names applied to {len(rows)} items (auto-retry)."
+                    )
+                elif err == "locked":
+                    _clear_inspector_auto_pending()
+                elif st:
+                    show_inspector_guidance(
+                        st,
+                        register_pending="all",
+                    )
+            elif kind == "group":
+                target = pending_inspector_auto_fix.get("rids")
+                if not isinstance(target, frozenset):
+                    _clear_inspector_auto_pending()
+                    return
+                g = _find_inspector_retry_dest_group_for_rids(target)
+                if not g or len(g) < 2:
+                    _clear_inspector_auto_pending()
+                    return
+                rows = self._build_execution_inspector_dest_suffix_preview_rows_for_moves(sorted(g))
+                if not rows:
+                    _clear_inspector_auto_pending()
+                    return
+                ok, err, st = self._planning_apply_duplicate_preview_rows(
+                    rows,
+                    dlg,
+                    change_note="execution_inspector_dest_suffix_group_retry",
+                )
+                if ok:
+                    _clear_inspector_auto_pending()
+                    clear_inspector_guidance()
+                    handle_post_mutation(
+                        feedback=f"Suggested names applied to {len(rows)} items (auto-retry)."
+                    )
+                elif err == "locked":
+                    _clear_inspector_auto_pending()
+                elif st:
+                    show_inspector_guidance(
+                        st,
+                        register_pending="group",
+                        pending_rows=rows,
+                    )
+
+        def show_inspector_guidance(
+            struct: dict,
+            *,
+            register_pending: str | None = None,
+            pending_rows: list[dict] | None = None,
+        ) -> None:
+            affected = {int(x) for x in (struct.get("affected_indices") or []) if x is not None}
+            inspector_guidance_highlight_pr.clear()
+            inspector_guidance_highlight_pr.update(affected)
+            guidance_title.setText("Auto-fix could not complete")
+            body = str(struct.get("suggested_fix", "") or "").strip()
+            detail = str(struct.get("message", "") or "").strip()
+            if detail and detail.lower() not in body.lower():
+                guidance_body.setText(f"{body}\n\n{detail}")
+            else:
+                guidance_body.setText(body)
+            while guidance_rows_layout.count():
+                item = guidance_rows_layout.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    w.deleteLater()
+            leaves = dict(struct.get("suggested_leaf_by_index") or {})
+            pm = self.planned_moves or []
+            for pr in sorted(affected):
+                try:
+                    pri = int(pr)
+                except (TypeError, ValueError):
+                    continue
+                if pri < 0 or pri >= len(pm):
+                    continue
+                mv = pm[pri]
+                row_w = QWidget()
+                rh = QHBoxLayout(row_w)
+                rh.setContentsMargins(0, 4, 0, 4)
+                nm = str(mv.get("source_name", "") or mv.get("source_path", "") or "").strip()
+                if len(nm) > 140:
+                    nm = nm[:137] + "…"
+                rh.addWidget(QLabel(nm), 1)
+                sug = str(leaves.get(pri, "") or "").strip()
+                if sug:
+                    rh.addWidget(QLabel(f"→ {sug}"))
+                src = mv.get("source") if isinstance(mv.get("source"), dict) else {}
+                is_folder = bool((src or {}).get("is_folder"))
+                submitted = self._is_move_submitted(mv)
+                file_row = not is_folder and not submitted
+                btn_rename = QPushButton("Rename…")
+                btn_rt = QPushButton("Retarget…")
+                btn_rm = QPushButton("Remove…")
+                btn_rename.setEnabled(file_row and bool(sug))
+                btn_rt.setEnabled(file_row)
+                btn_rm.setEnabled(file_row)
+                btn_rename.setToolTip("Apply the suggested destination file name for this row when valid.")
+                btn_rt.setToolTip("Change the destination folder for this mapping.")
+                btn_rm.setToolTip("Remove this mapping from the draft plan.")
+
+                def _wire_row_actions(pidx: int) -> None:
+                    def do_rename() -> None:
+                        group_prs = None
+                        for gg in inspector_dest_suffix_groups:
+                            if pidx in gg:
+                                group_prs = gg
+                                break
+                        rows_f = self._build_execution_inspector_dest_suffix_preview_rows_for_moves(
+                            sorted(group_prs or [pidx])
+                        )
+                        row_one = next(
+                            (r for r in (rows_f or []) if int(r["index"]) == int(pidx)),
+                            None,
+                        )
+                        if not row_one or not str(row_one.get("suggested_leaf", "") or "").strip():
+                            st2 = self._duplicate_apply_structured_failure(
+                                [{"index": pidx, "suggested_leaf": ""}],
+                                "Could not build a suggested name for this row.",
+                                bulk=False,
+                            )
+                            st2["reason"] = "no_rows"
+                            show_inspector_guidance(
+                                st2,
+                                register_pending="group" if group_prs and len(group_prs) >= 2 else None,
+                                pending_rows=rows_f,
+                            )
+                            return
+                        ve = self._validate_duplicate_group_apply_preview_rows([row_one])
+                        if ve:
+                            st3 = self._duplicate_apply_structured_failure([row_one], ve, bulk=False)
+                            show_inspector_guidance(
+                                st3,
+                                register_pending="group"
+                                if group_prs and len(group_prs) >= 2
+                                else None,
+                                pending_rows=rows_f or [row_one],
+                            )
+                            return
+                        ok2, err2, st4 = self._planning_apply_duplicate_preview_rows(
+                            [row_one],
+                            dlg,
+                            change_note="execution_inspector_dest_suffix_one",
+                        )
+                        if ok2:
+                            clear_inspector_guidance()
+                            _clear_inspector_auto_pending()
+                            handle_post_mutation(feedback="1 rename applied.")
+                        elif err2 != "locked" and st4:
+                            show_inspector_guidance(
+                                st4,
+                                register_pending="group"
+                                if group_prs and len(group_prs) >= 2
+                                else None,
+                                pending_rows=rows_f or [row_one],
+                            )
+
+                    def do_rt() -> None:
+                        if self._planning_retarget_planned_file_with_dialog(dlg, pidx):
+                            handle_post_mutation(feedback="Destination retargeted.")
+
+                    def do_rm() -> None:
+                        if self._planning_remove_planned_move_with_confirm(dlg, pidx):
+                            handle_post_mutation(feedback="Mapping removed from plan.")
+
+                    btn_rename.clicked.connect(do_rename)
+                    btn_rt.clicked.connect(do_rt)
+                    btn_rm.clicked.connect(do_rm)
+
+                _wire_row_actions(pri)
+                rh.addWidget(btn_rename)
+                rh.addWidget(btn_rt)
+                rh.addWidget(btn_rm)
+                guidance_rows_layout.addWidget(row_w)
+            guidance_frame.setVisible(True)
+            if register_pending == "group" and pending_rows:
+                _register_pending_inspector_group_retry(pending_rows)
+            elif register_pending == "all":
+                _register_pending_inspector_all_retry()
+            _scroll_inspector_to_affected_pr(affected)
+            _focus_inspector_affected_row(affected)
+            _apply_inspector_guidance_highlights()
 
         def wire_inspector_table(tbl: QTableWidget, *, kind: str) -> None:
             def on_context_menu(pos) -> None:
@@ -21464,15 +22050,25 @@ class MainWindow(QMainWindow):
                     return
                 cap = self._inspector_capabilities_for_transfer_step(st)
                 menu = QMenu(tbl)
-                a_go = menu.addAction("Go to item")
+                if kind == "dest":
+                    m_manual = menu.addMenu("Manual edits")
+                    a_go = m_manual.addAction("Go to item")
+                    a_par = m_manual.addAction("Go to parent folder mapping")
+                    a_dup = m_manual.addAction("Open duplicate file review…")
+                    m_manual.addSeparator()
+                    a_rm = m_manual.addAction("Remove mapping from plan")
+                    a_rn = m_manual.addAction("Rename planned destination file…")
+                    a_rt = m_manual.addAction("Retarget planned destination…")
+                else:
+                    a_go = menu.addAction("Go to item")
+                    a_par = menu.addAction("Go to parent folder mapping")
+                    a_dup = menu.addAction("Open duplicate file review…")
+                    menu.addSeparator()
+                    a_rm = menu.addAction("Remove mapping from plan")
+                    a_rn = menu.addAction("Rename planned destination file…")
+                    a_rt = menu.addAction("Retarget planned destination…")
                 a_go.setEnabled(cap["can_go"])
-                a_par = menu.addAction("Go to parent folder mapping")
                 a_par.setEnabled(cap["can_go_parent"])
-                a_dup = menu.addAction("Open duplicate file review…")
-                menu.addSeparator()
-                a_rm = menu.addAction("Remove mapping from plan")
-                a_rn = menu.addAction("Rename planned destination file…")
-                a_rt = menu.addAction("Retarget planned destination…")
                 if cap["is_rec"]:
                     a_rm.setVisible(False)
                     a_rn.setVisible(False)
@@ -21484,9 +22080,9 @@ class MainWindow(QMainWindow):
                 a_one_suffix = None
                 a_grp_suffix = None
                 if kind == "dest":
-                    menu.addSeparator()
-                    a_one_suffix = menu.addAction("Apply suggested rename for this row…")
-                    a_grp_suffix = menu.addAction("Apply suggested names to this destination group…")
+                    m_auto = menu.addMenu("Automated fixes")
+                    a_one_suffix = m_auto.addAction("Rename…")
+                    a_grp_suffix = m_auto.addAction("Auto-fix group")
                     gprs = getattr(tbl, "_oz_dup_dest_prs", None)
                     a_grp_suffix.setEnabled(bool(gprs) and len(gprs) >= 2)
                     a_one_suffix.setEnabled(bool(cap.get("can_rename")) and bool(gprs) and len(gprs) >= 2)
@@ -21523,43 +22119,66 @@ class MainWindow(QMainWindow):
                             None,
                         )
                         if not row_one:
-                            QMessageBox.warning(
-                                dlg,
-                                "Apply suggested rename",
+                            st_nf = self._duplicate_apply_structured_failure(
+                                [{"index": int(cap["pr"]), "suggested_leaf": ""}],
                                 "Could not build a suggested name for this row.",
+                                bulk=False,
+                            )
+                            st_nf["reason"] = "no_rows"
+                            pr_stub = [{"index": int(i), "suggested_leaf": ""} for i in sorted(gprs)]
+                            show_inspector_guidance(
+                                st_nf,
+                                register_pending="group",
+                                pending_rows=pr_stub,
                             )
                         else:
                             v_err_one = self._validate_duplicate_group_apply_preview_rows([row_one])
                             if v_err_one:
-                                QMessageBox.information(
-                                    dlg,
-                                    "Apply suggested rename",
-                                    "Renaming only this row would still leave duplicate destination targets in this group. "
-                                    'Use "Apply suggested names to this destination group" (or the group button) instead.',
+                                st_ve = self._duplicate_apply_structured_failure(
+                                    [row_one], v_err_one, bulk=False
+                                )
+                                show_inspector_guidance(
+                                    st_ve,
+                                    register_pending="group",
+                                    pending_rows=rows_full or [row_one],
                                 )
                             else:
-                                ok, err = self._planning_apply_duplicate_preview_rows(
+                                ok, err, st_apply = self._planning_apply_duplicate_preview_rows(
                                     [row_one], dlg, change_note="execution_inspector_dest_suffix_one"
                                 )
-                                if not ok and err and err != "locked":
-                                    QMessageBox.warning(dlg, "Apply suggested rename", err)
+                                if not ok and err and err != "locked" and st_apply:
+                                    show_inspector_guidance(
+                                        st_apply,
+                                        register_pending="group",
+                                        pending_rows=rows_full or [row_one],
+                                    )
                                 elif ok:
+                                    clear_inspector_guidance()
+                                    _clear_inspector_auto_pending()
                                     handle_post_mutation(feedback="1 rename applied.")
                 elif picked == a_grp_suffix and a_grp_suffix is not None:
                     gprs = getattr(tbl, "_oz_dup_dest_prs", None)
                     if gprs and len(gprs) >= 2:
                         rows = self._build_execution_inspector_dest_suffix_preview_rows_for_moves(sorted(gprs))
+                        pr_stub = [{"index": int(i), "suggested_leaf": ""} for i in sorted(gprs)]
                         if not rows:
-                            QMessageBox.warning(
-                                dlg,
-                                "Apply suggested names",
+                            st_b = self._duplicate_apply_structured_failure(
+                                pr_stub,
                                 "Could not build unique names for this group.",
+                                bulk=True,
+                            )
+                            st_b["reason"] = "no_rows"
+                            show_inspector_guidance(
+                                st_b,
+                                register_pending="group",
+                                pending_rows=pr_stub,
                             )
                         elif (
                             QMessageBox.question(
                                 dlg,
-                                "Apply suggested names",
-                                f"Apply {len(rows)} suggested unique names for this duplicate destination group?",
+                                "Auto-fix group",
+                                f"Assign {len(rows)} unique destination file names in this group "
+                                "(stem.ext, stem (2).ext, …)?",
                                 QMessageBox.Yes | QMessageBox.No,
                                 QMessageBox.No,
                             )
@@ -21569,18 +22188,29 @@ class MainWindow(QMainWindow):
                                 sorted(gprs)
                             )
                             if not rows2 or len(rows2) != len(rows):
-                                QMessageBox.warning(
-                                    dlg,
-                                    "Apply suggested names",
+                                st_ch = self._duplicate_apply_structured_failure(
+                                    rows,
                                     "Suggestions changed before apply; try again.",
+                                    bulk=True,
+                                )
+                                show_inspector_guidance(
+                                    st_ch,
+                                    register_pending="group",
+                                    pending_rows=rows,
                                 )
                             else:
-                                ok, err = self._planning_apply_duplicate_preview_rows(
+                                ok, err, st_apply = self._planning_apply_duplicate_preview_rows(
                                     rows2, dlg, change_note="execution_inspector_dest_suffix_group"
                                 )
-                                if not ok and err and err != "locked":
-                                    QMessageBox.warning(dlg, "Apply suggested names", err)
+                                if not ok and err and err != "locked" and st_apply:
+                                    show_inspector_guidance(
+                                        st_apply,
+                                        register_pending="group",
+                                        pending_rows=rows2,
+                                    )
                                 elif ok:
+                                    clear_inspector_guidance()
+                                    _clear_inspector_auto_pending()
                                     handle_post_mutation(
                                         feedback=f"Suggested names applied to {len(rows2)} items."
                                     )
@@ -21664,18 +22294,26 @@ class MainWindow(QMainWindow):
                                 rows = self._build_execution_inspector_dest_suffix_preview_rows_for_moves(
                                     sorted(prs)
                                 )
+                                pr_stub = [{"index": int(i), "suggested_leaf": ""} for i in sorted(prs)]
                                 if not rows:
-                                    QMessageBox.warning(
-                                        dlg,
-                                        "Apply suggested names",
+                                    st_b = self._duplicate_apply_structured_failure(
+                                        pr_stub,
                                         "Could not build unique names for this group.",
+                                        bulk=True,
+                                    )
+                                    st_b["reason"] = "no_rows"
+                                    show_inspector_guidance(
+                                        st_b,
+                                        register_pending="group",
+                                        pending_rows=pr_stub,
                                     )
                                     return
                                 if (
                                     QMessageBox.question(
                                         dlg,
-                                        "Apply suggested names",
-                                        f"Apply {len(rows)} suggested unique names for this duplicate destination group?",
+                                        "Auto-fix group",
+                                        f"Assign {len(rows)} unique destination file names in this group "
+                                        "(stem.ext, stem (2).ext, …)?",
                                         QMessageBox.Yes | QMessageBox.No,
                                         QMessageBox.No,
                                     )
@@ -21686,25 +22324,36 @@ class MainWindow(QMainWindow):
                                     sorted(prs)
                                 )
                                 if not rows2 or len(rows2) != len(rows):
-                                    QMessageBox.warning(
-                                        dlg,
-                                        "Apply suggested names",
+                                    st_ch = self._duplicate_apply_structured_failure(
+                                        rows,
                                         "Suggestions changed before apply; try again.",
+                                        bulk=True,
+                                    )
+                                    show_inspector_guidance(
+                                        st_ch,
+                                        register_pending="group",
+                                        pending_rows=rows,
                                     )
                                     return
-                                ok, err = self._planning_apply_duplicate_preview_rows(
+                                ok, err, st_apply = self._planning_apply_duplicate_preview_rows(
                                     rows2, dlg, change_note="execution_inspector_dest_suffix_group"
                                 )
-                                if not ok and err and err != "locked":
-                                    QMessageBox.warning(dlg, "Apply suggested names", err)
+                                if not ok and err and err != "locked" and st_apply:
+                                    show_inspector_guidance(
+                                        st_apply,
+                                        register_pending="group",
+                                        pending_rows=rows2,
+                                    )
                                 elif ok:
+                                    clear_inspector_guidance()
+                                    _clear_inspector_auto_pending()
                                     handle_post_mutation(
                                         feedback=f"Suggested names applied to {len(rows2)} items."
                                     )
 
                             return on_group_apply
 
-                        grp_apply_btn = QPushButton("Apply suggested names to this group")
+                        grp_apply_btn = QPushButton("Auto-fix group")
                         grp_apply_btn.setEnabled(len(pr_row_indices) >= 2)
                         grp_apply_btn.setToolTip(
                             "Assign stem.ext, stem (2).ext, ... using the first row's base name (planning-only)."
@@ -21730,6 +22379,7 @@ class MainWindow(QMainWindow):
 
             host_layout.addStretch(1)
             scroll.setWidget(host)
+            _apply_inspector_guidance_highlights()
 
         def on_go() -> None:
             st = sel_step_holder["step"]
@@ -21817,27 +22467,40 @@ class MainWindow(QMainWindow):
             rows_full = self._build_execution_inspector_dest_suffix_preview_rows_for_moves(sorted(group_prs))
             row_one = next((r for r in (rows_full or []) if int(r["index"]) == int(pr)), None)
             if not row_one:
-                QMessageBox.warning(
-                    dlg,
-                    "Apply suggested rename",
+                st_nf = self._duplicate_apply_structured_failure(
+                    [{"index": int(pr), "suggested_leaf": ""}],
                     "Could not build a suggested name for this row.",
+                    bulk=False,
+                )
+                st_nf["reason"] = "no_rows"
+                pr_stub = [{"index": int(i), "suggested_leaf": ""} for i in sorted(group_prs)]
+                show_inspector_guidance(
+                    st_nf,
+                    register_pending="group",
+                    pending_rows=pr_stub,
                 )
                 return
             v_err_one = self._validate_duplicate_group_apply_preview_rows([row_one])
             if v_err_one:
-                QMessageBox.information(
-                    dlg,
-                    "Apply suggested rename",
-                    "Renaming only this row would still leave duplicate destination targets in this group. "
-                    'Use "Apply suggested names to this group" (or apply all destination groups) instead.',
+                st_ve = self._duplicate_apply_structured_failure([row_one], v_err_one, bulk=False)
+                show_inspector_guidance(
+                    st_ve,
+                    register_pending="group",
+                    pending_rows=rows_full or [row_one],
                 )
                 return
-            ok, err = self._planning_apply_duplicate_preview_rows(
+            ok, err, st_apply = self._planning_apply_duplicate_preview_rows(
                 [row_one], dlg, change_note="execution_inspector_dest_suffix_one"
             )
-            if not ok and err and err != "locked":
-                QMessageBox.warning(dlg, "Apply suggested rename", err)
+            if not ok and err and err != "locked" and st_apply:
+                show_inspector_guidance(
+                    st_apply,
+                    register_pending="group",
+                    pending_rows=rows_full or [row_one],
+                )
             elif ok:
+                clear_inspector_guidance()
+                _clear_inspector_auto_pending()
                 handle_post_mutation(feedback="1 rename applied.")
 
         def on_apply_all_dest_suffix_groups() -> None:
@@ -21852,17 +22515,27 @@ class MainWindow(QMainWindow):
                 list(inspector_dest_suffix_groups)
             )
             if not rows:
-                QMessageBox.warning(
-                    dlg,
-                    "Apply suggested names",
+                stub: list[dict] = []
+                for g in inspector_dest_suffix_groups:
+                    for i in g:
+                        stub.append({"index": int(i), "suggested_leaf": ""})
+                st_all = self._duplicate_apply_structured_failure(
+                    stub,
                     "Could not build unique names for all groups.",
+                    bulk=True,
+                )
+                st_all["reason"] = "no_rows"
+                show_inspector_guidance(
+                    st_all,
+                    register_pending="all",
+                    pending_rows=rows,
                 )
                 return
             if (
                 QMessageBox.question(
                     dlg,
-                    "Apply suggested names",
-                    f"Apply {len(rows)} suggested unique names across every duplicate destination group "
+                    "Auto-fix all",
+                    f"Assign {len(rows)} unique destination file names across every duplicate destination group "
                     "that has two or more draft file mappings?\n\n"
                     "• Planned destination file names in your plan will change.\n"
                     "• Planning-only — does not rename source files or existing SharePoint files.",
@@ -21876,18 +22549,29 @@ class MainWindow(QMainWindow):
                 list(inspector_dest_suffix_groups)
             )
             if not rows2 or len(rows2) != len(rows):
-                QMessageBox.warning(
-                    dlg,
-                    "Apply suggested names",
+                st_ch = self._duplicate_apply_structured_failure(
+                    rows,
                     "Suggestions changed before apply; try again.",
+                    bulk=True,
+                )
+                show_inspector_guidance(
+                    st_ch,
+                    register_pending="all",
+                    pending_rows=rows,
                 )
                 return
-            ok, err = self._planning_apply_duplicate_preview_rows(
+            ok, err, st_apply = self._planning_apply_duplicate_preview_rows(
                 rows2, dlg, change_note="execution_inspector_dest_suffix_all"
             )
-            if not ok and err and err != "locked":
-                QMessageBox.warning(dlg, "Apply suggested names", err)
+            if not ok and err and err != "locked" and st_apply:
+                show_inspector_guidance(
+                    st_apply,
+                    register_pending="all",
+                    pending_rows=rows2,
+                )
             elif ok:
+                clear_inspector_guidance()
+                _clear_inspector_auto_pending()
                 handle_post_mutation(feedback=f"Suggested names applied to {len(rows2)} items.")
 
         rebuild_collision_tables()
@@ -21916,8 +22600,8 @@ class MainWindow(QMainWindow):
         row2.addWidget(retarget_btn)
         row2.addStretch(1)
         av.addLayout(row2)
-        apply_sel_suffix_btn = QPushButton("Apply suggested rename to selected row…")
-        apply_all_suffix_btn = QPushButton("Apply suggested names — all destination groups")
+        apply_sel_suffix_btn = QPushButton("Rename…")
+        apply_all_suffix_btn = QPushButton("Auto-fix all")
         apply_sel_suffix_btn.setToolTip(
             "If the selected draft row is in a duplicate destination file group, apply one safe rename when that alone is valid; "
             "otherwise use the per-group or all-groups action."
