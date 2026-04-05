@@ -99,6 +99,8 @@ from ozlink_console.transfer_manifest import (
     _planned_move_to_step,
 )
 from ozlink_console.plan_execution_duplicate_validation import (
+    build_execution_inspector_chained_dest_suffix_preview_rows,
+    build_execution_inspector_dest_suffix_preview_rows_for_moves,
     duplicate_collision_report_from_moves,
     duplicate_collision_report_from_transfer_steps,
     duplicate_transfer_step_groups_by_destination,
@@ -19675,6 +19677,82 @@ class MainWindow(QMainWindow):
             )
         return "applied"
 
+    def _build_execution_inspector_dest_suffix_preview_rows_for_moves(
+        self,
+        pr_sorted: list[int],
+        *,
+        moves_for_context: list[dict] | None = None,
+    ) -> list[dict] | None:
+        """Execution-inspector naming: first row keeps stem.ext priority, then stem (2).ext, stem (3).ext, …
+
+        Uniqueness uses the same destination-key rules as duplicate validation, seeded with every planned
+        move outside the group (or outside the group in ``moves_for_context`` when chaining).
+        """
+        moves = list(moves_for_context if moves_for_context is not None else (self.planned_moves or []))
+        return build_execution_inspector_dest_suffix_preview_rows_for_moves(
+            moves,
+            pr_sorted,
+            destination_file_key=self._destination_file_key_for_execution_validation,
+            move_target_name=lambda m: str(self._move_target_name(m) or "").strip(),
+            leaf_base_ext=self._duplicate_review_leaf_base_ext,
+        )
+
+    def _build_execution_inspector_chained_dest_suffix_preview_rows(
+        self, group_pr_lists: list[list[int]]
+    ) -> list[dict] | None:
+        """Suffix-based suggestions for every duplicate-destination group, chained like bulk duplicate apply."""
+        moves_live = list(self.planned_moves or [])
+        return build_execution_inspector_chained_dest_suffix_preview_rows(
+            moves_live,
+            group_pr_lists,
+            destination_file_key=self._destination_file_key_for_execution_validation,
+            move_target_name=lambda m: str(self._move_target_name(m) or "").strip(),
+            leaf_base_ext=self._duplicate_review_leaf_base_ext,
+        )
+
+    def _planning_apply_duplicate_preview_rows(
+        self, rows: list[dict], parent: QWidget, *, change_note: str
+    ) -> tuple[bool, str | None]:
+        """Apply suggested_leaf values after the same validation used by duplicate hub bulk apply."""
+        if not rows:
+            return False, "No renames to apply."
+        if len(rows) == 1:
+            v_err = self._validate_duplicate_group_apply_preview_rows(rows)
+        else:
+            v_err = self._validate_duplicate_bulk_apply_preview_rows(rows)
+        if v_err == "__stale_plan__":
+            return False, "The plan changed; refresh and try again."
+        if v_err:
+            return False, v_err
+        for r in rows:
+            try:
+                idx = int(r["index"])
+            except (KeyError, TypeError, ValueError):
+                return False, "Invalid suggestion row."
+            if idx < 0 or idx >= len(self.planned_moves or []):
+                return False, "The plan changed; refresh and try again."
+            move = self.planned_moves[idx]
+            if self._is_move_submitted(move):
+                self._show_submitted_item_locked_message(
+                    "Apply suggested names",
+                    f"'{move.get('source_name', 'This item')}'",
+                    self._submitted_batch_id_for_move(move),
+                )
+                return False, "locked"
+        for r in rows:
+            idx = int(r["index"])
+            self.planned_moves[idx]["target_name"] = str(r.get("suggested_leaf", "") or "").strip()
+        if hasattr(self, "planned_moves_status"):
+            n = len(rows)
+            self.planned_moves_status.setText(
+                f"Applied {n} suggested planned destination file name(s)."
+                if n > 1
+                else "Applied suggested planned destination file name."
+            )
+        self.refresh_planned_moves_table()
+        self._persist_planning_change(change_note)
+        return True, None
+
     def _show_duplicate_destination_file_review_dialog(self) -> None:
         grouped = grouped_duplicate_destination_moves(
             list(self.planned_moves or []),
@@ -21112,6 +21190,13 @@ class MainWindow(QMainWindow):
         subset_note.setWordWrap(True)
         outer.addWidget(subset_note)
 
+        inspector_feedback = QLabel("")
+        inspector_feedback.setObjectName("MutedText")
+        inspector_feedback.setWordWrap(True)
+        outer.addWidget(inspector_feedback)
+
+        inspector_dest_suffix_groups: list[list[int]] = []
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
@@ -21289,8 +21374,12 @@ class MainWindow(QMainWindow):
                     "or adjust the draft, then retry the run."
                 )
 
-        def handle_post_mutation() -> None:
+        def handle_post_mutation(*, feedback: str | None = None) -> None:
             ctx = refresh_context_holder.get("ctx")
+            saved_rid = ""
+            st_sel = sel_step_holder.get("step")
+            if isinstance(st_sel, dict):
+                saved_rid = str(st_sel.get("request_id", "") or "").strip()
             new_m = None
             if ctx is not None:
                 if ctx.get("kind") == "snapshot_subset":
@@ -21329,22 +21418,40 @@ class MainWindow(QMainWindow):
             hint.setText("")
             for b in (go_btn, go_parent_btn, remove_btn, rename_btn, retarget_btn):
                 b.setEnabled(False)
-            if tables_with_steps:
+            restored = False
+            if saved_rid:
+                for tbl in tables_with_steps:
+                    for r in range(tbl.rowCount()):
+                        it0 = tbl.item(r, 0)
+                        st2 = it0.data(Qt.UserRole) if it0 else None
+                        if (
+                            isinstance(st2, dict)
+                            and str(st2.get("request_id", "") or "").strip() == saved_rid
+                        ):
+                            tbl.selectRow(r)
+                            tbl.setCurrentCell(r, 0)
+                            sync_from_table(tbl)
+                            restored = True
+                            break
+                    if restored:
+                        break
+            if not restored and tables_with_steps:
                 sync_from_table(tables_with_steps[0])
-            if ctx is not None and ctx.get("kind") == "snapshot_subset":
-                refresh_msg = (
-                    "Collision groups were refreshed for the same subset/recursive options and your current draft."
+            if feedback:
+                inspector_feedback.setText(feedback)
+            elif ctx is not None and ctx.get("kind") == "snapshot_subset":
+                inspector_feedback.setText(
+                    "Collision groups refreshed — same subset/recursive options and current draft."
                 )
             elif ctx is not None and ctx.get("kind") == "none":
-                refresh_msg = "Collision groups were rebuilt from your current draft."
+                inspector_feedback.setText("Collision groups refreshed.")
             else:
-                refresh_msg = (
-                    "Collision groups were rebuilt from your current draft. "
+                inspector_feedback.setText(
+                    "Collision groups refreshed. "
                     "Subset, pilot, or recursive run context is not preserved in this preview."
                 )
-            QMessageBox.information(dlg, "Refreshed", refresh_msg)
 
-        def wire_inspector_table(tbl: QTableWidget) -> None:
+        def wire_inspector_table(tbl: QTableWidget, *, kind: str) -> None:
             def on_context_menu(pos) -> None:
                 row = tbl.rowAt(int(pos.y()))
                 if row < 0:
@@ -21374,6 +21481,15 @@ class MainWindow(QMainWindow):
                     a_rm.setEnabled(cap["can_remove"])
                     a_rn.setEnabled(cap["can_rename"])
                     a_rt.setEnabled(cap["can_retarget"])
+                a_one_suffix = None
+                a_grp_suffix = None
+                if kind == "dest":
+                    menu.addSeparator()
+                    a_one_suffix = menu.addAction("Apply suggested rename for this row…")
+                    a_grp_suffix = menu.addAction("Apply suggested names to this destination group…")
+                    gprs = getattr(tbl, "_oz_dup_dest_prs", None)
+                    a_grp_suffix.setEnabled(bool(gprs) and len(gprs) >= 2)
+                    a_one_suffix.setEnabled(bool(cap.get("can_rename")) and bool(gprs) and len(gprs) >= 2)
                 picked = menu.exec(tbl.viewport().mapToGlobal(pos))
                 if picked == a_go and cap["can_go"]:
                     self._inspector_run_go_from_step(st)
@@ -21384,13 +21500,90 @@ class MainWindow(QMainWindow):
                     self._show_duplicate_destination_file_review_dialog()
                 elif picked == a_rm and cap["can_remove"] and cap["pr"] is not None:
                     if self._planning_remove_planned_move_with_confirm(dlg, cap["pr"]):
-                        handle_post_mutation()
+                        handle_post_mutation(feedback="Mapping removed from plan.")
                 elif picked == a_rn and cap["can_rename"] and cap["pr"] is not None:
                     if self._planning_rename_planned_file_with_dialog(dlg, cap["pr"]):
-                        handle_post_mutation()
+                        handle_post_mutation(feedback="1 rename applied.")
                 elif picked == a_rt and cap["can_retarget"] and cap["pr"] is not None:
                     if self._planning_retarget_planned_file_with_dialog(dlg, cap["pr"]):
-                        handle_post_mutation()
+                        handle_post_mutation(feedback="Destination retargeted.")
+                elif (
+                    picked == a_one_suffix
+                    and a_one_suffix is not None
+                    and cap["can_rename"]
+                    and cap["pr"] is not None
+                ):
+                    gprs = getattr(tbl, "_oz_dup_dest_prs", None)
+                    if gprs and len(gprs) >= 2:
+                        rows_full = self._build_execution_inspector_dest_suffix_preview_rows_for_moves(
+                            sorted(gprs)
+                        )
+                        row_one = next(
+                            (r for r in (rows_full or []) if int(r["index"]) == int(cap["pr"])),
+                            None,
+                        )
+                        if not row_one:
+                            QMessageBox.warning(
+                                dlg,
+                                "Apply suggested rename",
+                                "Could not build a suggested name for this row.",
+                            )
+                        else:
+                            v_err_one = self._validate_duplicate_group_apply_preview_rows([row_one])
+                            if v_err_one:
+                                QMessageBox.information(
+                                    dlg,
+                                    "Apply suggested rename",
+                                    "Renaming only this row would still leave duplicate destination targets in this group. "
+                                    'Use "Apply suggested names to this destination group" (or the group button) instead.',
+                                )
+                            else:
+                                ok, err = self._planning_apply_duplicate_preview_rows(
+                                    [row_one], dlg, change_note="execution_inspector_dest_suffix_one"
+                                )
+                                if not ok and err and err != "locked":
+                                    QMessageBox.warning(dlg, "Apply suggested rename", err)
+                                elif ok:
+                                    handle_post_mutation(feedback="1 rename applied.")
+                elif picked == a_grp_suffix and a_grp_suffix is not None:
+                    gprs = getattr(tbl, "_oz_dup_dest_prs", None)
+                    if gprs and len(gprs) >= 2:
+                        rows = self._build_execution_inspector_dest_suffix_preview_rows_for_moves(sorted(gprs))
+                        if not rows:
+                            QMessageBox.warning(
+                                dlg,
+                                "Apply suggested names",
+                                "Could not build unique names for this group.",
+                            )
+                        elif (
+                            QMessageBox.question(
+                                dlg,
+                                "Apply suggested names",
+                                f"Apply {len(rows)} suggested unique names for this duplicate destination group?",
+                                QMessageBox.Yes | QMessageBox.No,
+                                QMessageBox.No,
+                            )
+                            == QMessageBox.Yes
+                        ):
+                            rows2 = self._build_execution_inspector_dest_suffix_preview_rows_for_moves(
+                                sorted(gprs)
+                            )
+                            if not rows2 or len(rows2) != len(rows):
+                                QMessageBox.warning(
+                                    dlg,
+                                    "Apply suggested names",
+                                    "Suggestions changed before apply; try again.",
+                                )
+                            else:
+                                ok, err = self._planning_apply_duplicate_preview_rows(
+                                    rows2, dlg, change_note="execution_inspector_dest_suffix_group"
+                                )
+                                if not ok and err and err != "locked":
+                                    QMessageBox.warning(dlg, "Apply suggested names", err)
+                                elif ok:
+                                    handle_post_mutation(
+                                        feedback=f"Suggested names applied to {len(rows2)} items."
+                                    )
 
             tbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             tbl.customContextMenuRequested.connect(on_context_menu)
@@ -21398,6 +21591,7 @@ class MainWindow(QMainWindow):
 
         def rebuild_collision_tables() -> None:
             nonlocal tables_with_steps
+            inspector_dest_suffix_groups.clear()
             _update_subset_note_text()
             while host_layout.count():
                 item = host_layout.takeAt(0)
@@ -21433,8 +21627,93 @@ class MainWindow(QMainWindow):
                     tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
                     tbl.setMinimumHeight(min(220, 48 + 22 * max(3, len(members))))
                     fill_table(tbl, members)
-                    wire_inspector_table(tbl)
+
+                    pr_row_indices: list[int] = []
+                    if kind == "dest":
+                        for st in members:
+                            if not isinstance(st, dict):
+                                continue
+                            rid = str(st.get("request_id", "") or "").strip()
+                            if rid.startswith("recsub-"):
+                                continue
+                            pr = self._planned_move_table_row_for_transfer_request_id(rid)
+                            if pr is None:
+                                continue
+                            if pr < 0 or pr >= len(self.planned_moves or []):
+                                continue
+                            move = self.planned_moves[pr]
+                            if bool((move.get("source") or {}).get("is_folder")):
+                                continue
+                            if self._is_move_submitted(move):
+                                continue
+                            pr_row_indices.append(int(pr))
+                        pr_row_indices = sorted(set(pr_row_indices))
+                        if len(pr_row_indices) >= 2:
+                            inspector_dest_suffix_groups.append(pr_row_indices)
+                        setattr(tbl, "_oz_dup_dest_prs", pr_row_indices)
+
+                    wire_inspector_table(tbl, kind=kind)
                     gl.addWidget(tbl)
+
+                    if kind == "dest":
+
+                        def _make_group_apply(prs: list[int]):
+                            def on_group_apply() -> None:
+                                if len(prs) < 2:
+                                    return
+                                rows = self._build_execution_inspector_dest_suffix_preview_rows_for_moves(
+                                    sorted(prs)
+                                )
+                                if not rows:
+                                    QMessageBox.warning(
+                                        dlg,
+                                        "Apply suggested names",
+                                        "Could not build unique names for this group.",
+                                    )
+                                    return
+                                if (
+                                    QMessageBox.question(
+                                        dlg,
+                                        "Apply suggested names",
+                                        f"Apply {len(rows)} suggested unique names for this duplicate destination group?",
+                                        QMessageBox.Yes | QMessageBox.No,
+                                        QMessageBox.No,
+                                    )
+                                    != QMessageBox.Yes
+                                ):
+                                    return
+                                rows2 = self._build_execution_inspector_dest_suffix_preview_rows_for_moves(
+                                    sorted(prs)
+                                )
+                                if not rows2 or len(rows2) != len(rows):
+                                    QMessageBox.warning(
+                                        dlg,
+                                        "Apply suggested names",
+                                        "Suggestions changed before apply; try again.",
+                                    )
+                                    return
+                                ok, err = self._planning_apply_duplicate_preview_rows(
+                                    rows2, dlg, change_note="execution_inspector_dest_suffix_group"
+                                )
+                                if not ok and err and err != "locked":
+                                    QMessageBox.warning(dlg, "Apply suggested names", err)
+                                elif ok:
+                                    handle_post_mutation(
+                                        feedback=f"Suggested names applied to {len(rows2)} items."
+                                    )
+
+                            return on_group_apply
+
+                        grp_apply_btn = QPushButton("Apply suggested names to this group")
+                        grp_apply_btn.setEnabled(len(pr_row_indices) >= 2)
+                        grp_apply_btn.setToolTip(
+                            "Assign stem.ext, stem (2).ext, ... using the first row's base name (planning-only)."
+                            if len(pr_row_indices) >= 2
+                            else "At least two draft file mappings are required in this group.",
+                        )
+                        grp_apply_btn.clicked.connect(_make_group_apply(list(pr_row_indices)))
+                        gl.addWidget(grp_apply_btn)
+
                     tables_with_steps.append(tbl)
                     host_layout.addWidget(grp)
 
@@ -21473,7 +21752,7 @@ class MainWindow(QMainWindow):
             if pr is None:
                 return
             if self._planning_remove_planned_move_with_confirm(dlg, pr):
-                handle_post_mutation()
+                handle_post_mutation(feedback="Mapping removed from plan.")
 
         def on_rename() -> None:
             st = sel_step_holder["step"]
@@ -21483,7 +21762,7 @@ class MainWindow(QMainWindow):
             if pr is None:
                 return
             if self._planning_rename_planned_file_with_dialog(dlg, pr):
-                handle_post_mutation()
+                handle_post_mutation(feedback="1 rename applied.")
 
         def on_retarget() -> None:
             st = sel_step_holder["step"]
@@ -21493,7 +21772,123 @@ class MainWindow(QMainWindow):
             if pr is None:
                 return
             if self._planning_retarget_planned_file_with_dialog(dlg, pr):
-                handle_post_mutation()
+                handle_post_mutation(feedback="Destination retargeted.")
+
+        def on_apply_selected_dest_suffix() -> None:
+            st = sel_step_holder["step"]
+            if not isinstance(st, dict):
+                QMessageBox.information(
+                    dlg,
+                    "Apply suggested rename",
+                    "Select a row in a duplicate destination file group first.",
+                )
+                return
+            rid = str(st.get("request_id", "") or "").strip()
+            if rid.startswith("recsub-"):
+                QMessageBox.information(
+                    dlg,
+                    "Apply suggested rename",
+                    "Recursive expansion rows must be fixed via the parent folder mapping or duplicate file review.",
+                )
+                return
+            pr = self._planned_move_table_row_for_transfer_request_id(rid)
+            if pr is None:
+                return
+            cap = self._inspector_capabilities_for_transfer_step(st)
+            if not cap.get("can_rename"):
+                QMessageBox.information(
+                    dlg,
+                    "Apply suggested rename",
+                    "This row cannot be renamed from here (submitted or non-file mapping).",
+                )
+                return
+            group_prs = None
+            for g in inspector_dest_suffix_groups:
+                if int(pr) in g:
+                    group_prs = g
+                    break
+            if not group_prs or len(group_prs) < 2:
+                QMessageBox.information(
+                    dlg,
+                    "Apply suggested rename",
+                    "Selected row is not in a duplicate destination file group with another draft file mapping.",
+                )
+                return
+            rows_full = self._build_execution_inspector_dest_suffix_preview_rows_for_moves(sorted(group_prs))
+            row_one = next((r for r in (rows_full or []) if int(r["index"]) == int(pr)), None)
+            if not row_one:
+                QMessageBox.warning(
+                    dlg,
+                    "Apply suggested rename",
+                    "Could not build a suggested name for this row.",
+                )
+                return
+            v_err_one = self._validate_duplicate_group_apply_preview_rows([row_one])
+            if v_err_one:
+                QMessageBox.information(
+                    dlg,
+                    "Apply suggested rename",
+                    "Renaming only this row would still leave duplicate destination targets in this group. "
+                    'Use "Apply suggested names to this group" (or apply all destination groups) instead.',
+                )
+                return
+            ok, err = self._planning_apply_duplicate_preview_rows(
+                [row_one], dlg, change_note="execution_inspector_dest_suffix_one"
+            )
+            if not ok and err and err != "locked":
+                QMessageBox.warning(dlg, "Apply suggested rename", err)
+            elif ok:
+                handle_post_mutation(feedback="1 rename applied.")
+
+        def on_apply_all_dest_suffix_groups() -> None:
+            if not inspector_dest_suffix_groups:
+                QMessageBox.information(
+                    dlg,
+                    "Apply suggested names",
+                    "No duplicate destination file groups with two or more draft file rows.",
+                )
+                return
+            rows = self._build_execution_inspector_chained_dest_suffix_preview_rows(
+                list(inspector_dest_suffix_groups)
+            )
+            if not rows:
+                QMessageBox.warning(
+                    dlg,
+                    "Apply suggested names",
+                    "Could not build unique names for all groups.",
+                )
+                return
+            if (
+                QMessageBox.question(
+                    dlg,
+                    "Apply suggested names",
+                    f"Apply {len(rows)} suggested unique names across every duplicate destination group "
+                    "that has two or more draft file mappings?\n\n"
+                    "• Planned destination file names in your plan will change.\n"
+                    "• Planning-only — does not rename source files or existing SharePoint files.",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                != QMessageBox.Yes
+            ):
+                return
+            rows2 = self._build_execution_inspector_chained_dest_suffix_preview_rows(
+                list(inspector_dest_suffix_groups)
+            )
+            if not rows2 or len(rows2) != len(rows):
+                QMessageBox.warning(
+                    dlg,
+                    "Apply suggested names",
+                    "Suggestions changed before apply; try again.",
+                )
+                return
+            ok, err = self._planning_apply_duplicate_preview_rows(
+                rows2, dlg, change_note="execution_inspector_dest_suffix_all"
+            )
+            if not ok and err and err != "locked":
+                QMessageBox.warning(dlg, "Apply suggested names", err)
+            elif ok:
+                handle_post_mutation(feedback=f"Suggested names applied to {len(rows2)} items.")
 
         rebuild_collision_tables()
         outer.addWidget(scroll, 1)
@@ -21521,6 +21916,22 @@ class MainWindow(QMainWindow):
         row2.addWidget(retarget_btn)
         row2.addStretch(1)
         av.addLayout(row2)
+        apply_sel_suffix_btn = QPushButton("Apply suggested rename to selected row…")
+        apply_all_suffix_btn = QPushButton("Apply suggested names — all destination groups")
+        apply_sel_suffix_btn.setToolTip(
+            "If the selected draft row is in a duplicate destination file group, apply one safe rename when that alone is valid; "
+            "otherwise use the per-group or all-groups action."
+        )
+        apply_all_suffix_btn.setToolTip(
+            "Apply stem.ext / stem (2).ext / … for every duplicate destination group that has two or more draft file rows."
+        )
+        row3 = QHBoxLayout()
+        row3.addWidget(apply_sel_suffix_btn)
+        row3.addWidget(apply_all_suffix_btn)
+        row3.addStretch(1)
+        av.addLayout(row3)
+        apply_sel_suffix_btn.clicked.connect(on_apply_selected_dest_suffix)
+        apply_all_suffix_btn.clicked.connect(on_apply_all_dest_suffix_groups)
         outer.addWidget(actions)
 
         footer = QHBoxLayout()
