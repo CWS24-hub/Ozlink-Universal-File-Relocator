@@ -9,6 +9,8 @@ from ozlink_console.plan_execution_duplicate_validation import (
     duplicate_collision_report_from_transfer_steps,
     format_execution_duplicate_message,
     grouped_duplicate_destination_moves,
+    norm_execution_key,
+    transfer_step_file_destination_key,
 )
 
 
@@ -30,6 +32,29 @@ class PlanExecutionDuplicateValidationTests(unittest.TestCase):
         ds, dd = duplicate_collision_report_from_transfer_steps(steps)
         self.assertEqual(len(ds), 0)
         self.assertEqual(len(dd), 1)
+
+    def test_transfer_step_destination_key_full_path_not_parent_plus_leaf_confusion(self):
+        """Same leaf under parent folder vs under a subfolder must yield different destination keys."""
+        in_templates = {
+            "operation": "copy",
+            "source_path": r"S:\src\a.docx",
+            "destination_path": r"Root\HR\Templates",
+            "destination_name": "Policy.docx",
+            "is_source_folder": False,
+        }
+        in_subfolder = {
+            "operation": "copy",
+            "source_path": r"S:\src\b.docx",
+            "destination_path": r"Root\HR\Templates\Work Safe Documentation\Policy.docx",
+            "destination_name": "Policy.docx",
+            "is_source_folder": False,
+        }
+        k1 = transfer_step_file_destination_key(in_templates)
+        k2 = transfer_step_file_destination_key(in_subfolder)
+        self.assertNotEqual(norm_execution_key(k1 or ""), norm_execution_key(k2 or ""))
+        ds, dd = duplicate_collision_report_from_transfer_steps([in_templates, in_subfolder])
+        self.assertEqual(len(ds), 0)
+        self.assertEqual(len(dd), 0)
 
     def test_planned_moves_duplicate_source_callback(self):
         moves = [
