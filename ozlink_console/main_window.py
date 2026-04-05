@@ -20654,11 +20654,130 @@ class MainWindow(QMainWindow):
                     best_path = fp
         return best_path
 
+    def _inspector_execution_options_allow_draft_manifest_refresh(self, eo: dict | None) -> bool:
+        """True when duplicate inspector may rebuild transfer_steps from current draft via build_simulation_manifest."""
+        eo = dict(eo or {})
+        if bool(eo.get("snapshot_browsed_recursive")):
+            return False
+        if bool(eo.get("snapshot_recursive_subtree")):
+            return False
+        if list(eo.get("snapshot_scoped_request_ids") or []):
+            return False
+        if int(eo.get("pilot_max_graph_operations") or 0) > 0:
+            return False
+        for k in (
+            "pilot_transfer_step_indices",
+            "pilot_transfer_step_uids",
+            "pilot_transfer_destination_keys",
+            "pilot_transfer_destination_paths",
+            "pilot_proposed_folder_destination_paths",
+            "pilot_proposed_folder_name",
+        ):
+            if eo.get(k):
+                return False
+        return True
+
+    def _inspector_build_fresh_simulation_manifest_snapshot(self) -> dict | None:
+        try:
+            ctx = getattr(self, "current_session_context", None) or {}
+            tenant_hint = str(ctx.get("tenant_domain", "") or "")
+            draft_key = str(self.active_draft_session_id or "").strip()
+            ss = getattr(self, "_draft_shell_state", None)
+            if not draft_key and isinstance(ss, SessionState):
+                draft_key = str(ss.DraftId or "").strip()
+            if not draft_key:
+                draft_key = "draft"
+            return build_simulation_manifest(
+                planned_moves=list(self.planned_moves or []),
+                proposed_folders=list(self.proposed_folders or []),
+                draft_id=draft_key,
+                tenant_hint=tenant_hint,
+                notes="Draft snapshot refresh from duplicate collision inspector.",
+                manifest_version=2,
+                plan_leaf_exclusions=sorted(getattr(self, "_plan_leaf_exclusions", set()) or []),
+                graph_unsafe_folder_step_indices=self._compute_graph_unsafe_folder_step_indices(),
+                graph_expanded_transfer_steps=self._compute_graph_expanded_transfer_steps_json(),
+            )
+        except Exception:
+            return None
+
+    def _inspector_capabilities_for_transfer_step(self, st: dict | None) -> dict:
+        empty = {
+            "rid": "",
+            "src_path_step": "",
+            "pr": None,
+            "is_rec": False,
+            "hh": "",
+            "parent_pr": None,
+            "can_go": False,
+            "can_go_parent": False,
+            "can_remove": False,
+            "can_rename": False,
+            "can_retarget": False,
+        }
+        if not isinstance(st, dict):
+            return empty
+        rid = str(st.get("request_id", "") or "").strip()
+        src_path_step = str(st.get("source_path", "") or "").strip()
+        pr = self._planned_move_table_row_for_transfer_request_id(rid)
+        is_rec = rid.startswith("recsub-")
+        hh = self._duplicate_inspector_recursive_folder_hint(src_path_step) if is_rec else ""
+        parent_pr = self._planned_move_row_for_folder_source_path(hh) if hh else None
+        move = self.planned_moves[pr] if pr is not None and pr < len(self.planned_moves or []) else None
+        submitted = bool(move and self._is_move_submitted(move))
+        is_file = bool(move and self._planned_move_is_file_allocation(move))
+        return {
+            "rid": rid,
+            "src_path_step": src_path_step,
+            "pr": pr,
+            "is_rec": is_rec,
+            "hh": hh,
+            "parent_pr": parent_pr,
+            "can_go": bool(pr is not None or bool(src_path_step)),
+            "can_go_parent": bool(is_rec and parent_pr is not None),
+            "can_remove": bool(pr is not None and not submitted),
+            "can_rename": bool(pr is not None and is_file and not submitted),
+            "can_retarget": bool(pr is not None and is_file and not submitted),
+        }
+
+    def _inspector_focus_planned_moves_row(self, move_row: int) -> None:
+        tabs = getattr(self, "workspace_tabs", None)
+        box = getattr(self, "planned_moves_box", None)
+        tbl_pm = getattr(self, "planned_moves_table", None)
+        if tabs is not None and box is not None:
+            tabs.setCurrentWidget(box)
+        if tbl_pm is not None:
+            tbl_pm.clearSelection()
+            tbl_pm.selectRow(int(move_row))
+            tbl_pm.setFocus()
+            it0 = tbl_pm.item(int(move_row), 0)
+            if it0 is not None:
+                tbl_pm.scrollToItem(it0)
+
+    def _inspector_run_go_from_step(self, st: dict) -> None:
+        if not isinstance(st, dict):
+            return
+        rid = str(st.get("request_id", "") or "").strip()
+        pr = self._planned_move_table_row_for_transfer_request_id(rid)
+        if pr is not None:
+            self._inspector_focus_planned_moves_row(pr)
+            return
+        src_path_step = str(st.get("source_path", "") or "").strip()
+        if src_path_step:
+            self._activate_workflow_source_row({"source_path": src_path_step})
+
+    def _inspector_run_go_parent_from_step(self, st: dict) -> None:
+        if not isinstance(st, dict):
+            return
+        hh = self._duplicate_inspector_recursive_folder_hint(str(st.get("source_path", "") or ""))
+        prow = self._planned_move_row_for_folder_source_path(hh)
+        if prow is None:
+            return
+        self._inspector_focus_planned_moves_row(prow)
+
     def _show_execution_duplicate_collision_inspector(self, manifest: dict) -> None:
-        steps = list((manifest or {}).get("transfer_steps") or [])
-        eo = dict((manifest or {}).get("execution_options") or {})
-        scoped_raw = eo.get("snapshot_scoped_request_ids") or []
-        scoped_ids = {str(x).strip() for x in scoped_raw if str(x).strip()}
+        manifest_holder: dict = {"m": copy.deepcopy(manifest)}
+        tables_with_steps: list = []
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Duplicate transfer steps — review")
@@ -20673,16 +20792,7 @@ class MainWindow(QMainWindow):
         intro.setWordWrap(True)
         outer.addWidget(intro)
 
-        if scoped_ids:
-            subset_note = QLabel(
-                "Subset mode is active: execution_options.snapshot_scoped_request_ids is set. "
-                "Steps with “In run subset” = False are still in this manifest and can collide with rows you "
-                "intend to run (including Graph-expanded recsub- file rows)."
-            )
-        else:
-            subset_note = QLabel(
-                "Duplicate checks apply to every file transfer step in this manifest (before any run subset is applied)."
-            )
+        subset_note = QLabel("")
         subset_note.setObjectName("MutedText")
         subset_note.setWordWrap(True)
         outer.addWidget(subset_note)
@@ -20695,11 +20805,35 @@ class MainWindow(QMainWindow):
         host_layout = QVBoxLayout(host)
         host_layout.setSpacing(12)
 
-        dest_groups = duplicate_transfer_step_groups_by_destination(steps)
-        src_groups = duplicate_transfer_step_groups_by_source(steps)
-        tables_with_steps: list = []
+        def _current_scoped_ids() -> set[str]:
+            eo = dict((manifest_holder.get("m") or {}).get("execution_options") or {})
+            scoped_raw = eo.get("snapshot_scoped_request_ids") or []
+            return {str(x).strip() for x in scoped_raw if str(x).strip()}
+
+        def _update_subset_note_text() -> None:
+            if _current_scoped_ids():
+                subset_note.setText(
+                    "Subset mode is active: execution_options.snapshot_scoped_request_ids is set. "
+                    "Steps with “In run subset” = False are still in this manifest and can collide with rows you "
+                    "intend to run (including Graph-expanded recsub- file rows)."
+                )
+            else:
+                subset_note.setText(
+                    "Duplicate checks apply to every file transfer step in this manifest (before any run subset is applied)."
+                )
+
+        col_labels = [
+            "Step index",
+            "Source path",
+            "Destination path",
+            "Destination name",
+            "Request ID",
+            "Provenance",
+            "In run subset",
+        ]
 
         def fill_table(table: QTableWidget, member_steps: list) -> None:
+            scoped_ids = _current_scoped_ids()
             table.setRowCount(0)
             for st in member_steps:
                 if not isinstance(st, dict):
@@ -20727,62 +20861,9 @@ class MainWindow(QMainWindow):
                         it.setData(Qt.UserRole, st)
                     table.setItem(r, c, it)
 
-        col_labels = [
-            "Step index",
-            "Source path",
-            "Destination path",
-            "Destination name",
-            "Request ID",
-            "Provenance",
-            "In run subset",
-        ]
-
-        def add_grouped_section(title: str, groups: list, kind: str) -> None:
-            if not groups:
-                return
-            sec_title = QLabel(title)
-            sec_title.setObjectName("SectionTitle")
-            host_layout.addWidget(sec_title)
-            for _nk, display_key, members in groups:
-                grp = QFrame()
-                grp.setObjectName("SectionBox")
-                gl = QVBoxLayout(grp)
-                label_text = f"Destination: {display_key}" if kind == "dest" else f"Source: {display_key}"
-                gh = QLabel(label_text)
-                gh.setObjectName("SectionTitle")
-                gl.addWidget(gh)
-                tbl = QTableWidget(0, 7)
-                tbl.setHorizontalHeaderLabels(col_labels)
-                tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
-                tbl.setSelectionMode(QAbstractItemView.SingleSelection)
-                tbl.verticalHeader().setVisible(False)
-                tbl.horizontalHeader().setStretchLastSection(True)
-                tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
-                tbl.setMinimumHeight(min(220, 48 + 22 * max(3, len(members))))
-                fill_table(tbl, members)
-                gl.addWidget(tbl)
-                tables_with_steps.append(tbl)
-                host_layout.addWidget(grp)
-
-        add_grouped_section("Duplicate destination file targets", dest_groups, "dest")
-        add_grouped_section("Duplicate source assignments", src_groups, "source")
-
-        if not dest_groups and not src_groups:
-            empty = QLabel(
-                "No duplicate groups could be built from transfer_steps (unexpected if validation failed)."
-            )
-            empty.setObjectName("MutedText")
-            empty.setWordWrap(True)
-            host_layout.addWidget(empty)
-
-        host_layout.addStretch(1)
-        scroll.setWidget(host)
-        outer.addWidget(scroll, 1)
-
         hint = QLabel("")
         hint.setObjectName("MutedText")
         hint.setWordWrap(True)
-        outer.addWidget(hint)
 
         sel_step_holder: dict = {"step": None}
         go_btn = QPushButton("Go to item")
@@ -20803,22 +20884,15 @@ class MainWindow(QMainWindow):
         ):
             b.setEnabled(False)
 
-        def _navigate_planned_moves_row(move_row: int) -> None:
-            tabs = getattr(self, "workspace_tabs", None)
-            box = getattr(self, "planned_moves_box", None)
-            tbl_pm = getattr(self, "planned_moves_table", None)
-            if tabs is not None and box is not None:
-                tabs.setCurrentWidget(box)
-            if tbl_pm is not None:
-                tbl_pm.clearSelection()
-                tbl_pm.selectRow(int(move_row))
-                tbl_pm.setFocus()
-                it0 = tbl_pm.item(int(move_row), 0)
-                if it0 is not None:
-                    tbl_pm.scrollToItem(it0)
-
-        def sync_from_table(tbl: QTableWidget) -> None:
+        def sync_from_table(tbl: QTableWidget | None) -> None:
             if tbl is None:
+                sel_step_holder["step"] = None
+                hint.setText("")
+                go_btn.setEnabled(False)
+                go_parent_btn.setEnabled(False)
+                remove_btn.setEnabled(False)
+                rename_btn.setEnabled(False)
+                retarget_btn.setEnabled(False)
                 return
             items = tbl.selectedItems()
             if not items:
@@ -20843,18 +20917,13 @@ class MainWindow(QMainWindow):
                 rename_btn.setEnabled(False)
                 retarget_btn.setEnabled(False)
                 return
-            rid = str(st.get("request_id", "") or "").strip()
-            src_path_step = str(st.get("source_path", "") or "").strip()
-            pr = self._planned_move_table_row_for_transfer_request_id(rid)
-            is_rec = rid.startswith("recsub-")
-            hh = (
-                self._duplicate_inspector_recursive_folder_hint(src_path_step)
-                if is_rec
-                else ""
-            )
-            parent_pr = self._planned_move_row_for_folder_source_path(hh) if hh else None
+            cap = self._inspector_capabilities_for_transfer_step(st)
+            rid = cap["rid"]
+            pr = cap["pr"]
+            is_rec = cap["is_rec"]
+            hh = cap["hh"]
 
-            go_btn.setEnabled(bool(pr is not None or src_path_step))
+            go_btn.setEnabled(cap["can_go"])
             if pr is not None:
                 go_btn.setToolTip("Open Planned Moves and select this draft mapping row.")
             elif is_rec:
@@ -20866,33 +20935,29 @@ class MainWindow(QMainWindow):
                     "Jump to this source path in the source tree (no matching Planned Moves row for this request id)."
                 )
 
-            go_parent_btn.setEnabled(bool(is_rec and parent_pr is not None))
+            go_parent_btn.setEnabled(cap["can_go_parent"])
             go_parent_btn.setToolTip(
                 "Open Planned Moves and select the folder mapping that produced this recsub- row."
-                if parent_pr is not None
+                if cap["parent_pr"] is not None
                 else "No parent folder mapping matched this recursive row."
             )
 
-            move = self.planned_moves[pr] if pr is not None and pr < len(self.planned_moves or []) else None
-            submitted = bool(move and self._is_move_submitted(move))
-            is_file = bool(move and self._planned_move_is_file_allocation(move))
-
-            remove_btn.setEnabled(bool(pr is not None and not submitted))
+            remove_btn.setEnabled(cap["can_remove"])
             remove_btn.setToolTip(
                 "Remove this planned mapping from the draft (same flow as duplicate file review)."
-                if pr is not None and not submitted
+                if cap["can_remove"]
                 else "Select a draft planned row (not a recsub- synthetic file row)."
             )
-            rename_btn.setEnabled(bool(pr is not None and is_file and not submitted))
+            rename_btn.setEnabled(cap["can_rename"])
             rename_btn.setToolTip(
                 "Rename the planned destination file name (file mappings only)."
-                if pr is not None and is_file and not submitted
+                if cap["can_rename"]
                 else "Only available for non-submitted file mappings."
             )
-            retarget_btn.setEnabled(bool(pr is not None and is_file and not submitted))
+            retarget_btn.setEnabled(cap["can_retarget"])
             retarget_btn.setToolTip(
                 "Change the planned destination folder (file mappings only)."
-                if pr is not None and is_file and not submitted
+                if cap["can_retarget"]
                 else "Only available for non-submitted file mappings."
             )
 
@@ -20909,28 +20974,155 @@ class MainWindow(QMainWindow):
                     "or adjust the draft, then retry the run."
                 )
 
+        def handle_post_mutation() -> None:
+            eo = dict((manifest_holder.get("m") or {}).get("execution_options") or {})
+            if self._inspector_execution_options_allow_draft_manifest_refresh(eo):
+                new_m = self._inspector_build_fresh_simulation_manifest_snapshot()
+                if new_m:
+                    dup_err = self._transfer_manifest_duplicate_validation_error(new_m)
+                    manifest_holder["m"] = new_m
+                    if not dup_err:
+                        QMessageBox.information(
+                            dlg,
+                            "Duplicates resolved",
+                            "A fresh manifest from your current draft has no duplicate transfer steps.\n\n"
+                            "Close and run again to export or execute with an updated manifest.",
+                        )
+                        dlg.accept()
+                        return
+                    rebuild_collision_tables()
+                    sel_step_holder["step"] = None
+                    hint.setText("")
+                    for b in (go_btn, go_parent_btn, remove_btn, rename_btn, retarget_btn):
+                        b.setEnabled(False)
+                    if tables_with_steps:
+                        sync_from_table(tables_with_steps[0])
+                    QMessageBox.information(
+                        dlg,
+                        "Refreshed",
+                        "Collision groups were rebuilt from your current draft. "
+                        "Subset, pilot, or recursive run context is not preserved in this preview.",
+                    )
+                    return
+            self._inspector_close_after_plan_mutation(dlg)
+
+        def wire_inspector_table(tbl: QTableWidget) -> None:
+            def on_context_menu(pos) -> None:
+                row = tbl.rowAt(int(pos.y()))
+                if row < 0:
+                    return
+                tbl.selectRow(row)
+                tbl.setCurrentCell(row, 0)
+                it0 = tbl.item(row, 0)
+                st = it0.data(Qt.UserRole) if it0 else None
+                if not isinstance(st, dict):
+                    return
+                cap = self._inspector_capabilities_for_transfer_step(st)
+                menu = QMenu(tbl)
+                a_go = menu.addAction("Go to item")
+                a_go.setEnabled(cap["can_go"])
+                a_par = menu.addAction("Go to parent folder mapping")
+                a_par.setEnabled(cap["can_go_parent"])
+                a_dup = menu.addAction("Open duplicate file review…")
+                menu.addSeparator()
+                a_rm = menu.addAction("Remove mapping from plan")
+                a_rn = menu.addAction("Rename planned destination file…")
+                a_rt = menu.addAction("Retarget planned destination…")
+                if cap["is_rec"]:
+                    a_rm.setVisible(False)
+                    a_rn.setVisible(False)
+                    a_rt.setVisible(False)
+                else:
+                    a_rm.setEnabled(cap["can_remove"])
+                    a_rn.setEnabled(cap["can_rename"])
+                    a_rt.setEnabled(cap["can_retarget"])
+                picked = menu.exec(tbl.viewport().mapToGlobal(pos))
+                if picked == a_go and cap["can_go"]:
+                    self._inspector_run_go_from_step(st)
+                    sync_from_table(tbl)
+                elif picked == a_par and cap["can_go_parent"]:
+                    self._inspector_run_go_parent_from_step(st)
+                elif picked == a_dup:
+                    self._show_duplicate_destination_file_review_dialog()
+                elif picked == a_rm and cap["can_remove"] and cap["pr"] is not None:
+                    if self._planning_remove_planned_move_with_confirm(dlg, cap["pr"]):
+                        handle_post_mutation()
+                elif picked == a_rn and cap["can_rename"] and cap["pr"] is not None:
+                    if self._planning_rename_planned_file_with_dialog(dlg, cap["pr"]):
+                        handle_post_mutation()
+                elif picked == a_rt and cap["can_retarget"] and cap["pr"] is not None:
+                    if self._planning_retarget_planned_file_with_dialog(dlg, cap["pr"]):
+                        handle_post_mutation()
+
+            tbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            tbl.customContextMenuRequested.connect(on_context_menu)
+            tbl.itemSelectionChanged.connect(lambda _t=tbl: sync_from_table(_t))
+
+        def rebuild_collision_tables() -> None:
+            nonlocal tables_with_steps
+            _update_subset_note_text()
+            while host_layout.count():
+                item = host_layout.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    w.deleteLater()
+            tables_with_steps = []
+            m = manifest_holder.get("m") or {}
+            steps = list(m.get("transfer_steps") or [])
+            dest_groups = duplicate_transfer_step_groups_by_destination(steps)
+            src_groups = duplicate_transfer_step_groups_by_source(steps)
+
+            def add_grouped_section(title: str, groups: list, kind: str) -> None:
+                if not groups:
+                    return
+                sec_title = QLabel(title)
+                sec_title.setObjectName("SectionTitle")
+                host_layout.addWidget(sec_title)
+                for _nk, display_key, members in groups:
+                    grp = QFrame()
+                    grp.setObjectName("SectionBox")
+                    gl = QVBoxLayout(grp)
+                    label_text = f"Destination: {display_key}" if kind == "dest" else f"Source: {display_key}"
+                    gh = QLabel(label_text)
+                    gh.setObjectName("SectionTitle")
+                    gl.addWidget(gh)
+                    tbl = QTableWidget(0, 7)
+                    tbl.setHorizontalHeaderLabels(col_labels)
+                    tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
+                    tbl.setSelectionMode(QAbstractItemView.SingleSelection)
+                    tbl.verticalHeader().setVisible(False)
+                    tbl.horizontalHeader().setStretchLastSection(True)
+                    tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
+                    tbl.setMinimumHeight(min(220, 48 + 22 * max(3, len(members))))
+                    fill_table(tbl, members)
+                    wire_inspector_table(tbl)
+                    gl.addWidget(tbl)
+                    tables_with_steps.append(tbl)
+                    host_layout.addWidget(grp)
+
+            add_grouped_section("Duplicate destination file targets", dest_groups, "dest")
+            add_grouped_section("Duplicate source assignments", src_groups, "source")
+
+            if not dest_groups and not src_groups:
+                empty = QLabel(
+                    "No duplicate groups could be built from transfer_steps (unexpected if validation failed)."
+                )
+                empty.setObjectName("MutedText")
+                empty.setWordWrap(True)
+                host_layout.addWidget(empty)
+
+            host_layout.addStretch(1)
+            scroll.setWidget(host)
+
         def on_go() -> None:
             st = sel_step_holder["step"]
-            if not isinstance(st, dict):
-                return
-            rid = str(st.get("request_id", "") or "").strip()
-            pr = self._planned_move_table_row_for_transfer_request_id(rid)
-            if pr is not None:
-                _navigate_planned_moves_row(pr)
-                return
-            src_path_step = str(st.get("source_path", "") or "").strip()
-            if src_path_step:
-                self._activate_workflow_source_row({"source_path": src_path_step})
+            if isinstance(st, dict):
+                self._inspector_run_go_from_step(st)
 
         def on_go_parent() -> None:
             st = sel_step_holder["step"]
-            if not isinstance(st, dict):
-                return
-            hh = self._duplicate_inspector_recursive_folder_hint(str(st.get("source_path", "") or ""))
-            prow = self._planned_move_row_for_folder_source_path(hh)
-            if prow is None:
-                return
-            _navigate_planned_moves_row(prow)
+            if isinstance(st, dict):
+                self._inspector_run_go_parent_from_step(st)
 
         def on_dup_review() -> None:
             self._show_duplicate_destination_file_review_dialog()
@@ -20943,7 +21135,7 @@ class MainWindow(QMainWindow):
             if pr is None:
                 return
             if self._planning_remove_planned_move_with_confirm(dlg, pr):
-                self._inspector_close_after_plan_mutation(dlg)
+                handle_post_mutation()
 
         def on_rename() -> None:
             st = sel_step_holder["step"]
@@ -20953,7 +21145,7 @@ class MainWindow(QMainWindow):
             if pr is None:
                 return
             if self._planning_rename_planned_file_with_dialog(dlg, pr):
-                self._inspector_close_after_plan_mutation(dlg)
+                handle_post_mutation()
 
         def on_retarget() -> None:
             st = sel_step_holder["step"]
@@ -20963,7 +21155,11 @@ class MainWindow(QMainWindow):
             if pr is None:
                 return
             if self._planning_retarget_planned_file_with_dialog(dlg, pr):
-                self._inspector_close_after_plan_mutation(dlg)
+                handle_post_mutation()
+
+        rebuild_collision_tables()
+        outer.addWidget(scroll, 1)
+        outer.addWidget(hint)
 
         go_btn.clicked.connect(on_go)
         go_parent_btn.clicked.connect(on_go_parent)
@@ -20971,9 +21167,6 @@ class MainWindow(QMainWindow):
         remove_btn.clicked.connect(on_remove)
         rename_btn.clicked.connect(on_rename)
         retarget_btn.clicked.connect(on_retarget)
-
-        for t in tables_with_steps:
-            t.itemSelectionChanged.connect(lambda _t=t: sync_from_table(_t))
 
         actions = QWidget()
         av = QVBoxLayout(actions)
