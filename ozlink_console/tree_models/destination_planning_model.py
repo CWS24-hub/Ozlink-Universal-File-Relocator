@@ -491,6 +491,28 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         self._rebuild_path_index()
         self.destination_structure_changed.emit()
 
+    def replace_row_with_nested(self, index: QModelIndex, nested: NestedSpec) -> None:
+        """Replace the row at ``index`` and its entire subtree with a fresh nested spec (no full model reset)."""
+        if not index.isValid():
+            return
+        parent_ix = index.parent()
+        row = index.row()
+        parent_node = self._invisible if not parent_ix.isValid() else self._node(parent_ix)
+        if parent_node is None or not parent_node._children or row < 0 or row >= len(parent_node._children):
+            return
+        old_node = parent_node._children[row]
+        self._unregister_subtree_paths(old_node)
+        self.beginRemoveRows(parent_ix, row, row)
+        parent_node._children.pop(row)
+        self.endRemoveRows()
+        self.beginInsertRows(parent_ix, row, row)
+        new_node = self._make_nested_node(parent_node, row, nested[0], nested[1])
+        parent_node._children.insert(row, new_node)
+        self._reindex(parent_node)
+        self.endInsertRows()
+        self._register_subtree_paths(new_node)
+        self.destination_structure_changed.emit()
+
     def _make_nested_node(self, parent_node: _Node, row: int, pl: Dict[str, Any], kids: List[NestedSpec]) -> _Node:
         if kids:
             node = _Node(parent_node, row, pl, [])
