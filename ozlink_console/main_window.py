@@ -2799,8 +2799,16 @@ class MainWindow(QMainWindow):
         self._graph_linkage_restore_finalize_pending_last_sig: tuple[int, ...] | None = None
         self._graph_linkage_banner_ui_last_sig: str = ""
         self._graph_linkage_ui_mode: str = "idle"
+        self._graph_linkage_progress_session_arm: bool = False
+        self._graph_linkage_progress_session_id: int = 0
+        self._graph_linkage_progress_session_total: int = 0
+        self._graph_linkage_progress_success_hide_timer: Optional[QTimer] = None
+        # When True, user hid the determinate strip for this session; cleared on each new linkage session_begin.
+        self._graph_linkage_strip_user_suppressed: bool = False
+        self._destination_semantic_reconcile_guard_depth: int = 0
         self._graph_dest_parent_negative_cache: set[str] = set()
         self._source_projection_restore_chunk_gen: int = 0
+        self._source_projection_restore_chunk_active: bool = False
         self._execution_manifest_path = ""
         self._execution_manifest = None
         self._current_details_node_data = None
@@ -4532,6 +4540,39 @@ class MainWindow(QMainWindow):
         self.planning_graph_linkage_compact_row.hide()
         self.planning_graph_assurance_banner.hide()
 
+        self.planning_graph_linkage_header_host = QWidget()
+        _pgh = QVBoxLayout(self.planning_graph_linkage_header_host)
+        _pgh.setContentsMargins(0, 0, 0, 0)
+        _pgh.setSpacing(6)
+        self.planning_graph_linkage_progress_strip = QWidget()
+        _psl = QHBoxLayout(self.planning_graph_linkage_progress_strip)
+        _psl.setContentsMargins(0, 2, 0, 2)
+        _psl.setSpacing(10)
+        self.planning_graph_linkage_progress_primary_label = QLabel("")
+        self.planning_graph_linkage_progress_primary_label.setObjectName("SummaryLabel")
+        self.planning_graph_linkage_progress_bar = QProgressBar()
+        self.planning_graph_linkage_progress_bar.setMinimum(0)
+        self.planning_graph_linkage_progress_bar.setMaximum(100)
+        self.planning_graph_linkage_progress_bar.setValue(0)
+        self.planning_graph_linkage_progress_bar.setFixedHeight(18)
+        self.planning_graph_linkage_progress_bar.setTextVisible(True)
+        self.planning_graph_linkage_progress_detail_label = QLabel("")
+        self.planning_graph_linkage_progress_detail_label.setObjectName("CardBody")
+        self.planning_graph_linkage_progress_strip_dismiss_btn = QPushButton("Dismiss")
+        self.planning_graph_linkage_progress_strip_dismiss_btn.setObjectName("SecondaryButton")
+        self.planning_graph_linkage_progress_strip_dismiss_btn.setMinimumHeight(22)
+        self.planning_graph_linkage_progress_strip_dismiss_btn.setCursor(Qt.PointingHandCursor)
+        self.planning_graph_linkage_progress_strip_dismiss_btn.clicked.connect(
+            self._dismiss_graph_linkage_progress_strip_user
+        )
+        _psl.addWidget(self.planning_graph_linkage_progress_primary_label, 0)
+        _psl.addWidget(self.planning_graph_linkage_progress_bar, 1)
+        _psl.addWidget(self.planning_graph_linkage_progress_detail_label, 0)
+        _psl.addWidget(self.planning_graph_linkage_progress_strip_dismiss_btn, 0)
+        self.planning_graph_linkage_progress_strip.hide()
+        _pgh.addWidget(self.planning_graph_linkage_progress_strip)
+        _pgh.addWidget(self.planning_graph_assurance_banner)
+
         self.planning_inputs["Source Site"].currentIndexChanged.connect(
             lambda _: self.on_site_selector_changed("source")
         )
@@ -4764,7 +4805,7 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(header_action_panel, 0, 3, 3, 1, Qt.AlignTop | Qt.AlignRight)
         header_layout.addWidget(planning_ctx_bar, 1, 0, 1, 3)
         header_layout.addWidget(self.planning_loading_banner, 2, 0, 1, 4)
-        header_layout.addWidget(self.planning_graph_assurance_banner, 3, 0, 1, 4)
+        header_layout.addWidget(self.planning_graph_linkage_header_host, 3, 0, 1, 4)
         header_layout.setColumnStretch(0, 2)
         header_layout.setColumnStretch(1, 2)
         header_layout.setColumnStretch(2, 2)
@@ -8626,6 +8667,12 @@ class MainWindow(QMainWindow):
                 # Canonical Gary-draft intake: enrich imported records with missing Graph ids
                 # immediately so execution/manifests are reliable without manual rework.
                 try:
+                    if (
+                        int(_audit_import.get("rows_missing_graph_ids") or 0)
+                        + int(_audit_import.get("proposed_rows_missing_graph_ids") or 0)
+                        > 0
+                    ):
+                        self._graph_linkage_progress_session_begin()
                     self.ensure_planned_moves_resolved_via_graph(
                         persist=True,
                         quiet=False,
@@ -10245,6 +10292,60 @@ class MainWindow(QMainWindow):
             fp = str(getattr(self, "_destination_last_materialized_overlay_fp", "") or "")
         return f"{fp}\x00{uqp}\x00{uqa}\x00" + "\x00".join(paths)
 
+    def _destination_collect_overlay_replay_bind_scope_paths(self) -> set[str]:
+        """Canonical paths where unresolved proposed/allocation replay still needs destination bind work."""
+        out: set[str] = set()
+        for p in (self.unresolved_proposed_by_parent_path or {}).keys():
+            c = self._canonical_destination_projection_path(str(p or ""))
+            if c:
+                out.add(c)
+        for p in (self.unresolved_allocations_by_parent_path or {}).keys():
+            c = self._canonical_destination_projection_path(str(p or ""))
+            if c:
+                out.add(c)
+        out |= set(getattr(self, "_destination_drfws_affected_paths", None) or set())
+        return {x for x in out if x}
+
+    def _destination_folder_worker_materialize_scope_paths(self, semantic_path: str) -> set[str]:
+        """Narrow bind scope for a single folder load: that branch plus any coalesced DRfWS paths."""
+        out: set[str] = set()
+        if semantic_path:
+            c = self._canonical_destination_projection_path(str(semantic_path or ""))
+            if c:
+                out.add(c)
+        out |= set(getattr(self, "_destination_drfws_affected_paths", None) or set())
+        return {x for x in out if x}
+
+    def _destination_materialize_with_optional_overlay_scope(
+        self,
+        reason: str,
+        *,
+        allow_defer: bool = True,
+        prefer_chunked_projection: bool = False,
+        narrow_restore_real_snapshot: bool = False,
+        scope_paths: Optional[set[str]] = None,
+    ) -> int:
+        """Temporarily set bind scope from overlay/replay deltas so materialize/bind stay subtree-scoped."""
+        scope = set(scope_paths) if scope_paths is not None else self._destination_collect_overlay_replay_bind_scope_paths()
+        prev = getattr(self, "_destination_bind_scope_paths", None)
+        if scope:
+            self._destination_bind_scope_paths = set(scope)
+            self._log_restore_phase(
+                "destination_materialize_bind_scope_from_overlay_replay",
+                reason=str(reason or ""),
+                bind_scope_candidate_count=len(scope),
+            )
+        try:
+            return self._materialize_destination_future_model(
+                reason,
+                allow_defer=allow_defer,
+                prefer_chunked_projection=prefer_chunked_projection,
+                narrow_restore_real_snapshot=narrow_restore_real_snapshot,
+            )
+        finally:
+            if scope:
+                self._destination_bind_scope_paths = prev
+
     def _destination_path_under_bind_scope(self, sem_path: str, scope: Optional[set[str]] = None) -> bool:
         if scope is None:
             scope = getattr(self, "_destination_bind_scope_paths", None)
@@ -10313,6 +10414,69 @@ class MainWindow(QMainWindow):
                 if k == root or k.startswith(root + "\\") or k.startswith(root + "/"):
                     keys.add(k)
         return len(keys)
+
+    def _destination_semantic_path_under_any_bind_scope_root(self, sem_path: str, scope_roots: list[str]) -> bool:
+        sp = str(sem_path or "").strip()
+        if not sp:
+            return False
+        for root in scope_roots:
+            r = str(root or "").strip()
+            if not r:
+                continue
+            if sp == r or sp.startswith(r + "\\") or sp.startswith(r + "/"):
+                return True
+        return False
+
+    def _destination_bind_scope_roots_cover_all_overlay_nodes(
+        self, model_nodes: dict, scope_roots: list[str]
+    ) -> bool:
+        """True when every non-real (projected) node path lies under at least one scope root."""
+        if not scope_roots:
+            return True
+        for sem_path, node in model_nodes.items():
+            if not isinstance(node, dict):
+                continue
+            if node.get("node_state") == "real":
+                continue
+            sp = str(sem_path or "").strip()
+            if not sp:
+                continue
+            if not self._destination_semantic_path_under_any_bind_scope_root(sp, scope_roots):
+                return False
+        return True
+
+    def _normalize_destination_bind_scope_model_roots_for_bind(
+        self, paths: Optional[set[str]], model_nodes: dict
+    ) -> Optional[list[str]]:
+        """Normalize overlay bind scope, or return None to use full-tree bind when scope would hide projected nodes."""
+        norm = self._normalize_destination_bind_scope_model_roots(paths, model_nodes)
+        if not norm:
+            return None
+        if self._destination_bind_scope_roots_cover_all_overlay_nodes(model_nodes, norm):
+            return norm
+        miss = 0
+        miss_samples: list[str] = []
+        for sem_path, node in model_nodes.items():
+            if not isinstance(node, dict):
+                continue
+            if node.get("node_state") == "real":
+                continue
+            sp = str(sem_path or "").strip()
+            if not sp:
+                continue
+            if not self._destination_semantic_path_under_any_bind_scope_root(sp, norm):
+                miss += 1
+                if len(miss_samples) < 6:
+                    miss_samples.append(sp[:160])
+        self._log_restore_phase(
+            "destination_bind_scope_promoted_to_full_tree",
+            reason="non_real_nodes_outside_scope_roots",
+            model_node_count=len(model_nodes),
+            bind_scope_root_count=len(norm),
+            uncovered_overlay_node_count=miss,
+            uncovered_overlay_samples=miss_samples,
+        )
+        return None
 
     def _destination_future_model_bind_structure_signature_scoped(self, model, scope_roots: list[str]) -> str:
         """Structure fingerprint for nodes under ``scope_roots`` only (plus explicit scope identity prefix)."""
@@ -10769,11 +10933,32 @@ class MainWindow(QMainWindow):
             return
         self._destination_full_tree_materialization_pending = False
         if not self._destination_steady_state_full_materialize_redundant():
-            self._materialize_destination_future_model("destination_full_tree_idle_success")
+            overlay_scope = self._destination_collect_overlay_replay_bind_scope_paths()
+            if overlay_scope:
+                self._destination_materialize_with_optional_overlay_scope(
+                    "destination_full_tree_idle_success",
+                    allow_defer=True,
+                    prefer_chunked_projection=True,
+                    scope_paths=overlay_scope,
+                )
+            else:
+                self._materialize_destination_future_model(
+                    "destination_full_tree_idle_success",
+                    allow_defer=True,
+                    prefer_chunked_projection=True,
+                )
 
     def start_destination_full_tree_worker(self, drive_id):
         if not drive_id:
             self._reset_destination_full_tree_state()
+            return
+
+        if getattr(self, "_destination_future_bind_sync_active", False):
+            log_info(
+                "destination_full_tree_skipped_bind_sync_active",
+                drive_id=str(drive_id or "")[:80],
+                hint="avoid_overlapping_full_tree_snapshot_with_destination_bind",
+            )
             return
 
         if (
@@ -13667,7 +13852,6 @@ class MainWindow(QMainWindow):
         self._restore_finalization_deferred_active = False
         self._restore_finalization_deferred_reason = ""
         self._graph_linkage_restore_finalize_pending_last_sig = None
-        self._graph_linkage_banner_ui_last_sig = ""
         self._destination_restore_completed_once = True
         self._memory_restore_in_progress = False
         self._memory_restore_background_trees = False
@@ -13731,16 +13915,50 @@ class MainWindow(QMainWindow):
         if isinstance(t, QTimer):
             t.stop()
             self._planning_graph_assurance_hide_timer = None
+        t2 = getattr(self, "_graph_linkage_progress_success_hide_timer", None)
+        if isinstance(t2, QTimer):
+            t2.stop()
+        self._graph_linkage_progress_success_hide_timer = None
         b = getattr(self, "planning_graph_assurance_banner", None)
         if b is not None:
             b.hide()
         cr = getattr(self, "planning_graph_linkage_compact_row", None)
         if cr is not None:
             cr.hide()
+        ps = getattr(self, "planning_graph_linkage_progress_strip", None)
+        if ps is not None:
+            ps.hide()
+        self._graph_linkage_progress_session_arm = False
         self._graph_linkage_ui_mode = "idle"
         if getattr(self, "_planning_header_restore_collapsed_after_banner", None):
             self._apply_planning_header_collapsed_state(True)
         self._planning_header_restore_collapsed_after_banner = None
+        self._graph_linkage_strip_user_suppressed = True
+
+    def _dismiss_graph_linkage_progress_strip_user(self) -> None:
+        """User dismiss for the determinate Graph strip only (session-local hide).
+
+        Hides: progress strip, auto-hide timer. Does not: change planned moves, Graph ids, negative cache,
+        or ``ensure_planned_moves_resolved_via_graph`` / session arm state — resolution keeps running.
+
+        Reappear: next ``_graph_linkage_progress_session_begin`` (new import/post-restore/debounce linkage pass)
+        clears suppression so the strip may show again if work remains.
+        """
+        self._graph_linkage_strip_user_suppressed = True
+        t2 = getattr(self, "_graph_linkage_progress_success_hide_timer", None)
+        if isinstance(t2, QTimer):
+            t2.stop()
+        self._graph_linkage_progress_success_hide_timer = None
+        ps = getattr(self, "planning_graph_linkage_progress_strip", None)
+        if ps is not None:
+            ps.hide()
+        if getattr(self, "_graph_linkage_ui_mode", "") == "strip":
+            self._graph_linkage_ui_mode = "idle"
+        log_info(
+            "graph_linkage_strip_user_dismissed",
+            progress_session_id=int(getattr(self, "_graph_linkage_progress_session_id", 0) or 0),
+            session_armed=bool(getattr(self, "_graph_linkage_progress_session_arm", False)),
+        )
 
     def _show_planning_graph_linkage_assurance_banner(self, *, title: str, detail: str) -> None:
         """Visible confirmation after post-restore Microsoft Graph linkage checks (upgrade / legacy drafts)."""
@@ -13756,6 +13974,9 @@ class MainWindow(QMainWindow):
         cr = getattr(self, "planning_graph_linkage_compact_row", None)
         if cr is not None:
             cr.hide()
+        ps = getattr(self, "planning_graph_linkage_progress_strip", None)
+        if ps is not None:
+            ps.hide()
         self.planning_graph_assurance_title.show()
         self.planning_graph_assurance_detail.show()
         self.planning_graph_assurance_title.setText(title)
@@ -13822,6 +14043,15 @@ class MainWindow(QMainWindow):
             self._apply_graph_linkage_banner_from_audit(audit, phase="post_memory_restore_empty")
             return
 
+        _will_enrich = (
+            bool(self.current_session_context.get("connected"))
+            and bool(self._graph_resolve_planning_context())
+            and (
+                int(audit.get("rows_missing_graph_ids") or 0) + int(audit.get("proposed_rows_missing_graph_ids") or 0)
+                > 0
+            )
+        )
+
         self._apply_graph_linkage_banner_from_audit(audit, phase="post_memory_restore_pre_resolve")
 
         if audit.get("rows_missing_graph_ids", 0) == 0 and audit.get("proposed_rows_missing_graph_ids", 0) == 0:
@@ -13855,6 +14085,8 @@ class MainWindow(QMainWindow):
             **self._graph_linkage_audit_for_log(audit),
         )
         try:
+            if _will_enrich:
+                self._graph_linkage_progress_session_begin()
             move_rows_updated, proposed_updated = self.ensure_planned_moves_resolved_via_graph(
                 persist=True, quiet=True, refresh_sources=True
             )
@@ -16458,6 +16690,7 @@ class MainWindow(QMainWindow):
             if len(work_items) >= chunk_row_threshold and self._source_tree_uses_model_view():
                 chunking_active = True
                 refreshed_count = len(work_items)
+                self._source_projection_restore_chunk_active = True
                 if is_dev_mode():
                     self._log_restore_phase(
                         "source_projection_restore_chunking_started",
@@ -16468,6 +16701,7 @@ class MainWindow(QMainWindow):
                     )
 
                 def _finish_chunked_source_projection_refresh():
+                    self._source_projection_restore_chunk_active = False
                     if updates_were_enabled:
                         tree.setUpdatesEnabled(True)
                     tree.viewport().update()
@@ -16508,6 +16742,7 @@ class MainWindow(QMainWindow):
 
                 def _chunk_step():
                     if chunk_gen != self._source_projection_restore_chunk_gen:
+                        self._source_projection_restore_chunk_active = False
                         if updates_were_enabled:
                             tree.setUpdatesEnabled(True)
                         return
@@ -18337,12 +18572,10 @@ class MainWindow(QMainWindow):
                     self._restore_destination_overlay_pending
                     or self._unresolved_proposed_queue_size()
                     or self._unresolved_allocation_queue_size()
-                    or self.planned_moves
-                    or self.proposed_folders
                 ):
 
                     def _root_bind_lazy_future_followup():
-                        self._materialize_destination_future_model(
+                        self._destination_materialize_with_optional_overlay_scope(
                             "root_bind_lazy_post_finalize_followup",
                             allow_defer=True,
                             prefer_chunked_projection=True,
@@ -26373,8 +26606,6 @@ class MainWindow(QMainWindow):
         projected_child_counts_by_parent = Counter()
         for child_node in model_nodes.values():
             parent_path = str(child_node.get("parent_semantic_path", "") or "")
-            if not parent_path:
-                continue
             merged_child_counts_by_parent[parent_path] += 1
             if child_node.get("node_state") != "real":
                 projected_child_counts_by_parent[parent_path] += 1
@@ -27604,6 +27835,93 @@ class MainWindow(QMainWindow):
             return True
         return bool(getattr(self, "_destination_future_bind_sync_active", False))
 
+    def _folder_worker_heavy_upstream_busy(self) -> bool:
+        """True while destination bind or large source projection chunking could overlap folder success work."""
+        if self._destination_future_tree_bind_busy():
+            return True
+        if bool(getattr(self, "_root_tree_bind_in_progress", False)):
+            return True
+        if bool(getattr(self, "_source_projection_restore_chunk_active", False)):
+            return True
+        return False
+
+    def _folder_worker_success_upstream_snapshot(self) -> dict[str, Any]:
+        st = getattr(self, "_destination_chunked_bind_state", None)
+        return {
+            "destination_bind_sync_active": bool(getattr(self, "_destination_future_bind_sync_active", False)),
+            "destination_chunked_bind_active": st is not None,
+            "destination_chunked_bind_phase": str((st or {}).get("phase") or "")
+            if isinstance(st, dict)
+            else "",
+            "root_tree_bind_in_progress": bool(getattr(self, "_root_tree_bind_in_progress", False)),
+            "source_projection_restore_chunk_active": bool(
+                getattr(self, "_source_projection_restore_chunk_active", False)
+            ),
+            "destination_future_projection_async_active": getattr(
+                self, "_destination_future_projection_async_state", None
+            )
+            is not None,
+            "destination_incremental_merge_in_progress": bool(
+                getattr(self, "_destination_incremental_merge_in_progress", False)
+            ),
+            "destination_idle_materialize_pending_excerpt": str(
+                getattr(self, "_destination_idle_materialize_pending_reason", "") or ""
+            )[:120],
+        }
+
+    def _log_folder_worker_success_load_bundle(
+        self,
+        *,
+        ui_kind: str,
+        trigger_path_excerpt: str,
+        semantic_path_excerpt: str,
+        wall_duration_ms: float,
+        ms_after_children_replace: float,
+        ms_overlay_pipeline: float,
+        future_model_applied_count: int,
+        folder_worker_materialize_scope_count: int,
+        materialize_skipped_upstream_busy: bool,
+        handoff_moved_count: int,
+        merge_moved_count: int,
+    ) -> None:
+        pending_dest = self.pending_folder_loads.get("destination") or set()
+        pending_src = self.pending_folder_loads.get("source") or set()
+        st = getattr(self, "_destination_chunked_bind_state", None)
+        self._log_restore_phase(
+            "folder_worker_success_load_bundle",
+            ui_kind=str(ui_kind or ""),
+            trigger_path_excerpt=str(trigger_path_excerpt or "")[:260],
+            semantic_path_excerpt=str(semantic_path_excerpt or "")[:260],
+            wall_duration_ms=round(float(wall_duration_ms), 2),
+            ms_after_children_replace=round(float(ms_after_children_replace), 2),
+            ms_overlay_pipeline=round(float(ms_overlay_pipeline), 2),
+            active_folder_workers_destination=len(pending_dest),
+            active_folder_workers_source=len(pending_src),
+            destination_restore_queue_size=len(getattr(self, "_destination_restore_materialization_queue", []) or []),
+            source_restore_queue_size=len(getattr(self, "_source_restore_materialization_queue", []) or []),
+            unresolved_proposed=self._unresolved_proposed_queue_size(),
+            unresolved_allocation=self._unresolved_allocation_queue_size(),
+            memory_restore_in_progress=bool(getattr(self, "_memory_restore_in_progress", False)),
+            expand_all_destination_pending=bool(self._expand_all_pending.get("destination")),
+            expand_all_source_pending=bool(self._expand_all_pending.get("source")),
+            sharepoint_lazy_mode=bool(getattr(self, "_sharepoint_lazy_mode", False)),
+            future_model_applied_count=int(future_model_applied_count or 0),
+            folder_worker_materialize_scope_count=int(folder_worker_materialize_scope_count or 0),
+            materialize_skipped_upstream_busy=bool(materialize_skipped_upstream_busy),
+            handoff_moved_count=int(handoff_moved_count or 0),
+            merge_moved_count=int(merge_moved_count or 0),
+            destination_bind_sync_active=bool(getattr(self, "_destination_future_bind_sync_active", False)),
+            destination_chunked_bind_active=st is not None,
+            destination_chunked_bind_phase=str((st or {}).get("phase") or "") if isinstance(st, dict) else "",
+            source_projection_restore_chunk_active=bool(
+                getattr(self, "_source_projection_restore_chunk_active", False)
+            ),
+            root_tree_bind_in_progress=bool(getattr(self, "_root_tree_bind_in_progress", False)),
+            destination_idle_materialize_pending_excerpt=str(
+                getattr(self, "_destination_idle_materialize_pending_reason", "") or ""
+            )[:120],
+        )
+
     def _queue_deferred_destination_library_root(self, site, library, force_refresh):
         prev = getattr(self, "_pending_destination_library_root", None)
         force_refresh = bool(force_refresh) or (
@@ -27910,7 +28228,9 @@ class MainWindow(QMainWindow):
             self._destination_future_bind_sync_active = True
             bsp_sync = getattr(self, "_destination_bind_scope_paths", None)
             norm_sync = (
-                self._normalize_destination_bind_scope_model_roots(bsp_sync, model_nodes) if bsp_sync else None
+                self._normalize_destination_bind_scope_model_roots_for_bind(bsp_sync, model_nodes)
+                if bsp_sync
+                else None
             )
             self._log_restore_phase(
                 "destination_future_model_bind_started",
@@ -28313,7 +28633,7 @@ class MainWindow(QMainWindow):
         nodes = (model.get("nodes") or {}) if isinstance(model, dict) else {}
         node_count = len(nodes)
         bsp = getattr(self, "_destination_bind_scope_paths", None)
-        norm_scope = self._normalize_destination_bind_scope_model_roots(bsp, nodes) if bsp else None
+        norm_scope = self._normalize_destination_bind_scope_model_roots_for_bind(bsp, nodes) if bsp else None
         scoped_model_node_count = (
             self._destination_chunked_bind_count_scoped_model_nodes(nodes, norm_scope)
             if norm_scope
@@ -28846,7 +29166,7 @@ class MainWindow(QMainWindow):
         )
         nodes = model.get("nodes") or {}
         tree_w = getattr(self, "destination_tree_widget", None)
-        norm_scoped_skip = self._normalize_destination_bind_scope_model_roots(
+        norm_scoped_skip = self._normalize_destination_bind_scope_model_roots_for_bind(
             getattr(self, "_destination_bind_scope_paths", None), nodes
         )
         if (
@@ -29882,10 +30202,26 @@ class MainWindow(QMainWindow):
         dmodel = getattr(self, "destination_planning_model", None)
         if dmodel is None or not source_ix.isValid() or not target_ix.isValid():
             return 0
+        if not dmodel.is_index_live(source_ix) or not dmodel.is_index_live(target_ix):
+            self._log_restore_phase(
+                "reconcile_invalid_index_detected",
+                reconcile_stage="merge_destination_projection_children_index",
+                semantic_path=semantic_path or "",
+            )
+            return 0
         moved_count = 0
         self._remove_placeholder_children(target_ix)
         while dmodel.rowCount(source_ix) > 0:
+            if not dmodel.is_index_live(source_ix) or not dmodel.is_index_live(target_ix):
+                self._log_restore_phase(
+                    "reconcile_invalid_index_detected",
+                    reconcile_stage="merge_destination_projection_children_index_loop",
+                    semantic_path=semantic_path or "",
+                )
+                break
             child_ix = dmodel.index(0, 0, source_ix)
+            if not child_ix.isValid():
+                break
             nested = dmodel.remove_node_at(child_ix)
             if nested is None:
                 break
@@ -29901,20 +30237,46 @@ class MainWindow(QMainWindow):
 
         total_moved = 0
         merged_groups = 0
+        snapshot_probe = list(dmodel.iter_depth_first())
+        self._log_restore_phase(
+            "reconcile_start",
+            reason=reason,
+            reconcile_surface="destination_semantic_duplicates_index",
+            node_count=len(snapshot_probe),
+            snapshot_size=len(snapshot_probe),
+            model_signature=int(dmodel.structure_generation()),
+        )
         # One full-tree walk per merge iteration — not O(unique_semantic_paths × tree_size), which
         # caused multi‑10s binds when many distinct paths each triggered iter_depth_first().
         _max_merge_rounds = max(64, len(self.planned_moves or []) + len(self.proposed_folders or []) + 32)
+        stale_semantic_abort = False
         for _round in range(_max_merge_rounds):
+            if stale_semantic_abort:
+                break
+            snapshot = list(dmodel.iter_depth_first())
+            snap_gen = int(dmodel.structure_generation())
             groups: dict[str, list] = {}
-            for ix in dmodel.iter_depth_first():
-                if not ix.isValid():
+            for ix in snapshot:
+                if not ix.isValid() or not dmodel.is_index_live(ix):
                     continue
+                if int(dmodel.structure_generation()) != snap_gen:
+                    self._log_restore_phase(
+                        "reconcile_skip_due_to_stale_model",
+                        reason=reason,
+                        reconcile_stage="destination_semantic_duplicates_index_walk",
+                        expected_generation=snap_gen,
+                        current_generation=int(dmodel.structure_generation()),
+                    )
+                    stale_semantic_abort = True
+                    break
                 node_data = ix.data(Qt.UserRole) or {}
                 if not isinstance(node_data, dict) or node_data.get("placeholder"):
                     continue
                 sp = self._destination_semantic_path(node_data)
                 if sp:
                     groups.setdefault(sp, []).append(ix)
+            if stale_semantic_abort:
+                break
             semantic_path = None
             items = None
             for sp, ix_list in groups.items():
@@ -29933,10 +30295,30 @@ class MainWindow(QMainWindow):
             duplicate_ix = duplicates[0]
             if not duplicate_ix.isValid():
                 break
+            if int(dmodel.structure_generation()) != snap_gen:
+                self._log_restore_phase(
+                    "reconcile_skip_due_to_stale_model",
+                    reason=reason,
+                    reconcile_stage="destination_semantic_duplicates_index_pre_merge",
+                    expected_generation=snap_gen,
+                    current_generation=int(dmodel.structure_generation()),
+                )
+                stale_semantic_abort = True
+                break
+            if not dmodel.is_index_live(canonical_ix) or not dmodel.is_index_live(duplicate_ix):
+                self._log_restore_phase(
+                    "reconcile_invalid_index_detected",
+                    reason=reason,
+                    reconcile_stage="destination_semantic_duplicates_index",
+                    semantic_path=semantic_path,
+                )
+                break
             canonical_data = canonical_ix.data(Qt.UserRole) or {}
             canonical_state = self._destination_node_state(canonical_data)
             dup_labels = "; ".join(
-                self._tree_item_path(ix.data(Qt.UserRole) or {}) for ix in duplicates if ix.isValid()
+                self._tree_item_path(ix.data(Qt.UserRole) or {})
+                for ix in duplicates
+                if ix.isValid() and dmodel.is_index_live(ix)
             )
             self._log_restore_phase(
                 "destination_semantic_duplicate_detected",
@@ -30001,12 +30383,12 @@ class MainWindow(QMainWindow):
 
     def _destination_folder_children_grouped_by_sibling_name_key(self, parent_ix: QModelIndex):
         dmodel = getattr(self, "destination_planning_model", None)
-        if dmodel is None or not parent_ix.isValid():
+        if dmodel is None or not parent_ix.isValid() or not dmodel.is_index_live(parent_ix):
             return {}
         groups = {}
         for r in range(dmodel.rowCount(parent_ix)):
             ix = dmodel.index(r, 0, parent_ix)
-            if not ix.isValid():
+            if not ix.isValid() or not dmodel.is_index_live(ix):
                 continue
             nd = ix.data(Qt.UserRole) or {}
             if not isinstance(nd, dict) or nd.get("placeholder") or not nd.get("is_folder"):
@@ -30024,10 +30406,20 @@ class MainWindow(QMainWindow):
             return 0, 0
         total_moved = 0
         merged_groups = 0
+        snapshot_parents = list(dmodel.iter_depth_first())
+        self._log_restore_phase(
+            "reconcile_start",
+            reason=reason,
+            reconcile_surface="destination_sibling_folder_name_collisions_index",
+            node_count=len(snapshot_parents),
+            snapshot_size=len(snapshot_parents),
+            model_signature=int(dmodel.structure_generation()),
+        )
         while True:
             progressed = False
-            for parent_ix in dmodel.iter_depth_first():
-                if not parent_ix.isValid():
+            snapshot_parents = list(dmodel.iter_depth_first())
+            for parent_ix in snapshot_parents:
+                if not parent_ix.isValid() or not dmodel.is_index_live(parent_ix):
                     continue
                 pnd = parent_ix.data(Qt.UserRole) or {}
                 if not isinstance(pnd, dict) or not pnd.get("is_folder"):
@@ -30044,6 +30436,14 @@ class MainWindow(QMainWindow):
                         continue
                     duplicate_ix = duplicates[0]
                     if not duplicate_ix.isValid():
+                        continue
+                    if not dmodel.is_index_live(canonical_ix) or not dmodel.is_index_live(duplicate_ix):
+                        self._log_restore_phase(
+                            "reconcile_invalid_index_detected",
+                            reason=reason,
+                            reconcile_stage="sibling_folder_name_collision",
+                            name_key=_name_key,
+                        )
                         continue
                     canonical_data = canonical_ix.data(Qt.UserRole) or {}
                     duplicate_data = duplicate_ix.data(Qt.UserRole) or {}
@@ -30256,8 +30656,16 @@ class MainWindow(QMainWindow):
         return moved_count
 
     def _reconcile_destination_semantic_duplicates(self, reason):
-        if self._destination_tree_uses_model_view():
-            return self._reconcile_destination_semantic_duplicates_index(reason)
+        prev_depth = int(getattr(self, "_destination_semantic_reconcile_guard_depth", 0) or 0)
+        self._destination_semantic_reconcile_guard_depth = prev_depth + 1
+        try:
+            if self._destination_tree_uses_model_view():
+                return self._reconcile_destination_semantic_duplicates_index(reason)
+            return self._reconcile_destination_semantic_duplicates_widget_path(reason)
+        finally:
+            self._destination_semantic_reconcile_guard_depth = max(0, prev_depth)
+
+    def _reconcile_destination_semantic_duplicates_widget_path(self, reason):
         semantic_groups = {}
         for item in self._iter_destination_items() or []:
             node_data = item.data(0, Qt.UserRole) or {}
@@ -30372,7 +30780,16 @@ class MainWindow(QMainWindow):
     def _reconcile_destination_semantic_duplicates_maybe_deferred(
         self, reason, *, affected_destination_paths: Optional[Iterable[str]] = None
     ):
-        if not self._should_defer_destination_duplicate_reconcile(reason):
+        guard_depth = int(getattr(self, "_destination_semantic_reconcile_guard_depth", 0) or 0)
+        if guard_depth > 0:
+            self._log_restore_phase(
+                "reconcile_mutation_guard_triggered",
+                reason=reason,
+                guard_depth=guard_depth,
+                reconcile_stage="maybe_deferred_entry",
+            )
+        should_defer = self._should_defer_destination_duplicate_reconcile(reason) or guard_depth > 0
+        if not should_defer:
             self._destination_deferred_reconcile_burst_pending = False
             return self._reconcile_destination_semantic_duplicates(reason)
         if reason == "folder_worker_success" and affected_destination_paths:
@@ -30390,12 +30807,13 @@ class MainWindow(QMainWindow):
             ),
             root_prime_pending=bool(getattr(self, "_destination_root_prime_pending", False)),
             drfws_affected_path_count=len(getattr(self, "_destination_drfws_affected_paths", set()) or set()),
+            nested_reconcile_guard=bool(guard_depth > 0),
         )
         # Full reconcile stays deferred, but merge same-named folder siblings immediately so the
         # tree does not show duplicate shells for the whole restore/materialization window.
         # During import/restore many destination folder_worker_success callbacks arrive in one burst;
         # one early sibling sync per burst is enough — repeating it on every callback queues heavy UI work.
-        skip_early_sibling = (
+        skip_early_sibling = bool(guard_depth > 0) or (
             reason == "folder_worker_success"
             and getattr(self, "_destination_deferred_reconcile_burst_pending", False)
         )
@@ -34426,6 +34844,7 @@ class MainWindow(QMainWindow):
                         )
                         skip_destination_child_replace = True
                 model = self.destination_planning_model
+                t_fw_bundle_0 = time.perf_counter()
                 if not skip_destination_child_replace:
                     child_payloads = []
                     for child in sorted(
@@ -34449,6 +34868,7 @@ class MainWindow(QMainWindow):
                         p["load_failed"] = False
 
                     model.update_payload_for_index(parent_index, _mut_partial)
+                t_after_children_replace = time.perf_counter()
                 self._mark_destination_real_tree_snapshot_stale()
                 node_data = dict(parent_index.data(Qt.UserRole) or {})
                 trigger_path = node_data.get("item_path") or node_data.get("display_path") or ""
@@ -34465,6 +34885,8 @@ class MainWindow(QMainWindow):
                 semantic_path = self._destination_semantic_path(node_data)
                 if semantic_path == "Root":
                     self._destination_root_prime_pending = False
+                fw_mat_scope_n = 0
+                materialize_skipped_upstream_busy = False
                 try:
                     if self._expand_all_pending.get("destination"):
                         self._expand_all_deferred_refresh["destination"] = True
@@ -34532,7 +34954,14 @@ class MainWindow(QMainWindow):
                         if getattr(self, "_sharepoint_lazy_mode", False):
                             future_model_applied_count = 0
                         else:
-                            future_model_applied_count = self._materialize_destination_future_model("folder_worker_success")
+                            fw_scope = self._destination_folder_worker_materialize_scope_paths(semantic_path)
+                            fw_mat_scope_n = len(fw_scope)
+                            future_model_applied_count = self._destination_materialize_with_optional_overlay_scope(
+                                "folder_worker_success",
+                                allow_defer=True,
+                                prefer_chunked_projection=True,
+                                scope_paths=fw_scope,
+                            )
                     self._log_restore_phase(
                         "destination_replay_attachment_applied",
                         trigger_path=self.normalize_memory_path(trigger_path),
@@ -34544,6 +34973,48 @@ class MainWindow(QMainWindow):
                         merge_moved_count=merge_moved_count,
                         future_model_applied_count=future_model_applied_count,
                         queue_size=self._unresolved_proposed_queue_size(),
+                        folder_worker_materialize_scope_count=fw_mat_scope_n,
+                    )
+                    t_fw_diag = time.perf_counter()
+                    dest_worker_slots = sum(
+                        1 for k in (self.folder_load_workers or {}) if str(k).startswith("destination:")
+                    )
+                    mat_mode = (
+                        "scoped_overlay"
+                        if fw_mat_scope_n
+                        else (
+                            "none_or_deferred"
+                            if not future_model_applied_count
+                            else "applied_unscoped"
+                        )
+                    )
+                    self._log_restore_phase(
+                        "folder_worker_success_destination_diag",
+                        worker_id=str(worker_id or "")[:80],
+                        drive_id_excerpt=str(drive_id or "")[:80],
+                        trigger_path=self.normalize_memory_path(trigger_path),
+                        semantic_path_excerpt=str(semantic_path or "")[:240],
+                        elapsed_children_replace_ms=int((t_after_children_replace - t_fw_bundle_0) * 1000),
+                        elapsed_overlay_block_ms=int((t_fw_diag - t_fw_bundle_0) * 1000),
+                        pending_destination_folder_loads=len(self.pending_folder_loads.get("destination", set())),
+                        active_destination_worker_slots=dest_worker_slots,
+                        unresolved_proposed_after=self._unresolved_proposed_queue_size(),
+                        unresolved_allocation_after=self._unresolved_allocation_queue_size(),
+                        bind_scope_active=bool(getattr(self, "_destination_bind_scope_paths", None)),
+                        destination_bind_sync_active=bool(getattr(self, "_destination_future_bind_sync_active", False)),
+                        chunked_bind_active=bool(getattr(self, "_destination_chunked_bind_state", None) is not None),
+                        full_tree_worker_running=bool(
+                            self._destination_full_tree_worker is not None
+                            and self._destination_full_tree_worker.isRunning()
+                        ),
+                        expand_all_pending_destination=bool(self._expand_all_pending.get("destination")),
+                        memory_restore_in_progress=bool(getattr(self, "_memory_restore_in_progress", False)),
+                        restore_destination_overlay_pending=bool(
+                            getattr(self, "_restore_destination_overlay_pending", False)
+                        ),
+                        materialize_mode=mat_mode,
+                        materialize_applied_count=future_model_applied_count,
+                        materialize_scope_path_count=fw_mat_scope_n,
                     )
                     if not self._expand_all_pending.get("destination"):
                         if not getattr(self, "_destination_restore_completed_once", False):
@@ -34666,6 +35137,7 @@ class MainWindow(QMainWindow):
                 semantic_path = self._destination_semantic_path(node_data)
                 if semantic_path == "Root":
                     self._destination_root_prime_pending = False
+                fw_mat_scope_n = 0
                 try:
                     if self._expand_all_pending.get("destination"):
                         self._expand_all_deferred_refresh["destination"] = True
@@ -34741,7 +35213,14 @@ class MainWindow(QMainWindow):
                         if getattr(self, "_sharepoint_lazy_mode", False):
                             future_model_applied_count = 0
                         else:
-                            future_model_applied_count = self._materialize_destination_future_model("folder_worker_success")
+                            fw_scope = self._destination_folder_worker_materialize_scope_paths(semantic_path)
+                            fw_mat_scope_n = len(fw_scope)
+                            future_model_applied_count = self._destination_materialize_with_optional_overlay_scope(
+                                "folder_worker_success",
+                                allow_defer=True,
+                                prefer_chunked_projection=True,
+                                scope_paths=fw_scope,
+                            )
                     self._log_restore_phase(
                         "destination_replay_attachment_applied",
                         trigger_path=self.normalize_memory_path(trigger_path),
@@ -34753,6 +35232,7 @@ class MainWindow(QMainWindow):
                         merge_moved_count=merge_moved_count,
                         future_model_applied_count=future_model_applied_count,
                         queue_size=self._unresolved_proposed_queue_size(),
+                        folder_worker_materialize_scope_count=fw_mat_scope_n,
                     )
                     if not self._expand_all_pending.get("destination"):
                         if not getattr(self, "_destination_restore_completed_once", False):
@@ -38188,6 +38668,10 @@ class MainWindow(QMainWindow):
         """Refresh source metadata by id, then fill missing Graph ids from paths. Returns (moves_updated, proposed_updated)."""
         ctx = self._graph_resolve_planning_context()
         if not ctx:
+            if bool(getattr(self, "_graph_linkage_progress_session_arm", False)):
+                audit_e = self._audit_planned_moves_graph_destination_identity()
+                self._graph_linkage_progress_strip_finalize(audit_e)
+                self._graph_linkage_progress_session_arm = False
             return (0, 0)
 
         graph = self.graph
@@ -38207,6 +38691,7 @@ class MainWindow(QMainWindow):
                 return None
 
         self._destination_idle_materialize_reentrancy_block += 1
+        _graph_progress_track = False
         try:
             su = 0
             if refresh_sources:
@@ -38219,10 +38704,33 @@ class MainWindow(QMainWindow):
             else:
                 su, src_touch = 0, set()
 
+            missing_m_set, missing_p_set = self._graph_linkage_missing_row_index_sets()
+            total_graph_enrich = len(missing_m_set) + len(missing_p_set)
+            armed = bool(getattr(self, "_graph_linkage_progress_session_arm", False))
+            _graph_progress_track = armed and total_graph_enrich > 0
+            if _graph_progress_track:
+                self._graph_linkage_progress_session_total = total_graph_enrich
+                self._graph_linkage_progress_strip_tick(0, total_graph_enrich, 0)
+
             mu = 0
             graph_touch: set[str] = set()
+            processed_missing = 0
+            resolved_missing = 0
+            graph_dest_unresolved_forensics: list[dict[str, Any]] = []
+            proposed_unresolved_forensics: list[dict[str, Any]] = []
+
+            def _sink_move_dest(failed_row: dict[str, Any]) -> None:
+                self._graph_resolve_enrich_forensic_projection_hints(failed_row)
+                self._graph_resolve_classify_forensic_row(failed_row)
+                graph_dest_unresolved_forensics.append(failed_row)
+
+            def _sink_proposed_parent(failed_row: dict[str, Any]) -> None:
+                self._graph_resolve_enrich_forensic_projection_hints(failed_row)
+                self._graph_resolve_classify_forensic_row(failed_row)
+                proposed_unresolved_forensics.append(failed_row)
+
             for i, move in enumerate(self.planned_moves or []):
-                if enrich_single_planned_move(
+                ok = enrich_single_planned_move(
                     move,
                     get_item_by_path=gpath,
                     get_root_item=groot,
@@ -38235,23 +38743,87 @@ class MainWindow(QMainWindow):
                     move_index=i,
                     request_id=str(move.get("request_id", "") or "")[:80],
                     dest_parent_negative_cache=self._graph_dest_parent_negative_cache,
-                ):
+                    destination_parent_resolve_diag_sink=_sink_move_dest,
+                )
+                if ok:
                     mu += 1
                     graph_touch.update(self._narrow_source_projection_paths_for_move(move))
+                if i in missing_m_set:
+                    processed_missing += 1
+                    if self._planned_move_destination_graph_ids_present(move):
+                        resolved_missing += 1
+                    if _graph_progress_track:
+                        self._graph_linkage_progress_strip_tick(
+                            processed_missing, total_graph_enrich, resolved_missing
+                        )
                 if i % 8 == 0:
                     QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
 
             pu = 0
             for pi, pf in enumerate(self.proposed_folders or []):
-                if enrich_proposed_folder_record(
+                ok = enrich_proposed_folder_record(
                     pf,
                     get_item_by_path=gpath,
                     dest_drive_id=ctx["dest_drive_id"],
                     dest_library_name=ctx["dest_library_name"],
                     dest_site_name=ctx["dest_site_name"],
                     proposed_index=pi,
-                ):
+                    proposed_parent_resolve_diag_sink=_sink_proposed_parent,
+                )
+                if ok:
                     pu += 1
+                if pi in missing_p_set:
+                    processed_missing += 1
+                    if self._proposed_folder_destination_graph_ids_present(pf):
+                        resolved_missing += 1
+                    if _graph_progress_track:
+                        self._graph_linkage_progress_strip_tick(
+                            processed_missing, total_graph_enrich, resolved_missing
+                        )
+
+            retry_move_indices = sorted(
+                {
+                    int(d["move_index"])
+                    for d in graph_dest_unresolved_forensics
+                    if d.get("unresolved_category") == "negative_cache_block"
+                    and int(d.get("move_index", -1)) >= 0
+                }
+            )
+            if retry_move_indices:
+                log_info(
+                    "graph_resolve_negative_cache_retry_pass",
+                    move_count=len(retry_move_indices),
+                    move_indices=retry_move_indices[:80],
+                )
+                graph_dest_unresolved_forensics[:] = [
+                    d
+                    for d in graph_dest_unresolved_forensics
+                    if int(d.get("move_index", -1)) not in set(retry_move_indices)
+                ]
+                for ri in retry_move_indices:
+                    moves_list = list(self.planned_moves or [])
+                    if ri < 0 or ri >= len(moves_list):
+                        continue
+                    move_r = moves_list[ri]
+                    ok_r = enrich_single_planned_move(
+                        move_r,
+                        get_item_by_path=gpath,
+                        get_root_item=groot,
+                        source_drive_id=ctx["source_drive_id"],
+                        source_library_name=ctx["source_library_name"],
+                        dest_drive_id=ctx["dest_drive_id"],
+                        dest_library_name=ctx["dest_library_name"],
+                        source_site_name=ctx["source_site_name"],
+                        dest_site_name=ctx["dest_site_name"],
+                        move_index=ri,
+                        request_id=str(move_r.get("request_id", "") or "")[:80],
+                        dest_parent_negative_cache=self._graph_dest_parent_negative_cache,
+                        destination_parent_resolve_diag_sink=_sink_move_dest,
+                        skip_dest_parent_negative_cache_read=True,
+                    )
+                    if ok_r:
+                        mu += 1
+                        graph_touch.update(self._narrow_source_projection_paths_for_move(move_r))
 
             if (su or mu or pu) and persist:
                 narrow_paths = self._expand_source_projection_paths_with_parents(src_touch | graph_touch)
@@ -38281,8 +38853,46 @@ class MainWindow(QMainWindow):
                 proposed_updated=pu,
                 persist=bool(persist),
             )
+            if graph_dest_unresolved_forensics or proposed_unresolved_forensics:
+                m_by = Counter(
+                    str(d.get("final_failure_reason") or "unknown") for d in graph_dest_unresolved_forensics
+                )
+                p_by = Counter(
+                    str(d.get("final_failure_reason") or "unknown") for d in proposed_unresolved_forensics
+                )
+                m_cat = Counter(
+                    str(d.get("unresolved_category") or "uncategorized")
+                    for d in graph_dest_unresolved_forensics
+                )
+                p_cat = Counter(
+                    str(d.get("unresolved_category") or "uncategorized")
+                    for d in proposed_unresolved_forensics
+                )
+                log_info(
+                    "graph_resolve_batch_unresolved_summary",
+                    phase="ensure_planned_moves_resolved_via_graph",
+                    destination_parent_unresolved_move_count=len(graph_dest_unresolved_forensics),
+                    proposed_parent_unresolved_count=len(proposed_unresolved_forensics),
+                    destination_failures_by_reason=dict(m_by),
+                    proposed_failures_by_reason=dict(p_by),
+                    destination_unresolved_by_category=dict(m_cat),
+                    proposed_unresolved_by_category=dict(p_cat),
+                    unresolved_move_indices=[
+                        int(d.get("move_index", -1)) for d in graph_dest_unresolved_forensics
+                    ],
+                    unresolved_move_request_ids=[
+                        str(d.get("request_id") or "")[:80] for d in graph_dest_unresolved_forensics
+                    ],
+                    unresolved_proposed_indices=[
+                        int(d.get("proposed_index", -1)) for d in proposed_unresolved_forensics
+                    ],
+                )
             return (su + mu, pu)
         finally:
+            if _graph_progress_track or bool(getattr(self, "_graph_linkage_progress_session_arm", False)):
+                audit_done = self._audit_planned_moves_graph_destination_identity()
+                self._graph_linkage_progress_strip_finalize(audit_done)
+                self._graph_linkage_progress_session_arm = False
             self._destination_idle_materialize_reentrancy_block -= 1
 
     def _try_refresh_planned_move_sources_after_source_root(self) -> None:
@@ -38312,6 +38922,129 @@ class MainWindow(QMainWindow):
                 self.planned_moves_status.setText(
                     f"Updated {su} source path(s) to match current names in SharePoint."
                 )
+
+    def _graph_resolve_enrich_forensic_projection_hints(self, row: dict[str, Any]) -> None:
+        """Augment Graph resolve forensic rows with cached destination future-model presence (not SharePoint)."""
+        cache = getattr(self, "_destination_future_model_overlay_cache", None) or {}
+        payload = (cache.get("payload") or {}) if isinstance(cache, dict) else {}
+        nodes = payload.get("nodes") if isinstance(payload.get("nodes"), dict) else {}
+        row["destination_future_model_cache_present"] = bool(nodes)
+        hints: list[dict[str, Any]] = []
+        atts = row.get("candidate_attempts")
+        if isinstance(atts, list):
+            seen_pr: set[str] = set()
+            for att in atts:
+                if not isinstance(att, dict):
+                    continue
+                pr = str(att.get("parent_path_for_graph_api") or "").strip()
+                dedupe = pr or ":library_root:"
+                if dedupe in seen_pr:
+                    continue
+                seen_pr.add(dedupe)
+                canon = (
+                    self._canonical_destination_projection_path(pr.replace("/", "\\"))
+                    if pr
+                    else ""
+                )
+                node = nodes.get(canon) if canon else None
+                if node is None and pr:
+                    for alt in (pr.replace("/", "\\"), pr.replace("\\", "/")):
+                        ck = self._canonical_destination_projection_path(alt)
+                        if ck in nodes:
+                            node = nodes[ck]
+                            canon = ck
+                            break
+                hints.append(
+                    {
+                        "graph_api_parent_rel_excerpt": pr[:300],
+                        "canonical_projection_key_excerpt": (canon or "")[:300],
+                        "logical_parent_in_future_model": node is not None,
+                        "future_model_node_state": str((node or {}).get("node_state", "") or "")[:40]
+                        if node
+                        else "",
+                    }
+                )
+        elif str(row.get("phase") or "") == "proposed_folder_parent":
+            seen_c: set[str] = set()
+            for c in row.get("drive_relative_path_candidates") or []:
+                cs = str(c or "").strip()
+                if not cs or cs in seen_c:
+                    continue
+                seen_c.add(cs)
+                ck = self._canonical_destination_projection_path(cs.replace("/", "\\"))
+                node = nodes.get(ck)
+                hints.append(
+                    {
+                        "graph_api_parent_rel_excerpt": cs[:300],
+                        "canonical_projection_key_excerpt": ck[:300],
+                        "logical_parent_in_future_model": node is not None,
+                        "future_model_node_state": str((node or {}).get("node_state", "") or "")[:40]
+                        if node
+                        else "",
+                    }
+                )
+        row["projection_parent_hints"] = hints
+
+    def _graph_resolve_classify_forensic_row(self, row: dict[str, Any]) -> str:
+        """Assign ``unresolved_category`` for Graph parent resolution failures (forensic / batch summaries)."""
+        phase = str(row.get("phase") or "")
+        final = str(row.get("final_failure_reason") or "")
+        cands = row.get("drive_relative_path_candidates") or []
+        n_cand = len(cands) if isinstance(cands, list) else 0
+        cskip = int(row.get("cache_skip_count") or 0)
+        gmiss = int(row.get("graph_parent_miss_count") or 0)
+        hints = row.get("projection_parent_hints") or []
+        any_future = any(
+            isinstance(h, dict) and bool(h.get("logical_parent_in_future_model")) for h in hints
+        )
+        cat: str
+        if phase == "proposed_folder_parent":
+            if any_future:
+                cat = "projection_only_parent"
+            elif n_cand >= 2 and gmiss > 0:
+                cat = "path_mismatch_case_or_normalization"
+            elif gmiss > 0 or "not_found" in final:
+                cat = "real_missing_parent"
+            else:
+                cat = "other"
+        else:
+            if final == "negative_cache_all_candidates_skipped" or (
+                n_cand > 0 and cskip >= n_cand and gmiss == 0
+            ):
+                cat = "negative_cache_block"
+            elif any_future:
+                cat = "projection_only_parent"
+            elif n_cand >= 2 and gmiss > 0 and cskip < n_cand:
+                cat = "path_mismatch_case_or_normalization"
+            elif gmiss > 0 or final == "parent_folder_not_found_in_destination_library":
+                cat = "real_missing_parent"
+            else:
+                cat = "other"
+        row["unresolved_category"] = cat
+        if cat == "projection_only_parent":
+            log_info(
+                "graph_resolve_projection_only_parent_unresolved",
+                unresolved_category=cat,
+                phase=phase,
+                move_index=int(row.get("move_index", -1)),
+                proposed_index=int(row.get("proposed_index", -1)),
+                raw_destination_path_excerpt=str(row.get("raw_destination_path_excerpt", ""))[:240],
+                raw_parent_path_excerpt=str(row.get("raw_parent_path_excerpt", ""))[:240],
+                hint="parent_exists_in_future_projection_not_sharepoint_create_folders_or_wait_for_sync",
+            )
+        log_info(
+            "graph_resolve_unresolved_category",
+            unresolved_category=cat,
+            final_failure_reason=final,
+            phase=phase,
+            move_index=int(row.get("move_index", -1)),
+            proposed_index=int(row.get("proposed_index", -1)),
+            any_future_model_parent_hint=any_future,
+            candidate_count=n_cand,
+            graph_parent_miss_count=gmiss,
+            cache_skip_count=cskip,
+        )
+        return cat
 
     def _audit_planned_moves_graph_destination_identity(self) -> dict[str, Any]:
         """Inspect persisted/runtime planned rows for SharePoint destination Graph IDs (no network I/O)."""
@@ -38403,6 +39136,167 @@ class MainWindow(QMainWindow):
             "affected_items": affected_items,
             "affected_items_omitted_count": affected_omitted,
         }
+
+    def _graph_linkage_missing_row_index_sets(self) -> tuple[set[int], set[int]]:
+        """Planned / proposed row indices missing destination Graph drive+item ids (matches audit rules, no I/O)."""
+        missing_moves: set[int] = set()
+        missing_proposed: set[int] = set()
+        for i, m in enumerate(self.planned_moves or []):
+            if not isinstance(m, dict):
+                continue
+            dst = m.get("destination") if isinstance(m.get("destination"), dict) else {}
+            did = str(dst.get("id") or m.get("destination_id") or "").strip()
+            ddrv = str(dst.get("drive_id") or "").strip()
+            if bool(did and ddrv):
+                continue
+            missing_moves.add(i)
+        for pi, pf in enumerate(self.proposed_folders or []):
+            if not str(getattr(pf, "ParentPath", "") or "").strip():
+                continue
+            if (not str(getattr(pf, "DestinationDriveId", "") or "").strip()) or (
+                not str(getattr(pf, "DestinationParentItemId", "") or "").strip()
+            ):
+                missing_proposed.add(pi)
+        return (missing_moves, missing_proposed)
+
+    def _planned_move_destination_graph_ids_present(self, move: dict) -> bool:
+        if not isinstance(move, dict):
+            return False
+        dst = move.get("destination") if isinstance(move.get("destination"), dict) else {}
+        did = str(dst.get("id") or move.get("destination_id") or "").strip()
+        ddrv = str(dst.get("drive_id") or "").strip()
+        return bool(did and ddrv)
+
+    def _proposed_folder_destination_graph_ids_present(self, pf) -> bool:
+        return bool(
+            str(getattr(pf, "DestinationDriveId", "") or "").strip()
+            and str(getattr(pf, "DestinationParentItemId", "") or "").strip()
+        )
+
+    def _graph_linkage_progress_session_begin(self) -> None:
+        self._graph_linkage_progress_session_arm = True
+        self._graph_linkage_progress_session_id = int(
+            getattr(self, "_graph_linkage_progress_session_id", 0) or 0
+        ) + 1
+        self._graph_linkage_strip_user_suppressed = False
+
+    def _graph_linkage_progress_strip_expand_planning_header_if_needed(self) -> None:
+        strip = getattr(self, "planning_graph_linkage_progress_strip", None)
+        if strip is None:
+            return
+        if not strip.isVisible():
+            self._planning_header_restore_collapsed_after_banner = bool(
+                getattr(self, "_planning_header_collapsed", False)
+            )
+        if getattr(self, "_planning_header_collapsed", False):
+            self._apply_planning_header_collapsed_state(False)
+
+    def _graph_linkage_progress_strip_seed_from_audit(self, audit: dict[str, Any]) -> None:
+        mm = int(audit.get("rows_missing_graph_ids") or 0)
+        mp = int(audit.get("proposed_rows_missing_graph_ids") or 0)
+        total = mm + mp
+        if total <= 0:
+            return
+        if getattr(self, "_graph_linkage_strip_user_suppressed", False):
+            return
+        self._graph_linkage_progress_session_total = total
+        self._graph_linkage_progress_strip_expand_planning_header_if_needed()
+        cr = getattr(self, "planning_graph_linkage_compact_row", None)
+        if cr is not None:
+            cr.hide()
+        b = getattr(self, "planning_graph_assurance_banner", None)
+        if b is not None:
+            b.hide()
+        t = getattr(self, "_planning_graph_assurance_hide_timer", None)
+        if isinstance(t, QTimer):
+            t.stop()
+        self._planning_graph_assurance_hide_timer = None
+        self.planning_graph_linkage_progress_strip.show()
+        self._graph_linkage_ui_mode = "strip"
+        self._graph_linkage_progress_strip_tick(0, total, 0)
+
+    def _graph_linkage_progress_strip_tick(self, processed: int, total: int, resolved: int) -> None:
+        strip = getattr(self, "planning_graph_linkage_progress_strip", None)
+        if strip is None:
+            return
+        if getattr(self, "_graph_linkage_strip_user_suppressed", False):
+            return
+        strip.show()
+        tmax = max(1, total)
+        resolved = max(0, min(resolved, tmax))
+        processed = max(0, min(processed, tmax))
+        failed_so_far = max(0, processed - resolved)
+        remaining = max(0, total - processed)
+        self.planning_graph_linkage_progress_primary_label.setText(
+            f"Resolving links: {resolved} / {total} resolved"
+        )
+        detail_parts = [f"{processed} processed"]
+        if remaining:
+            detail_parts.append(f"{remaining} queued")
+        if failed_so_far:
+            detail_parts.append(f"{failed_so_far} failed so far")
+        self.planning_graph_linkage_progress_detail_label.setText(" · ".join(detail_parts))
+        self.planning_graph_linkage_progress_bar.setRange(0, tmax)
+        self.planning_graph_linkage_progress_bar.setValue(resolved)
+
+    def _graph_linkage_progress_strip_soft_hide(self) -> None:
+        self._graph_linkage_progress_success_hide_timer = None
+        ps = getattr(self, "planning_graph_linkage_progress_strip", None)
+        if ps is not None:
+            ps.hide()
+        if getattr(self, "_graph_linkage_ui_mode", "") == "strip":
+            self._graph_linkage_ui_mode = "idle"
+
+    def _graph_linkage_progress_strip_finalize(self, audit: dict[str, Any]) -> None:
+        mm = int(audit.get("rows_missing_graph_ids") or 0)
+        mp = int(audit.get("proposed_rows_missing_graph_ids") or 0)
+        unresolved = mm + mp
+        total = int(getattr(self, "_graph_linkage_progress_session_total", 0) or 0)
+        strip = getattr(self, "planning_graph_linkage_progress_strip", None)
+        if strip is None:
+            return
+        self._graph_linkage_banner_ui_last_sig = self._graph_linkage_banner_work_signature(audit)
+        if getattr(self, "_graph_linkage_strip_user_suppressed", False):
+            return
+        ht0 = getattr(self, "_graph_linkage_progress_success_hide_timer", None)
+        if isinstance(ht0, QTimer):
+            ht0.stop()
+        self._graph_linkage_progress_success_hide_timer = None
+        strip.show()
+        total_s = int(total) if int(total) > 0 else int(unresolved)
+        resolved_s = max(0, total_s - int(unresolved))
+        tmax = max(1, total_s)
+        self.planning_graph_linkage_progress_bar.setRange(0, tmax)
+        self.planning_graph_linkage_progress_bar.setValue(min(resolved_s, tmax))
+        if unresolved == 0:
+            self.planning_graph_linkage_progress_primary_label.setText(
+                "Graph linkage: success — all rows resolved" + (f" ({total_s})" if total_s else "")
+            )
+            self.planning_graph_linkage_progress_detail_label.setText(
+                f"{resolved_s} / {total_s} resolved · no failures"
+            )
+            self._graph_linkage_ui_mode = "strip"
+            ht = QTimer(self)
+            ht.setSingleShot(True)
+            ht.timeout.connect(self._graph_linkage_progress_strip_soft_hide)
+            self._graph_linkage_progress_success_hide_timer = ht
+            ht.start(6000)
+        elif resolved_s <= 0:
+            self.planning_graph_linkage_progress_primary_label.setText(
+                "Graph linkage: failed — no rows resolved"
+            )
+            self.planning_graph_linkage_progress_detail_label.setText(
+                f"{unresolved} still unresolved · check logs (graph_resolve_unresolved_category)"
+            )
+            self._graph_linkage_ui_mode = "strip"
+        else:
+            self.planning_graph_linkage_progress_primary_label.setText(
+                f"Graph linkage: partial — {resolved_s} resolved, {unresolved} still unresolved"
+            )
+            self.planning_graph_linkage_progress_detail_label.setText(
+                f"{resolved_s} / {total_s} resolved · {unresolved} failed or blocked"
+            )
+            self._graph_linkage_ui_mode = "strip"
 
     def _graph_linkage_audit_for_log(self, audit: dict[str, Any]) -> dict[str, Any]:
         out: dict[str, Any] = {k: v for k, v in audit.items() if k != "affected_items"}
@@ -38537,51 +39431,8 @@ class MainWindow(QMainWindow):
             )
         )
 
-    def _show_graph_linkage_compact_progress(self, *, message: str, audit: dict[str, Any], phase: str) -> None:
-        if getattr(self, "planning_graph_assurance_title", None) is None:
-            return
-        as_banner = getattr(self, "planning_graph_assurance_banner", None)
-        if as_banner is not None and not as_banner.isVisible():
-            self._planning_header_restore_collapsed_after_banner = bool(
-                getattr(self, "_planning_header_collapsed", False)
-            )
-        if getattr(self, "_planning_header_collapsed", False):
-            self._apply_planning_header_collapsed_state(False)
-        self._graph_linkage_ui_mode = "compact"
-        self.planning_graph_assurance_title.hide()
-        self.planning_graph_assurance_detail.hide()
-        self.planning_graph_assurance_dismiss_btn.show()
-        lbl = getattr(self, "planning_graph_linkage_compact_label", None)
-        bar = getattr(self, "planning_graph_linkage_compact_progress", None)
-        row = getattr(self, "planning_graph_linkage_compact_row", None)
-        if lbl is not None:
-            lbl.setText(message)
-        if bar is not None:
-            bar.setRange(0, 0)
-        if row is not None:
-            row.show()
-        if as_banner is not None:
-            as_banner.show()
-        t = getattr(self, "_planning_graph_assurance_hide_timer", None)
-        if isinstance(t, QTimer):
-            t.stop()
-        self._planning_graph_assurance_hide_timer = QTimer(self)
-        self._planning_graph_assurance_hide_timer.setSingleShot(True)
-        self._planning_graph_assurance_hide_timer.timeout.connect(self._dismiss_planning_graph_linkage_assurance_banner)
-        self._planning_graph_assurance_hide_timer.start(300000)
-        st = self.statusBar()
-        if st is not None:
-            st.showMessage(message[:400], 8000)
-        log_info(
-            "graph_linkage_banner",
-            phase=phase,
-            visible=True,
-            ui_mode="compact",
-            **self._graph_linkage_audit_for_log(audit),
-        )
-
     def _apply_graph_linkage_banner_from_audit(self, audit: dict[str, Any], *, phase: str = "") -> None:
-        """Show compact progress for recoverable Graph work; reserve the large banner for real problems."""
+        """Determinate Graph linkage progress when armed; reserve the large banner for real problems."""
         missing_m = int(audit.get("rows_missing_graph_ids") or 0)
         missing_p = int(audit.get("proposed_rows_missing_graph_ids") or 0)
         if missing_m == 0 and missing_p == 0:
@@ -38611,39 +39462,56 @@ class MainWindow(QMainWindow):
             need_full_banner = True
 
         if not need_full_banner:
-            n = missing_m + missing_p
-            msg = f"Linking {n} item(s) to SharePoint…"
-            if missing_p:
-                msg = f"Linking {n} planned / proposed row(s) to SharePoint…"
-            if path_only and rec:
-                msg += f" ({rec} recoverable from paths.)"
-            if same_work and getattr(self, "_graph_linkage_ui_mode", "") == "compact":
-                lbl = getattr(self, "planning_graph_linkage_compact_label", None)
-                if lbl is not None:
-                    lbl.setText(msg)
-                bar = getattr(self, "planning_graph_linkage_compact_progress", None)
-                if bar is not None:
-                    bar.setRange(0, 0)
+            armed_progress = bool(getattr(self, "_graph_linkage_progress_session_arm", False))
+            if same_work and getattr(self, "_graph_linkage_ui_mode", "") == "strip":
                 log_info(
                     "graph_linkage_banner",
                     phase=phase,
                     visible=True,
-                    ui_mode="compact",
+                    ui_mode="strip",
                     deduped_update=True,
                     **self._graph_linkage_audit_for_log(audit),
                 )
                 self._publish_graph_linkage_audit_snapshot(audit, phase=phase)
                 self._graph_linkage_banner_ui_last_sig = work_sig
                 return
+            if armed_progress:
+                self._graph_linkage_banner_ui_last_sig = work_sig
+                self._graph_linkage_progress_strip_seed_from_audit(audit)
+                self._publish_graph_linkage_audit_snapshot(audit, phase=phase)
+                log_info(
+                    "graph_linkage_banner",
+                    phase=phase,
+                    visible=True,
+                    ui_mode="strip",
+                    **self._graph_linkage_audit_for_log(audit),
+                )
+                return
+            cr = getattr(self, "planning_graph_linkage_compact_row", None)
+            if cr is not None:
+                cr.hide()
+            if getattr(self, "_graph_linkage_ui_mode", "") != "strip":
+                ps0 = getattr(self, "planning_graph_linkage_progress_strip", None)
+                if ps0 is not None:
+                    ps0.hide()
             self._graph_linkage_banner_ui_last_sig = work_sig
-            self._show_graph_linkage_compact_progress(message=msg, audit=audit, phase=phase)
             self._publish_graph_linkage_audit_snapshot(audit, phase=phase)
+            log_info(
+                "graph_linkage_banner",
+                phase=phase,
+                visible=False,
+                ui_mode="audit_only",
+                **self._graph_linkage_audit_for_log(audit),
+            )
             return
 
         self._graph_linkage_ui_mode = "full"
         cr = getattr(self, "planning_graph_linkage_compact_row", None)
         if cr is not None:
             cr.hide()
+        ps = getattr(self, "planning_graph_linkage_progress_strip", None)
+        if ps is not None:
+            ps.hide()
         self.planning_graph_assurance_title.show()
         self.planning_graph_assurance_detail.show()
         self._graph_linkage_banner_ui_last_sig = work_sig
@@ -38742,6 +39610,11 @@ class MainWindow(QMainWindow):
 
         if not self._planning_needs_graph_id_enrichment():
             return
+        _audit_d = self._audit_planned_moves_graph_destination_identity()
+        if int(_audit_d.get("rows_missing_graph_ids") or 0) + int(
+            _audit_d.get("proposed_rows_missing_graph_ids") or 0
+        ) > 0:
+            self._graph_linkage_progress_session_begin()
         self.ensure_planned_moves_resolved_via_graph(persist=True, quiet=False, refresh_sources=False)
 
     def _on_simulate_run_save_manifest(self):

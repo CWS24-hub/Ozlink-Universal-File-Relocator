@@ -60,6 +60,33 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         self._invisible._children = []
         self._destination_index_key_fn = destination_index_key_fn
         self._path_to_nodes: Dict[str, List[_Node]] = {}
+        self._structure_generation: int = 0
+
+    def _notify_structure_changed(self) -> None:
+        self._structure_generation += 1
+        self.destination_structure_changed.emit()
+
+    def structure_generation(self) -> int:
+        return int(self._structure_generation)
+
+    def is_index_live(self, index: QModelIndex) -> bool:
+        """True if ``index`` still points at a row attached under its parent (safe for model access)."""
+        if not index.isValid():
+            return False
+        node = self._node(index)
+        if node is None:
+            return False
+        parent_ix = index.parent()
+        parent_node = self._invisible if not parent_ix.isValid() else self._node(parent_ix)
+        if parent_node is None:
+            return False
+        children = parent_node._children
+        if not children:
+            return False
+        row = index.row()
+        if row < 0 or row >= len(children):
+            return False
+        return children[row] is node
 
     def _node(self, index: QModelIndex) -> Optional[_Node]:
         if not index.isValid():
@@ -286,7 +313,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         self._invisible._children = []
         self._path_to_nodes.clear()
         self.endResetModel()
-        self.destination_structure_changed.emit()
+        self._notify_structure_changed()
 
     def reset_root_payloads(self, payloads: List[Dict[str, Any]]) -> None:
         self.beginResetModel()
@@ -298,7 +325,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         self._reindex(self._invisible)
         self.endResetModel()
         self._rebuild_path_index()
-        self.destination_structure_changed.emit()
+        self._notify_structure_changed()
 
     def set_empty_library_message(self, text: str) -> None:
         payload = {
@@ -312,7 +339,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         self._reindex(self._invisible)
         self.endResetModel()
         self._rebuild_path_index()
-        self.destination_structure_changed.emit()
+        self._notify_structure_changed()
 
     def replace_all_children(self, parent: QModelIndex, child_payloads: List[Dict[str, Any]]) -> None:
         parent_node = self._node(parent)
@@ -338,7 +365,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             self._reindex(parent_node)
             self.endInsertRows()
             self._register_subtree_paths(parent_node._children[0])
-            self.destination_structure_changed.emit()
+            self._notify_structure_changed()
             return
         self.beginInsertRows(parent, 0, n - 1)
         new_children: List[_Node] = []
@@ -349,7 +376,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         self._reindex(parent_node)
         self.endInsertRows()
         self._register_subtree_paths_from_roots(new_children)
-        self.destination_structure_changed.emit()
+        self._notify_structure_changed()
 
     def set_loading_children(self, parent: QModelIndex) -> None:
         parent_node = self._node(parent)
@@ -372,7 +399,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         parent_node._children = [_Node(parent_node, 0, load_pl, [])]
         self._reindex(parent_node)
         self.endInsertRows()
-        self.destination_structure_changed.emit()
+        self._notify_structure_changed()
 
     def remove_placeholder_children(self, parent: QModelIndex) -> None:
         parent_node = self._node(parent)
@@ -387,7 +414,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
                 parent_node._children.pop(row)
                 self.endRemoveRows()
         self._reindex(parent_node)
-        self.destination_structure_changed.emit()
+        self._notify_structure_changed()
 
     def append_child_payloads(self, parent: QModelIndex, payloads: List[Dict[str, Any]]) -> None:
         parent_node = self._invisible if not parent.isValid() else self._node(parent)
@@ -404,7 +431,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         self._reindex(parent_node)
         self.endInsertRows()
         self._register_subtree_paths_from_roots(parent_node._children[start : start + n])
-        self.destination_structure_changed.emit()
+        self._notify_structure_changed()
 
     def update_payload_for_index(self, index: QModelIndex, mutator) -> None:
         node = self._node(index)
@@ -489,7 +516,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         self._reindex(self._invisible)
         self.endResetModel()
         self._rebuild_path_index()
-        self.destination_structure_changed.emit()
+        self._notify_structure_changed()
 
     def replace_row_with_nested(self, index: QModelIndex, nested: NestedSpec) -> None:
         """Replace the row at ``index`` and its entire subtree with a fresh nested spec (no full model reset)."""
@@ -511,7 +538,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         self._reindex(parent_node)
         self.endInsertRows()
         self._register_subtree_paths(new_node)
-        self.destination_structure_changed.emit()
+        self._notify_structure_changed()
 
     def _make_nested_node(self, parent_node: _Node, row: int, pl: Dict[str, Any], kids: List[NestedSpec]) -> _Node:
         if kids:
@@ -548,7 +575,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         parent_node._children.pop(row)
         self._reindex(parent_node)
         self.endRemoveRows()
-        self.destination_structure_changed.emit()
+        self._notify_structure_changed()
         return nested
 
     def append_nested_child(self, parent_ix: QModelIndex, nested: NestedSpec) -> QModelIndex:
@@ -564,5 +591,5 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         self._reindex(parent_node)
         self.endInsertRows()
         self._register_subtree_paths(new_node)
-        self.destination_structure_changed.emit()
+        self._notify_structure_changed()
         return self.index(row, 0, parent_ix)

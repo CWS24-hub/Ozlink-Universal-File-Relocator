@@ -46,6 +46,15 @@ def test_allocation_path_strips_repeated_site_library_prefix():
     assert rel == "FTBMRoot/X"
 
 
+def test_allocation_path_strips_leading_planning_root_alias():
+    rel = allocation_path_to_drive_relative(
+        r"Root\Finance\Follow up\Tax Bracket Calculations.xlsx",
+        library_name="Documents",
+        site_name="Contoso",
+    )
+    assert rel == "Finance/Follow up/Tax Bracket Calculations.xlsx"
+
+
 def test_drive_relative_path_candidates_include_fallbacks():
     c = drive_relative_path_candidates(
         r"HR\Files to be Migrated\FTBMRoot\Y",
@@ -68,7 +77,8 @@ def test_enrich_single_planned_move_resolves_destination_when_only_prop_placehol
         r = str(rel or "").replace("\\", "/").strip("/")
         if drive == "d-src" and r == "S/a.jpg":
             return {"id": "SRC-FILE-1", "name": "a.jpg"}
-        if drive == "d-dst" and r == "Root/Personal":
+        # Planning paths often include a leading Root segment; drive-relative resolution strips it.
+        if drive == "d-dst" and r in ("Root/Personal", "Personal"):
             return {"id": "REAL-PARENT-1"}
         return None
 

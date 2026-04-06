@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Callable, MutableSet, Optional
 
@@ -57,6 +58,19 @@ def _strip_leading_site_library_parts(parts: list[str], site_l: str, lib_l: str)
     return out
 
 
+def _strip_leading_planning_root_alias(parts: list[str]) -> list[str]:
+    """
+    Remove leading ``Root`` segment from planning / tree display paths.
+
+    Graph drive-relative paths are from the document library root; SharePoint has no folder named
+    ``Root`` here. Do **not** strip ``FTBMRoot`` — that is often a real library folder name.
+    """
+    out = list(parts)
+    while out and out[0].strip().lower() == "root":
+        out = out[1:]
+    return out
+
+
 def allocation_path_to_drive_relative(
     path: str,
     *,
@@ -83,11 +97,13 @@ def allocation_path_to_drive_relative(
     if " / " in text:
         parts = [p.strip() for p in text.split(" / ") if p.strip()]
         parts = _strip_leading_site_library_parts(parts, site_l, lib_l)
+        parts = _strip_leading_planning_root_alias(parts)
         return "/".join(parts).replace("\\", "/").strip("/")
 
     segs = _path_segments(text)
     segs = [s.strip() for s in segs if s.strip()]
     segs = _strip_leading_site_library_parts(segs, site_l, lib_l)
+    segs = _strip_leading_planning_root_alias(segs)
     return "/".join(segs).strip("/")
 
 
@@ -135,6 +151,7 @@ def drive_relative_path_candidates(
 
     flex = [p.strip() for p in re.split(r"[/\\]+", text) if p.strip()]
     flex = _strip_leading_site_library_parts(flex, site_l, lib_l)
+    flex = _strip_leading_planning_root_alias(flex)
     if flex:
         add("/".join(flex))
 
@@ -353,6 +370,8 @@ def enrich_single_planned_move(
     move_index: int | None = None,
     request_id: str = "",
     dest_parent_negative_cache: Optional[MutableSet[str]] = None,
+    destination_parent_resolve_diag_sink: Optional[Callable[[dict[str, Any]], None]] = None,
+    skip_dest_parent_negative_cache_read: bool = False,
 ) -> bool:
     """
     Fill ``source`` / ``destination`` nested dicts with Graph ids when missing.
@@ -465,7 +484,11 @@ def enrich_single_planned_move(
             else:
                 dest_resolved = False
                 tried: list[str] = []
+                candidate_attempts: list[dict[str, Any]] = []
                 cache_skipped = 0
+                graph_miss = 0
+                exc_count = 0
+                aborted_root = False
                 nc = dest_parent_negative_cache
                 for idx, cand in enumerate(candidates):
                     parent_rel, leaf = _parent_and_leaf(cand)
@@ -474,8 +497,20 @@ def enrich_single_planned_move(
                     cache_key = graph_dest_parent_negative_cache_key(
                         d_drive, parent_rel or "", dest_library_name, dest_site_name
                     )
-                    if nc is not None and cache_key in nc:
+                    attempt: dict[str, Any] = {
+                        "candidate_index": idx,
+                        "full_drive_relative_candidate": cand[:500],
+                        "parent_path_for_graph_api": parent_rel[:500] if parent_rel else "",
+                        "leaf_segment": leaf[:200] if leaf else "",
+                    }
+                    if (
+                        not skip_dest_parent_negative_cache_read
+                        and nc is not None
+                        and cache_key in nc
+                    ):
                         cache_skipped += 1
+                        attempt["outcome"] = "skipped_negative_cache"
+                        candidate_attempts.append(attempt)
                         log_trace(
                             "graph_resolve",
                             "dest_parent_negative_cache_hit",
@@ -489,6 +524,10 @@ def enrich_single_planned_move(
                         try:
                             parent_item = get_item_by_path(d_drive, parent_rel)
                         except Exception as exc:
+                            exc_count += 1
+                            attempt["outcome"] = "parent_lookup_exception"
+                            attempt["error_excerpt"] = str(exc)[:400]
+                            candidate_attempts.append(attempt)
                             log_warn(
                                 "graph_resolve_dest_parent_exception",
                                 candidate_index=idx,
@@ -503,6 +542,11 @@ def enrich_single_planned_move(
                         try:
                             parent_item = get_root_item(d_drive)
                         except Exception as exc:
+                            exc_count += 1
+                            aborted_root = True
+                            attempt["outcome"] = "root_lookup_exception"
+                            attempt["error_excerpt"] = str(exc)[:400]
+                            candidate_attempts.append(attempt)
                             log_warn(
                                 "graph_resolve_dest_root_exception",
                                 error=str(exc)[:500],
@@ -513,6 +557,8 @@ def enrich_single_planned_move(
                             break
 
                     if parent_item and parent_item.get("id"):
+                        attempt["outcome"] = "parent_resolved_ok"
+                        candidate_attempts.append(attempt)
                         pid = str(parent_item.get("id", "")).strip()
                         dst["id"] = pid
                         dst["drive_id"] = d_drive
@@ -535,6 +581,9 @@ def enrich_single_planned_move(
                                 **base_log,
                             )
                         break
+                    graph_miss += 1
+                    attempt["outcome"] = "parent_graph_response_missing_or_no_id"
+                    candidate_attempts.append(attempt)
                     log_trace(
                         "graph_resolve",
                         "dest_parent_candidate_miss",
@@ -547,6 +596,12 @@ def enrich_single_planned_move(
                         nc.add(cache_key)
 
                 if not dest_resolved:
+                    if aborted_root:
+                        final_reason = "root_lookup_exception"
+                    elif cache_skipped == len(candidates) and candidates:
+                        final_reason = "negative_cache_all_candidates_skipped"
+                    else:
+                        final_reason = "parent_folder_not_found_in_destination_library"
                     if cache_skipped == len(candidates) and candidates:
                         log_trace(
                             "graph_resolve",
@@ -570,6 +625,37 @@ def enrich_single_planned_move(
                             candidate_count=len(candidates),
                             **base_log,
                         )
+                    forensic: dict[str, Any] = {
+                        **base_log,
+                        "phase": "planned_move_destination_parent",
+                        "resolver_uses_real_sharepoint_parent_only": True,
+                        "raw_source_path_excerpt": src_path[:500],
+                        "raw_destination_path_excerpt": dst_path[:500],
+                        "dest_site_excerpt": dest_site_name[:80],
+                        "dest_library_excerpt": dest_library_name[:80],
+                        "drive_relative_path_candidates": [c[:400] for c in candidates],
+                        "candidate_parent_variants_attempted": tried[:40],
+                        "candidate_attempts": candidate_attempts,
+                        "final_failure_reason": final_reason,
+                        "cache_skip_count": cache_skipped,
+                        "graph_parent_miss_count": graph_miss,
+                        "parent_lookup_exception_count": exc_count,
+                    }
+                    if destination_parent_resolve_diag_sink is not None:
+                        try:
+                            destination_parent_resolve_diag_sink(forensic)
+                        except Exception:
+                            pass
+                    log_info(
+                        "graph_resolve_dest_row_forensic",
+                        candidate_attempt_detail_json=json.dumps(
+                            forensic.get("candidate_attempts") or [], ensure_ascii=False
+                        )[:12000],
+                        projection_parent_hints_json=json.dumps(
+                            forensic.get("projection_parent_hints") or [], ensure_ascii=False
+                        )[:8000],
+                        **{k: v for k, v in forensic.items() if k not in ("candidate_attempts", "projection_parent_hints")},
+                    )
 
     return changed
 
@@ -582,6 +668,7 @@ def enrich_proposed_folder_record(
     dest_library_name: str,
     dest_site_name: str = "",
     proposed_index: int | None = None,
+    proposed_parent_resolve_diag_sink: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> bool:
     """Set DestinationDriveId / DestinationParentItemId when missing (for Graph mkdir)."""
     d_drive = str(dest_drive_id or "").strip()
@@ -640,6 +727,32 @@ def enrich_proposed_folder_record(
         },
     )
     if not item or not item.get("id"):
+        forensic_pf: dict[str, Any] = {
+            **plog,
+            "phase": "proposed_folder_parent",
+            "resolver_uses_real_sharepoint_parent_only": True,
+            "raw_parent_path_excerpt": parent_path[:500],
+            "destination_path_excerpt": str(getattr(pf, "DestinationPath", "") or "")[:400],
+            "dest_site_excerpt": dest_site_name[:80],
+            "dest_library_excerpt": dest_library_name[:80],
+            "drive_relative_path_candidates": [c[:400] for c in candidates],
+            "final_failure_reason": "proposed_parent_folder_not_found_in_destination_library",
+            "cache_skip_count": 0,
+            "graph_parent_miss_count": 1,
+            "parent_lookup_exception_count": 0,
+        }
+        if proposed_parent_resolve_diag_sink is not None:
+            try:
+                proposed_parent_resolve_diag_sink(forensic_pf)
+            except Exception:
+                pass
+        log_info(
+            "graph_resolve_proposed_row_forensic",
+            projection_parent_hints_json=json.dumps(
+                forensic_pf.get("projection_parent_hints") or [], ensure_ascii=False
+            )[:8000],
+            **{k: v for k, v in forensic_pf.items() if k != "projection_parent_hints"},
+        )
         return False
 
     pf.DestinationDriveId = d_drive
