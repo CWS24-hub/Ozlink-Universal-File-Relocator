@@ -2731,6 +2731,13 @@ class MainWindow(QMainWindow):
         self._destination_future_projection_async_state = None
         self._destination_materialize_pending_after_async_projection = ""
         self._destination_incremental_merge_in_progress = False
+        self._destination_incremental_merge_session = None
+        self._destination_incremental_merge_timer = QTimer(self)
+        self._destination_incremental_merge_timer.setSingleShot(True)
+        self._destination_incremental_merge_timer.timeout.connect(self._run_destination_incremental_merge_session_tick)
+        self._destination_merge_tick_max_ms = 12
+        self._destination_merge_tick_max_rows = 5
+        self._destination_merge_visibility_rows_per_tick = 8
         self._destination_future_projection_timer = QTimer(self)
         self._destination_future_projection_timer.setSingleShot(True)
         self._destination_future_projection_timer.timeout.connect(self._run_destination_future_projection_chunk)
@@ -26498,6 +26505,7 @@ class MainWindow(QMainWindow):
         timer = getattr(self, "_destination_future_projection_timer", None)
         if timer is not None:
             timer.stop()
+        self._cancel_destination_incremental_merge_session(str(reason or "async_projection_cancelled"))
         if had:
             if reason:
                 self._log_restore_phase(
@@ -26538,17 +26546,34 @@ class MainWindow(QMainWindow):
             "Merging destination — incremental merge: attaching projected items to the tree…",
             loading=True,
         )
+        merge_completion_ctx = {
+            "proj_t0": proj_t0,
+            "reason": reason,
+            "pending_after": pending_after,
+            "model_root_path": model.get("root_path", "Root"),
+            "planned_moves_count": len(state.get("moves") or []),
+        }
         visible_future_branch_count = self._incremental_merge_destination_future_projection(
             model,
             state.get("fast_paint_paths") or frozenset(),
             merge_all_projected_roots=True,
+            merge_session_completion_context=merge_completion_ctx,
         )
+        if not merge_completion_ctx.get("_deferred_incremental_merge_session"):
+            self._finish_destination_future_async_projection_tail(visible_future_branch_count, merge_completion_ctx)
+
+    def _finish_destination_future_async_projection_tail(self, visible_future_branch_count: int, merge_completion_ctx: dict):
+        proj_t0 = float(merge_completion_ctx.get("proj_t0") or time.perf_counter())
+        reason = merge_completion_ctx.get("reason", "background_projection")
+        pending_after = str(merge_completion_ctx.get("pending_after") or "").strip()
+        model_root_path = str(merge_completion_ctx.get("model_root_path") or "Root")
+        planned_moves_count = int(merge_completion_ctx.get("planned_moves_count") or 0)
         applied_count = visible_future_branch_count
         self._log_restore_phase(
             "destination_future_model_materialize_applied",
             reason=reason,
             materialize_phase="background_incremental_merge",
-            root_path=model.get("root_path", "Root"),
+            root_path=model_root_path,
             applied_count=applied_count,
             visible_future_branch_count=visible_future_branch_count,
         )
@@ -26557,17 +26582,17 @@ class MainWindow(QMainWindow):
             "destination_future_model_materialize_complete",
             reason=reason,
             materialize_phase="background_incremental_merge",
-            root_path=model.get("root_path", "Root"),
+            root_path=model_root_path,
             applied_count=applied_count,
             visible_future_branch_count=visible_future_branch_count,
             wall_duration_ms=proj_wall_ms,
-            planned_moves_count=len(state.get("moves") or []),
+            planned_moves_count=planned_moves_count,
         )
         self._log_restore_phase(
             "destination_visible_future_branch_count",
             reason=reason,
             materialize_phase="background_incremental_merge",
-            root_path=model.get("root_path", "Root"),
+            root_path=model_root_path,
             visible_future_branch_count=visible_future_branch_count,
             wall_duration_ms=proj_wall_ms,
         )
@@ -26605,6 +26630,273 @@ class MainWindow(QMainWindow):
                     _run_pending_materialize,
                 ),
             )
+
+    def _cancel_destination_incremental_merge_session(self, reason: str = "") -> None:
+        timer = getattr(self, "_destination_incremental_merge_timer", None)
+        if timer is not None:
+            timer.stop()
+        sess = getattr(self, "_destination_incremental_merge_session", None)
+        if sess is None:
+            return
+        tree = sess.get("tree")
+        try:
+            if tree is not None:
+                tree.blockSignals(False)
+        except Exception:
+            pass
+        self._destination_incremental_merge_session = None
+        self._destination_incremental_merge_in_progress = False
+        self._set_tree_status_message("destination", "", loading=False)
+        if reason:
+            log_info(
+                "destination_incremental_merge_session_complete",
+                cancelled=True,
+                reason=str(reason),
+                tick_index=sess.get("tick_index", 0),
+                cumulative_rows_attached=sess.get("cumulative_rows_attached", 0),
+            )
+
+    def _destination_incremental_merge_session_tick_attach(self, sess: dict) -> None:
+        """Bounded attach work for one timer tick (model-view or widget). Mutates ``sess``."""
+        budget = QElapsedTimer()
+        budget.start()
+        max_ms = int(getattr(self, "_destination_merge_tick_max_ms", 12) or 12)
+        max_rows = int(getattr(self, "_destination_merge_tick_max_rows", 5) or 5)
+        rows_this_tick = 0
+        model_nodes = sess["model_nodes"]
+        parent_order = sess["parent_order"]
+        by_parent = sess["by_parent"]
+        uses_mv = sess["uses_model_view"]
+        dmodel = sess.get("dmodel")
+        tree = sess.get("tree")
+
+        while sess["parent_i"] < len(parent_order):
+            if rows_this_tick >= max_rows or budget.elapsed() > max_ms:
+                return
+            parent_path = parent_order[sess["parent_i"]]
+            roots_here = by_parent[parent_path]
+            if sess["root_j"] >= len(roots_here):
+                sess["parent_i"] += 1
+                sess["root_j"] = 0
+                continue
+
+            parent_item = self._find_visible_destination_item_by_path(parent_path) if parent_path else None
+            if parent_item is None or (isinstance(parent_item, QModelIndex) and not parent_item.isValid()):
+                for root_path in roots_here[sess["root_j"] :]:
+                    self._log_restore_phase(
+                        "destination_future_incremental_merge_parent_missing",
+                        child_path=root_path,
+                        parent_path=parent_path,
+                    )
+                sess["roots_considered"] += len(roots_here) - sess["root_j"]
+                sess["root_j"] = len(roots_here)
+                continue
+
+            if sess["child_maps"].get(parent_path) is None:
+                if uses_mv:
+                    sess["child_maps"][parent_path] = self._destination_children_semantic_map_index(parent_item)
+                else:
+                    sess["child_maps"][parent_path] = self._destination_children_semantic_map_widget(parent_item)
+
+            child_map = sess["child_maps"][parent_path]
+            root_path = roots_here[sess["root_j"]]
+            sess["root_j"] += 1
+            sess["roots_considered"] += 1
+
+            if root_path in child_map:
+                continue
+            if self._find_destination_child_by_path(parent_item, root_path):
+                continue
+
+            if not sess["placeholder_cleared"].get(parent_path):
+                self._remove_placeholder_children(parent_item)
+                sess["placeholder_cleared"][parent_path] = True
+
+            if uses_mv:
+                nested = self._build_destination_future_nested(model_nodes, root_path)
+                new_ix = dmodel.append_nested_child(parent_item, nested)
+                if new_ix is not None and new_ix.isValid():
+                    child_map[root_path] = new_ix
+                self._sort_destination_future_children_index(parent_item)
+            else:
+                child_item = self._build_destination_tree_item_from_future_model(model_nodes, root_path)
+                parent_item.addChild(child_item)
+                child_map[root_path] = child_item
+                self._sort_destination_future_children(parent_item)
+
+            sess["cumulative_rows_attached"] += 1
+            rows_this_tick += 1
+
+    def _destination_incremental_merge_session_tick_visibility(self, sess: dict) -> None:
+        per_tick = int(getattr(self, "_destination_merge_visibility_rows_per_tick", 8) or 8)
+        tree = sess.get("tree")
+        dmodel = sess.get("dmodel")
+        uses_mv = sess["uses_model_view"]
+        if uses_mv and dmodel is not None:
+            rc = dmodel.rowCount(QModelIndex())
+            sess["vis_total"] = rc
+            end = min(sess["vis_r"] + per_tick, rc)
+            for r in range(sess["vis_r"], end):
+                tix = dmodel.index(r, 0, QModelIndex())
+                self._refresh_destination_item_visibility_index(tix, expand=True)
+            sess["vis_r"] = end
+        else:
+            rc = tree.topLevelItemCount() if tree is not None else 0
+            sess["vis_total"] = rc
+            end = min(sess["vis_r"] + per_tick, rc)
+            for index in range(sess["vis_r"], end):
+                top_item = tree.topLevelItem(index)
+                self._refresh_destination_item_visibility(top_item, expand=True)
+            sess["vis_r"] = end
+
+    def _destination_incremental_merge_session_run_finalize(self, sess: dict) -> None:
+        tree = sess["tree"]
+        model = sess["model"]
+        merge_group_t0 = float(sess.get("merge_group_t0") or time.perf_counter())
+        destination_expanded_paths = sess["destination_expanded_paths"]
+        destination_selected_path = sess["destination_selected_path"]
+        entry_roots = sess["entry_roots"]
+        by_parent = sess["by_parent"]
+        visible_future_branch_count = sess["visible_future_branch_count"]
+        merge_ctx = sess["merge_ctx"]
+
+        self._log_restore_phase(
+            "destination_future_incremental_merge_parent_batch",
+            wall_ms=round((time.perf_counter() - merge_group_t0) * 1000.0, 2),
+            entry_roots=len(entry_roots),
+            parent_batch_count=len(by_parent),
+        )
+
+        visible_descendant_count = self._apply_visible_destination_allocation_descendants(
+            destination_expanded_paths=destination_expanded_paths
+        )
+        if visible_descendant_count > 150:
+            _dirty = getattr(self, "_destination_indicator_dirty_semantic_paths", None)
+            if _dirty is not None:
+                _dirty.clear()
+        elif entry_roots and self._destination_tree_uses_model_view():
+            self._mark_destination_indicator_dirty_paths(set(entry_roots) | set(by_parent.keys()))
+        self._schedule_refresh_destination_tree_indicators()
+        self._restore_expanded_tree_paths("destination", destination_expanded_paths)
+        self._restore_selected_tree_path("destination", destination_selected_path)
+        self._refresh_expand_all_button_for_panel("destination")
+
+        top_n = self._planning_tree_top_level_count(tree)
+        self._log_restore_phase(
+            "destination_future_incremental_merge_complete",
+            root_path=model.get("root_path", "Root"),
+            top_level_count=top_n,
+            visible_descendant_count=visible_descendant_count,
+            entry_roots=len(entry_roots),
+        )
+        self._log_restore_phase(
+            "destination_future_model_visible_summary",
+            root_path=model.get("root_path", "Root"),
+            total_real_nodes=model.get("total_real_nodes", 0),
+            total_proposed_nodes=model.get("total_proposed_nodes", 0),
+            total_allocation_nodes=model.get("total_allocation_nodes", 0),
+            top_level_count=top_n,
+            visible_future_branch_count=visible_future_branch_count,
+            merge_mode="incremental_timer_sliced",
+        )
+        self._schedule_workspace_ui_persist(panel_key="destination")
+        self._reconcile_destination_semantic_duplicates("destination_incremental_merge_complete")
+
+        tick_idx = int(sess.get("tick_index") or 0)
+        wall_total_ms = round((time.perf_counter() - float(sess.get("session_wall_t0") or time.perf_counter())) * 1000.0, 1)
+        log_info(
+            "destination_incremental_merge_session_complete",
+            tick_index=tick_idx,
+            roots_processed=int(sess.get("roots_considered") or 0),
+            total_root_ops=int(sess.get("total_root_ops") or 0),
+            cumulative_rows_attached=int(sess.get("cumulative_rows_attached") or 0),
+            wall_ms_total=wall_total_ms,
+            cancelled=False,
+        )
+
+        try:
+            tree.blockSignals(False)
+        except Exception:
+            pass
+        self._destination_incremental_merge_session = None
+        self._destination_incremental_merge_in_progress = False
+        self._finish_destination_future_async_projection_tail(visible_future_branch_count, merge_ctx)
+
+    def _run_destination_incremental_merge_session_tick(self) -> None:
+        sess = getattr(self, "_destination_incremental_merge_session", None)
+        if sess is None:
+            return
+        sess["tick_index"] = int(sess.get("tick_index") or 0) + 1
+        tick_idx = sess["tick_index"]
+        tick_local = QElapsedTimer()
+        tick_local.start()
+        rows_before = int(sess.get("cumulative_rows_attached") or 0)
+        try:
+            if sess.get("phase") == "attach":
+                self._destination_incremental_merge_session_tick_attach(sess)
+                if sess["parent_i"] >= len(sess["parent_order"]):
+                    sess["phase"] = "visibility"
+                    sess["vis_r"] = 0
+                    dmodel = sess.get("dmodel")
+                    tree = sess.get("tree")
+                    if sess["uses_model_view"] and dmodel is not None:
+                        sess["vis_total"] = dmodel.rowCount(QModelIndex())
+                    else:
+                        sess["vis_total"] = tree.topLevelItemCount() if tree is not None else 0
+            elif sess.get("phase") == "visibility":
+                self._destination_incremental_merge_session_tick_visibility(sess)
+                if sess["vis_r"] >= sess.get("vis_total", 0):
+                    sess["phase"] = "finalize"
+            if sess.get("phase") == "finalize" and getattr(self, "_destination_incremental_merge_session", None):
+                self._destination_incremental_merge_session_run_finalize(sess)
+                return
+        except Exception as exc:
+            log_error(
+                "destination_incremental_merge_tick_failed",
+                error=str(exc),
+                tick_index=tick_idx,
+            )
+            self._cancel_destination_incremental_merge_session(str(exc))
+            return
+
+        rows_tick = int(sess.get("cumulative_rows_attached") or 0) - rows_before
+        wall_session_ms = round((time.perf_counter() - float(sess.get("session_wall_t0") or time.perf_counter())) * 1000.0, 1)
+        tick_wall_ms = tick_local.elapsed()
+        total_ops = int(sess.get("total_root_ops") or 0)
+        roots_done = int(sess.get("roots_considered") or 0)
+        cum_rows = int(sess.get("cumulative_rows_attached") or 0)
+        phase = str(sess.get("phase") or "")
+        log_info(
+            "destination_incremental_merge_tick",
+            tick_index=tick_idx,
+            phase=phase,
+            rows_attached_this_tick=rows_tick,
+            cumulative_rows_attached=cum_rows,
+            roots_processed=roots_done,
+            total_root_ops=total_ops,
+            tick_wall_ms=tick_wall_ms,
+            wall_ms_since_session_start=wall_session_ms,
+        )
+        log_info(
+            "destination_incremental_merge_progress",
+            tick_index=tick_idx,
+            phase=phase,
+            rows_attached_this_tick=rows_tick,
+            cumulative_rows_attached=cum_rows,
+            roots_processed=roots_done,
+            total_root_ops=total_ops,
+            wall_ms_since_session_start=wall_session_ms,
+        )
+        sched = int(sess.get("total_root_ops") or 0)
+        done = min(roots_done, sched) if sched else roots_done
+        pct = (100 * done // sched) if sched else 0
+        self._set_tree_status_message(
+            "destination",
+            f"Merging destination — projected branches {done:,}/{sched:,} ({pct}%) — rows attached {cum_rows:,}…",
+            loading=True,
+        )
+        if getattr(self, "_destination_incremental_merge_session", None) is not None:
+            self._destination_incremental_merge_timer.start(0)
 
     def _run_destination_future_projection_chunk(self):
         state = self._destination_future_projection_async_state
@@ -29413,14 +29705,20 @@ class MainWindow(QMainWindow):
         return out
 
     def _incremental_merge_destination_future_projection(
-        self, model, fast_paths, *, merge_all_projected_roots: bool = False
+        self,
+        model,
+        fast_paths,
+        *,
+        merge_all_projected_roots: bool = False,
+        merge_session_completion_context: Optional[dict] = None,
     ):
         """Attach projected-allocation descendant subtrees without clearing the destination tree.
 
         When ``merge_all_projected_roots`` is True (destination preview materialize), every incremental
         merge entry root is scheduled: expansion state is not used to drop projected_descendant
-        branches. Attachment still runs in the existing parent-ordered loop with per-tick yields and
-        ``processEvents`` — no full-tree synchronous walk is added.
+        branches. If ``merge_session_completion_context`` is set (async preview completion), attachment
+        uses a timer-sliced session (bounded rows + wall-clock per tick) so the UI stays responsive.
+        Otherwise the merge runs synchronously with periodic ``processEvents`` yields.
         """
         tree = getattr(self, "destination_tree_widget", None)
         if tree is None:
@@ -29472,6 +29770,64 @@ class MainWindow(QMainWindow):
                     entry_roots_before=merge_roots_before,
                     entry_roots_after=len(entry_roots),
                 )
+
+        dmodel = getattr(self, "destination_planning_model", None)
+        uses_mv = self._destination_tree_uses_model_view()
+
+        if merge_all_projected_roots and merge_session_completion_context is not None:
+            if (uses_mv and dmodel is not None) or not uses_mv:
+                by_parent = group_paths_by_parent_semantic(entry_roots, model_nodes)
+                parent_order = sorted(
+                    by_parent.keys(),
+                    key=lambda p: (
+                        len(self._path_segments(p)) if p else 0,
+                        [s.lower() for s in self._path_segments(p)],
+                    ),
+                )
+                total_root_ops = sum(len(by_parent[p]) for p in parent_order)
+                merge_session_completion_context["_deferred_incremental_merge_session"] = True
+                self._future_bind_nodes_built = 0
+                self._destination_incremental_merge_in_progress = True
+                tree.blockSignals(True)
+                merge_group_t0 = time.perf_counter()
+                session_wall_t0 = time.perf_counter()
+                self._destination_incremental_merge_session = {
+                    "phase": "attach",
+                    "model": model,
+                    "model_nodes": model_nodes,
+                    "by_parent": by_parent,
+                    "parent_order": parent_order,
+                    "parent_i": 0,
+                    "root_j": 0,
+                    "child_maps": {},
+                    "placeholder_cleared": {},
+                    "merge_group_t0": merge_group_t0,
+                    "session_wall_t0": session_wall_t0,
+                    "tick_index": 0,
+                    "cumulative_rows_attached": 0,
+                    "roots_considered": 0,
+                    "total_root_ops": total_root_ops,
+                    "entry_roots": entry_roots,
+                    "destination_expanded_paths": destination_expanded_paths,
+                    "destination_selected_path": destination_selected_path,
+                    "visible_future_branch_count": visible_future_branch_count,
+                    "uses_model_view": uses_mv,
+                    "dmodel": dmodel,
+                    "tree": tree,
+                    "merge_ctx": merge_session_completion_context,
+                    "vis_r": 0,
+                    "vis_total": 0,
+                }
+                log_info(
+                    "destination_incremental_merge_session_begin",
+                    entry_roots=len(entry_roots),
+                    parent_batch_count=len(by_parent),
+                    total_root_ops=total_root_ops,
+                    merge_all_projected_roots=True,
+                    uses_model_view=uses_mv,
+                )
+                self._destination_incremental_merge_timer.start(0)
+                return visible_future_branch_count
 
         self._destination_incremental_merge_in_progress = True
         tree.blockSignals(True)
