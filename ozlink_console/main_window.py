@@ -6319,6 +6319,7 @@ class MainWindow(QMainWindow):
                 "Loaded branches collapsed.",
                 "Building destination preview",
                 "Merging destination",
+                "Destination preview",
             )
             if not any(message_text.startswith(prefix) for prefix in allowed_prefixes):
                 return
@@ -6330,6 +6331,25 @@ class MainWindow(QMainWindow):
         if label is not None:
             label.setText(message)
             self._apply_loading_visual_state(label, loading=loading, kind="tree")
+
+    def _destination_preview_async_status_message(self, state: dict[str, Any]) -> str:
+        """User-facing destination preview progress during async descendant projection (chunked)."""
+        ex = int(state.get("projection_descendants_examined", 0) or 0)
+        sched = int(state.get("projection_descendants_scheduled", 0) or 0)
+        mi = int(state.get("move_index", 0) or 0)
+        moves = state.get("moves") or []
+        total_moves = len(moves)
+        sched_show = max(sched, ex)
+        alloc_hint = ""
+        if total_moves > 0:
+            alloc_hint = f" · allocation {min(mi + 1, total_moves)}/{total_moves}"
+        if sched <= 0 and ex <= 0:
+            return (
+                f"Building destination preview — projecting folders (scanning allocations){alloc_hint}…"
+            )
+        return (
+            f"Building destination preview — projecting folders: {ex:,}/{sched_show:,} items{alloc_hint}"
+        )
 
     def _set_window_title_status(self, status_text=""):
         title = str(getattr(self, "_base_window_title", "Ozlink IT – SharePoint File Relocation Console"))
@@ -26396,6 +26416,11 @@ class MainWindow(QMainWindow):
             root_path=model.get("root_path", "Root"),
             visible_future_branch_count=len(model.get("nodes", {})),
         )
+        self._set_tree_status_message(
+            "destination",
+            "Merging destination — incremental merge: attaching projected items to the tree…",
+            loading=True,
+        )
         visible_future_branch_count = self._incremental_merge_destination_future_projection(
             model,
             state.get("fast_paint_paths") or frozenset(),
@@ -26428,7 +26453,7 @@ class MainWindow(QMainWindow):
             visible_future_branch_count=visible_future_branch_count,
             wall_duration_ms=proj_wall_ms,
         )
-        self._set_tree_status_message("destination", "Destination preview ready.", loading=False)
+        self._set_tree_status_message("destination", "Destination preview ready — all phases complete.", loading=False)
         self._destination_future_model_pending_after_source_restore = False
         try:
             self._destination_last_materialized_overlay_fp = self._current_destination_full_overlay_fingerprint()
@@ -26467,15 +26492,11 @@ class MainWindow(QMainWindow):
         state = self._destination_future_projection_async_state
         if state is None:
             return
-        moves = state.get("moves") or []
-        move_index = int(state.get("move_index", 0))
-        total_moves = len(moves)
-        if total_moves > 0:
-            display_n = min(move_index + 1, total_moves)
-            status_msg = f"Building destination preview… ({display_n}/{total_moves})"
-        else:
-            status_msg = "Building destination preview…"
-        self._set_tree_status_message("destination", status_msg, loading=True)
+        self._set_tree_status_message(
+            "destination",
+            self._destination_preview_async_status_message(state),
+            loading=True,
+        )
         timer = QElapsedTimer()
         timer.start()
         # Tighter bounds so large allocation descendant sweeps (thousands of nodes) yield the
@@ -26499,6 +26520,15 @@ class MainWindow(QMainWindow):
                     state["current_chunk"] = None
                     continue
                 chunk["added_count"] = 0
+                n_desc = len(chunk.get("descendants") or ())
+                state["projection_descendants_scheduled"] = int(
+                    state.get("projection_descendants_scheduled", 0) or 0
+                ) + int(n_desc)
+                self._set_tree_status_message(
+                    "destination",
+                    self._destination_preview_async_status_message(state),
+                    loading=True,
+                )
 
             descendants = chunk["descendants"]
             i = state["descendant_index"]
@@ -26516,8 +26546,21 @@ class MainWindow(QMainWindow):
                             items_this_tick=items_this_tick,
                             elapsed_ms=timer.elapsed(),
                         )
+                    self._set_tree_status_message(
+                        "destination",
+                        self._destination_preview_async_status_message(state),
+                        loading=True,
+                    )
                     self._destination_future_projection_timer.start(0)
                     return
+                examined = int(state.get("projection_descendants_examined", 0) or 0) + 1
+                state["projection_descendants_examined"] = examined
+                if examined == 1 or examined % 16 == 0:
+                    self._set_tree_status_message(
+                        "destination",
+                        self._destination_preview_async_status_message(state),
+                        loading=True,
+                    )
                 descendant_data = descendants[i]
                 if self._try_add_single_allocation_descendant_to_future_model(
                     chunk["move"],
@@ -29644,7 +29687,11 @@ class MainWindow(QMainWindow):
                 reason=reason,
             )
         if use_chunked:
-            self._set_tree_status_message("destination", "Building destination preview…", loading=True)
+            self._set_tree_status_message(
+                "destination",
+                "Building destination preview — fast preview: building overlay model…",
+                loading=True,
+            )
             model_fast = self._build_destination_future_model(
                 skip_allocation_descendants=True,
                 restrict_real_snapshot_import=bool(narrow_restore_real_snapshot),
@@ -29662,6 +29709,11 @@ class MainWindow(QMainWindow):
                 materialize_phase="fast_first_paint",
                 root_path=model_fast.get("root_path", "Root"),
                 visible_future_branch_count=len(model_fast.get("nodes", {})),
+            )
+            self._set_tree_status_message(
+                "destination",
+                f"Building destination preview — fast preview: binding tree ({len(model_fast.get('nodes') or {}):,} branches)…",
+                loading=True,
             )
 
             def _complete_fast_first_paint_bind(visible_future_branch_count, _da):
@@ -29703,6 +29755,8 @@ class MainWindow(QMainWindow):
                     "descendant_index": 0,
                     "fast_paint_paths": frozenset(model_fast["nodes"].keys()),
                     "projection_wall_t0": time.perf_counter(),
+                    "projection_descendants_examined": 0,
+                    "projection_descendants_scheduled": 0,
                 }
                 try:
                     self._reconcile_destination_sibling_folders_during_allocation_apply("fast_paint_pre_projection")
@@ -29710,7 +29764,9 @@ class MainWindow(QMainWindow):
                     self._log_restore_exception("destination_fast_paint_pre_projection_dedup", dedup_exc)
                 self._set_tree_status_message(
                     "destination",
-                    f"Building destination preview… (1/{max(1, len(self.planned_moves))})",
+                    self._destination_preview_async_status_message(
+                        self._destination_future_projection_async_state
+                    ),
                     loading=True,
                 )
                 self._destination_future_projection_timer.start(0)
@@ -29737,6 +29793,11 @@ class MainWindow(QMainWindow):
             reason=reason,
             root_path=model.get("root_path", "Root"),
             visible_future_branch_count=len(model.get("nodes", {})),
+        )
+        self._set_tree_status_message(
+            "destination",
+            f"Building destination preview — binding full tree ({len(model.get('nodes') or {}):,} branches)…",
+            loading=True,
         )
 
         def _complete_full_destination_bind(visible_future_branch_count, _da):
