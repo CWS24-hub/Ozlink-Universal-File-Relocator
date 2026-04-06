@@ -16,6 +16,7 @@ import re
 import io
 import math
 import zipfile
+import requests
 from datetime import datetime, timezone
 from pathlib import Path
 from dataclasses import dataclass
@@ -138,8 +139,10 @@ from ozlink_console.destination_projection_cache import (
     real_snapshot_signature,
 )
 from ozlink_console.planned_move_graph_resolve import (
+    _parent_and_leaf,
     enrich_proposed_folder_record,
     enrich_single_planned_move,
+    graph_dest_parent_negative_cache_key,
     refresh_planned_move_source_from_graph,
 )
 
@@ -38781,6 +38784,97 @@ class MainWindow(QMainWindow):
                             processed_missing, total_graph_enrich, resolved_missing
                         )
 
+            real_missing_paths, retry_real_missing_m, retry_real_missing_p = (
+                self._graph_resolve_collect_real_missing_parent_mkdir_targets(
+                    graph_dest_unresolved_forensics,
+                    proposed_unresolved_forensics,
+                )
+            )
+            if real_missing_paths:
+                log_info(
+                    "graph_resolve_real_missing_parent_mkdir_pass",
+                    path_count=len(real_missing_paths),
+                    move_index_count=len(retry_real_missing_m),
+                    proposed_index_count=len(retry_real_missing_p),
+                    move_indices=sorted(retry_real_missing_m)[:80],
+                    proposed_indices=sorted(retry_real_missing_p)[:80],
+                )
+                mkdir_session_verified: set[str] = set()
+                sorted_mkdir_paths = sorted(
+                    real_missing_paths,
+                    key=lambda s: (len([p for p in str(s).split("/") if p]), str(s)),
+                )
+                for rel_mk in sorted_mkdir_paths:
+                    self._graph_resolve_ensure_drive_folder_path(
+                        graph,
+                        ctx["dest_drive_id"],
+                        rel_mk,
+                        dest_library_name=ctx["dest_library_name"],
+                        dest_site_name=ctx["dest_site_name"],
+                        mkdir_session_verified_prefixes=mkdir_session_verified,
+                    )
+                rm_m = set(retry_real_missing_m)
+                rm_p = set(retry_real_missing_p)
+                graph_dest_unresolved_forensics[:] = [
+                    d
+                    for d in graph_dest_unresolved_forensics
+                    if not (
+                        str(d.get("unresolved_category") or "") == "real_missing_parent"
+                        and int(d.get("move_index", -1)) in rm_m
+                    )
+                ]
+                proposed_unresolved_forensics[:] = [
+                    d
+                    for d in proposed_unresolved_forensics
+                    if not (
+                        str(d.get("unresolved_category") or "") == "real_missing_parent"
+                        and int(d.get("proposed_index", -1)) in rm_p
+                    )
+                ]
+                for ri in sorted(retry_real_missing_m):
+                    moves_list = list(self.planned_moves or [])
+                    if ri < 0 or ri >= len(moves_list):
+                        continue
+                    move_rm = moves_list[ri]
+                    ok_rm = enrich_single_planned_move(
+                        move_rm,
+                        get_item_by_path=gpath,
+                        get_root_item=groot,
+                        source_drive_id=ctx["source_drive_id"],
+                        source_library_name=ctx["source_library_name"],
+                        dest_drive_id=ctx["dest_drive_id"],
+                        dest_library_name=ctx["dest_library_name"],
+                        source_site_name=ctx["source_site_name"],
+                        dest_site_name=ctx["dest_site_name"],
+                        move_index=ri,
+                        request_id=str(move_rm.get("request_id", "") or "")[:80],
+                        dest_parent_negative_cache=self._graph_dest_parent_negative_cache,
+                        destination_parent_resolve_diag_sink=_sink_move_dest,
+                    )
+                    if ok_rm:
+                        mu += 1
+                        graph_touch.update(self._narrow_source_projection_paths_for_move(move_rm))
+                    if ri % 8 == 0:
+                        QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+                for pi in sorted(retry_real_missing_p):
+                    prop_list = list(self.proposed_folders or [])
+                    if pi < 0 or pi >= len(prop_list):
+                        continue
+                    pf_rm = prop_list[pi]
+                    ok_pr = enrich_proposed_folder_record(
+                        pf_rm,
+                        get_item_by_path=gpath,
+                        dest_drive_id=ctx["dest_drive_id"],
+                        dest_library_name=ctx["dest_library_name"],
+                        dest_site_name=ctx["dest_site_name"],
+                        proposed_index=pi,
+                        proposed_parent_resolve_diag_sink=_sink_proposed_parent,
+                    )
+                    if ok_pr:
+                        pu += 1
+                    if pi % 8 == 0:
+                        QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+
             retry_move_indices = sorted(
                 {
                     int(d["move_index"])
@@ -38922,6 +39016,212 @@ class MainWindow(QMainWindow):
                 self.planned_moves_status.setText(
                     f"Updated {su} source path(s) to match current names in SharePoint."
                 )
+
+    def _graph_resolve_discard_negative_cache_key_for_parent(
+        self,
+        dest_drive_id: str,
+        dest_library_name: str,
+        dest_site_name: str,
+        parent_rel: str,
+    ) -> None:
+        nc = getattr(self, "_graph_dest_parent_negative_cache", None)
+        if nc is None:
+            return
+        key = graph_dest_parent_negative_cache_key(
+            dest_drive_id, parent_rel or "", dest_library_name, dest_site_name
+        )
+        nc.discard(key)
+
+    def _graph_resolve_collect_real_missing_parent_mkdir_targets(
+        self,
+        graph_dest_unresolved_forensics: list[dict[str, Any]],
+        proposed_unresolved_forensics: list[dict[str, Any]],
+    ) -> tuple[set[str], set[int], set[int]]:
+        """
+        Paths (drive-relative) that must exist as folders for rows classified real_missing_parent.
+        Moves use the parent folder of the first path candidate; proposed rows use the first candidate as-is.
+        """
+        paths: set[str] = set()
+        move_indices: set[int] = set()
+        proposed_indices: set[int] = set()
+        for d in graph_dest_unresolved_forensics:
+            if str(d.get("unresolved_category") or "") != "real_missing_parent":
+                continue
+            mi = int(d.get("move_index", -1))
+            if mi < 0:
+                continue
+            cands = d.get("drive_relative_path_candidates")
+            if not isinstance(cands, list) or not cands:
+                continue
+            c0 = str(cands[0] or "").replace("\\", "/").strip("/")
+            if not c0:
+                continue
+            parent_rel, _leaf = _parent_and_leaf(c0)
+            parent_norm = str(parent_rel or "").replace("\\", "/").strip("/")
+            if not parent_norm:
+                continue
+            paths.add(parent_norm)
+            move_indices.add(mi)
+        for d in proposed_unresolved_forensics:
+            if str(d.get("unresolved_category") or "") != "real_missing_parent":
+                continue
+            pi = int(d.get("proposed_index", -1))
+            if pi < 0:
+                continue
+            cands = d.get("drive_relative_path_candidates")
+            if not isinstance(cands, list) or not cands:
+                continue
+            c0 = str(cands[0] or "").replace("\\", "/").strip("/")
+            if not c0:
+                continue
+            paths.add(c0)
+            proposed_indices.add(pi)
+        return paths, move_indices, proposed_indices
+
+    def _graph_resolve_ensure_drive_folder_path(
+        self,
+        graph: GraphClient,
+        dest_drive_id: str,
+        relative_path: str,
+        *,
+        dest_library_name: str,
+        dest_site_name: str,
+        mkdir_session_verified_prefixes: set[str],
+    ) -> bool:
+        """
+        Ensure each segment of a drive-relative folder path exists (Graph mkdir). Idempotent:
+        re-fetch by path before each create; treat 409 as existing folder and re-resolve by path.
+        """
+        rel = str(relative_path or "").replace("\\", "/").strip("/")
+        drive_id = str(dest_drive_id or "").strip()
+        if not rel or not drive_id:
+            return True
+        segments = [p for p in rel.split("/") if p]
+        if not segments:
+            return True
+        try:
+            root_item = graph.get_drive_root_item(drive_id)
+        except Exception as exc:
+            log_warn(
+                "graph_resolve_mkdir_root_failed",
+                error=str(exc)[:300],
+                drive_id_suffix=drive_id[-12:] if len(drive_id) > 12 else drive_id,
+            )
+            return False
+        if not root_item or not root_item.get("id"):
+            log_warn(
+                "graph_resolve_mkdir_root_missing",
+                drive_id_suffix=drive_id[-12:] if len(drive_id) > 12 else drive_id,
+            )
+            return False
+        parent_id = str(root_item["id"]).strip()
+        prefix_parts: list[str] = []
+        for seg in segments:
+            prefix_parts.append(seg)
+            prefix = "/".join(prefix_parts)
+            if prefix in mkdir_session_verified_prefixes:
+                try:
+                    cached_item = graph.get_drive_item_by_path(drive_id, prefix)
+                except Exception as exc:
+                    log_warn(
+                        "graph_resolve_mkdir_verified_prefix_refetch_failed",
+                        prefix_excerpt=prefix[:220],
+                        error=str(exc)[:300],
+                    )
+                    return False
+                if not cached_item or not cached_item.get("id"):
+                    mkdir_session_verified_prefixes.discard(prefix)
+                else:
+                    parent_id = str(cached_item["id"]).strip()
+                    self._graph_resolve_discard_negative_cache_key_for_parent(
+                        drive_id, dest_library_name, dest_site_name, prefix
+                    )
+                    continue
+            item: Optional[dict[str, Any]] = None
+            try:
+                item = graph.get_drive_item_by_path(drive_id, prefix)
+            except Exception as exc:
+                log_warn(
+                    "graph_resolve_mkdir_preflight_get_failed",
+                    prefix_excerpt=prefix[:220],
+                    error=str(exc)[:300],
+                )
+                return False
+            if item and item.get("id"):
+                parent_id = str(item["id"]).strip()
+                self._graph_resolve_discard_negative_cache_key_for_parent(
+                    drive_id, dest_library_name, dest_site_name, prefix
+                )
+                mkdir_session_verified_prefixes.add(prefix)
+                continue
+            parent_before_create = parent_id
+            try:
+                created = graph.create_child_folder(
+                    drive_id, parent_id, seg, conflict_behavior="fail"
+                )
+            except requests.HTTPError as exc:
+                if exc.response is not None and exc.response.status_code == 409:
+                    item409 = graph.get_drive_item_by_path(drive_id, prefix)
+                    if item409 and item409.get("id"):
+                        parent_id = str(item409["id"]).strip()
+                        try:
+                            graph.invalidate_drive_folder_children_cache(
+                                drive_id, parent_before_create
+                            )
+                        except Exception:
+                            pass
+                        self._graph_resolve_discard_negative_cache_key_for_parent(
+                            drive_id, dest_library_name, dest_site_name, prefix
+                        )
+                        mkdir_session_verified_prefixes.add(prefix)
+                        log_info(
+                            "graph_resolve_mkdir_parent_segment_exists_after_conflict",
+                            drive_relative_prefix_excerpt=prefix[:300],
+                            segment_excerpt=seg[:120],
+                            drive_id_suffix=drive_id[-12:] if len(drive_id) > 12 else drive_id,
+                        )
+                        continue
+                log_warn(
+                    "graph_resolve_mkdir_create_http_error",
+                    prefix_excerpt=prefix[:220],
+                    segment_excerpt=seg[:120],
+                    status=getattr(exc.response, "status_code", None),
+                    error=str(exc)[:400],
+                )
+                return False
+            except Exception as exc:
+                log_warn(
+                    "graph_resolve_mkdir_create_failed",
+                    prefix_excerpt=prefix[:220],
+                    segment_excerpt=seg[:120],
+                    error=str(exc)[:400],
+                )
+                return False
+            new_id = str((created or {}).get("id", "") or "").strip()
+            if not new_id:
+                log_warn(
+                    "graph_resolve_mkdir_no_id_in_response",
+                    prefix_excerpt=prefix[:220],
+                    segment_excerpt=seg[:120],
+                )
+                return False
+            parent_id = new_id
+            try:
+                graph.invalidate_drive_folder_children_cache(drive_id, parent_before_create)
+            except Exception:
+                pass
+            self._graph_resolve_discard_negative_cache_key_for_parent(
+                drive_id, dest_library_name, dest_site_name, prefix
+            )
+            mkdir_session_verified_prefixes.add(prefix)
+            log_info(
+                "graph_resolve_mkdir_parent_segment_created",
+                drive_relative_prefix_excerpt=prefix[:300],
+                segment_excerpt=seg[:120],
+                drive_id_suffix=drive_id[-12:] if len(drive_id) > 12 else drive_id,
+                new_item_id_suffix=new_id[-16:] if len(new_id) > 16 else new_id,
+            )
+        return True
 
     def _graph_resolve_enrich_forensic_projection_hints(self, row: dict[str, Any]) -> None:
         """Augment Graph resolve forensic rows with cached destination future-model presence (not SharePoint)."""
