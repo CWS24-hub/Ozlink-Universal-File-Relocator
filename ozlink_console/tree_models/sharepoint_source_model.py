@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, List, Optional
 from PySide6.QtCore import QAbstractItemModel, QModelIndex, Qt
 from PySide6.QtGui import QBrush
 
+from ozlink_console.logger import log_info
 from ozlink_console.tree_models.explorer_columns import (
     EXPLORER_COLUMN_COUNT,
     EXPLORER_COLUMN_LABELS,
@@ -59,6 +60,32 @@ class SharePointSourceTreeModel(QAbstractItemModel):
         # Canonical path key -> node (O(1) lookup for find_visible_source_item_by_path when fn is set).
         self._source_index_key_fn = source_index_key_fn
         self._path_to_node: Dict[str, _Node] = {}
+        self._structure_generation: int = 0
+
+    def _bump_structure_generation(self) -> None:
+        self._structure_generation += 1
+
+    def structure_generation(self) -> int:
+        return int(self._structure_generation)
+
+    def is_index_live(self, index: QModelIndex) -> bool:
+        """True if ``index`` still points at a row attached under its parent (safe for model mutations)."""
+        if not index.isValid():
+            return False
+        node = self._node(index)
+        if node is None:
+            return False
+        parent_ix = index.parent()
+        parent_node = self._invisible if not parent_ix.isValid() else self._node(parent_ix)
+        if parent_node is None:
+            return False
+        children = parent_node._children
+        if not children:
+            return False
+        row = index.row()
+        if row < 0 or row >= len(children):
+            return False
+        return children[row] is node
 
     def _node(self, index: QModelIndex) -> Optional[_Node]:
         if not index.isValid():
@@ -243,6 +270,7 @@ class SharePointSourceTreeModel(QAbstractItemModel):
         self._invisible._children = []
         self._path_to_node.clear()
         self.endResetModel()
+        self._bump_structure_generation()
 
     def reset_root_payloads(self, payloads: List[Dict[str, Any]]) -> None:
         self.beginResetModel()
@@ -257,6 +285,7 @@ class SharePointSourceTreeModel(QAbstractItemModel):
         self._reindex(self._invisible)
         self.endResetModel()
         self._rebuild_path_index()
+        self._bump_structure_generation()
 
     def set_empty_library_message(self, text: str) -> None:
         payload = {
@@ -270,11 +299,43 @@ class SharePointSourceTreeModel(QAbstractItemModel):
         self._reindex(self._invisible)
         self.endResetModel()
         self._rebuild_path_index()
+        self._bump_structure_generation()
 
-    def replace_all_children(self, parent: QModelIndex, child_payloads: List[Dict[str, Any]]) -> None:
+    def replace_all_children(
+        self,
+        parent: QModelIndex,
+        child_payloads: List[Dict[str, Any]],
+        *,
+        log_context: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Remove existing rows under ``parent`` and insert new child nodes from payloads."""
+        ctx = dict(log_context) if log_context else {}
+        gen = self.structure_generation()
+        if not self.is_index_live(parent):
+            log_info(
+                "source_replace_children_invalid_index",
+                model_generation=gen,
+                child_count=len(child_payloads),
+                **{
+                    k: ctx[k]
+                    for k in ("worker_id", "drive_id", "item_id", "item_id_suffix", "parent_path_excerpt")
+                    if k in ctx
+                },
+            )
+            return
         parent_node = self._node(parent)
         if parent_node is None:
+            log_info(
+                "source_replace_children_skip_stale_parent",
+                reason="parent_node_none_after_liveness",
+                model_generation=gen,
+                child_count=len(child_payloads),
+                **{
+                    k: ctx[k]
+                    for k in ("worker_id", "drive_id", "item_id", "item_id_suffix", "parent_path_excerpt")
+                    if k in ctx
+                },
+            )
             return
         old_count = self.rowCount(parent)
         if old_count:
@@ -296,6 +357,18 @@ class SharePointSourceTreeModel(QAbstractItemModel):
             self._reindex(parent_node)
             self.endInsertRows()
             self._register_subtree_paths(parent_node._children[0])
+            self._bump_structure_generation()
+            log_info(
+                "source_replace_children_complete",
+                model_generation=self.structure_generation(),
+                child_count=1,
+                mode="empty_placeholder",
+                **{
+                    k: ctx[k]
+                    for k in ("worker_id", "drive_id", "item_id", "item_id_suffix", "parent_path_excerpt")
+                    if k in ctx
+                },
+            )
             return
         self.beginInsertRows(parent, 0, n - 1)
         new_children: List[_Node] = []
@@ -310,8 +383,22 @@ class SharePointSourceTreeModel(QAbstractItemModel):
         self.endInsertRows()
         for c in new_children:
             self._register_subtree_paths(c)
+        self._bump_structure_generation()
+        log_info(
+            "source_replace_children_complete",
+            model_generation=self.structure_generation(),
+            child_count=n,
+            mode="payloads",
+            **{
+                k: ctx[k]
+                for k in ("worker_id", "drive_id", "item_id", "item_id_suffix", "parent_path_excerpt")
+                if k in ctx
+            },
+        )
 
     def set_loading_children(self, parent: QModelIndex) -> None:
+        if not self.is_index_live(parent):
+            return
         parent_node = self._node(parent)
         if parent_node is None:
             return
@@ -332,6 +419,7 @@ class SharePointSourceTreeModel(QAbstractItemModel):
         parent_node._children = [_Node(parent_node, 0, load_pl, [])]
         self._reindex(parent_node)
         self.endInsertRows()
+        self._bump_structure_generation()
 
     def update_payload_for_index(self, index: QModelIndex, mutator) -> None:
         node = self._node(index)

@@ -7586,6 +7586,12 @@ class MainWindow(QMainWindow):
             "source_folder_parent_persistent": source_folder_parent_persistent,
             "destination_folder_parent_persistent": destination_folder_parent_persistent,
         }
+        if str(worker_key).startswith("source:") and getattr(self, "source_sharepoint_model", None) is not None:
+            entry["source_model_structure_generation_at_request"] = int(
+                self.source_sharepoint_model.structure_generation()
+            )
+        else:
+            entry["source_model_structure_generation_at_request"] = None
         self.folder_load_workers[worker_key] = entry
         self._log_worker_lifecycle("created", "folder", worker_id, worker_key)
         self._log_worker_lifecycle("registered_active", "folder", worker_id, worker_key)
@@ -18263,14 +18269,88 @@ class MainWindow(QMainWindow):
         if self._full_trace_enabled():
             self._ui_trace("tree", "expand_route", panel_key=panel_key, item=None, route=route)
 
-    def _apply_source_folder_load_model_tail(self, parent_index, items, previous_child_paths, panel_key):
+    def _apply_source_folder_load_model_tail(
+        self,
+        parent_index,
+        items,
+        previous_child_paths,
+        panel_key,
+        *,
+        worker_id=None,
+        expected_structure_generation=None,
+        drive_id="",
+        item_id="",
+    ):
         model = self.source_sharepoint_model
+        iid_s = str(item_id or "")
+        log_ctx_base = {
+            "worker_id": worker_id,
+            "drive_id": drive_id,
+            "item_id": item_id,
+            "item_id_suffix": iid_s[-16:] if len(iid_s) > 16 else iid_s,
+            "parent_path_excerpt": "",
+        }
+        nd0 = parent_index.data(Qt.UserRole) or {} if isinstance(parent_index, QModelIndex) and parent_index.isValid() else {}
+        log_ctx_base["parent_path_excerpt"] = str(nd0.get("item_path") or nd0.get("display_path") or "")[:220]
+
+        cur_gen = model.structure_generation()
+        if expected_structure_generation is not None and cur_gen != int(expected_structure_generation):
+            log_info(
+                "source_replace_children_generation_mismatch",
+                expected_generation=expected_structure_generation,
+                current_generation=cur_gen,
+                child_count=len(items or []),
+                **{
+                    k: log_ctx_base[k]
+                    for k in ("worker_id", "drive_id", "item_id", "item_id_suffix", "parent_path_excerpt")
+                    if log_ctx_base.get(k) not in (None, "")
+                },
+            )
+            return
+
+        if not isinstance(parent_index, QModelIndex) or not parent_index.isValid():
+            log_info(
+                "source_replace_children_invalid_index",
+                model_generation=cur_gen,
+                child_count=len(items or []),
+                **{
+                    k: log_ctx_base[k]
+                    for k in ("worker_id", "drive_id", "item_id", "item_id_suffix")
+                    if log_ctx_base.get(k) not in (None, "")
+                },
+            )
+            return
+        if not model.is_index_live(parent_index):
+            log_info(
+                "source_replace_children_skip_stale_parent",
+                reason="parent_not_live_before_replace",
+                model_generation=cur_gen,
+                child_count=len(items or []),
+                **{
+                    k: log_ctx_base[k]
+                    for k in ("worker_id", "drive_id", "item_id", "item_id_suffix", "parent_path_excerpt")
+                    if log_ctx_base.get(k) not in (None, "")
+                },
+            )
+            return
+
+        log_info(
+            "source_replace_children_start",
+            model_generation=cur_gen,
+            child_count=len(items or []),
+            **{
+                k: log_ctx_base[k]
+                for k in ("worker_id", "drive_id", "item_id", "item_id_suffix", "parent_path_excerpt")
+                if log_ctx_base.get(k) not in (None, "")
+            },
+        )
+
         child_payloads = []
         for child in sorted(items, key=lambda value: (not value.get("is_folder", False), value.get("name", "").lower())):
             pl = self._source_payload_from_graph_item(child)
             self._apply_tree_item_visual_state(None, pl)
             child_payloads.append(pl)
-        model.replace_all_children(parent_index, child_payloads)
+        model.replace_all_children(parent_index, child_payloads, log_context=log_ctx_base)
 
         def _mut_parent(p):
             p["children_loaded"] = True
@@ -26452,6 +26532,7 @@ class MainWindow(QMainWindow):
         visible_future_branch_count = self._incremental_merge_destination_future_projection(
             model,
             state.get("fast_paint_paths") or frozenset(),
+            merge_all_projected_roots=True,
         )
         applied_count = visible_future_branch_count
         self._log_restore_phase(
@@ -29322,8 +29403,16 @@ class MainWindow(QMainWindow):
         self._flush_pending_destination_library_root_if_any(flush_reason="after_sync_bind")
         return out
 
-    def _incremental_merge_destination_future_projection(self, model, fast_paths):
-        """Attach projected-allocation descendant subtrees without clearing the destination tree."""
+    def _incremental_merge_destination_future_projection(
+        self, model, fast_paths, *, merge_all_projected_roots: bool = False
+    ):
+        """Attach projected-allocation descendant subtrees without clearing the destination tree.
+
+        When ``merge_all_projected_roots`` is True (destination preview materialize), every incremental
+        merge entry root is scheduled: expansion state is not used to drop projected_descendant
+        branches. Attachment still runs in the existing parent-ordered loop with per-tick yields and
+        ``processEvents`` — no full-tree synchronous walk is added.
+        """
         tree = getattr(self, "destination_tree_widget", None)
         if tree is None:
             return 0
@@ -29358,15 +29447,22 @@ class MainWindow(QMainWindow):
         ui_state = self._capture_workspace_tree_state()
         destination_expanded_paths = set(ui_state.get("destination_expanded_paths", set()) or set())
         destination_selected_path = str(ui_state.get("destination_selected_path", "") or "")
-        nt = self._destination_bind_normalized_expanded_targets(destination_expanded_paths)
         merge_roots_before = len(entry_roots)
-        entry_roots = [p for p in entry_roots if self._destination_incremental_merge_root_needed_now(p, nt)]
-        if merge_roots_before != len(entry_roots):
+        if merge_all_projected_roots:
             self._log_restore_phase(
-                "destination_incremental_merge_entry_roots_filtered",
-                entry_roots_before=merge_roots_before,
-                entry_roots_after=len(entry_roots),
+                "destination_incremental_merge_entry_roots_all_projected",
+                entry_roots_count=len(entry_roots),
+                skip_expansion_gate=True,
             )
+        else:
+            nt = self._destination_bind_normalized_expanded_targets(destination_expanded_paths)
+            entry_roots = [p for p in entry_roots if self._destination_incremental_merge_root_needed_now(p, nt)]
+            if merge_roots_before != len(entry_roots):
+                self._log_restore_phase(
+                    "destination_incremental_merge_entry_roots_filtered",
+                    entry_roots_before=merge_roots_before,
+                    entry_roots_after=len(entry_roots),
+                )
 
         self._destination_incremental_merge_in_progress = True
         tree.blockSignals(True)
@@ -34851,11 +34947,40 @@ class MainWindow(QMainWindow):
 
             item = worker_state.get("item")
             if panel_key == "source" and self._source_tree_uses_model_view():
+                src_model = self.source_sharepoint_model
+                exp_gen = worker_state.get("source_model_structure_generation_at_request")
+                cur_gen = src_model.structure_generation()
+                if exp_gen is not None and int(cur_gen) != int(exp_gen):
+                    iid_s = str(item_id or "")
+                    log_info(
+                        "source_replace_children_generation_mismatch",
+                        worker_id=worker_id,
+                        worker_key=worker_key,
+                        drive_id=drive_id,
+                        item_id=item_id,
+                        item_id_suffix=iid_s[-16:] if len(iid_s) > 16 else iid_s,
+                        expected_generation=int(exp_gen),
+                        current_generation=int(cur_gen),
+                    )
+                    self._snapshot_branch_refresh_baseline_by_worker.pop(worker_key, None)
+                    self._destination_preserved_children_by_worker.pop(worker_key, None)
+                    return
                 pmi = worker_state.get("source_folder_parent_persistent")
                 parent_index = QModelIndex(pmi) if pmi is not None and pmi.isValid() else QModelIndex()
-                if not parent_index.isValid():
-                    parent_index = self.source_sharepoint_model.find_index_by_drive_item(drive_id, item_id)
-                if not parent_index.isValid():
+                if not parent_index.isValid() or not src_model.is_index_live(parent_index):
+                    parent_index = src_model.find_index_by_drive_item(drive_id, item_id)
+                if not parent_index.isValid() or not src_model.is_index_live(parent_index):
+                    iid_s = str(item_id or "")
+                    log_info(
+                        "source_replace_children_skip_stale_parent",
+                        reason="parent_index_invalid_or_not_live_after_resolve",
+                        worker_id=worker_id,
+                        worker_key=worker_key,
+                        drive_id=drive_id,
+                        item_id=item_id,
+                        item_id_suffix=iid_s[-16:] if len(iid_s) > 16 else iid_s,
+                        model_generation=int(cur_gen),
+                    )
                     self._snapshot_branch_refresh_baseline_by_worker.pop(worker_key, None)
                     self._destination_preserved_children_by_worker.pop(worker_key, None)
                     self._log_worker_lifecycle(
@@ -34877,7 +35002,16 @@ class MainWindow(QMainWindow):
                         skip_destination_child_replace=False,
                         preserved_destination_children=0,
                     )
-                self._apply_source_folder_load_model_tail(parent_index, items_list, previous_child_paths, panel_key)
+                self._apply_source_folder_load_model_tail(
+                    parent_index,
+                    items_list,
+                    previous_child_paths,
+                    panel_key,
+                    worker_id=worker_id,
+                    expected_structure_generation=exp_gen,
+                    drive_id=drive_id,
+                    item_id=item_id,
+                )
                 neg_src = getattr(self, "_source_path_lookup_negative", None)
                 if neg_src:
                     nd = parent_index.data(Qt.UserRole) or {}
@@ -35467,11 +35601,30 @@ class MainWindow(QMainWindow):
 
             item = worker_state.get("item")
             if panel_key == "source" and self._source_tree_uses_model_view():
+                src_model = self.source_sharepoint_model
+                exp_gen = worker_state.get("source_model_structure_generation_at_request")
+                cur_gen = src_model.structure_generation()
+                if exp_gen is not None and int(cur_gen) != int(exp_gen):
+                    iid_s = str(item_id or "")
+                    log_info(
+                        "source_replace_children_generation_mismatch",
+                        worker_id=worker_id,
+                        worker_key=worker_key,
+                        drive_id=drive_id,
+                        item_id=item_id,
+                        item_id_suffix=iid_s[-16:] if len(iid_s) > 16 else iid_s,
+                        expected_generation=int(exp_gen),
+                        current_generation=int(cur_gen),
+                        phase="folder_load_error",
+                    )
+                    self._snapshot_branch_refresh_baseline_by_worker.pop(worker_key, None)
+                    self._destination_preserved_children_by_worker.pop(worker_key, None)
+                    return
                 pmi = worker_state.get("source_folder_parent_persistent")
                 parent_index = QModelIndex(pmi) if pmi is not None and pmi.isValid() else QModelIndex()
-                if not parent_index.isValid():
-                    parent_index = self.source_sharepoint_model.find_index_by_drive_item(drive_id, item_id)
-                if not parent_index.isValid():
+                if not parent_index.isValid() or not src_model.is_index_live(parent_index):
+                    parent_index = src_model.find_index_by_drive_item(drive_id, item_id)
+                if not parent_index.isValid() or not src_model.is_index_live(parent_index):
                     self._snapshot_branch_refresh_baseline_by_worker.pop(worker_key, None)
                     self._destination_preserved_children_by_worker.pop(worker_key, None)
                     self._log_worker_lifecycle(
@@ -35485,7 +35638,23 @@ class MainWindow(QMainWindow):
                     "base_display_label": "Could not load folder contents.",
                     "tree_role": "source",
                 }
-                self.source_sharepoint_model.replace_all_children(parent_index, [err_pl])
+                iid_s = str(item_id or "")
+                ndp = parent_index.data(Qt.UserRole) or {}
+                err_log_ctx = {
+                    "worker_id": worker_id,
+                    "drive_id": drive_id,
+                    "item_id": item_id,
+                    "item_id_suffix": iid_s[-16:] if len(iid_s) > 16 else iid_s,
+                    "parent_path_excerpt": str(ndp.get("item_path") or ndp.get("display_path") or "")[:220],
+                }
+                log_info(
+                    "source_replace_children_start",
+                    model_generation=int(cur_gen),
+                    child_count=1,
+                    phase="folder_load_error_placeholder",
+                    **{k: v for k, v in err_log_ctx.items() if v not in (None, "")},
+                )
+                src_model.replace_all_children(parent_index, [err_pl], log_context=err_log_ctx)
 
                 def _mut_err(p):
                     p["children_loaded"] = False
