@@ -157,6 +157,7 @@ def planned_move_dict_for_expanded_file(
         "request_id": str(mapping_id),
         "source_path": str(source_path or ""),
         "destination_path": str(destination_path or ""),
+        "target_name": str(file_name or ""),
         "source_name": str(file_name or ""),
         "destination_name": str(file_name or ""),
         "allocation_method": str(allocation_method or ""),

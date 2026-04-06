@@ -2207,6 +2207,9 @@ class ConflictRowWidget(QWidget):
         self._insp_folder_line = ""
         self._insp_fix_line = ""
         self._inspector_failure_active = False
+        # Duplicate inspector presentation: planned_path | existing_file | both | source | ""
+        self.inspector_clash_kind: str = ""
+        self.inspector_peer_planned_pr: int | None = None
 
     def set_last_in_group(self, is_last: bool) -> None:
         self.separator_line.setVisible(not is_last)
@@ -17524,8 +17527,49 @@ class MainWindow(QMainWindow):
     def _unresolved_proposed_queue_size(self):
         return sum(len(entries) for entries in self.unresolved_proposed_by_parent_path.values())
 
+    def _allocation_destination_path_canonical_segments(self, move) -> list[str]:
+        """Segments of ``move['destination_path']`` after destination projection (backslash-separated)."""
+        if not isinstance(move, dict):
+            return []
+        raw = str(move.get("destination_path", "") or "").strip()
+        if not raw:
+            return []
+        canon = self._canonical_destination_projection_path(self.normalize_memory_path(raw)) or self.normalize_memory_path(
+            raw
+        )
+        return [s for s in str(canon).replace("/", "\\").split("\\") if s]
+
+    def _allocation_destination_path_includes_target_leaf(self, move) -> bool:
+        """True when ``destination_path`` already ends with the planned destination leaf (full-path shape).
+
+        Graph-expanded and some persisted rows store the complete destination file (or folder) path in
+        ``destination_path``. Legacy rows store the parent folder only and rely on ``target_name`` /
+        ``source_name`` for the leaf. Appending the leaf again would duplicate the segment and make
+        unrelated files share one projection key.
+        """
+        if not isinstance(move, dict):
+            return False
+        leaf = str(self._move_target_name(move) or "").strip()
+        if not leaf:
+            return False
+        segs = self._allocation_destination_path_canonical_segments(move)
+        return bool(segs) and segs[-1].strip().lower() == leaf.lower()
+
     def _allocation_parent_path(self, move):
-        return self._canonical_destination_projection_path(self.normalize_memory_path(move.get("destination_path", "")))
+        if not isinstance(move, dict):
+            return ""
+        raw = str(move.get("destination_path", "") or "").strip()
+        if not raw:
+            return ""
+        if self._allocation_destination_path_includes_target_leaf(move):
+            segs = self._allocation_destination_path_canonical_segments(move)
+            if len(segs) <= 1:
+                return ""
+            parent = "\\".join(segs[:-1])
+            return self._canonical_destination_projection_path(self.normalize_memory_path(parent)) or self.normalize_memory_path(
+                parent
+            )
+        return self._canonical_destination_projection_path(self.normalize_memory_path(raw)) or self.normalize_memory_path(raw)
 
     def _move_target_name(self, move):
         if not isinstance(move, dict):
@@ -17540,8 +17584,15 @@ class MainWindow(QMainWindow):
         return str(source_node.get("name", "") or "").strip()
 
     def _allocation_projection_path(self, move):
+        if not isinstance(move, dict):
+            return ""
+        raw = str(move.get("destination_path", "") or "").strip()
+        target_name = str(self._move_target_name(move) or "").strip()
+        if raw and target_name and self._allocation_destination_path_includes_target_leaf(move):
+            return self._canonical_destination_projection_path(self.normalize_memory_path(raw)) or self.normalize_memory_path(
+                raw
+            )
         parent_path = self._allocation_parent_path(move)
-        target_name = self._move_target_name(move)
         if not parent_path or not target_name:
             return self._canonical_destination_projection_path(self.normalize_memory_path(parent_path or target_name))
         return self._canonical_destination_projection_path(self.normalize_memory_path(f"{parent_path}\\{target_name}"))
@@ -22000,6 +22051,54 @@ class MainWindow(QMainWindow):
             or self.normalize_memory_path(str(target_path or "").strip())
         )
 
+    def _inspector_destination_node_data_at_exact_path(self, canonical_path: str) -> dict | None:
+        """Read-only: node payload at an exact canonical destination path, or None if not uniquely visible."""
+        normalized_target = self._canonical_destination_projection_path(canonical_path) or self.normalize_memory_path(
+            str(canonical_path or "").strip()
+        )
+        if not normalized_target:
+            return None
+        if self._destination_tree_uses_model_view():
+            model = getattr(self, "destination_planning_model", None)
+            if model is None:
+                return None
+            candidate_ixs = model.find_indices_for_canonical_destination_path(normalized_target)
+            if not candidate_ixs:
+                return None
+            selected = self._select_canonical_destination_item(candidate_ixs, prefer=None)
+            if selected is None or not selected.isValid():
+                return None
+            nd = selected.data(Qt.UserRole) or {}
+            visible_path = self._tree_item_path(nd)
+            if not visible_path:
+                return None
+            match_details = self._destination_parent_match_details(canonical_path, visible_path)
+            if not match_details["exact_match"]:
+                return None
+            return nd if isinstance(nd, dict) else None
+        tree = getattr(self, "destination_tree_widget", None)
+        if tree is None:
+            return None
+        for index in range(tree.topLevelItemCount()):
+            for item in self._iter_tree_items(tree.topLevelItem(index)):
+                node_data = item.data(0, Qt.UserRole) or {}
+                if node_data.get("placeholder"):
+                    continue
+                visible_path = self._tree_item_path(node_data)
+                if not visible_path:
+                    continue
+                match_details = self._destination_parent_match_details(canonical_path, visible_path)
+                if match_details["exact_match"]:
+                    return node_data if isinstance(node_data, dict) else None
+        return None
+
+    def _inspector_existing_real_file_at_destination_path(self, canonical_path: str) -> bool:
+        """True when a non-folder tree node at this path is loaded and treated as real (not projected/planned shell)."""
+        nd = self._inspector_destination_node_data_at_exact_path(canonical_path)
+        if not nd or nd.get("placeholder") or nd.get("is_folder"):
+            return False
+        return self._destination_node_state(nd) == "real"
+
     def _inspector_destination_selection_matches_canonical(self, expected_canon_path: str) -> bool:
         """True when the destination tree's current row matches ``expected_canon_path`` (normalized full path)."""
         exp_raw = self._canonical_destination_projection_path(expected_canon_path) or self.normalize_memory_path(
@@ -22100,6 +22199,32 @@ class MainWindow(QMainWindow):
                 on_banner_info(success_banner)
             return
         _fail()
+
+    def _inspector_navigate_existing_destination_file_for_step(
+        self,
+        st: dict,
+        *,
+        on_banner_fail: Any | None = None,
+        on_banner_info: Any | None = None,
+    ) -> None:
+        """Destination tree: select the existing library file at the step path (only when a real node is visible)."""
+        if not isinstance(st, dict):
+            return
+        canon = self._inspector_resolve_step_destination_file_path(st)
+        if not canon or not self._inspector_existing_real_file_at_destination_path(canon):
+            if on_banner_fail is not None:
+                on_banner_fail(
+                    "No existing destination file is visible at this exact path in the tree — "
+                    "expand folders or refresh, or use Show other planned row if this is only a plan overlap."
+                )
+            return
+        self._inspector_navigate_destination_for_step(
+            st,
+            mode="file",
+            on_banner_fail=on_banner_fail,
+            success_banner="Showing existing destination file at this path",
+            on_banner_info=on_banner_info,
+        )
 
     def _inspector_go_to_destination_from_step(
         self,
@@ -22258,10 +22383,13 @@ class MainWindow(QMainWindow):
         hint.setWordWrap(True)
 
         sel_step_holder: dict = {"step": None}
-        show_conflict_btn = QPushButton("Show conflict")
-        show_conflict_btn.setToolTip(
-            "In the destination tree, expand and select the conflicting destination item "
-            "(the file row at the collision path)."
+        show_other_planned_btn = QPushButton("Show other planned row")
+        show_other_planned_btn.setToolTip(
+            "Select another planned move in this duplicate group and open its row in Planned Moves."
+        )
+        show_existing_file_btn = QPushButton("Show existing file")
+        show_existing_file_btn.setToolTip(
+            "In the destination tree, select the existing library file at this exact path (when visible)."
         )
         show_dest_folder_btn = QPushButton("Show target folder")
         show_dest_folder_btn.setToolTip(
@@ -22276,7 +22404,8 @@ class MainWindow(QMainWindow):
             "Open the planning duplicate destination hub (same as the Planned Moves banner)."
         )
         for b in (
-            show_conflict_btn,
+            show_other_planned_btn,
+            show_existing_file_btn,
             show_dest_folder_btn,
             go_parent_btn,
             remove_btn,
@@ -22295,7 +22424,10 @@ class MainWindow(QMainWindow):
             if rw is None:
                 sel_step_holder["step"] = None
                 hint.setText("")
-                show_conflict_btn.setEnabled(False)
+                show_other_planned_btn.setVisible(False)
+                show_existing_file_btn.setVisible(False)
+                show_other_planned_btn.setEnabled(False)
+                show_existing_file_btn.setEnabled(False)
                 show_dest_folder_btn.setEnabled(False)
                 go_parent_btn.setEnabled(False)
                 remove_btn.setEnabled(False)
@@ -22306,7 +22438,10 @@ class MainWindow(QMainWindow):
             sel_step_holder["step"] = st
             if not st:
                 hint.setText("")
-                show_conflict_btn.setEnabled(False)
+                show_other_planned_btn.setVisible(False)
+                show_existing_file_btn.setVisible(False)
+                show_other_planned_btn.setEnabled(False)
+                show_existing_file_btn.setEnabled(False)
                 show_dest_folder_btn.setEnabled(False)
                 go_parent_btn.setEnabled(False)
                 remove_btn.setEnabled(False)
@@ -22324,7 +22459,36 @@ class MainWindow(QMainWindow):
             parent_fp = self._destination_parent_path(canon_fp) if canon_fp else ""
             has_folder_nav = bool(str(parent_fp or "").strip())
 
-            show_conflict_btn.setEnabled(bool(cap["can_go"] and has_file_nav))
+            is_dest = rw.group_kind == "dest"
+            ck = str(getattr(rw, "inspector_clash_kind", "") or "")
+            peer_pr = getattr(rw, "inspector_peer_planned_pr", None)
+            has_real_existing = bool(
+                canon_fp and self._inspector_existing_real_file_at_destination_path(canon_fp)
+            )
+
+            show_other_planned_btn.setVisible(is_dest and ck in ("planned_path", "both"))
+            show_other_planned_btn.setEnabled(
+                bool(is_dest and ck in ("planned_path", "both") and peer_pr is not None and cap["can_go"])
+            )
+            show_existing_file_btn.setVisible(is_dest and ck in ("existing_file", "both"))
+            show_existing_file_btn.setEnabled(
+                bool(
+                    is_dest
+                    and ck in ("existing_file", "both")
+                    and cap["can_go"]
+                    and has_file_nav
+                    and has_real_existing
+                )
+            )
+            if is_dest and ck in ("existing_file", "both") and not has_real_existing:
+                show_existing_file_btn.setToolTip(
+                    "No existing library file is visible at this exact path yet — expand the destination tree or refresh."
+                )
+            else:
+                show_existing_file_btn.setToolTip(
+                    "In the destination tree, select the existing library file at this exact path (when visible)."
+                )
+
             show_dest_folder_btn.setEnabled(bool(cap["can_go"] and has_folder_nav))
 
             go_parent_btn.setEnabled(cap["can_go_parent"])
@@ -22362,8 +22526,8 @@ class MainWindow(QMainWindow):
                 hint.setText("Draft planned mapping — mutation actions use the same flows as Duplicate destination files.")
             else:
                 hint.setText(
-                    "This transfer step does not match a current Planned Moves row; use Show conflict / "
-                    "Show target folder on the right, or adjust the draft, then retry the run."
+                    "This transfer step does not match a current Planned Moves row; use Show target folder on the right "
+                    "or adjust the draft, then retry the run."
                 )
 
         inspector_retarget_tree_hooks: list[tuple[Any, Any]] = []
@@ -22587,7 +22751,8 @@ class MainWindow(QMainWindow):
                 sel_step_holder["step"] = None
                 hint.setText("")
                 for b in (
-                    show_conflict_btn,
+                    show_other_planned_btn,
+                    show_existing_file_btn,
                     show_dest_folder_btn,
                     go_parent_btn,
                     remove_btn,
@@ -22600,7 +22765,8 @@ class MainWindow(QMainWindow):
             sel_step_holder["step"] = None
             hint.setText("")
             for b in (
-                show_conflict_btn,
+                show_other_planned_btn,
+                show_existing_file_btn,
                 show_dest_folder_btn,
                 go_parent_btn,
                 remove_btn,
@@ -22928,10 +23094,17 @@ class MainWindow(QMainWindow):
                 has_file_ctx = bool(canon_ctx)
                 has_folder_ctx = bool(str(parent_ctx or "").strip())
                 nav_ok = bool(cap["can_go"])
+                rw_ck = str(getattr(rw, "inspector_clash_kind", "") or "")
+                rw_peer = getattr(rw, "inspector_peer_planned_pr", None)
+                is_dest = kind == "dest"
+                has_real_ctx = bool(
+                    canon_ctx and self._inspector_existing_real_file_at_destination_path(canon_ctx)
+                )
                 menu = QMenu(rw)
                 if kind == "dest":
                     m_manual = menu.addMenu("Manual edits")
-                    a_sc = m_manual.addAction("Show conflict")
+                    a_op = m_manual.addAction("Show other planned row")
+                    a_sef = m_manual.addAction("Show existing file")
                     a_sf = m_manual.addAction("Show target folder")
                     a_par = m_manual.addAction("Go to parent folder mapping")
                     a_dup = m_manual.addAction("Open duplicate file review…")
@@ -22940,7 +23113,8 @@ class MainWindow(QMainWindow):
                     a_rn = m_manual.addAction("Rename planned destination file…")
                     a_rt = m_manual.addAction("Retarget planned destination…")
                 else:
-                    a_sc = menu.addAction("Show conflict")
+                    a_op = menu.addAction("Show other planned row")
+                    a_sef = menu.addAction("Show existing file")
                     a_sf = menu.addAction("Show target folder")
                     a_par = menu.addAction("Go to parent folder mapping")
                     a_dup = menu.addAction("Open duplicate file review…")
@@ -22948,9 +23122,19 @@ class MainWindow(QMainWindow):
                     a_rm = menu.addAction("Remove mapping from plan")
                     a_rn = menu.addAction("Rename planned destination file…")
                     a_rt = menu.addAction("Retarget planned destination…")
-                a_sc.setVisible(nav_ok and has_file_ctx)
+                a_op.setVisible(is_dest and rw_ck in ("planned_path", "both"))
+                a_op.setEnabled(bool(is_dest and rw_ck in ("planned_path", "both") and nav_ok and rw_peer is not None))
+                a_sef.setVisible(is_dest and rw_ck in ("existing_file", "both"))
+                a_sef.setEnabled(
+                    bool(
+                        is_dest
+                        and rw_ck in ("existing_file", "both")
+                        and nav_ok
+                        and has_file_ctx
+                        and has_real_ctx
+                    )
+                )
                 a_sf.setVisible(nav_ok and has_folder_ctx)
-                a_sc.setEnabled(nav_ok and has_file_ctx)
                 a_sf.setEnabled(nav_ok and has_folder_ctx)
                 a_par.setEnabled(cap["can_go_parent"])
                 if cap["is_rec"]:
@@ -22974,12 +23158,21 @@ class MainWindow(QMainWindow):
                     menu.addSeparator()
                     a_all_suffix = menu.addAction("Auto-fix all")
                 picked = menu.exec(rw.mapToGlobal(pos))
-                if picked == a_sc and nav_ok and has_file_ctx:
-                    self._inspector_navigate_destination_for_step(
+                if picked == a_op and is_dest and rw_ck in ("planned_path", "both") and nav_ok and rw_peer is not None:
+                    otr = int(rw_peer)
+                    for orw in inspector_conflict_rows:
+                        if orw.planned_row_index is not None and int(orw.planned_row_index) == otr:
+                            _deselect_other_rows(orw)
+                            orw.set_selected(True)
+                            sync_from_conflict_row(orw)
+                            scroll.ensureWidgetVisible(orw)
+                            break
+                    self._inspector_focus_planned_moves_row(otr)
+                    _set_inspector_banner("Showing the other planned row for this duplicate group.", "info")
+                elif picked == a_sef and is_dest and rw_ck in ("existing_file", "both") and nav_ok and has_real_ctx:
+                    self._inspector_navigate_existing_destination_file_for_step(
                         st,
-                        mode="file",
                         on_banner_fail=lambda m: _set_inspector_banner(m, "warning"),
-                        success_banner="Showing conflicting destination item",
                         on_banner_info=lambda t: _set_inspector_banner(t, "info"),
                     )
                     sync_from_conflict_row(rw)
@@ -23318,7 +23511,10 @@ class MainWindow(QMainWindow):
                             and pidx is not None
                         )
 
+                        rw.inspector_clash_kind = ""
+                        rw.inspector_peer_planned_pr = None
                         if kind == "source":
+                            rw.inspector_clash_kind = "source"
                             prob = "Same source file is planned to more than one destination."
                             conf_line = (
                                 f"Conflict: this source maps to multiple destination paths "
@@ -23331,7 +23527,26 @@ class MainWindow(QMainWindow):
                                 f"Step {idx} · {prov} · In run subset: {in_sub}"
                             )
                         else:
-                            prob = "Duplicate destination file name in this group."
+                            peer_pr: int | None = None
+                            if pidx is not None:
+                                for q in pr_row_indices:
+                                    if int(q) != int(pidx):
+                                        peer_pr = int(q)
+                                        break
+                            elif pr_row_indices:
+                                peer_pr = int(pr_row_indices[0])
+                            has_peer = len(pr_row_indices) >= 2
+                            has_existing = bool(
+                                canon_fp and self._inspector_existing_real_file_at_destination_path(canon_fp)
+                            )
+                            if has_peer and has_existing:
+                                rw.inspector_clash_kind = "both"
+                            elif has_existing:
+                                rw.inspector_clash_kind = "existing_file"
+                            else:
+                                rw.inspector_clash_kind = "planned_path"
+                            rw.inspector_peer_planned_pr = peer_pr
+
                             dk_raw = transfer_step_file_destination_key(st) or ""
                             path_for_msg = (
                                 self._canonical_destination_projection_path(str(dk_raw).strip())
@@ -23339,23 +23554,63 @@ class MainWindow(QMainWindow):
                                 or canon_fp
                             )
                             file_path_disp = _elide_middle(path_for_msg, 96) if path_for_msg else "—"
-                            conf_line = (
-                                f'Conflict: "{dest_leaf}" — same full planned destination file path as another row '
-                                f"(exact path match only): {file_path_disp}"
-                            )
 
-                        if sug:
+                            if rw.inspector_clash_kind == "planned_path":
+                                prob = "Planned destination path overlap."
+                                conf_line = (
+                                    "Another planned move targets this same final destination path.\n"
+                                    f"Target path: {file_path_disp}"
+                                )
+                            elif rw.inspector_clash_kind == "existing_file":
+                                prob = "Existing destination file."
+                                conf_line = (
+                                    "A file already exists at this exact destination path.\n"
+                                    f"Existing file path: {file_path_disp}"
+                                )
+                            else:
+                                prob = "Planned overlap and existing destination file."
+                                conf_line = (
+                                    "This target path is already used by another planned row and also exists "
+                                    f"in the destination.\nTarget path: {file_path_disp}"
+                                )
+
+                        if kind == "source" or not dest_p.strip():
+                            if sug:
+                                fix_line = f'Fix: Rename incoming file to "{sug}"'
+                            elif can_suffix and cap.get("can_rename"):
+                                fix_line = (
+                                    "Fix: Use Rename… (planner can suggest a unique name in this group)."
+                                )
+                            elif cap.get("can_rename") and pidx is not None:
+                                fix_line = "Fix: Use Rename… to change the planned destination file name."
+                            else:
+                                fix_line = (
+                                    "Fix: Use Retarget…, Remove, or duplicate review where available."
+                                )
+                        elif sug:
                             fix_line = f'Fix: Rename incoming file to "{sug}"'
-                        elif can_suffix and cap.get("can_rename"):
-                            fix_line = (
-                                "Fix: Use Rename… (planner can suggest a unique name in this group)."
-                            )
-                        elif cap.get("can_rename") and pidx is not None:
-                            fix_line = "Fix: Use Rename… to change the planned destination file name."
+                        elif rw.inspector_clash_kind == "planned_path":
+                            if can_suffix and cap.get("can_rename"):
+                                fix_line = (
+                                    "Fix: Rename or retarget one of the planned rows — or use Rename… for a "
+                                    "planner suggestion."
+                                )
+                            else:
+                                fix_line = "Fix: Rename or retarget one of the planned rows."
+                        elif rw.inspector_clash_kind == "existing_file":
+                            if can_suffix and cap.get("can_rename"):
+                                fix_line = (
+                                    "Fix: Rename the incoming file or retarget it — or use Rename… for a suggestion."
+                                )
+                            else:
+                                fix_line = "Fix: Rename the incoming file or retarget it."
                         else:
-                            fix_line = (
-                                "Fix: Use Retarget…, Remove, or duplicate review where available."
-                            )
+                            if can_suffix and cap.get("can_rename"):
+                                fix_line = (
+                                    "Fix: Adjust planned rows or the incoming mapping (Rename… / Retarget… / Remove)."
+                                )
+                            else:
+                                fix_line = "Fix: Rename or retarget planned rows, or rename / retarget this mapping."
 
                         folder_line = f"Target folder: {folder_display}"
                         meta_line = f"Step {idx} · {prov} · In run subset: {in_sub}"
@@ -23370,9 +23625,17 @@ class MainWindow(QMainWindow):
                             fix_line=fix_line,
                         )
 
-                        rw.row_state_badge.setText(
-                            "Dest. clash" if kind == "dest" else "Source clash"
-                        )
+                        if kind == "source":
+                            badge = "Source clash"
+                        elif not dest_p.strip():
+                            badge = "Dest. clash"
+                        elif rw.inspector_clash_kind == "both":
+                            badge = "Plan + exists"
+                        elif rw.inspector_clash_kind == "existing_file":
+                            badge = "Exists"
+                        else:
+                            badge = "Planned dup"
+                        rw.row_state_badge.setText(badge)
                         if cap.get("can_rename") and sug and len(sug) < 32:
                             rw.rename_btn.setText(f'Rename to "{sug}"')
                         else:
@@ -23427,11 +23690,35 @@ class MainWindow(QMainWindow):
                         has_file_m = bool(canon_m)
                         has_folder_m = bool(str(parent_m or "").strip())
                         nav_ok_m = bool(cap["can_go"])
-                        a_sc = more_m.addAction("Show conflict")
+                        rw_ck_m = str(getattr(rw, "inspector_clash_kind", "") or "")
+                        rw_peer_m = getattr(rw, "inspector_peer_planned_pr", None)
+                        is_dest_m = kind == "dest"
+                        has_real_m = bool(
+                            canon_m and self._inspector_existing_real_file_at_destination_path(canon_m)
+                        )
+                        a_op_m = more_m.addAction("Show other planned row")
+                        a_sef_m = more_m.addAction("Show existing file")
                         a_sf = more_m.addAction("Show target folder")
-                        a_sc.setVisible(nav_ok_m and has_file_m)
+                        a_op_m.setVisible(is_dest_m and rw_ck_m in ("planned_path", "both"))
+                        a_op_m.setEnabled(
+                            bool(
+                                is_dest_m
+                                and rw_ck_m in ("planned_path", "both")
+                                and nav_ok_m
+                                and rw_peer_m is not None
+                            )
+                        )
+                        a_sef_m.setVisible(is_dest_m and rw_ck_m in ("existing_file", "both"))
+                        a_sef_m.setEnabled(
+                            bool(
+                                is_dest_m
+                                and rw_ck_m in ("existing_file", "both")
+                                and nav_ok_m
+                                and has_file_m
+                                and has_real_m
+                            )
+                        )
                         a_sf.setVisible(nav_ok_m and has_folder_m)
-                        a_sc.setEnabled(nav_ok_m and has_file_m)
                         a_sf.setEnabled(nav_ok_m and has_folder_m)
                         a_par = more_m.addAction("Go to parent folder mapping")
                         a_dup = more_m.addAction("Open duplicate file review…")
@@ -23467,20 +23754,35 @@ class MainWindow(QMainWindow):
                                 else None
                             ),
                         )
-                        _bind_more(
-                            a_sc,
-                            lambda rww: (
-                                self._inspector_navigate_destination_for_step(
-                                    rww.transfer_step,
-                                    mode="file",
+                        def _more_focus_peer_row(rww: ConflictRowWidget) -> None:
+                            pr_peer = getattr(rww, "inspector_peer_planned_pr", None)
+                            if pr_peer is None:
+                                return
+                            ppi = int(pr_peer)
+                            for orw in inspector_conflict_rows:
+                                if orw.planned_row_index is not None and int(orw.planned_row_index) == ppi:
+                                    _deselect_other_rows(orw)
+                                    orw.set_selected(True)
+                                    sync_from_conflict_row(orw)
+                                    scroll.ensureWidgetVisible(orw)
+                                    break
+                            self._inspector_focus_planned_moves_row(ppi)
+                            _set_inspector_banner(
+                                "Showing the other planned row for this duplicate group.",
+                                "info",
+                            )
+
+                        def _more_show_existing_file(rww: ConflictRowWidget) -> None:
+                            stx = rww.transfer_step
+                            if isinstance(stx, dict):
+                                self._inspector_navigate_existing_destination_file_for_step(
+                                    stx,
                                     on_banner_fail=lambda m: _set_inspector_banner(m, "warning"),
-                                    success_banner="Showing conflicting destination item",
                                     on_banner_info=lambda t: _set_inspector_banner(t, "info"),
                                 )
-                                if isinstance(rww.transfer_step, dict)
-                                else None
-                            ),
-                        )
+
+                        _bind_more(a_op_m, lambda rww: _more_focus_peer_row(rww))
+                        _bind_more(a_sef_m, lambda rww: _more_show_existing_file(rww))
                         _bind_more(
                             a_sf,
                             lambda rww: (
@@ -23566,14 +23868,32 @@ class MainWindow(QMainWindow):
                 first_rw.set_selected(True)
                 sync_from_conflict_row(first_rw)
 
-        def on_show_conflict() -> None:
+        def on_show_other_planned() -> None:
+            rw = sel_row_widget.get("rw")
+            if not isinstance(rw, ConflictRowWidget):
+                _set_inspector_banner("Select a row in the duplicate list first.", "warning")
+                return
+            pr_peer = getattr(rw, "inspector_peer_planned_pr", None)
+            if pr_peer is None:
+                _set_inspector_banner("No other planned row is linked for this duplicate group.", "warning")
+                return
+            ppi = int(pr_peer)
+            for orw in inspector_conflict_rows:
+                if orw.planned_row_index is not None and int(orw.planned_row_index) == ppi:
+                    _deselect_other_rows(orw)
+                    orw.set_selected(True)
+                    sync_from_conflict_row(orw)
+                    scroll.ensureWidgetVisible(orw)
+                    break
+            self._inspector_focus_planned_moves_row(ppi)
+            _set_inspector_banner("Showing the other planned row for this duplicate group.", "info")
+
+        def on_show_existing_file() -> None:
             st = sel_step_holder["step"]
             if isinstance(st, dict):
-                self._inspector_navigate_destination_for_step(
+                self._inspector_navigate_existing_destination_file_for_step(
                     st,
-                    mode="file",
                     on_banner_fail=lambda m: _set_inspector_banner(m, "warning"),
-                    success_banner="Showing conflicting destination item",
                     on_banner_info=lambda t: _set_inspector_banner(t, "info"),
                 )
 
@@ -23771,7 +24091,8 @@ class MainWindow(QMainWindow):
                     banner_flavor="success",
                 )
 
-        show_conflict_btn.clicked.connect(on_show_conflict)
+        show_other_planned_btn.clicked.connect(on_show_other_planned)
+        show_existing_file_btn.clicked.connect(on_show_existing_file)
         show_dest_folder_btn.clicked.connect(on_show_dest_folder)
         go_parent_btn.clicked.connect(on_go_parent)
         dup_review_btn.clicked.connect(on_dup_review)
@@ -23783,7 +24104,8 @@ class MainWindow(QMainWindow):
         av = QVBoxLayout(actions)
         av.setContentsMargins(0, 0, 0, 0)
         row1 = QHBoxLayout()
-        row1.addWidget(show_conflict_btn)
+        row1.addWidget(show_other_planned_btn)
+        row1.addWidget(show_existing_file_btn)
         row1.addWidget(show_dest_folder_btn)
         row1.addWidget(go_parent_btn)
         row1.addWidget(dup_review_btn)
