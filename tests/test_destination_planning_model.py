@@ -56,6 +56,26 @@ def test_destination_model_replace_children_and_clear():
     assert model.rowCount(QModelIndex()) == 0
 
 
+def test_rowcount_safe_when_internal_pointer_not_node():
+    """Regression: stale/corrupt indexes must not assume internalPointer is _Node (avoids list._children)."""
+    model = DestinationPlanningTreeModel()
+    model.reset_root_payloads(
+        [
+            {
+                "base_display_label": "Folder: R",
+                "name": "R",
+                "is_folder": True,
+                "item_path": "R",
+            }
+        ]
+    )
+    root_ix = model.index(0, 0, QModelIndex())
+    folder_node = root_ix.internalPointer()
+    folder_node._children = [[]]
+    assert model.rowCount(root_ix) == 1
+    assert model.index(0, 0, root_ix).isValid() is False
+
+
 def test_append_child_payloads_invalid_parent_is_top_level():
     model = DestinationPlanningTreeModel()
     model.append_child_payloads(

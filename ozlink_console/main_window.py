@@ -20392,6 +20392,15 @@ class MainWindow(QMainWindow):
         model = getattr(self, "destination_planning_model", None)
         if model is None or not parent_ix.isValid():
             return 0
+        if hasattr(model, "is_index_live") and not model.is_index_live(parent_ix):
+            log_info(
+                "destination_child_lookup_invalid_parent_index",
+                reason="allocation_apply_parent_not_live",
+                parent_path_hint=self._canonical_destination_projection_path(
+                    self._tree_item_path(parent_ix.data(Qt.UserRole) or {})
+                ),
+            )
+            return 0
         parent_data = parent_ix.data(Qt.UserRole) or {}
         allocation_destination_path = self._canonical_destination_projection_path(
             self._tree_item_path(parent_data) or self._allocation_projection_path(move)
@@ -31091,6 +31100,8 @@ class MainWindow(QMainWindow):
         model = getattr(self, "destination_planning_model", None)
         if model is None:
             return {}
+        if parent_ix.isValid() and hasattr(model, "is_index_live") and not model.is_index_live(parent_ix):
+            return {}
         parent = parent_ix if parent_ix.isValid() else QModelIndex()
         out = {}
         for r in range(model.rowCount(parent)):
@@ -31236,6 +31247,13 @@ class MainWindow(QMainWindow):
         normalized_target = self._canonical_destination_projection_path(destination_path) or self.normalize_memory_path(
             destination_path
         )
+        if dm is not None and parent_ix.isValid() and hasattr(dm, "is_index_live") and not dm.is_index_live(parent_ix):
+            log_info(
+                "destination_child_lookup_invalid_parent_index",
+                reason="cached_lookup_parent_not_live",
+                destination_path_hint=normalized_target,
+            )
+            return None
         ck = self._destination_child_map_cache_key_index(parent_ix)
         sub = cache.get(ck)
         if sub is None:
@@ -31243,11 +31261,38 @@ class MainWindow(QMainWindow):
             cache[ck] = sub
         hit = sub.get(normalized_target) if normalized_target else None
         if hit is not None:
-            try:
-                if hit.isValid() and dm is not None and hit.model() is dm:
-                    return hit
-            except RuntimeError:
-                pass
+            if not isinstance(hit, QModelIndex):
+                log_info(
+                    "destination_child_lookup_cache_bad_entry",
+                    reason="wrong_type",
+                    got_type=type(hit).__name__,
+                    cache_key=ck,
+                    destination_path_hint=normalized_target,
+                )
+                if isinstance(sub, dict):
+                    sub.pop(normalized_target, None)
+                hit = None
+            else:
+                try:
+                    if (
+                        hit.isValid()
+                        and dm is not None
+                        and hit.model() is dm
+                        and hasattr(dm, "is_index_live")
+                        and dm.is_index_live(hit)
+                    ):
+                        return hit
+                except RuntimeError:
+                    pass
+                log_info(
+                    "destination_child_lookup_cache_bad_entry",
+                    reason="stale_or_invalid_hit",
+                    cache_key=ck,
+                    destination_path_hint=normalized_target,
+                )
+                if isinstance(sub, dict):
+                    sub.pop(normalized_target, None)
+                hit = None
         found = self._find_destination_child_by_path(parent_ix, destination_path)
         if found is not None and normalized_target and isinstance(cache.get(ck), dict):
             cache[ck][normalized_target] = found
@@ -31287,6 +31332,8 @@ class MainWindow(QMainWindow):
         if isinstance(parent_item, QModelIndex):
             model = getattr(self, "destination_planning_model", None)
             if model is None:
+                return None
+            if hasattr(model, "is_index_live") and parent_item.isValid() and not model.is_index_live(parent_item):
                 return None
             for r in range(model.rowCount(parent_item)):
                 ix = model.index(r, 0, parent_item)
@@ -31341,6 +31388,13 @@ class MainWindow(QMainWindow):
             matches = []
             model = getattr(self, "destination_planning_model", None)
             if model is None:
+                return None
+            if hasattr(model, "is_index_live") and parent_item.isValid() and not model.is_index_live(parent_item):
+                log_info(
+                    "destination_child_lookup_invalid_parent_index",
+                    reason="row_scan_parent_not_live",
+                    destination_path_hint=normalized_target,
+                )
                 return None
             for r in range(model.rowCount(parent_item)):
                 ix = model.index(r, 0, parent_item)
@@ -34441,6 +34495,14 @@ class MainWindow(QMainWindow):
         if isinstance(item, QModelIndex):
             if tree is None or not item.isValid() or not tree.isExpanded(item):
                 return
+            dm = getattr(self, "destination_planning_model", None)
+            if dm is not None and hasattr(dm, "is_index_live") and not dm.is_index_live(item):
+                log_info(
+                    "destination_deferred_projected_descendants_skip_stale",
+                    item_path=path,
+                    reason="index_not_live_after_defer",
+                )
+                return
             self._load_destination_projected_descendants_index(item)
             return
         if not item.isExpanded():
@@ -34451,6 +34513,13 @@ class MainWindow(QMainWindow):
         dmodel = getattr(self, "destination_planning_model", None)
         tree = getattr(self, "destination_tree_widget", None)
         if dmodel is None or not ix.isValid():
+            return
+        if hasattr(dmodel, "is_index_live") and not dmodel.is_index_live(ix):
+            log_info(
+                "destination_deferred_projected_descendants_skip_stale",
+                reason="load_entry_index_not_live",
+                item_path=self._tree_item_path(dict(ix.data(Qt.UserRole) or {})),
+            )
             return
         node_data = dict(ix.data(Qt.UserRole) or {})
         if self._full_trace_enabled():

@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from PySide6.QtCore import QAbstractItemModel, QModelIndex, Qt, Signal
 from PySide6.QtGui import QBrush
 
+from ozlink_console.logger import log_info
 from ozlink_console.tree_models.explorer_columns import (
     EXPLORER_COLUMN_COUNT,
     EXPLORER_COLUMN_LABELS,
@@ -61,10 +62,27 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         self._destination_index_key_fn = destination_index_key_fn
         self._path_to_nodes: Dict[str, List[_Node]] = {}
         self._structure_generation: int = 0
+        self._invalid_internal_pointer_logged_gen: int = -1
 
     def _notify_structure_changed(self) -> None:
         self._structure_generation += 1
         self.destination_structure_changed.emit()
+
+    def _log_invalid_internal_pointer_once(self, *, context: str, ptr: Any) -> None:
+        gen = int(self._structure_generation)
+        if self._invalid_internal_pointer_logged_gen == gen:
+            return
+        self._invalid_internal_pointer_logged_gen = gen
+        try:
+            tname = type(ptr).__name__
+        except Exception:
+            tname = "unknown"
+        log_info(
+            "destination_invalid_internal_pointer_type",
+            context=context,
+            model_generation=gen,
+            pointer_type=tname,
+        )
 
     def structure_generation(self) -> int:
         return int(self._structure_generation)
@@ -91,7 +109,13 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
     def _node(self, index: QModelIndex) -> Optional[_Node]:
         if not index.isValid():
             return None
-        return index.internalPointer()
+        p = index.internalPointer()
+        if p is None:
+            return None
+        if not isinstance(p, _Node):
+            self._log_invalid_internal_pointer_once(context="index_internal_pointer", ptr=p)
+            return None
+        return p
 
     def index(self, row: int, column: int, parent: QModelIndex) -> QModelIndex:
         if column < 0 or column >= EXPLORER_COLUMN_COUNT or row < 0:
@@ -105,7 +129,11 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         ch = parent_node._children
         if row >= len(ch):
             return QModelIndex()
-        return self.createIndex(row, column, ch[row])
+        el = ch[row]
+        if not isinstance(el, _Node):
+            self._log_invalid_internal_pointer_once(context="child_slot_not_node", ptr=el)
+            return QModelIndex()
+        return self.createIndex(row, column, el)
 
     def parent(self, index: QModelIndex) -> QModelIndex:
         if not index.isValid():
