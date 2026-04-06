@@ -12,6 +12,9 @@ from typing import Any
 from .logger import log_info, log_trace, log_warn
 from .version_info import APP_VERSION
 from .models import AllocationRow, ProposedFolder, SessionState, MemoryManifest
+
+# Optional sidecar written with exports / full workspace saves; older bundles omit this file.
+WORKSPACE_SNAPSHOT_SCHEMA_VERSION = 2
 from .paths import (
     ensure_app_storage_directories,
     memory_root,
@@ -71,6 +74,7 @@ class MemoryManager:
             "session": self.root / "Draft-SessionState.json",
             "session_recovery": self.root / "Draft-SessionState.recovery.json",
             "manifest": self.root / "MemoryManifest.json",
+            "workspace_snapshot": self.root / "WorkspaceSnapshot.json",
         }
         self.legacy_paths = {
             "allocations": self.legacy_root / "Draft-AllocationQueue.json",
@@ -770,6 +774,29 @@ class MemoryManager:
         )
         log_trace("memory", "save_session", draft_id_excerpt=str(getattr(state, "DraftId", "") or "")[:40])
 
+    def write_workspace_snapshot(self, payload: dict[str, Any]) -> None:
+        """Replace ``WorkspaceSnapshot.json`` entirely (no merge with any prior JSON on disk)."""
+        if not isinstance(payload, dict):
+            raise TypeError("workspace snapshot payload must be a dict")
+        data = dict(payload)
+        data.setdefault("schema_version", WORKSPACE_SNAPSHOT_SCHEMA_VERSION)
+        text = json.dumps(data, indent=2, ensure_ascii=False)
+        json.loads(text)
+        path = self.paths["workspace_snapshot"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._atomic_write_text(path, text)
+        log_trace("memory", "write_workspace_snapshot", schema_version=data.get("schema_version"))
+
+    def read_workspace_snapshot_optional(self) -> dict[str, Any] | None:
+        path = self.paths["workspace_snapshot"]
+        if not path.is_file():
+            return None
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        return raw if isinstance(raw, dict) else None
+
     def save_manifest(self, manifest: MemoryManifest) -> None:
         self._backup_file(self.paths["manifest"], self.paths["manifest"].stem)
         self._atomic_write_text(self.paths["manifest"], json.dumps(manifest.to_dict(), indent=2))
@@ -951,6 +978,19 @@ class MemoryManager:
                 elif name == "Draft-ProposedFolders.json":
                     payload = self._normalize_imported_proposed_payload(payload)
                 self._atomic_write_text(target, json.dumps(payload, indent=2))
+
+        ws_src = source_folder / "WorkspaceSnapshot.json"
+        if ws_src.is_file():
+            try:
+                ws_payload = json.loads(ws_src.read_text(encoding="utf-8"))
+                if isinstance(ws_payload, dict):
+                    self._atomic_write_text(
+                        self.paths["workspace_snapshot"],
+                        json.dumps(ws_payload, indent=2, ensure_ascii=False),
+                    )
+                    log_info("WorkspaceSnapshot.json imported with bundle.", source=str(ws_src))
+            except Exception as exc:
+                log_warn("WorkspaceSnapshot.json import skipped.", error=str(exc))
 
         session_payload = self._read_json_path(self.paths["session"], {})
         if isinstance(session_payload, dict):

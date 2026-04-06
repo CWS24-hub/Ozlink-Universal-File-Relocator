@@ -3,10 +3,25 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Callable, Optional
+from typing import Any, Callable, MutableSet, Optional
 
 from ozlink_console.graph import GraphClient
 from ozlink_console.logger import log_info, log_trace, log_warn
+
+
+def graph_dest_parent_negative_cache_key(
+    dest_drive_id: str,
+    parent_rel: str,
+    dest_library_name: str,
+    dest_site_name: str,
+) -> str:
+    """Session key for a failed Graph lookup of a destination parent folder (drive + library context)."""
+    pr = (parent_rel or "").strip()
+    marker = pr if pr else ":root:"
+    return (
+        f"{str(dest_drive_id or '').strip()}\x00{str(dest_library_name or '').strip()}\x00"
+        f"{str(dest_site_name or '').strip()}\x00{marker}"
+    )
 
 
 def is_internal_proposed_destination_item_id(value: str) -> bool:
@@ -337,6 +352,7 @@ def enrich_single_planned_move(
     dest_site_name: str = "",
     move_index: int | None = None,
     request_id: str = "",
+    dest_parent_negative_cache: Optional[MutableSet[str]] = None,
 ) -> bool:
     """
     Fill ``source`` / ``destination`` nested dicts with Graph ids when missing.
@@ -449,10 +465,25 @@ def enrich_single_planned_move(
             else:
                 dest_resolved = False
                 tried: list[str] = []
+                cache_skipped = 0
+                nc = dest_parent_negative_cache
                 for idx, cand in enumerate(candidates):
                     parent_rel, leaf = _parent_and_leaf(cand)
                     label = parent_rel if parent_rel else "(library_root)"
                     tried.append(f"[{idx}] parent={label[:100]} leaf={leaf[:80] if leaf else ''}")
+                    cache_key = graph_dest_parent_negative_cache_key(
+                        d_drive, parent_rel or "", dest_library_name, dest_site_name
+                    )
+                    if nc is not None and cache_key in nc:
+                        cache_skipped += 1
+                        log_trace(
+                            "graph_resolve",
+                            "dest_parent_negative_cache_hit",
+                            candidate_index=idx,
+                            cache_key_excerpt=cache_key[:200],
+                            **base_log,
+                        )
+                        continue
                     parent_item: Optional[dict[str, Any]] = None
                     if parent_rel:
                         try:
@@ -465,6 +496,8 @@ def enrich_single_planned_move(
                                 error=str(exc)[:500],
                                 **base_log,
                             )
+                            if nc is not None:
+                                nc.add(cache_key)
                             continue
                     else:
                         try:
@@ -475,6 +508,8 @@ def enrich_single_planned_move(
                                 error=str(exc)[:500],
                                 **base_log,
                             )
+                            if nc is not None:
+                                nc.add(cache_key)
                             break
 
                     if parent_item and parent_item.get("id"):
@@ -508,19 +543,33 @@ def enrich_single_planned_move(
                         leaf_excerpt=leaf[:120] if leaf else "",
                         **base_log,
                     )
+                    if nc is not None:
+                        nc.add(cache_key)
 
                 if not dest_resolved:
-                    log_warn(
-                        "graph_resolve_dest_parent_all_candidates_failed",
-                        reason="parent_folder_not_found_in_destination_library",
-                        hint="create_parent_folders_in_sharepoint_or_fix_destination_path",
-                        raw_destination_path_excerpt=dst_path[:240],
-                        dest_library=dest_library_name[:80],
-                        dest_site=dest_site_name[:80],
-                        attempts_summary=tried[:24],
-                        candidate_count=len(candidates),
-                        **base_log,
-                    )
+                    if cache_skipped == len(candidates) and candidates:
+                        log_trace(
+                            "graph_resolve",
+                            "graph_resolve_dest_parent_all_candidates_failed_suppressed_negative_cache",
+                            reason="all_parent_candidates_known_missing_this_session",
+                            raw_destination_path_excerpt=dst_path[:240],
+                            dest_library=dest_library_name[:80],
+                            dest_site=dest_site_name[:80],
+                            candidate_count=len(candidates),
+                            **base_log,
+                        )
+                    else:
+                        log_warn(
+                            "graph_resolve_dest_parent_all_candidates_failed",
+                            reason="parent_folder_not_found_in_destination_library",
+                            hint="create_parent_folders_in_sharepoint_or_fix_destination_path",
+                            raw_destination_path_excerpt=dst_path[:240],
+                            dest_library=dest_library_name[:80],
+                            dest_site=dest_site_name[:80],
+                            attempts_summary=tried[:24],
+                            candidate_count=len(candidates),
+                            **base_log,
+                        )
 
     return changed
 

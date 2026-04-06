@@ -410,6 +410,24 @@ def test_map_visible_source_items_uses_single_bulk_walk_for_multiple_index_misse
     assert len(out) == 2
 
 
+def test_minimal_descendant_cover_paths_collapses_nested():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    mw._path_segments = MainWindow._path_segments.__get__(mw, MainWindow)
+    paths = {"R\\A", "R\\A\\B", "R\\A\\C"}
+    cov = mw._minimal_descendant_cover_paths(paths)
+    assert set(cov) == {"R\\A"}
+
+
+def test_minimal_descendant_cover_paths_keeps_disjoint():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    mw._path_segments = MainWindow._path_segments.__get__(mw, MainWindow)
+    paths = {"R\\A", "R\\B", "R\\B\\X"}
+    cov = set(mw._minimal_descendant_cover_paths(paths))
+    assert cov == {"R\\A", "R\\B"}
+
+
 def test_evaluate_source_relationship_direct_suffix_reflects_destination_name():
     """Relationship text is derived from current planned_moves (execution-safe display)."""
     _qapp()

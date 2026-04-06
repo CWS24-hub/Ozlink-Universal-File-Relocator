@@ -116,8 +116,10 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         return EXPLORER_COLUMN_COUNT
 
     def data(self, index: QModelIndex, role: int = Qt.DisplayRole):
+        if not index.isValid():
+            return None
         node = self._node(index)
-        if node is None:
+        if node is None or not isinstance(node, _Node):
             return None
         p = getattr(node, "payload", None)
         if not isinstance(p, dict):
