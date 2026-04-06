@@ -19,7 +19,7 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Any, List, Literal
+from typing import Any, Iterable, List, Literal, Optional
 import xml.etree.ElementTree as ET
 
 from PySide6.QtWidgets import (
@@ -2685,6 +2685,12 @@ class MainWindow(QMainWindow):
         # While True, deferred full duplicate-reconcile is already queued from a folder_worker_success burst;
         # skip redundant synchronous early sibling passes (same import/restore cycle).
         self._destination_deferred_reconcile_burst_pending = False
+        self._destination_drfws_affected_paths: set[str] = set()
+        self._destination_last_drfws_completed_work_sig: str = ""
+        self._destination_bind_scope_paths: Optional[set[str]] = None
+        self._destination_last_chunked_bind_structure_sig: str = ""
+        self._source_projection_row_relationship_sig: dict[str, str] = {}
+        self._source_projection_refresh_eval_plan_sig: str = ""
         # >0 while code holds stale destination QModelIndex rows or runs graph refresh loops that
         # call processEvents(); nested _run_deferred_destination_materialization would rebind the model
         # and crash in DestinationPlanningModel.data (native access violation).
@@ -7615,6 +7621,7 @@ class MainWindow(QMainWindow):
         self._graph_linkage_context_retry_count = 0
         self._graph_linkage_enrich_busy_skips = 0
         self._destination_deferred_reconcile_burst_pending = False
+        self._reset_projection_delta_coalesce_state()
         self._draft_shell_state = session_state
         self._draft_shell_raw = dict(session_raw or {})
         self.active_draft_session_id = session_state.DraftId or self.active_draft_session_id
@@ -8542,6 +8549,7 @@ class MainWindow(QMainWindow):
         self._graph_linkage_context_retry_count = 0
         self._graph_linkage_enrich_busy_skips = 0
         self._destination_deferred_reconcile_burst_pending = False
+        self._reset_projection_delta_coalesce_state()
         try:
             source_file, _ = QFileDialog.getOpenFileName(
                 self,
@@ -10174,6 +10182,80 @@ class MainWindow(QMainWindow):
             lambda: self._safe_invoke("destination_resume_parked_after_full_tree", _go),
         )
 
+    def _reset_projection_delta_coalesce_state(self):
+        """Clear delta/work-signature state after import, restore, or other global planning resets."""
+        self._destination_drfws_affected_paths.clear()
+        self._destination_last_drfws_completed_work_sig = ""
+        self._destination_bind_scope_paths = None
+        self._destination_last_chunked_bind_structure_sig = ""
+        self._source_projection_row_relationship_sig.clear()
+        self._source_projection_refresh_eval_plan_sig = ""
+
+    def _merge_destination_drfws_affected_paths(self, paths: Optional[Iterable[str]]) -> None:
+        if not paths:
+            return
+        for p in paths:
+            c = self._canonical_destination_projection_path(str(p or ""))
+            if c:
+                self._destination_drfws_affected_paths.add(c)
+
+    def _destination_drfws_pending_work_signature(self) -> str:
+        paths = sorted(self._destination_drfws_affected_paths or [])
+        uqp = self._unresolved_proposed_queue_size()
+        uqa = self._unresolved_allocation_queue_size()
+        cache = getattr(self, "_destination_future_model_overlay_cache", None) or {}
+        fp = str((cache or {}).get("full_fp") or "")
+        if not fp:
+            fp = str(getattr(self, "_destination_last_materialized_overlay_fp", "") or "")
+        return f"{fp}\x00{uqp}\x00{uqa}\x00" + "\x00".join(paths)
+
+    def _destination_path_under_bind_scope(self, sem_path: str, scope: Optional[set[str]] = None) -> bool:
+        if scope is None:
+            scope = getattr(self, "_destination_bind_scope_paths", None)
+        if not scope:
+            return True
+        sp = str(sem_path or "").strip()
+        if not sp:
+            return True
+        for s in scope:
+            if not s:
+                continue
+            if sp == s or sp.startswith(s + "\\") or sp.startswith(s + "/"):
+                return True
+        return False
+
+    def _destination_future_model_bind_structure_signature(self, model) -> str:
+        nodes = (model.get("nodes") or {}) if isinstance(model, dict) else {}
+        lines: list[str] = []
+        for k in sorted(nodes.keys()):
+            n = nodes[k]
+            if not isinstance(n, dict):
+                n = {}
+            lines.append(
+                f"{k}\t{n.get('node_state')}\t{n.get('name', '')}\t{bool(n.get('is_folder'))}"
+                f"\t{bool(n.get('planned_allocation'))}"
+            )
+        raw = "\n".join(lines).encode("utf-8", errors="replace")
+        return hashlib.sha256(raw).hexdigest()[:40]
+
+    def _source_projection_planning_signature_refresh(self) -> str:
+        try:
+            sigs = move_list_signatures(self.planned_moves or [])
+            return hashlib.sha256(repr(sigs).encode()).hexdigest()[:32]
+        except Exception:
+            return ""
+
+    def _source_relationship_row_signature(self, node_data, eval_index) -> str:
+        if not node_data:
+            return ""
+        rel = self._evaluate_source_relationship(node_data, eval_index=eval_index)
+        sp = self._canonical_source_projection_path(self._tree_item_path(node_data))
+        needs = self._has_needs_review_for_source_path(self._tree_item_path(node_data))
+        return (
+            f"{sp}\x00{rel.get('mode', '')}\x00{rel.get('suffix', '')}\x00{needs}\x00"
+            f"{rel.get('normalized_planned_source_path', '')}"
+        )
+
     def _schedule_destination_full_tree_materialization(self, delay_ms=2500):
         timer = getattr(self, "_destination_full_tree_materialize_timer", None)
         if timer is None:
@@ -10328,6 +10410,22 @@ class MainWindow(QMainWindow):
                             coalesced_duplicate_schedule=True,
                         )
                     return
+            if self._destination_drfws_affected_paths:
+                sig = self._destination_drfws_pending_work_signature()
+                last = str(getattr(self, "_destination_last_drfws_completed_work_sig", "") or "")
+                if sig and last and sig == last:
+                    if is_dev_mode():
+                        log_info(
+                            "destination_double_render_guard",
+                            phase="second_pass_skipped_unchanged_drfws_work_signature",
+                            scheduling_path="_schedule_deferred_destination_materialization",
+                            reason=reason,
+                            coalesced_duplicate_schedule=True,
+                            affected_path_count=len(self._destination_drfws_affected_paths),
+                            work_signature_prefix=sig[:48],
+                        )
+                    self._destination_drfws_affected_paths.clear()
+                    return
         prev_pending = str(getattr(self, "_destination_idle_materialize_pending_reason", "") or "")
         self._destination_idle_materialize_pending_reason = reason
         timer = getattr(self, "_destination_idle_materialize_timer", None)
@@ -10448,9 +10546,19 @@ class MainWindow(QMainWindow):
             return
         self._destination_idle_materialize_pending_reason = ""
         _mat_t0 = time.perf_counter()
-        applied_count = self._materialize_destination_future_model(
-            reason, allow_defer=False, prefer_chunked_projection=True
-        )
+        drfws_r = "deferred_reconcile_folder_worker_success"
+        if str(reason or "") == drfws_r:
+            self._destination_bind_scope_paths = (
+                set(self._destination_drfws_affected_paths) if self._destination_drfws_affected_paths else None
+            )
+        else:
+            self._destination_bind_scope_paths = None
+        try:
+            applied_count = self._materialize_destination_future_model(
+                reason, allow_defer=False, prefer_chunked_projection=True
+            )
+        finally:
+            self._destination_bind_scope_paths = None
         self._destination_deferred_reconcile_burst_pending = False
         if _probe:
             log_info(
@@ -10498,6 +10606,12 @@ class MainWindow(QMainWindow):
             self._destination_idle_materialize_pending_reason = reason
             self._schedule_deferred_destination_materialization(reason, delay_ms=220)
             return
+        if str(reason or "") == drfws_r:
+            completed = int(applied_count or 0) > 0 or self._destination_steady_state_full_materialize_redundant()
+            if completed and getattr(self, "_destination_chunked_bind_state", None) is None:
+                sig_done = self._destination_drfws_pending_work_signature()
+                self._destination_last_drfws_completed_work_sig = sig_done
+                self._destination_drfws_affected_paths.clear()
         if applied_count or not self.pending_folder_loads.get("destination"):
             self._set_tree_status_message("destination", "Destination structure ready.", loading=False)
             if self._is_graph_ids_deferred_destination_materialize_reason(reason) and self._expand_all_pending.get(
@@ -16161,6 +16275,7 @@ class MainWindow(QMainWindow):
         chunk_budget_ms = 72
         chunking_active = False
         work_items: list[tuple[Any, dict, str]] = []
+        skipped_relationship_unchanged = [0]
 
         def _apply_one_source_projection_row(subtree_row, subtree_data, eval_index):
             if isinstance(subtree_row, QModelIndex):
@@ -16199,6 +16314,10 @@ class MainWindow(QMainWindow):
                     work_items.append((subtree_row, subtree_data, subtree_path or ""))
 
             eval_index = self._build_source_relationship_eval_index()
+            plan_sig = self._source_projection_planning_signature_refresh()
+            if plan_sig != str(getattr(self, "_source_projection_refresh_eval_plan_sig", "") or ""):
+                self._source_projection_row_relationship_sig.clear()
+                self._source_projection_refresh_eval_plan_sig = plan_sig
             refreshed_count = 0
 
             if len(work_items) >= chunk_row_threshold and self._source_tree_uses_model_view():
@@ -16217,19 +16336,23 @@ class MainWindow(QMainWindow):
                     if updates_were_enabled:
                         tree.setUpdatesEnabled(True)
                     tree.viewport().update()
+                    n_skip = int(skipped_relationship_unchanged[0])
+                    n_updated = max(0, len(work_items) - n_skip)
                     self._log_restore_phase(
                         phase_name,
                         trigger_path=self.normalize_memory_path(trigger_path),
-                        refreshed_item_count=refreshed_count,
+                        refreshed_item_count=n_updated,
                         refreshed_path_count=len(normalized_paths),
                         chunking_used=True,
+                        work_item_row_count=len(work_items),
+                        relationship_rows_skipped_unchanged=n_skip,
                     )
                     elapsed = perf.elapsed() if dev else 0
                     if dev:
                         _perf_explorer_log(
                             "refresh_source_projection_for_paths",
                             elapsed_ms=elapsed,
-                            refreshed_item_count=refreshed_count,
+                            refreshed_item_count=n_updated,
                             root_path_count=len(normalized_paths),
                             phase_name=str(phase_name or ""),
                             chunked=True,
@@ -16258,6 +16381,26 @@ class MainWindow(QMainWindow):
                     min_rows_per_slice = 24
                     while i < len(work_items):
                         row, data, _sp = work_items[i]
+                        rel_sig = self._source_relationship_row_signature(data, eval_index)
+                        if _sp:
+                            prev_r = self._source_projection_row_relationship_sig.get(_sp)
+                            if prev_r == rel_sig:
+                                skipped_relationship_unchanged[0] += 1
+                                i += 1
+                                step_at[0] = i
+                                if i < len(work_items) and (i % min_rows_per_slice) != 0:
+                                    continue
+                                if (time.perf_counter() - t0) * 1000.0 >= chunk_budget_ms:
+                                    if is_dev_mode():
+                                        self._log_restore_phase(
+                                            "source_projection_restore_chunk",
+                                            cumulative_rows=i,
+                                            total_rows=len(work_items),
+                                        )
+                                    QTimer.singleShot(0, _chunk_step)
+                                    return
+                                continue
+                            self._source_projection_row_relationship_sig[_sp] = rel_sig
                         _apply_one_source_projection_row(row, data, eval_index)
                         i += 1
                         step_at[0] = i
@@ -16281,6 +16424,13 @@ class MainWindow(QMainWindow):
             for subtree_row, subtree_data, subtree_path in work_items:
                 if subtree_path and subtree_path in refreshed_paths:
                     continue
+                rel_sig = self._source_relationship_row_signature(subtree_data, eval_index)
+                if subtree_path:
+                    prev_r = self._source_projection_row_relationship_sig.get(subtree_path)
+                    if prev_r == rel_sig:
+                        skipped_relationship_unchanged[0] += 1
+                        continue
+                    self._source_projection_row_relationship_sig[subtree_path] = rel_sig
                 _apply_one_source_projection_row(subtree_row, subtree_data, eval_index)
                 if subtree_path:
                     refreshed_paths.add(subtree_path)
@@ -16297,6 +16447,8 @@ class MainWindow(QMainWindow):
             trigger_path=self.normalize_memory_path(trigger_path),
             refreshed_item_count=refreshed_count,
             refreshed_path_count=len(normalized_paths),
+            work_item_row_count=len(work_items) if work_items else 0,
+            relationship_rows_skipped_unchanged=int(skipped_relationship_unchanged[0]),
         )
         elapsed = perf.elapsed() if dev else 0
         if dev:
@@ -27924,12 +28076,14 @@ class MainWindow(QMainWindow):
         gen = self._destination_future_bind_generation
         nodes = (model.get("nodes") or {}) if isinstance(model, dict) else {}
         node_count = len(nodes)
+        bsp = getattr(self, "_destination_bind_scope_paths", None)
         self._destination_chunked_bind_state = {
             "gen": gen,
             "model": model,
             "on_complete": on_complete,
             "phase": "build",
             "bind_t0": time.perf_counter(),
+            "bind_scope_paths": set(bsp) if bsp else None,
         }
         thr = self._destination_chunked_bind_node_threshold()
         schedule_reason = "node_threshold" if node_count >= thr else "allocation_heuristic"
@@ -28166,6 +28320,9 @@ class MainWindow(QMainWindow):
                             node_data = item.data(0, Qt.UserRole) or {}
                         except Exception:
                             continue
+                    sem_alloc = self._destination_semantic_path(node_data)
+                    if not self._destination_path_under_bind_scope(sem_alloc, st.get("bind_scope_paths")):
+                        continue
                     if not self.node_is_planned_allocation(node_data):
                         continue
                     if not bool(node_data.get("is_folder", False)):
@@ -28240,6 +28397,8 @@ class MainWindow(QMainWindow):
                     else:
                         node_data = item.data(0, Qt.UserRole) or {}
                     semantic_path = self._destination_semantic_path(node_data)
+                    if not self._destination_path_under_bind_scope(semantic_path, st.get("bind_scope_paths")):
+                        continue
                     item_keys = {semantic_path}
                     sk = self._destination_expansion_state_key(semantic_path)
                     if sk:
@@ -28305,6 +28464,12 @@ class MainWindow(QMainWindow):
                     bind_generation=st.get("gen"),
                 )
                 self._schedule_workspace_ui_persist(panel_key="destination")
+                try:
+                    self._destination_last_chunked_bind_structure_sig = self._destination_future_model_bind_structure_signature(
+                        model
+                    )
+                except Exception:
+                    pass
                 self._reconcile_destination_semantic_duplicates("destination_bind_chunked_async")
             except Exception as exc:
                 _fail(exc, phase_name="chunked_destination_bind.finalize")
@@ -28344,6 +28509,34 @@ class MainWindow(QMainWindow):
             hook="_bind_destination_tree_from_future_state_model",
         )
         nodes = model.get("nodes") or {}
+        tree_w = getattr(self, "destination_tree_widget", None)
+        if (
+            self._destination_future_bind_should_chunk_async(model, on_complete=on_complete)
+            and on_complete is not None
+            and not getattr(self, "_destination_bind_scope_paths", None)
+            and tree_w is not None
+            and self._destination_tree_uses_model_view()
+            and getattr(self, "_destination_chunked_bind_state", None) is None
+        ):
+            sig = self._destination_future_model_bind_structure_signature(model)
+            last = str(getattr(self, "_destination_last_chunked_bind_structure_sig", "") or "")
+            if last and sig == last and self._planning_tree_top_level_count(tree_w) > 0:
+                vf = self._count_visible_destination_future_state_nodes()
+                da = vf
+                self._log_restore_phase(
+                    "destination_future_model_bind_skipped",
+                    skip_reason="unchanged_chunked_structure_signature",
+                    bind_mode="chunked_async",
+                    model_node_count=len(nodes),
+                    structure_sig_prefix=sig[:16],
+                )
+                if callable(on_complete):
+                    try:
+                        on_complete(vf, da)
+                    except Exception as cb_exc:
+                        self._log_restore_exception("destination_future_bind.on_complete", cb_exc)
+                self._flush_pending_destination_library_root_if_any(flush_reason="after_bind_skipped_identical_structure")
+                return None
         if self._destination_future_bind_should_chunk_async(model, on_complete=on_complete):
             if on_complete is None:
                 out = self._bind_destination_future_model_sync(model)
@@ -29801,10 +29994,14 @@ class MainWindow(QMainWindow):
             return False
         return False
 
-    def _reconcile_destination_semantic_duplicates_maybe_deferred(self, reason):
+    def _reconcile_destination_semantic_duplicates_maybe_deferred(
+        self, reason, *, affected_destination_paths: Optional[Iterable[str]] = None
+    ):
         if not self._should_defer_destination_duplicate_reconcile(reason):
             self._destination_deferred_reconcile_burst_pending = False
             return self._reconcile_destination_semantic_duplicates(reason)
+        if reason == "folder_worker_success" and affected_destination_paths:
+            self._merge_destination_drfws_affected_paths(affected_destination_paths)
         self._log_restore_phase(
             "destination_projection_reconcile_deferred",
             reason=reason,
@@ -29817,6 +30014,7 @@ class MainWindow(QMainWindow):
                 (getattr(self, "root_load_workers", None) or {}).get("destination")
             ),
             root_prime_pending=bool(getattr(self, "_destination_root_prime_pending", False)),
+            drfws_affected_path_count=len(getattr(self, "_destination_drfws_affected_paths", set()) or set()),
         )
         # Full reconcile stays deferred, but merge same-named folder siblings immediately so the
         # tree does not show duplicate shells for the whole restore/materialization window.
@@ -33943,7 +34141,8 @@ class MainWindow(QMainWindow):
                             else 0
                         )
                         merge_moved_count = self._reconcile_destination_semantic_duplicates_maybe_deferred(
-                            "folder_worker_success"
+                            "folder_worker_success",
+                            affected_destination_paths=(semantic_path,),
                         )
                         if getattr(self, "_sharepoint_lazy_mode", False):
                             future_model_applied_count = 0
@@ -34151,7 +34350,8 @@ class MainWindow(QMainWindow):
                             else 0
                         )
                         merge_moved_count = self._reconcile_destination_semantic_duplicates_maybe_deferred(
-                            "folder_worker_success"
+                            "folder_worker_success",
+                            affected_destination_paths=(semantic_path,),
                         )
                         if getattr(self, "_sharepoint_lazy_mode", False):
                             future_model_applied_count = 0
