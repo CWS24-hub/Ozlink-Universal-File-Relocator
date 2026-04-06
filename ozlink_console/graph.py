@@ -1,11 +1,12 @@
 import hashlib
 import json
 import os
+import threading
 import time
 import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import msal
@@ -42,6 +43,10 @@ AUTH_CONFIG = {
 }
 
 
+class GraphRecursiveCountAborted(Exception):
+    """Raised when recursive library counting stops cooperatively (worker superseded or interrupt)."""
+
+
 ADMIN_DIRECTORY_ROLE_NAMES = {
     "global administrator",
     "sharepoint administrator",
@@ -75,6 +80,8 @@ class GraphClient:
         self.device_flow: Optional[Dict[str, Any]] = None
         self.profile: Optional[Dict[str, Any]] = None
         self._drive_children_cache: Dict[tuple[str, str], List[Dict[str, Any]]] = {}
+        # Serialize token/header reads and token mutations across UI thread + QThread workers.
+        self._client_rlock = threading.RLock()
         self._graph_cache_root: Path = graph_cache_root()
         self.session_context: Dict[str, Any] = {
             "connected": False,
@@ -194,8 +201,9 @@ class GraphClient:
         if "access_token" not in result:
             raise RuntimeError(result.get("error_description", "Authentication failed."))
 
-        self.token = result["access_token"]
-        self.session_context["connected"] = True
+        with self._client_rlock:
+            self.token = result["access_token"]
+            self.session_context["connected"] = True
         self._persist_msal_token_cache()
         log_trace("graph_auth", "token_acquired_device_flow", connected=True)
         return result
@@ -209,7 +217,7 @@ class GraphClient:
             return None
         return accounts[0]
 
-    def _try_acquire_token_silent(self, *, force_refresh: bool = False) -> bool:
+    def _try_acquire_token_silent_unlocked(self, *, force_refresh: bool = False) -> bool:
         account = self._get_cached_account()
         if not account:
             return False
@@ -232,37 +240,51 @@ class GraphClient:
 
         self.token = result["access_token"]
         self.session_context["connected"] = True
-        self._persist_msal_token_cache()
         return True
+
+    def _try_acquire_token_silent(self, *, force_refresh: bool = False) -> bool:
+        with self._client_rlock:
+            ok = self._try_acquire_token_silent_unlocked(force_refresh=force_refresh)
+        if ok:
+            self._persist_msal_token_cache()
+        return ok
 
     def refresh_access_token_silently(self, *, force_refresh: bool = False) -> bool:
         return self._try_acquire_token_silent(force_refresh=force_refresh)
 
     def disconnect(self) -> None:
         log_trace("graph_auth", "disconnect")
-        self.token = None
-        self.device_flow = None
-        self.profile = None
-        self._drive_children_cache.clear()
-        self.app = None
-        self._token_cache = None
+        with self._client_rlock:
+            self.token = None
+            self.device_flow = None
+            self.profile = None
+            self._drive_children_cache.clear()
+            self.app = None
+            self._token_cache = None
+            self.session_context = {
+                "connected": False,
+                "user_role": "user",
+                "operator_display_name": "",
+                "operator_upn": "",
+                "tenant_domain": "",
+            }
         self._clear_persistent_msal_token_cache_file()
-        self.session_context = {
-            "connected": False,
-            "user_role": "user",
-            "operator_display_name": "",
-            "operator_upn": "",
-            "tenant_domain": "",
-        }
 
     # -------------------------------------------------------------------------
     # Core HTTP helpers
     # -------------------------------------------------------------------------
     def get_headers(self) -> Dict[str, str]:
-        if not self.token and not self._try_acquire_token_silent():
-            raise RuntimeError("No access token is available. Connect to Microsoft 365 first.")
+        acquired = False
+        with self._client_rlock:
+            if not self.token:
+                acquired = self._try_acquire_token_silent_unlocked()
+                if not acquired:
+                    raise RuntimeError("No access token is available. Connect to Microsoft 365 first.")
+            bearer = self.token
+        if acquired:
+            self._persist_msal_token_cache()
         return {
-            "Authorization": f"Bearer {self.token}",
+            "Authorization": f"Bearer {bearer}",
             "Accept": "application/json",
         }
 
@@ -329,6 +351,7 @@ class GraphClient:
         json_body: Optional[Dict[str, Any]] = None,
         timeout: int = 60,
         stream: bool = False,
+        transient_audit: Optional[Dict[str, Any]] = None,
     ) -> requests.Response:
         max_attempts = 3
         default_backoffs: Tuple[float, float] = (0.22, 0.45)
@@ -387,6 +410,21 @@ class GraphClient:
                     )
                     raise
                 delay_s = self._graph_transient_retry_delay_after_failure(attempt, exc, default_backoffs)
+                if transient_audit:
+                    log_info(
+                        "count_worker_retry",
+                        worker_id=transient_audit.get("worker_id"),
+                        drive_id_suffix=transient_audit.get("drive_id_suffix"),
+                        thread_ident=transient_audit.get("thread_ident"),
+                        recursion_depth=transient_audit.get("recursion_depth"),
+                        parent_item_id_suffix=transient_audit.get("parent_item_id_suffix"),
+                        method=method,
+                        path_excerpt=excerpt,
+                        attempt=attempt + 2,
+                        max_attempts=max_attempts,
+                        delay_s=round(delay_s, 4),
+                        error_excerpt=str(exc)[:240],
+                    )
                 log_warn(
                     "graph_http_transient_retry",
                     method=method,
@@ -422,17 +460,72 @@ class GraphClient:
         return b"".join(chunks)
 
     def get_paged(self, url: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        return self._get_paged_impl(url, params, cancel_check=None, page_audit=None)
+
+    def _get_paged_impl(
+        self,
+        url: str,
+        params: Optional[Dict[str, Any]] = None,
+        *,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        page_audit: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
         items: List[Dict[str, Any]] = []
         next_url = url
         next_params = params
+        page_ix = 0
 
         while next_url:
-            response = self._request("GET", next_url, params=next_params, timeout=60)
-            payload = response.json()
+            if cancel_check is not None and cancel_check():
+                log_info(
+                    "count_worker_abort",
+                    reason="cancel_before_graph_page",
+                    worker_id=(page_audit or {}).get("worker_id"),
+                    drive_id_suffix=(page_audit or {}).get("drive_id_suffix"),
+                    thread_ident=(page_audit or {}).get("thread_ident"),
+                    recursion_depth=(page_audit or {}).get("recursion_depth"),
+                    parent_item_id_suffix=(page_audit or {}).get("parent_item_id_suffix"),
+                    page_index=page_ix,
+                )
+                raise GraphRecursiveCountAborted("cancelled before paged GET")
+            excerpt = _graph_url_excerpt(next_url)
+            if page_audit:
+                log_info(
+                    "count_worker_request_begin",
+                    worker_id=page_audit.get("worker_id"),
+                    drive_id_suffix=page_audit.get("drive_id_suffix"),
+                    thread_ident=page_audit.get("thread_ident"),
+                    recursion_depth=page_audit.get("recursion_depth"),
+                    parent_item_id_suffix=page_audit.get("parent_item_id_suffix"),
+                    page_index=page_ix,
+                    path_excerpt=excerpt,
+                )
+            try:
+                response = self._request(
+                    "GET",
+                    next_url,
+                    params=next_params,
+                    timeout=60,
+                    transient_audit=page_audit,
+                )
+                payload = response.json()
+            finally:
+                if page_audit:
+                    log_info(
+                        "count_worker_request_end",
+                        worker_id=page_audit.get("worker_id"),
+                        drive_id_suffix=page_audit.get("drive_id_suffix"),
+                        thread_ident=page_audit.get("thread_ident"),
+                        recursion_depth=page_audit.get("recursion_depth"),
+                        parent_item_id_suffix=page_audit.get("parent_item_id_suffix"),
+                        page_index=page_ix,
+                        path_excerpt=excerpt,
+                    )
 
             items.extend(payload.get("value", []))
             next_url = payload.get("@odata.nextLink")
             next_params = None
+            page_ix += 1
 
         return items
 
@@ -1175,22 +1268,97 @@ class GraphClient:
         )
         return payload
 
-    def count_drive_items_recursive_split(self, drive_id: str) -> tuple[int, int]:
+    def _list_drive_children_uncached_paged_for_count(
+        self,
+        drive_id: str,
+        item_id: Optional[str],
+        *,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        page_audit: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Paged /children listing without touching ``_drive_children_cache`` or disk child caches.
+
+        Used for background recursive counts so QThread workers do not race the UI thread on
+        in-memory / on-disk Graph child caches.
+        """
+        did = str(drive_id or "").strip()
+        if not did:
+            return []
+        if item_id is None:
+            url = f"{AUTH_CONFIG['graph_base']}/drives/{did}/root/children"
+        else:
+            iid = str(item_id).strip()
+            if not iid:
+                return []
+            url = f"{AUTH_CONFIG['graph_base']}/drives/{did}/items/{iid}/children"
+        return self._get_paged_impl(url, None, cancel_check=cancel_check, page_audit=page_audit)
+
+    def count_drive_items_recursive_split(
+        self,
+        drive_id: str,
+        *,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        count_audit: Optional[Dict[str, Any]] = None,
+    ) -> tuple[int, int]:
         """Return ``(file_count, folder_count)`` under the library root (recursive, paged).
 
         Each file row counts toward files; each folder row counts toward folders. The library root
         item itself is not included. ``file_count + folder_count`` matches ``count_drive_items_recursive``.
+
+        When ``count_audit`` is set (background full-count worker), listings bypass shared child caches
+        and emit structured ``count_worker_*`` logs; ``cancel_check`` allows cooperative abort.
         """
+        did = str(drive_id or "").strip()
+        if not did:
+            return 0, 0
+        drive_suffix = did[-16:] if len(did) > 16 else did
+        audit_base: Dict[str, Any] = dict(count_audit) if count_audit else {}
+        if count_audit is not None:
+            audit_base.setdefault("drive_id_suffix", drive_suffix)
+            log_info(
+                "count_worker_start",
+                worker_id=audit_base.get("worker_id"),
+                drive_id_suffix=audit_base.get("drive_id_suffix"),
+                thread_ident=audit_base.get("thread_ident"),
+            )
+
         files = 0
         folders = 0
-        stack: List[Optional[str]] = [None]
+        stack: List[Tuple[Optional[str], int]] = [(None, 0)]
 
         while stack:
-            item_id = stack.pop()
-            children = (
-                self.list_drive_root_children(drive_id)
-                if item_id is None
-                else self.list_drive_item_children(drive_id, item_id)
+            if cancel_check is not None and cancel_check():
+                log_info(
+                    "count_worker_abort",
+                    reason="cancel_before_folder_pop",
+                    worker_id=audit_base.get("worker_id"),
+                    drive_id_suffix=audit_base.get("drive_id_suffix"),
+                    thread_ident=audit_base.get("thread_ident"),
+                )
+                raise GraphRecursiveCountAborted("cancelled before folder traversal")
+            item_id, depth = stack.pop()
+            page_audit: Optional[Dict[str, Any]] = None
+            if count_audit is not None:
+                parent_suffix = (
+                    ":library_root:"
+                    if item_id is None
+                    else (
+                        str(item_id)[-16:]
+                        if len(str(item_id)) > 16
+                        else str(item_id)
+                    )
+                )
+                page_audit = {
+                    **audit_base,
+                    "recursion_depth": depth,
+                    "parent_item_id_suffix": parent_suffix,
+                }
+            children = self._list_drive_children_uncached_paged_for_count(
+                did,
+                item_id,
+                cancel_check=cancel_check,
+                page_audit=page_audit,
             )
 
             for child in children:
@@ -1198,9 +1366,19 @@ class GraphClient:
                     folders += 1
                     child_id = child.get("id")
                     if child_id:
-                        stack.append(child_id)
+                        stack.append((child_id, depth + 1))
                 else:
                     files += 1
+
+        if count_audit is not None:
+            log_info(
+                "count_worker_finished",
+                worker_id=audit_base.get("worker_id"),
+                drive_id_suffix=audit_base.get("drive_id_suffix"),
+                thread_ident=audit_base.get("thread_ident"),
+                file_count=files,
+                folder_count=folders,
+            )
 
         return files, folders
 

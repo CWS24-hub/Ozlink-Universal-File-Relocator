@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import os
+import threading
 import json
 import hashlib
 import subprocess
@@ -76,7 +77,7 @@ from PySide6.QtGui import (
     QPixmap,
 )
 
-from ozlink_console.graph import GraphClient
+from ozlink_console.graph import GraphClient, GraphRecursiveCountAborted
 from ozlink_console.tree_models.explorer_columns import (
     EXPLORER_COLUMN_COUNT,
     EXPLORER_COLUMN_LABELS,
@@ -1304,15 +1305,34 @@ class FullCountWorker(QThread):
     success = Signal(dict)
     error = Signal(dict)
 
-    def __init__(self, graph, drive_id):
+    def __init__(self, graph, drive_id, *, worker_id: int = 0):
         super().__init__()
         self.graph = graph
         self.drive_id = drive_id
+        self.worker_id = int(worker_id)
 
     def run(self):
-        log_trace("worker", "FullCountWorker_start", drive_id_suffix=str(self.drive_id)[-16:])
+        drive_id = str(self.drive_id or "").strip()
+        did_suffix = drive_id[-16:] if len(drive_id) > 16 else drive_id
+        tid = threading.get_ident()
+        count_audit = {
+            "worker_id": self.worker_id,
+            "drive_id_suffix": did_suffix,
+            "thread_ident": tid,
+        }
+        log_trace(
+            "worker",
+            "FullCountWorker_start",
+            worker_id=self.worker_id,
+            drive_id_suffix=did_suffix,
+            thread_ident=tid,
+        )
         try:
-            file_count, folder_count = self.graph.count_drive_items_recursive_split(self.drive_id)
+            file_count, folder_count = self.graph.count_drive_items_recursive_split(
+                drive_id,
+                cancel_check=self.isInterruptionRequested,
+                count_audit=count_audit,
+            )
             total_count = file_count + folder_count
             log_trace(
                 "worker",
@@ -1320,17 +1340,20 @@ class FullCountWorker(QThread):
                 total_count=total_count,
                 file_count=file_count,
                 folder_count=folder_count,
+                worker_id=self.worker_id,
             )
             self.success.emit({
-                "drive_id": self.drive_id,
+                "drive_id": drive_id,
                 "total_count": total_count,
                 "file_count": file_count,
                 "folder_count": folder_count,
             })
+        except GraphRecursiveCountAborted:
+            return
         except Exception as e:
             log_trace("worker", "FullCountWorker_error", error_excerpt=str(e)[:500])
             self.error.emit({
-                "drive_id": self.drive_id,
+                "drive_id": drive_id,
                 "error": str(e),
             })
 
@@ -11132,7 +11155,12 @@ class MainWindow(QMainWindow):
             return
 
         if self.full_count_worker is not None and self.full_count_worker.isRunning():
-            self._retired_full_count_workers[self._active_full_count_worker_id] = self.full_count_worker
+            prev = self.full_count_worker
+            try:
+                prev.requestInterruption()
+            except Exception:
+                pass
+            self._retired_full_count_workers[self._active_full_count_worker_id] = prev
 
         self.full_source_item_count = None
         self.full_source_file_count = None
@@ -11146,7 +11174,7 @@ class MainWindow(QMainWindow):
 
         self._full_count_sequence += 1
         worker_id = self._full_count_sequence
-        worker = FullCountWorker(self.graph, drive_id)
+        worker = FullCountWorker(self.graph, drive_id, worker_id=worker_id)
         self.full_count_worker = worker
         self._active_full_count_worker_id = worker_id
 
