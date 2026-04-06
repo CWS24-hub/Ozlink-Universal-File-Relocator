@@ -92,6 +92,9 @@ class SessionState:
     SelectedDestinationSite: str = ""
     SelectedDestinationSiteKey: str = ""
     SelectedDestinationLibrary: str = ""
+    # Planning header platform (sharepoint | local); restored before site/library rebind on import/restore.
+    SourceBrowseMode: str = "sharepoint"
+    DestinationBrowseMode: str = "sharepoint"
     SessionFingerprint: str = ""
     SourceExpandedPaths: list[str] = field(default_factory=list)
     DestinationExpandedPaths: list[str] = field(default_factory=list)

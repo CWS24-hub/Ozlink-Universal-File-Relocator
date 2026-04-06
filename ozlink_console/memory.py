@@ -23,6 +23,26 @@ from .paths import (
     user_scoped_storage_root,
 )
 
+
+def _restore_candidate_preference_score(name: str) -> int:
+    """Higher score wins when sorting fallback candidates (non-authoritative live paths)."""
+    n = str(name or "")
+    order = (
+        "python_global_primary",
+        "python_global_recovery",
+        "python_backup_latest",
+        "python_global_backup_latest",
+        "legacy_live_primary",
+        "legacy_live_recovery",
+        "legacy_backup_latest",
+    )
+    try:
+        idx = order.index(n)
+    except ValueError:
+        return 0
+    return len(order) - idx
+
+
 class MemoryManager:
     def __init__(self, *, tenant_domain: str = "", operator_upn: str = "") -> None:
         self.tenant_domain = str(tenant_domain or "").strip().lower()
@@ -412,20 +432,62 @@ class MemoryManager:
                     )
                     return None, f"no user-scoped memory candidates for {self.expected_fingerprint}"
 
+        primary = next((c for c in inspected if str(c.get("name", "")) == "python_live_primary"), None)
+        recovery = next((c for c in inspected if str(c.get("name", "")) == "python_live_recovery"), None)
+
+        if primary and primary.get("valid"):
+            selected = primary
+            reason = (
+                "authoritative_python_live_primary "
+                f"valid={selected.get('valid')} populated={selected.get('populated')} "
+                f"allocations={selected.get('allocation_count', 0)} "
+                f"proposed={selected.get('proposed_count', 0)} "
+                f"timestamp_sort_value={selected.get('timestamp_sort_value', float('-inf'))}"
+            )
+            log_info(
+                "Restore candidate selected (live primary is authoritative).",
+                selected_name=str(selected.get("name", "")),
+                allocation_count=int(selected.get("allocation_count", 0) or 0),
+                proposed_count=int(selected.get("proposed_count", 0) or 0),
+                populated=bool(selected.get("populated")),
+                stale_backup_skipped=True,
+            )
+            log_trace("memory", "select_restore_candidate", selected_name="python_live_primary", reason_excerpt=reason[:400])
+            return selected, reason
+
+        if recovery and recovery.get("valid"):
+            selected = recovery
+            reason = (
+                "authoritative_python_live_recovery "
+                f"valid={selected.get('valid')} populated={selected.get('populated')} "
+                f"allocations={selected.get('allocation_count', 0)} "
+                f"proposed={selected.get('proposed_count', 0)} "
+                f"timestamp_sort_value={selected.get('timestamp_sort_value', float('-inf'))}"
+            )
+            log_info(
+                "Restore candidate selected (live recovery is authoritative).",
+                selected_name=str(selected.get("name", "")),
+                allocation_count=int(selected.get("allocation_count", 0) or 0),
+                proposed_count=int(selected.get("proposed_count", 0) or 0),
+                populated=bool(selected.get("populated")),
+                stale_backup_skipped=True,
+            )
+            log_trace("memory", "select_restore_candidate", selected_name="python_live_recovery", reason_excerpt=reason[:400])
+            return selected, reason
+
         ranked = sorted(
             inspected,
             key=lambda candidate: (
                 1 if candidate.get("valid") else 0,
                 1 if candidate.get("populated") else 0,
-                candidate.get("allocation_count", 0) + candidate.get("proposed_count", 0),
-                1 if candidate.get("draft_id") else 0,
+                _restore_candidate_preference_score(str(candidate.get("name", ""))),
                 candidate.get("timestamp_sort_value", float("-inf")),
             ),
             reverse=True,
         )
         selected = ranked[0]
         reason = (
-            f"selected={selected.get('name')} valid={selected.get('valid')} "
+            f"fallback_selected={selected.get('name')} valid={selected.get('valid')} "
             f"populated={selected.get('populated')} "
             f"allocations={selected.get('allocation_count', 0)} "
             f"proposed={selected.get('proposed_count', 0)} "
@@ -433,6 +495,14 @@ class MemoryManager:
             f"timestamp={selected.get('timestamp')} "
             f"timestamp_kind={selected.get('timestamp_kind', 'unknown')} "
             f"timestamp_sort_value={selected.get('timestamp_sort_value', float('-inf'))}"
+        )
+        log_info(
+            "Restore candidate selected (fallback; live paths invalid or missing).",
+            selected_name=str(selected.get("name", "")),
+            allocation_count=int(selected.get("allocation_count", 0) or 0),
+            proposed_count=int(selected.get("proposed_count", 0) or 0),
+            populated=bool(selected.get("populated")),
+            stale_backup_skipped=False,
         )
         log_trace(
             "memory",
@@ -688,11 +758,7 @@ class MemoryManager:
         return state
 
     def save_session(self, state: SessionState) -> None:
-        existing_raw = self._read_json_path(self.paths["session"], {})
         payload = state.to_dict()
-        if isinstance(existing_raw, dict):
-            existing_raw.update(payload)
-            payload = existing_raw
 
         self._write_json_safely(
             self.paths["session"],

@@ -2766,6 +2766,8 @@ class MainWindow(QMainWindow):
         self._manifest_run_worker = None
         self._snapshot_pipeline_run_worker = None
         self._snapshot_pipeline_ephemeral_bundle_dir = None
+        self._import_rehydration_verify_pending = False
+        self._import_tree_reload_retry_used = False
         self._execution_manifest_path = ""
         self._execution_manifest = None
         self._current_details_node_data = None
@@ -6899,6 +6901,8 @@ class MainWindow(QMainWindow):
         if isinstance(destination_site, dict):
             state.SelectedDestinationSiteKey = destination_site.get("site_key") or destination_site.get("web_url") or destination_site.get("id", "")
         state.SelectedDestinationLibrary = destination_library.get("name", "") if isinstance(destination_library, dict) else ""
+        state.SourceBrowseMode = self._planning_browse_mode("source")
+        state.DestinationBrowseMode = self._planning_browse_mode("destination")
         operator_upn = self.current_session_context.get("operator_upn", "")
         tenant_domain = self.current_session_context.get("tenant_domain", "")
         state.SessionFingerprint = existing_state.SessionFingerprint or f"{operator_upn}|{tenant_domain}".strip("|")
@@ -7834,6 +7838,8 @@ class MainWindow(QMainWindow):
             pre_reset_proposed_folders_count=pre_pf,
         )
         self._clear_runtime_draft_state(refresh_ui=False)
+        self.planned_moves = []
+        self._factory_reset_clear_snapshot_ephemeral_bundle()
         dpt = getattr(self, "_deferred_planning_refresh_timer", None)
         if dpt is not None:
             dpt.stop()
@@ -7879,6 +7885,8 @@ class MainWindow(QMainWindow):
         self._suppress_autosave = False
         self._rebuild_submission_visual_cache()
         self.refresh_planned_moves_table()
+        if getattr(self, "planned_moves_table", None) is not None:
+            self.planned_moves_table.clearSelection()
         self.clear_selection_details()
         self.update_progress_summaries()
         if getattr(self, "planned_moves_status", None) is not None:
@@ -7919,6 +7927,19 @@ class MainWindow(QMainWindow):
             cache_invalidation_done=True,
             factory_workspace_reset=True,
         )
+        log_info("factory_reset", planned_moves=len(self.planned_moves))
+
+    def _factory_reset_clear_snapshot_ephemeral_bundle(self) -> None:
+        """Remove snapshot-pipeline temp bundle dir and drop the handle (factory / full workspace reset)."""
+        import shutil
+
+        ep = getattr(self, "_snapshot_pipeline_ephemeral_bundle_dir", None)
+        if not ep:
+            return
+        try:
+            shutil.rmtree(str(ep), ignore_errors=True)
+        finally:
+            self._snapshot_pipeline_ephemeral_bundle_dir = None
 
     @staticmethod
     def _qt_worker_is_running(worker) -> bool:
@@ -8309,7 +8330,18 @@ class MainWindow(QMainWindow):
                     return
                 self.memory_manager.import_bundle(Path(source_folder))
                 source_description = source_folder
+            self._import_rehydration_verify_pending = True
+            self._import_tree_reload_retry_used = False
             self._load_draft_shell_into_runtime()
+            _cand = self._memory_restore_candidate if isinstance(self._memory_restore_candidate, dict) else {}
+            log_info(
+                "planning_state_snapshot",
+                phase="import_after_shell_load",
+                planned_moves_count=len(self.planned_moves),
+                proposed_folders_count=len(self.proposed_folders),
+                restore_candidate_name=str(_cand.get("name", "") or ""),
+                source=source_description,
+            )
             if self.current_session_context.get("connected"):
                 self._apply_restored_selector_state()
                 # Canonical Gary-draft intake: enrich imported records with missing Graph ids
@@ -8322,10 +8354,21 @@ class MainWindow(QMainWindow):
                     )
                 except Exception as exc:
                     self._log_restore_exception("import_draft_graph_enrich", exc)
+            else:
+                self._import_rehydration_verify_pending = False
+            log_info(
+                "planning_state_snapshot",
+                phase="import_after_rehydration",
+                planned_moves_count=len(self.planned_moves),
+                proposed_folders_count=len(self.proposed_folders),
+                restore_candidate_name=str(_cand.get("name", "") or ""),
+                source=source_description,
+            )
             log_info("Draft import completed.", source=source_description)
             self.refresh_requests_page()
             QMessageBox.information(self, "Import Draft", "Draft bundle imported.")
         except Exception as exc:
+            self._import_rehydration_verify_pending = False
             log_error("Draft import failed.", error=str(exc), source=source_file if 'source_file' in locals() else source_folder)
             QMessageBox.warning(self, "Import Draft", "Could not import the selected draft bundle.")
 
@@ -8390,6 +8433,8 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
+            self._import_rehydration_verify_pending = True
+            self._import_tree_reload_retry_used = False
             session_state, allocations, proposed, session_raw, pm_override = self.memory_manager.apply_draft_reset_backup(
                 Path(path)
             )
@@ -8410,6 +8455,8 @@ class MainWindow(QMainWindow):
                     )
                 except Exception as exc:
                     self._log_restore_exception("restore_workspace_reset_backup_graph_enrich", exc)
+            else:
+                self._import_rehydration_verify_pending = False
             log_info("Workspace reset backup restored.", source=path)
             self.refresh_requests_page()
             QMessageBox.information(
@@ -8419,6 +8466,7 @@ class MainWindow(QMainWindow):
                 "If sites and libraries do not match the tree, re-select them or use Refresh.",
             )
         except Exception as exc:
+            self._import_rehydration_verify_pending = False
             log_error("Restore workspace reset backup failed.", error=str(exc), source=path)
             QMessageBox.warning(
                 self,
@@ -12534,6 +12582,69 @@ class MainWindow(QMainWindow):
 
         return True
 
+    def _apply_browse_modes_from_session_state(self) -> None:
+        """Re-apply source/destination platform from the session shell (import / memory restore).
+
+        Runs before site+library matching so SharePoint vs local stacks match the saved draft.
+        """
+        state = self._draft_shell_state if isinstance(self._draft_shell_state, SessionState) else SessionState()
+        raw = self._draft_shell_raw if isinstance(self._draft_shell_raw, dict) else {}
+        sm = str(getattr(state, "SourceBrowseMode", "") or raw.get("SourceBrowseMode") or "").strip().lower()
+        dm = str(getattr(state, "DestinationBrowseMode", "") or raw.get("DestinationBrowseMode") or "").strip().lower()
+        if sm not in ("sharepoint", "local"):
+            sm = "sharepoint"
+        if dm not in ("sharepoint", "local"):
+            dm = "sharepoint"
+        self._apply_planning_panel_platform("source", sm)
+        self._apply_planning_panel_platform("destination", dm)
+        log_info(
+            "session_browse_modes_applied",
+            source_browse_mode=sm,
+            destination_browse_mode=dm,
+        )
+
+    def _verify_import_rehydration_trees(self) -> None:
+        """After bundle import / reset-backup restore: if SharePoint trees stayed empty, reload library roots once."""
+        if not self.current_session_context.get("connected"):
+            return
+        if getattr(self, "_import_tree_reload_retry_used", False):
+            return
+        empty_src = False
+        empty_dst = False
+        if self._planning_browse_mode("source") == "sharepoint":
+            ss = self.planning_inputs.get("Source Site")
+            sl = self.planning_inputs.get("Source Library")
+            site = ss.currentData() if ss is not None else None
+            lib = sl.currentData() if sl is not None else None
+            if isinstance(site, dict) and isinstance(lib, dict) and str(lib.get("id", "") or "").strip():
+                stw = getattr(self, "source_tree_widget", None)
+                if stw is not None and self._planning_tree_top_level_count(stw) == 0:
+                    empty_src = True
+        if self._planning_browse_mode("destination") == "sharepoint":
+            ds = self.planning_inputs.get("Destination Site")
+            dl = self.planning_inputs.get("Destination Library")
+            site = ds.currentData() if ds is not None else None
+            lib = dl.currentData() if dl is not None else None
+            if isinstance(site, dict) and isinstance(lib, dict) and str(lib.get("id", "") or "").strip():
+                dtw = self._active_destination_tree_widget()
+                if dtw is not None and self._planning_tree_top_level_count(dtw) == 0:
+                    empty_dst = True
+        if not empty_src and not empty_dst:
+            return
+        log_warn(
+            "import_rehydration_empty_tree",
+            source_empty=empty_src,
+            destination_empty=empty_dst,
+        )
+        self._import_tree_reload_retry_used = True
+        try:
+            if empty_src:
+                self.on_library_selector_changed("source", force=True)
+            if empty_dst:
+                self.on_library_selector_changed("destination", force=True)
+        except Exception as exc:
+            log_warn("import_rehydration_retry_failed", error=str(exc)[:400])
+
     def _restore_selector_matches(self):
         self._log_restore_phase("phase2_restore_selector_matches_start")
         state = self._draft_shell_state if isinstance(self._draft_shell_state, SessionState) else SessionState()
@@ -12564,9 +12675,9 @@ class MainWindow(QMainWindow):
         )
 
         if source_site_matched:
-            self._populate_library_selector_for_group("source")
+            self.on_site_selector_changed("source", force=True, chain_library=False)
         if destination_site_matched:
-            self._populate_library_selector_for_group("destination")
+            self.on_site_selector_changed("destination", force=True, chain_library=False)
 
         source_library_index = self._find_selector_index(
             source_library_selector,
@@ -12624,6 +12735,7 @@ class MainWindow(QMainWindow):
         self._restore_finalization_deferred_active = False
         self._restore_finalization_deferred_reason = ""
         try:
+            self._apply_browse_modes_from_session_state()
             self._run_restore_phase("phase2_restore_selectors", self._restore_selector_matches)
             self._log_restore_phase("phase2_post_login_restore_after_selectors")
             self._run_restore_phase(
@@ -12783,11 +12895,26 @@ class MainWindow(QMainWindow):
             autosave_suppressed=self._suppress_autosave,
             finalization_reason=reason,
         )
+        _fc = self._memory_restore_candidate if isinstance(self._memory_restore_candidate, dict) else {}
+        log_info(
+            "planning_state_snapshot",
+            phase="restore_finalize",
+            planned_moves_count=len(self.planned_moves),
+            proposed_folders_count=len(self.proposed_folders),
+            restore_candidate_name=str(_fc.get("name", "") or ""),
+            finalization_reason=str(reason or ""),
+        )
         # After restoring from local memory/cache snapshot, do not force-clear tree cache.
         # This keeps startup fast and avoids immediately replacing snapshot content with live root fetches.
         self._schedule_live_root_refresh("source", delay_ms=900, force_refresh=False)
         self._schedule_live_root_refresh("destination", delay_ms=1200, force_refresh=False)
         self._flush_pending_source_full_count_after_memory_restore()
+        if getattr(self, "_import_rehydration_verify_pending", False):
+            self._import_rehydration_verify_pending = False
+            QTimer.singleShot(
+                600,
+                lambda: self._safe_invoke("import_rehydration_tree_verify", self._verify_import_rehydration_trees),
+            )
         # Older/path-only drafts (e.g. first-generation builds) may have missed Graph id enrichment
         # because _try_resolve_planned_move_graph_ids_debounced returns while restore was still in progress.
         self._schedule_post_memory_restore_graph_id_enrichment()
@@ -13546,7 +13673,7 @@ class MainWindow(QMainWindow):
         self._set_expand_all_button_label(panel_key, True)
         self._continue_expand_all(panel_key)
 
-    def on_site_selector_changed(self, selector_group, *, force=False):
+    def on_site_selector_changed(self, selector_group, *, force=False, chain_library: bool = True):
         try:
             if self._pending_login_restore_args and not force:
                 self._log_restore_phase(
@@ -13576,7 +13703,8 @@ class MainWindow(QMainWindow):
                 return
 
             self._populate_library_selector_for_group(selector_group)
-            self.on_library_selector_changed(selector_group, force=force)
+            if chain_library:
+                self.on_library_selector_changed(selector_group, force=force)
         except Exception as exc:
             self._log_restore_exception("on_site_selector_changed", exc)
 
@@ -17621,6 +17749,10 @@ class MainWindow(QMainWindow):
         if not norm_old or not norm_new:
             return out
         old_cf = norm_old.casefold()
+        primary_is_folder = False
+        if primary_move is not None:
+            ps = primary_move.get("source") if isinstance(primary_move.get("source"), dict) else {}
+            primary_is_folder = bool(ps.get("is_folder", False))
         for m in self.planned_moves:
             if primary_move is not None and m is primary_move:
                 continue
@@ -17639,7 +17771,27 @@ class MainWindow(QMainWindow):
                 rel_suffix = proj_n[len(norm_old) + 1 :]
             else:
                 continue
-            next_full = self.normalize_memory_path(f"{norm_new}\\{rel_suffix}") if rel_suffix else norm_new
+            if rel_suffix:
+                next_full = self.normalize_memory_path(f"{norm_new}\\{rel_suffix}")
+            else:
+                msrc = m.get("source") if isinstance(m.get("source"), dict) else {}
+                m_is_folder = bool(msrc.get("is_folder", False))
+                file_leaf = str(self._move_target_name(m) or "").strip()
+                if not m_is_folder and file_leaf:
+                    # Exact projection match on old root with no relative suffix: do not assign every
+                    # row norm_new's last segment (would stamp one file's leaf onto all siblings).
+                    if primary_is_folder:
+                        next_full = self.normalize_memory_path(f"{norm_new}\\{file_leaf}")
+                    else:
+                        segs = [x for x in str(norm_new).replace("/", "\\").split("\\") if x]
+                        parent_new = "\\".join(segs[:-1]) if len(segs) > 1 else ""
+                        next_full = (
+                            self.normalize_memory_path(f"{parent_new}\\{file_leaf}")
+                            if parent_new
+                            else self.normalize_memory_path(f"{norm_new}\\{file_leaf}")
+                        )
+                else:
+                    next_full = norm_new
             segs = [x for x in next_full.split("\\") if x]
             if not segs:
                 continue
@@ -36092,18 +36244,6 @@ class MainWindow(QMainWindow):
             )
             return
 
-        self.ensure_planned_moves_resolved_via_graph(persist=True, quiet=True)
-
-        dup_err = self._planned_moves_duplicate_validation_error(self.planned_moves)
-        if dup_err:
-            QMessageBox.warning(
-                self,
-                "Cannot export manifest",
-                dup_err
-                + "\n\nUse Draft ⋮ → Review duplicate destination files… for a grouped view (you can remove one mapping at a time).",
-            )
-            return
-
         draft_key = str(self.active_draft_session_id or "").strip()
         if not draft_key and isinstance(self._draft_shell_state, SessionState):
             draft_key = str(self._draft_shell_state.DraftId or "").strip()
@@ -36123,26 +36263,73 @@ class MainWindow(QMainWindow):
         if not str(path).lower().endswith(".json"):
             path = str(path) + ".json"
 
-        ctx = getattr(self, "current_session_context", None) or {}
-        tenant_hint = str(ctx.get("tenant_domain") or "")
+        dup_err: str | None = None
+        write_exc: OSError | None = None
+        manifest: dict | None = None
+        ms_graph = ms_dup = ms_build = ms_write = 0
 
-        manifest = build_simulation_manifest(
-            planned_moves=list(self.planned_moves or []),
-            proposed_folders=list(self.proposed_folders or []),
-            draft_id=str(self.active_draft_session_id or draft_key or ""),
-            tenant_hint=tenant_hint,
-            notes="Simulation export from Ozlink Console. Local absolute paths can be run from the Execution page or Planned Moves (Run manifest).",
-            manifest_version=2,
-            plan_leaf_exclusions=sorted(getattr(self, "_plan_leaf_exclusions", set()) or []),
-            graph_unsafe_folder_step_indices=self._compute_graph_unsafe_folder_step_indices(),
-            graph_expanded_transfer_steps=self._compute_graph_expanded_transfer_steps_json(),
-        )
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            write_manifest_json(path, manifest)
-        except OSError as exc:
-            log_error("simulate_manifest_write_failed", path=str(path), error=str(exc))
-            QMessageBox.warning(self, "Simulate run", f"Could not write the file:\n{exc}")
+            t0 = time.perf_counter()
+            self.ensure_planned_moves_resolved_via_graph(persist=True, quiet=True)
+            ms_graph = int((time.perf_counter() - t0) * 1000)
+
+            t0 = time.perf_counter()
+            dup_err = self._planned_moves_duplicate_validation_error(self.planned_moves)
+            ms_dup = int((time.perf_counter() - t0) * 1000)
+
+            if not dup_err:
+                ctx = getattr(self, "current_session_context", None) or {}
+                tenant_hint = str(ctx.get("tenant_domain") or "")
+
+                t0 = time.perf_counter()
+                manifest = build_simulation_manifest(
+                    planned_moves=list(self.planned_moves or []),
+                    proposed_folders=list(self.proposed_folders or []),
+                    draft_id=str(self.active_draft_session_id or draft_key or ""),
+                    tenant_hint=tenant_hint,
+                    notes="Simulation export from Ozlink Console. Local absolute paths can be run from the Execution page or Planned Moves (Run manifest).",
+                    manifest_version=2,
+                    plan_leaf_exclusions=sorted(getattr(self, "_plan_leaf_exclusions", set()) or []),
+                    graph_unsafe_folder_step_indices=self._compute_graph_unsafe_folder_step_indices(),
+                    graph_expanded_transfer_steps=self._compute_graph_expanded_transfer_steps_json(),
+                )
+                ms_build = int((time.perf_counter() - t0) * 1000)
+
+                t0 = time.perf_counter()
+                try:
+                    write_manifest_json(path, manifest)
+                except OSError as exc:
+                    write_exc = exc
+                ms_write = int((time.perf_counter() - t0) * 1000)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        if dup_err:
+            QMessageBox.warning(
+                self,
+                "Cannot export manifest",
+                dup_err
+                + "\n\nUse Draft ⋮ → Review duplicate destination files… for a grouped view (you can remove one mapping at a time).",
+            )
             return
+
+        if write_exc is not None:
+            log_error("simulate_manifest_write_failed", path=str(path), error=str(write_exc))
+            QMessageBox.warning(self, "Simulate run", f"Could not write the file:\n{write_exc}")
+            return
+
+        if manifest is None:
+            return
+
+        if is_dev_mode():
+            log_info(
+                "simulate_manifest_save_timing_ms",
+                graph_resolve=ms_graph,
+                duplicate_check=ms_dup,
+                manifest_build=ms_build,
+                file_write=ms_write,
+            )
 
         log_info(
             "simulate_manifest_written",
