@@ -27906,7 +27906,7 @@ class MainWindow(QMainWindow):
         if sub == "expand_prepare":
             op = QElapsedTimer()
             op.start()
-            budget_ms = int(getattr(self, "_destination_finalize_expand_prepare_budget_ms", 5) or 5)
+            budget_ms = int(getattr(self, "_destination_finalize_expand_prepare_budget_ms", 25) or 25)
             prepare_phase = str(sess.get("expand_prepare_phase") or "bucket")
             if prepare_phase == "bucket":
                 remainder = sess.get("expand_bucket_remainder")
@@ -32839,7 +32839,13 @@ class MainWindow(QMainWindow):
         out: dict,
         invalidate_semantic_fn,
     ) -> dict:
-        """Incremental semantic merge: move duplicate's children into canonical in time slices."""
+        """Incremental semantic merge: move duplicate's children into canonical in time slices.
+
+        ``merge_snap_gen`` is refreshed after in-session structural work (placeholder strip,
+        each child move) so ``structure_generation`` bumps from our own ``remove_node_at`` /
+        ``append_nested_child`` do not trigger a false external-stale invalidation on the next
+        loop iteration or tick.
+        """
         mst = sess.get("semantic_merge_state")
         if mst is None:
             out["reconcile_phase"] = "semantic_merge"
@@ -32872,11 +32878,13 @@ class MainWindow(QMainWindow):
         op_slice.start()
         budget_ms = int(getattr(self, "_destination_finalize_semantic_merge_budget_ms", 8) or 8)
         hard_ms = int(getattr(self, "_destination_finalize_semantic_merge_hard_cap_ms", 48) or 48)
-        max_ops = int(getattr(self, "_destination_finalize_semantic_merge_max_children_per_tick", 16) or 16)
+        max_ops = int(getattr(self, "_destination_finalize_semantic_merge_max_children_per_tick", 1) or 1)
 
         if not mst.get("placeholder_removed"):
             self._remove_placeholder_children(target_ix)
             mst["placeholder_removed"] = True
+            merge_snap_gen = int(dmodel.structure_generation())
+            mst["merge_snap_gen"] = merge_snap_gen
 
         moved_before = int(mst.get("moved_count") or 0)
         moved_total = moved_before
@@ -32906,6 +32914,8 @@ class MainWindow(QMainWindow):
                 break
             moved_total += self._merge_nested_spec_into_parent_index(target_ix, nested)
             n_ops += 1
+            merge_snap_gen = int(dmodel.structure_generation())
+            mst["merge_snap_gen"] = merge_snap_gen
 
         mst["moved_count"] = moved_total
         moved_delta = moved_total - moved_before
