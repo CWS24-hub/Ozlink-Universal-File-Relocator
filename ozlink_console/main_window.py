@@ -26997,6 +26997,57 @@ class MainWindow(QMainWindow):
         sess["current_merge_root_path"] = ""
         sess["pending_merge_root_sort_target"] = None
 
+    def _destination_incremental_merge_push_child_paths_frames(
+        self,
+        sess: dict,
+        fill_stack: list,
+        grand: list,
+        *,
+        uses_mv: bool,
+        parent_ix=None,
+        parent_item=None,
+    ) -> None:
+        """Push stack frame(s) to attach sorted ``grand`` paths; split very large lists into chunks.
+
+        Order is preserved: chunks are pushed in reverse so the incremental-merge stack (LIFO)
+        processes the first chunk first. Nested descendant frames pushed while draining a chunk
+        sit above the chunk frame and are unchanged by this helper.
+        """
+        if not grand:
+            return
+        total = len(grand)
+        chunk_sz = max(16, int(getattr(self, "_destination_merge_attach_child_paths_chunk_size", 128) or 128))
+        trigger = max(chunk_sz, int(getattr(self, "_destination_merge_attach_child_paths_chunk_trigger", 256) or 256))
+
+        def _append_frame(paths: list, *, chunk_idx: int = 0, chunk_total: int = 1) -> None:
+            row: dict = {"child_paths": paths, "next_i": 0}
+            if chunk_total > 1:
+                row["cps_chunk"] = (chunk_idx, chunk_total, total)
+            if uses_mv:
+                row["parent_ix"] = parent_ix
+            else:
+                row["parent_item"] = parent_item
+            fill_stack.append(row)
+
+        if total <= trigger:
+            _append_frame(list(grand))
+            return
+
+        chunks = [grand[i : i + chunk_sz] for i in range(0, total, chunk_sz)]
+        nch = len(chunks)
+        log_info(
+            "destination_incremental_merge_child_paths_frame_chunked",
+            total_paths=int(total),
+            chunk_size=int(chunk_sz),
+            chunk_count=int(nch),
+            chunk_trigger=int(trigger),
+            uses_mv=bool(uses_mv),
+            merge_root_path_excerpt=str(sess.get("current_merge_root_path") or "")[:240],
+            pending_parent_path_excerpt=str(sess.get("pending_sort_parent_path_str") or "")[:240],
+        )
+        for ci in range(nch - 1, -1, -1):
+            _append_frame(chunks[ci], chunk_idx=ci, chunk_total=nch)
+
     def _destination_incremental_merge_session_tick_attach(self, sess: dict) -> None:
         """Bounded attach work: shallow rows + stack (semantic children or one-level NestedSpec chunks).
 
@@ -27109,6 +27160,16 @@ class MainWindow(QMainWindow):
 
                 child_paths = frame["child_paths"]
                 ni = int(frame["next_i"] or 0)
+                cc = frame.get("cps_chunk")
+                if cc and ni == 0 and int(cc[0]) > 0:
+                    log_info(
+                        "destination_incremental_merge_child_paths_chunk_resumed",
+                        chunk_index=int(cc[0]),
+                        chunk_total=int(cc[1]),
+                        sibling_total_paths=int(cc[2]),
+                        chunk_path_count=len(child_paths),
+                        tick_wall_ms=int(budget.elapsed()),
+                    )
                 if ni >= len(child_paths):
                     fill_stack.pop()
                     if not fill_stack:
@@ -27133,7 +27194,9 @@ class MainWindow(QMainWindow):
                         if nk_c:
                             fill_stack.append({"parent_ix": new_ix, "nested_specs": list(nk_c), "next_i": 0})
                         elif grand:
-                            fill_stack.append({"parent_ix": new_ix, "child_paths": grand, "next_i": 0})
+                            self._destination_incremental_merge_push_child_paths_frames(
+                                sess, fill_stack, grand, uses_mv=True, parent_ix=new_ix
+                            )
                     else:
                         new_ix = dmodel.append_nested_child(p_ix, (pay_c, []))
                         if new_ix is None or not new_ix.isValid():
@@ -27142,7 +27205,9 @@ class MainWindow(QMainWindow):
                         _note_row_attached()
                         grand = _sorted_child_paths(cpath)
                         if grand:
-                            fill_stack.append({"parent_ix": new_ix, "child_paths": grand, "next_i": 0})
+                            self._destination_incremental_merge_push_child_paths_frames(
+                                sess, fill_stack, grand, uses_mv=True, parent_ix=new_ix
+                            )
                 else:
                     p_w = frame["parent_item"]
                     kind_c, pay_c = self._destination_incremental_merge_row_attach_spec(model_nodes, cpath)
@@ -27153,7 +27218,9 @@ class MainWindow(QMainWindow):
                         if nk_c:
                             fill_stack.append({"parent_item": new_w, "nested_specs": list(nk_c), "next_i": 0})
                         elif grand:
-                            fill_stack.append({"parent_item": new_w, "child_paths": grand, "next_i": 0})
+                            self._destination_incremental_merge_push_child_paths_frames(
+                                sess, fill_stack, grand, uses_mv=False, parent_item=new_w
+                            )
                     else:
                         new_w = self._build_destination_future_tree_item_shallow(model_nodes, cpath)
                         p_w.addChild(new_w)
@@ -27161,7 +27228,9 @@ class MainWindow(QMainWindow):
                         _note_row_attached()
                         grand = _sorted_child_paths(cpath)
                         if grand:
-                            fill_stack.append({"parent_item": new_w, "child_paths": grand, "next_i": 0})
+                            self._destination_incremental_merge_push_child_paths_frames(
+                                sess, fill_stack, grand, uses_mv=False, parent_item=new_w
+                            )
                 continue
 
             parent_path = parent_order[sess["parent_i"]]
@@ -27232,7 +27301,9 @@ class MainWindow(QMainWindow):
                         if nk_r:
                             fill_stack.append({"parent_ix": new_ix, "nested_specs": list(nk_r), "next_i": 0})
                         elif grand:
-                            fill_stack.append({"parent_ix": new_ix, "child_paths": grand, "next_i": 0})
+                            self._destination_incremental_merge_push_child_paths_frames(
+                                sess, fill_stack, grand, uses_mv=True, parent_ix=new_ix
+                            )
                         else:
                             self._destination_incremental_merge_finish_merge_root(sess, parent_item, uses_mv)
                     else:
@@ -27244,7 +27315,9 @@ class MainWindow(QMainWindow):
                         sess["cumulative_rows_attached"] = int(sess.get("cumulative_rows_attached") or 0) + 1
                         _note_row_attached()
                         if grand:
-                            fill_stack.append({"parent_ix": new_ix, "child_paths": grand, "next_i": 0})
+                            self._destination_incremental_merge_push_child_paths_frames(
+                                sess, fill_stack, grand, uses_mv=True, parent_ix=new_ix
+                            )
                         else:
                             self._destination_incremental_merge_finish_merge_root(sess, parent_item, uses_mv)
                     else:
@@ -27259,7 +27332,9 @@ class MainWindow(QMainWindow):
                     if nk_r:
                         fill_stack.append({"parent_item": new_w, "nested_specs": list(nk_r), "next_i": 0})
                     elif grand:
-                        fill_stack.append({"parent_item": new_w, "child_paths": grand, "next_i": 0})
+                        self._destination_incremental_merge_push_child_paths_frames(
+                            sess, fill_stack, grand, uses_mv=False, parent_item=new_w
+                        )
                     else:
                         self._destination_incremental_merge_finish_merge_root(sess, parent_item, uses_mv)
                 else:
@@ -27269,7 +27344,9 @@ class MainWindow(QMainWindow):
                     sess["cumulative_rows_attached"] = int(sess.get("cumulative_rows_attached") or 0) + 1
                     _note_row_attached()
                     if grand:
-                        fill_stack.append({"parent_item": new_w, "child_paths": grand, "next_i": 0})
+                        self._destination_incremental_merge_push_child_paths_frames(
+                            sess, fill_stack, grand, uses_mv=False, parent_item=new_w
+                        )
                     else:
                         self._destination_incremental_merge_finish_merge_root(sess, parent_item, uses_mv)
 
@@ -33121,9 +33198,9 @@ class MainWindow(QMainWindow):
             out["semantic_phase_done"] = True
             return out
 
-        budget_ms = int(getattr(self, "_destination_finalize_reconcile_budget_ms", 10) or 10)
+        budget_ms = int(getattr(self, "_destination_finalize_reconcile_budget_ms", 18) or 18)
         hard_ms = int(getattr(self, "_destination_finalize_reconcile_hard_cap_ms", 98) or 98)
-        max_nodes = int(getattr(self, "_destination_finalize_reconcile_max_nodes_per_tick", 24) or 24)
+        max_nodes = int(getattr(self, "_destination_finalize_reconcile_max_nodes_per_tick", 200) or 200)
         op = QElapsedTimer()
         op.start()
 
