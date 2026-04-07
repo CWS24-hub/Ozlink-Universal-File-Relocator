@@ -156,6 +156,7 @@ _INCREMENTAL_DEFERRED_PLANNING_REFRESH_REASONS = frozenset(
         "planned_move_added",
         "planned_move_override_added",
         "planning_change_lightweight",
+        "planned_item_moved",
         "planned_item_moved_paste_quick",
         "planned_item_moved_manual_drag",
         "leaf_excluded_from_plan",
@@ -2761,6 +2762,20 @@ class MainWindow(QMainWindow):
         self._expand_all_status_last_update_ms = {"source": 0, "destination": 0}
         self._destination_expand_all_after_full_tree = False
         self._workspace_restore_expanded_all_intent = {"source": False, "destination": False}
+        # Destination expand-all / loaded-branch state: avoid full-tree BFS on the GUI thread (see
+        # _destination_tick_loaded_branch_state_recompute).
+        self._destination_lbs_budget_ms = 5
+        self._destination_lbs_cache_valid = False
+        self._destination_lbs_cache_has_loaded = False
+        self._destination_lbs_cache_all_expanded = True
+        self._destination_lbs_recompute_queue = None
+        self._destination_lbs_partial_has_loaded = False
+        self._destination_lbs_partial_all_expanded = True
+        self._destination_loaded_folder_count = 0
+        self._destination_expanded_loaded_folder_count = 0
+        self._destination_lbs_recompute_timer = QTimer(self)
+        self._destination_lbs_recompute_timer.setSingleShot(True)
+        self._destination_lbs_recompute_timer.timeout.connect(self._destination_tick_loaded_branch_state_recompute)
         self.unresolved_proposed_by_parent_path = {}
         self.unresolved_allocations_by_parent_path = {}
         self.proposed_folders = []
@@ -4909,6 +4924,8 @@ class MainWindow(QMainWindow):
         if getattr(self, "_destination_tree_model_view", False):
             self.destination_tree_widget.expanded.connect(self._on_destination_planning_model_expanded)
             self.destination_tree_widget.collapsed.connect(self._on_destination_planning_model_collapsed)
+            self.destination_tree_widget.expanded.connect(self._destination_note_expand_state_changed_for_loaded_branch_cache)
+            self.destination_tree_widget.collapsed.connect(self._destination_note_expand_state_changed_for_loaded_branch_cache)
             self.destination_tree_widget.selectionModel().selectionChanged.connect(
                 lambda *_args: self.on_tree_selection_changed("destination")
             )
@@ -6542,16 +6559,44 @@ class MainWindow(QMainWindow):
         if hasattr(button, "setToolTip"):
             button.setToolTip(tip)
 
-    def _panel_loaded_branch_state_planning_model(self, tree):
+    def _destination_note_expand_state_changed_for_loaded_branch_cache(self, *_args) -> None:
+        """Expand/collapse does not change model structure; invalidate sliced loaded-branch cache."""
+        self._destination_invalidate_loaded_branch_state_cache()
+        self._destination_schedule_loaded_branch_state_recompute()
+
+    def _destination_invalidate_loaded_branch_state_cache(self) -> None:
+        self._destination_lbs_cache_valid = False
+        self._destination_lbs_recompute_queue = None
+        t = getattr(self, "_destination_lbs_recompute_timer", None)
+        if t is not None and t.isActive():
+            t.stop()
+
+    def _destination_schedule_loaded_branch_state_recompute(self) -> None:
+        t = getattr(self, "_destination_lbs_recompute_timer", None)
+        if t is None:
+            return
+        if not t.isActive():
+            t.start(0)
+
+    def _destination_tick_loaded_branch_state_recompute(self) -> None:
+        """Time-sliced BFS for loaded-branch / expand-all button state (no single-tick full tree walk)."""
+        tree = getattr(self, "destination_tree_widget", None)
         model = getattr(self, "destination_planning_model", None)
         if model is None or tree is None:
-            return False, False
-        has_loaded_branches = False
-        all_loaded_branches_expanded = True
-        queue = []
-        for r in range(model.rowCount(QModelIndex())):
-            queue.append(model.index(r, 0, QModelIndex()))
-        while queue:
+            return
+        op = QElapsedTimer()
+        op.start()
+        budget_ms = int(getattr(self, "_destination_lbs_budget_ms", 5) or 5)
+        if self._destination_lbs_recompute_queue is None:
+            q: list = []
+            for r in range(model.rowCount(QModelIndex())):
+                q.append(model.index(r, 0, QModelIndex()))
+            self._destination_lbs_recompute_queue = q
+            self._destination_lbs_partial_has_loaded = False
+            self._destination_lbs_loaded_folder_total = 0
+            self._destination_lbs_expanded_loaded_total = 0
+        queue = self._destination_lbs_recompute_queue
+        while queue and op.elapsed() < budget_ms:
             ix = queue.pop(0)
             if not ix.isValid():
                 continue
@@ -6566,11 +6611,36 @@ class MainWindow(QMainWindow):
                     continue
                 real_children.append(cix)
             if bool(node_data.get("is_folder")) and real_children:
-                has_loaded_branches = True
-                if not tree.isExpanded(ix):
-                    all_loaded_branches_expanded = False
+                self._destination_lbs_partial_has_loaded = True
+                self._destination_lbs_loaded_folder_total += 1
+                if tree.isExpanded(ix):
+                    self._destination_lbs_expanded_loaded_total += 1
             queue.extend(real_children)
-        return has_loaded_branches, all_loaded_branches_expanded
+        if queue:
+            self._destination_lbs_recompute_queue = queue
+            self._destination_lbs_recompute_timer.start(0)
+            return
+        loaded_n = int(getattr(self, "_destination_lbs_loaded_folder_total", 0) or 0)
+        exp_n = int(getattr(self, "_destination_lbs_expanded_loaded_total", 0) or 0)
+        self._destination_loaded_folder_count = loaded_n
+        self._destination_expanded_loaded_folder_count = exp_n
+        has_loaded = bool(self._destination_lbs_partial_has_loaded)
+        self._destination_lbs_cache_has_loaded = has_loaded
+        self._destination_lbs_cache_all_expanded = (not has_loaded) or (exp_n == loaded_n)
+        self._destination_lbs_cache_valid = True
+        self._destination_lbs_recompute_queue = None
+
+    def _panel_loaded_branch_state_planning_model(self, tree):
+        model = getattr(self, "destination_planning_model", None)
+        if model is None or tree is None:
+            return False, False
+        if not getattr(self, "_destination_lbs_cache_valid", False):
+            self._destination_schedule_loaded_branch_state_recompute()
+            return (
+                getattr(self, "_destination_lbs_cache_has_loaded", False),
+                getattr(self, "_destination_lbs_cache_all_expanded", True),
+            )
+        return self._destination_lbs_cache_has_loaded, self._destination_lbs_cache_all_expanded
 
     def _panel_loaded_branch_state(self, panel_key):
         tree = self.source_tree_widget if panel_key == "source" else self.destination_tree_widget
@@ -10724,6 +10794,23 @@ class MainWindow(QMainWindow):
 
     def _schedule_deferred_destination_materialization(self, reason, delay_ms=180):
         reason = str(reason or "idle_destination_materialize")
+        if reason == "planned_item_moved":
+            timer_dedupe = getattr(self, "_destination_idle_materialize_timer", None)
+            prev_r = str(getattr(self, "_destination_idle_materialize_pending_reason", "") or "")
+            if (
+                timer_dedupe is not None
+                and timer_dedupe.isActive()
+                and prev_r == "planned_item_moved"
+            ):
+                if is_dev_mode():
+                    log_info(
+                        "destination_double_render_guard",
+                        phase="coalesce_duplicate_planned_item_moved",
+                        scheduling_path="_schedule_deferred_destination_materialization",
+                        reason=reason,
+                        delay_ms=int(delay_ms),
+                    )
+                return
         if self._should_park_deferred_materialize_for_full_tree(reason):
             had_parked = bool(str(getattr(self, "_destination_idle_materialize_parked_for_full_tree_reason", "") or "").strip())
             merged = self._park_deferred_destination_materialize_for_full_tree_wait(reason)
@@ -17036,6 +17123,8 @@ class MainWindow(QMainWindow):
 
     def _on_destination_planning_model_structure_changed(self):
         self._invalidate_destination_path_lookup_cache_only()
+        self._destination_invalidate_loaded_branch_state_cache()
+        self._destination_schedule_loaded_branch_state_recompute()
 
     def _mark_destination_indicator_dirty_paths(self, paths):
         """Queue partial indicator refresh for these semantic paths and their ancestors."""
@@ -27544,13 +27633,14 @@ class MainWindow(QMainWindow):
             op = QElapsedTimer()
             op.start()
             self._restore_selected_tree_path("destination", destination_selected_path)
-            self._refresh_expand_all_button_for_panel("destination")
             wall = op.elapsed()
+            QTimer.singleShot(0, lambda: self._refresh_expand_all_button_for_panel("destination"))
             log_info(
                 "destination_incremental_merge_finalize_tick",
                 tick_index=tick_idx,
                 pipeline_stage="select_and_expand_button",
                 tick_wall_ms=wall,
+                expand_all_button_refresh_deferred=True,
             )
             sess["finalize_subphase"] = "persist"
             return False
@@ -39839,7 +39929,10 @@ class MainWindow(QMainWindow):
                 move_origin=move_origin,
             )  # return ignored; full persist follows
             self._schedule_deferred_destination_materialization("planned_item_moved", delay_ms=220)
-            self._persist_planning_change("planned_item_moved")
+            _ov_paths = self._expand_source_projection_paths_with_parents(
+                self._collect_source_projection_paths_for_move_networks(override_move, [])
+            )
+            self._persist_planning_change("planned_item_moved", source_projection_paths=_ov_paths)
             return True
 
         move["destination_path"] = target_path
@@ -39885,7 +39978,15 @@ class MainWindow(QMainWindow):
             touch_reapply_total, touch_reapply_per_parent = self._reapply_allocation_overlays_for_paste_touch_paths(
                 old_p, new_p, target_path
             )
-            quick_path_ok = touch_reapply_total > 0
+            # Quick path normally requires overlay reapply to touch rows (touch_reapply_total > 0). First manual
+            # drag often yields 0 without wrong data — allow lightweight finalize/persist without deferred
+            # materialize. Do not rebind queues or ensure projection here (see revert notes).
+            safe_manual_drag = (
+                bool(from_manual_planning_drag)
+                and move is not None
+                and inherited_move is None
+            )
+            quick_path_ok = touch_reapply_total > 0 or safe_manual_drag
             finalize_reason = "" if quick_path_ok else "touch_reapply_total_zero"
             moved_proj = self._allocation_projection_path(move)
             if is_dev_mode():
@@ -39899,6 +40000,10 @@ class MainWindow(QMainWindow):
                     incremental_kind=incremental_kind,
                     quick_path_ok=quick_path_ok,
                     touch_reapply_total=touch_reapply_total,
+                    safe_manual_drag=bool(safe_manual_drag),
+                    quick_path_via_safe_manual_drag=bool(
+                        quick_path_ok and touch_reapply_total == 0 and safe_manual_drag
+                    ),
                     touch_reapply_per_parent=touch_reapply_per_parent,
                     scrubbed_projection_nodes=scrubbed,
                     touch_candidate_parents=len(candidate_parents),
@@ -39966,7 +40071,10 @@ class MainWindow(QMainWindow):
             move_origin=move_origin,
         )  # return ignored; heavy persist uses full deferred refresh elsewhere
         self._schedule_deferred_destination_materialization("planned_item_moved", delay_ms=220)
-        self._persist_planning_change("planned_item_moved")
+        _moved_narrow = self._expand_source_projection_paths_with_parents(
+            self._collect_source_projection_paths_for_move_networks(move, rewritten_related)
+        )
+        self._persist_planning_change("planned_item_moved", source_projection_paths=_moved_narrow)
         if from_manual_planning_drag and move is not None:
             old_parent_path = self._destination_parent_path(current_projection_path)
             src_canon = self._canonical_source_projection_path(move.get("source_path", ""))
@@ -48054,6 +48162,14 @@ class MainWindow(QMainWindow):
             for i in range(1, len(segs) + 1):
                 out.add("\\".join(segs[:i]))
         return out
+
+    def _collect_source_projection_paths_for_move_networks(self, move, rewritten_related) -> set[str]:
+        """Narrow source paths for persist — avoids scanning the entire visible source tree."""
+        raw: set[str] = set()
+        for m in [move] + list(rewritten_related or []):
+            if isinstance(m, dict):
+                raw |= self._expand_source_projection_paths_for_move_network(m)
+        return raw
 
     def _persist_planning_change(
         self, reason, *, notify_saved=False, source_projection_paths=None, clear_source_path_lookups=True

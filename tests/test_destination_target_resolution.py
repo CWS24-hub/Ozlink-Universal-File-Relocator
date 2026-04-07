@@ -453,7 +453,7 @@ def test_move_planned_from_paste_falls_back_finalize_when_quick_apply_zero():
         AssertionError("lightweight should not run when quick apply fails")
     )
     heavy = []
-    mw._persist_planning_change = lambda r: heavy.append(r)
+    mw._persist_planning_change = lambda r, **kw: heavy.append((r, kw.get("source_projection_paths")))
     mw.refresh_planned_moves_table = lambda: None
     mw.planned_moves_status = MagicMock()
     mw.destination_tree_status = MagicMock()
@@ -463,7 +463,9 @@ def test_move_planned_from_paste_falls_back_finalize_when_quick_apply_zero():
 
     assert mw._move_planned_destination_node(src, tgt, from_paste_here=True) is True
     assert scheduled
-    assert heavy == ["planned_item_moved"]
+    assert len(heavy) == 1
+    assert heavy[0][0] == "planned_item_moved"
+    assert heavy[0][1] is not None
 
 
 def test_move_planned_from_manual_drag_uses_lightweight_persist_when_quick_apply_succeeds():
@@ -520,7 +522,8 @@ def test_move_planned_from_manual_drag_uses_lightweight_persist_when_quick_apply
     assert move["destination_path"] == "Root\\NewParent"
 
 
-def test_move_planned_from_manual_drag_falls_back_finalize_when_quick_apply_zero():
+def test_move_planned_from_manual_drag_still_lightweight_when_touch_reapply_zero():
+    """Manual planning drag uses quick path even when overlay reapply applies nothing (first-move case)."""
     _qapp()
     mw = MainWindow.__new__(MainWindow)
     move = {
@@ -551,11 +554,11 @@ def test_move_planned_from_manual_drag_falls_back_finalize_when_quick_apply_zero
     mw._paths_equivalent = lambda a, b, role: False
     scheduled = []
     mw._schedule_deferred_destination_materialization = lambda r, delay_ms=180: scheduled.append((r, delay_ms))
-    mw._persist_planning_change_lightweight = lambda **kw: (_ for _ in ()).throw(
-        AssertionError("lightweight should not run when quick apply fails")
-    )
+    lightweight = []
+    mw._persist_planning_change_lightweight = lambda **kw: lightweight.append(kw)
     heavy = []
     mw._persist_planning_change = lambda r: heavy.append(r)
+    mw._bump_destination_materialized_overlay_fingerprint = lambda **kw: None
     mw.refresh_planned_moves_table = lambda: None
     mw.planned_moves_status = MagicMock()
     mw.destination_tree_status = MagicMock()
@@ -564,8 +567,10 @@ def test_move_planned_from_manual_drag_falls_back_finalize_when_quick_apply_zero
     tgt = {"name": "NewParent", "display_path": "Root\\NewParent", "item_path": "Root\\NewParent", "is_folder": True}
 
     assert mw._move_planned_destination_node(src, tgt, from_manual_planning_drag=True) is True
-    assert scheduled
-    assert heavy == ["planned_item_moved"]
+    assert not scheduled
+    assert not heavy
+    assert len(lightweight) == 1
+    assert lightweight[0].get("planning_refresh_reason") == "planned_item_moved_manual_drag"
 
 
 def test_move_planned_manual_drag_second_move_still_lightweight_when_quick_succeeds():
