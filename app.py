@@ -2,13 +2,20 @@ import os
 import sys
 import threading
 import faulthandler
-from datetime import datetime
 
 from PySide6.QtCore import QtMsgType, qInstallMessageHandler
 from PySide6.QtWidgets import QApplication
 
-from ozlink_console.logger import log_error, log_info, log_trace
-from ozlink_console.paths import ensure_app_storage_directories, logs_root
+from ozlink_console.logger import (
+    get_crash_binary_log_file,
+    get_crash_log_path,
+    init_session_logging,
+    log_error,
+    log_info,
+    log_session_diagnostics_initialized,
+    log_trace,
+)
+from ozlink_console.paths import ensure_app_storage_directories
 from ozlink_console.dev_mode import apply_cli_dev_flag
 from ozlink_console.main_window import MainWindow
 
@@ -19,9 +26,11 @@ _CRASH_FILE_HANDLE = None
 def _install_native_crash_capture():
     global _CRASH_FILE_HANDLE
 
-    crash_path = logs_root() / f"OzlinkConsole_crash_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
-    _CRASH_FILE_HANDLE = open(crash_path, "a", encoding="utf-8", buffering=1)
-    _CRASH_FILE_HANDLE.write(f"[native-crash] crash log started path={crash_path}\n")
+    init_session_logging()
+    crash_path = get_crash_log_path()
+    _CRASH_FILE_HANDLE = get_crash_binary_log_file()
+    banner = f"[native-crash] crash log started path={crash_path}\n"
+    _CRASH_FILE_HANDLE.write(banner.encode("utf-8", errors="replace"))
     _CRASH_FILE_HANDLE.flush()
 
     faulthandler.enable(file=_CRASH_FILE_HANDLE, all_threads=True)
@@ -41,7 +50,7 @@ def _install_native_crash_capture():
             f"[qt-message] type={type_map.get(msg_type, str(msg_type))} "
             f"file={file_name} line={line_number} function={function_name} message={message}\n"
         )
-        _CRASH_FILE_HANDLE.write(formatted)
+        _CRASH_FILE_HANDLE.write(formatted.encode("utf-8", errors="replace"))
         _CRASH_FILE_HANDLE.flush()
         log_info(
             "Qt message captured.",
@@ -54,6 +63,7 @@ def _install_native_crash_capture():
 
     qInstallMessageHandler(_qt_message_handler)
     log_info("Native crash capture enabled.", crash_log_path=str(crash_path))
+    log_session_diagnostics_initialized()
 
 
 def _install_global_exception_hooks():
@@ -88,6 +98,7 @@ def run_app():
     # Set OZLINK_FULL_TRACE=1 before launch when diagnosing projection/restore issues.
     os.environ.setdefault("OZLINK_FULL_TRACE", "0")
     ensure_app_storage_directories()
+    init_session_logging()
     _install_global_exception_hooks()
     _install_native_crash_capture()
     app = QApplication(sys.argv)

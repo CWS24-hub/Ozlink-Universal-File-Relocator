@@ -13,7 +13,7 @@ from PySide6.QtCore import QModelIndex, Qt, QTimer
 from PySide6.QtWidgets import QApplication, QMessageBox, QTreeView, QTreeWidget, QTreeWidgetItem
 
 import ozlink_console.logger as logger_module
-from ozlink_console.logger import JsonLineFormatter
+from ozlink_console.logger import JsonLineFormatter, reset_logging_for_tests
 from ozlink_console.main_window import MainWindow
 from ozlink_console.memory import MemoryManager
 from ozlink_console.tree_models.sharepoint_source_model import SharePointSourceTreeModel
@@ -253,12 +253,7 @@ class LoggerRegressionTests(unittest.TestCase):
 
 class MemoryImportRegressionTests(unittest.TestCase):
     def tearDown(self):
-        logger = logger_module._LOGGER
-        if logger is not None:
-            for handler in list(logger.handlers):
-                handler.close()
-                logger.removeHandler(handler)
-        logger_module._LOGGER = None
+        reset_logging_for_tests()
 
     def test_import_bundle_normalizes_legacy_destination_paths(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -321,12 +316,7 @@ class MemoryImportRegressionTests(unittest.TestCase):
                 self.assertTrue(manager.paths["allocations_recovery"].exists())
                 self.assertTrue(manager.paths["proposed_recovery"].exists())
 
-                logger = logger_module._LOGGER
-                if logger is not None:
-                    for handler in list(logger.handlers):
-                        handler.close()
-                        logger.removeHandler(handler)
-                logger_module._LOGGER = None
+                reset_logging_for_tests()
 
 
 class GraphClientRegressionTests(unittest.TestCase):
