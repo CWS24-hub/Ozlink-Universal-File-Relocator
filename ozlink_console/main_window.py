@@ -27645,7 +27645,7 @@ class MainWindow(QMainWindow):
             return False
 
         if mode == "lazy_df":
-            per = int(getattr(self, "_destination_finalize_lazy_df_nodes_per_tick", 24) or 24)
+            per = int(getattr(self, "_destination_finalize_lazy_df_nodes_per_tick", 200) or 200)
             stack = sess.get("finalize_lazy_df_stack")
             if stack is None:
                 stack = [[QModelIndex(), 0]]
@@ -27654,12 +27654,21 @@ class MainWindow(QMainWindow):
             snap_gen = int(sess.get("finalize_lazy_df_stack_gen") or 0)
 
             if int(dmodel.structure_generation()) != snap_gen:
+                _cur_gen = int(dmodel.structure_generation())
+                log_info(
+                    "lazy_df_stack_reset",
+                    reason="stale_gen_start",
+                    current_structure_generation=_cur_gen,
+                    previous_snap_gen=snap_gen,
+                    tick_index=tick_idx,
+                    stack_depth_before_reset=len(stack) if stack is not None else 0,
+                )
                 self._log_restore_phase(
                     "reconcile_skip_due_to_stale_model",
                     reason="destination_finalize_lazy_df_tick_gen",
                     reconcile_stage="destination_finalize_lazy_df_tick_gen",
                     expected_generation=snap_gen,
-                    current_generation=int(dmodel.structure_generation()),
+                    current_generation=_cur_gen,
                 )
                 stack = [[QModelIndex(), 0]]
                 sess["finalize_lazy_df_stack"] = stack
@@ -27681,6 +27690,15 @@ class MainWindow(QMainWindow):
                     break
                 nodes_walked += 1
                 if int(dmodel.structure_generation()) != snap_gen:
+                    _cur_gen = int(dmodel.structure_generation())
+                    log_info(
+                        "lazy_df_stack_reset",
+                        reason="stale_gen_mid",
+                        current_structure_generation=_cur_gen,
+                        previous_snap_gen=snap_gen,
+                        tick_index=tick_idx,
+                        stack_depth_before_reset=len(stack) if stack is not None else 0,
+                    )
                     stack = [[QModelIndex(), 0]]
                     sess["finalize_lazy_df_stack"] = stack
                     sess["finalize_lazy_df_stack_gen"] = int(dmodel.structure_generation())
@@ -27715,6 +27733,15 @@ class MainWindow(QMainWindow):
 
                 dmodel.update_payload_for_index(ix, _mut)
                 if int(dmodel.structure_generation()) != snap_gen:
+                    _cur_gen = int(dmodel.structure_generation())
+                    log_info(
+                        "lazy_df_stack_reset",
+                        reason="stale_gen_after_update",
+                        current_structure_generation=_cur_gen,
+                        previous_snap_gen=snap_gen,
+                        tick_index=tick_idx,
+                        stack_depth_before_reset=len(stack) if stack is not None else 0,
+                    )
                     stack = [[QModelIndex(), 0]]
                     sess["finalize_lazy_df_stack"] = stack
                     sess["finalize_lazy_df_stack_gen"] = int(dmodel.structure_generation())
@@ -32878,7 +32905,7 @@ class MainWindow(QMainWindow):
         op_slice.start()
         budget_ms = int(getattr(self, "_destination_finalize_semantic_merge_budget_ms", 8) or 8)
         hard_ms = int(getattr(self, "_destination_finalize_semantic_merge_hard_cap_ms", 48) or 48)
-        max_ops = int(getattr(self, "_destination_finalize_semantic_merge_max_children_per_tick", 1) or 1)
+        max_ops = int(getattr(self, "_destination_finalize_semantic_merge_max_children_per_tick", 2) or 2)
 
         if not mst.get("placeholder_removed"):
             self._remove_placeholder_children(target_ix)
