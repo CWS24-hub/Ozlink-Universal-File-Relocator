@@ -2738,6 +2738,7 @@ class MainWindow(QMainWindow):
         self._destination_merge_tick_max_ms = 12
         self._destination_merge_tick_max_rows = 5
         self._destination_merge_visibility_rows_per_tick = 8
+        self._destination_merge_heavy_root_child_threshold = 48
         self._destination_future_projection_timer = QTimer(self)
         self._destination_future_projection_timer.setSingleShot(True)
         self._destination_future_projection_timer.timeout.connect(self._run_destination_future_projection_chunk)
@@ -26656,23 +26657,185 @@ class MainWindow(QMainWindow):
                 cumulative_rows_attached=sess.get("cumulative_rows_attached", 0),
             )
 
+    def _destination_incremental_merge_finish_merge_root(self, sess: dict, sort_target, uses_mv: bool) -> None:
+        """Bump merge-root counters. Parent sorts are deferred to ``post_attach_sort`` (one folder per tick)."""
+        _ = uses_mv
+        if sort_target is not None:
+            pp = str(sess.get("pending_sort_parent_path_str") or "").strip()
+            if pp:
+                sess.setdefault("parent_sort_pending", set()).add(pp)
+        sess["merge_roots_completed"] = int(sess.get("merge_roots_completed") or 0) + 1
+        sess["roots_considered"] = int(sess.get("roots_considered") or 0) + 1
+        sess["current_merge_root_path"] = ""
+        sess["pending_merge_root_sort_target"] = None
+
     def _destination_incremental_merge_session_tick_attach(self, sess: dict) -> None:
-        """Bounded attach work for one timer tick (model-view or widget). Mutates ``sess``."""
+        """Bounded attach work: shallow rows + stack (semantic children or one-level NestedSpec chunks).
+
+        ``kind == \"full\"`` specs are never appended as a deep tree in one call — only one model row
+        per ``append_nested_child(..., (pl, []))``, with descendants resumed via ``nested_specs`` frames.
+        """
         budget = QElapsedTimer()
         budget.start()
         max_ms = int(getattr(self, "_destination_merge_tick_max_ms", 12) or 12)
-        max_rows = int(getattr(self, "_destination_merge_tick_max_rows", 5) or 5)
-        rows_this_tick = 0
+        hard_cap_ms = int(getattr(self, "_destination_merge_attach_hard_cap_ms", 28) or 28)
+        max_nodes = max(1, int(getattr(self, "_destination_merge_tick_max_rows", 5) or 5))
+        cap_nodes = int(getattr(self, "_destination_merge_attach_max_nodes_per_tick", 4) or 4)
+        max_nodes = max(1, min(max_nodes, cap_nodes))
+        nodes_this_tick = 0
+        sess["attach_rows_this_tick_counter"] = 0
+        sess["attach_subtree_items_tick"] = 0
         model_nodes = sess["model_nodes"]
         parent_order = sess["parent_order"]
         by_parent = sess["by_parent"]
         uses_mv = sess["uses_model_view"]
         dmodel = sess.get("dmodel")
-        tree = sess.get("tree")
+        fill_stack = sess.setdefault("fill_stack", [])
+        heavy_thr = int(getattr(self, "_destination_merge_heavy_root_child_threshold", 48) or 48)
+        heavy_logged = sess.setdefault("heavy_logged_roots", set())
 
-        while sess["parent_i"] < len(parent_order):
-            if rows_this_tick >= max_rows or budget.elapsed() > max_ms:
-                return
+        def _note_row_attached() -> None:
+            nonlocal nodes_this_tick
+            nodes_this_tick += 1
+            sess["attach_rows_this_tick_counter"] = int(sess.get("attach_rows_this_tick_counter") or 0) + 1
+            sess["attach_subtree_items_tick"] = int(sess.get("attach_subtree_items_tick") or 0) + 1
+
+        def _budget_hit() -> bool:
+            return nodes_this_tick >= max_nodes or budget.elapsed() > max_ms
+
+        def _hard_stop() -> bool:
+            return budget.elapsed() >= hard_cap_ms
+
+        def _sorted_child_paths(folder_sem: str) -> list:
+            node = model_nodes.get(folder_sem) or {}
+            raw = list(node.get("children") or [])
+            return sorted(raw, key=lambda p: self._destination_model_sort_key(model_nodes, p))
+
+        def _widget_append_payload_one_level(parent_w, pl: dict):
+            label = str(pl.get("base_display_label") or pl.get("name") or "")
+            ch = QTreeWidgetItem([label, "", "", ""])
+            ch.setData(0, Qt.UserRole, dict(pl))
+            self._apply_tree_item_visual_state(ch, pl)
+            is_folder = bool(pl.get("is_folder", False))
+            _sem_w = self._destination_semantic_path(pl) or ""
+            node_state = (model_nodes.get(_sem_w) or {}).get("node_state")
+            if is_folder:
+                ch.setChildIndicatorPolicy(
+                    QTreeWidgetItem.ShowIndicator
+                    if (
+                        self._destination_has_future_descendants(pl)
+                        or bool(
+                            node_state in ("allocated", "proposed", "projected_descendant")
+                            or pl.get("planned_allocation")
+                            or (
+                                pl.get("planned_allocation_descendant") and bool(pl.get("is_folder", False))
+                            )
+                        )
+                    )
+                    else QTreeWidgetItem.DontShowIndicator
+                )
+            else:
+                ch.setChildIndicatorPolicy(QTreeWidgetItem.DontShowIndicator)
+            parent_w.addChild(ch)
+            return ch
+
+        while (
+            (sess["parent_i"] < len(parent_order) or fill_stack)
+            and not _budget_hit()
+            and not _hard_stop()
+        ):
+            if fill_stack:
+                frame = fill_stack[-1]
+                if frame.get("nested_specs") is not None:
+                    specs: List[NestedSpec] = list(frame["nested_specs"])
+                    ni = int(frame.get("next_i") or 0)
+                    if ni >= len(specs):
+                        fill_stack.pop()
+                        if not fill_stack:
+                            st = sess.get("pending_merge_root_sort_target")
+                            self._destination_incremental_merge_finish_merge_root(sess, st, uses_mv)
+                        continue
+                    sub = specs[ni]
+                    frame["next_i"] = ni + 1
+                    pl, subkids = sub
+                    pl = dict(pl)
+                    if uses_mv:
+                        p_ix = frame["parent_ix"]
+                        new_ix = dmodel.append_nested_child(p_ix, (pl, []))
+                        if new_ix is None or not new_ix.isValid():
+                            continue
+                        sess["cumulative_rows_attached"] = int(sess.get("cumulative_rows_attached") or 0) + 1
+                        _note_row_attached()
+                        if subkids:
+                            fill_stack.append({"parent_ix": new_ix, "nested_specs": list(subkids), "next_i": 0})
+                    else:
+                        p_w = frame["parent_item"]
+                        new_w = _widget_append_payload_one_level(p_w, pl)
+                        sess["cumulative_rows_attached"] = int(sess.get("cumulative_rows_attached") or 0) + 1
+                        _note_row_attached()
+                        if subkids:
+                            fill_stack.append(
+                                {"parent_item": new_w, "nested_specs": list(subkids), "next_i": 0}
+                            )
+                    continue
+
+                child_paths = frame["child_paths"]
+                ni = int(frame["next_i"] or 0)
+                if ni >= len(child_paths):
+                    fill_stack.pop()
+                    if not fill_stack:
+                        st = sess.get("pending_merge_root_sort_target")
+                        self._destination_incremental_merge_finish_merge_root(sess, st, uses_mv)
+                    continue
+
+                cpath = child_paths[ni]
+                frame["next_i"] = ni + 1
+
+                if uses_mv:
+                    p_ix = frame["parent_ix"]
+                    kind_c, pay_c = self._destination_incremental_merge_row_attach_spec(model_nodes, cpath)
+                    if kind_c == "full":
+                        pl_c, nk_c = pay_c
+                        new_ix = dmodel.append_nested_child(p_ix, (dict(pl_c), []))
+                        if new_ix is None or not new_ix.isValid():
+                            continue
+                        sess["cumulative_rows_attached"] = int(sess.get("cumulative_rows_attached") or 0) + 1
+                        _note_row_attached()
+                        grand = _sorted_child_paths(cpath)
+                        if nk_c:
+                            fill_stack.append({"parent_ix": new_ix, "nested_specs": list(nk_c), "next_i": 0})
+                        elif grand:
+                            fill_stack.append({"parent_ix": new_ix, "child_paths": grand, "next_i": 0})
+                    else:
+                        new_ix = dmodel.append_nested_child(p_ix, (pay_c, []))
+                        if new_ix is None or not new_ix.isValid():
+                            continue
+                        sess["cumulative_rows_attached"] = int(sess.get("cumulative_rows_attached") or 0) + 1
+                        _note_row_attached()
+                        grand = _sorted_child_paths(cpath)
+                        if grand:
+                            fill_stack.append({"parent_ix": new_ix, "child_paths": grand, "next_i": 0})
+                else:
+                    p_w = frame["parent_item"]
+                    kind_c, pay_c = self._destination_incremental_merge_row_attach_spec(model_nodes, cpath)
+                    if kind_c == "full":
+                        pl_c, nk_c = pay_c
+                        new_w = _widget_append_payload_one_level(p_w, pl_c)
+                        grand = _sorted_child_paths(cpath)
+                        if nk_c:
+                            fill_stack.append({"parent_item": new_w, "nested_specs": list(nk_c), "next_i": 0})
+                        elif grand:
+                            fill_stack.append({"parent_item": new_w, "child_paths": grand, "next_i": 0})
+                    else:
+                        new_w = self._build_destination_future_tree_item_shallow(model_nodes, cpath)
+                        p_w.addChild(new_w)
+                        sess["cumulative_rows_attached"] = int(sess.get("cumulative_rows_attached") or 0) + 1
+                        _note_row_attached()
+                        grand = _sorted_child_paths(cpath)
+                        if grand:
+                            fill_stack.append({"parent_item": new_w, "child_paths": grand, "next_i": 0})
+                continue
+
             parent_path = parent_order[sess["parent_i"]]
             roots_here = by_parent[parent_path]
             if sess["root_j"] >= len(roots_here):
@@ -26688,8 +26851,10 @@ class MainWindow(QMainWindow):
                         child_path=root_path,
                         parent_path=parent_path,
                     )
-                sess["roots_considered"] += len(roots_here) - sess["root_j"]
+                nskip = len(roots_here) - sess["root_j"]
                 sess["root_j"] = len(roots_here)
+                sess["merge_roots_completed"] = int(sess.get("merge_roots_completed") or 0) + nskip
+                sess["roots_considered"] = int(sess.get("roots_considered") or 0) + nskip
                 continue
 
             if sess["child_maps"].get(parent_path) is None:
@@ -26700,32 +26865,106 @@ class MainWindow(QMainWindow):
 
             child_map = sess["child_maps"][parent_path]
             root_path = roots_here[sess["root_j"]]
-            sess["root_j"] += 1
-            sess["roots_considered"] += 1
 
-            if root_path in child_map:
-                continue
-            if self._find_destination_child_by_path(parent_item, root_path):
+            if root_path in child_map or self._find_destination_child_by_path(parent_item, root_path):
+                sess["root_j"] += 1
+                self._destination_incremental_merge_finish_merge_root(sess, None, uses_mv)
                 continue
 
             if not sess["placeholder_cleared"].get(parent_path):
                 self._remove_placeholder_children(parent_item)
                 sess["placeholder_cleared"][parent_path] = True
 
-            if uses_mv:
-                nested = self._build_destination_future_nested(model_nodes, root_path)
-                new_ix = dmodel.append_nested_child(parent_item, nested)
-                if new_ix is not None and new_ix.isValid():
-                    child_map[root_path] = new_ix
-                self._sort_destination_future_children_index(parent_item)
-            else:
-                child_item = self._build_destination_tree_item_from_future_model(model_nodes, root_path)
-                parent_item.addChild(child_item)
-                child_map[root_path] = child_item
-                self._sort_destination_future_children(parent_item)
+            sess["root_j"] += 1
+            sess["pending_merge_root_sort_target"] = parent_item
+            sess["pending_sort_parent_path_str"] = str(parent_path or "")
+            sess["current_merge_root_path"] = root_path
 
-            sess["cumulative_rows_attached"] += 1
-            rows_this_tick += 1
+            grand = _sorted_child_paths(root_path)
+            if len(grand) >= heavy_thr and root_path not in heavy_logged:
+                heavy_logged.add(root_path)
+                log_info(
+                    "destination_incremental_merge_heavy_root_detected",
+                    root_path=str(root_path)[:500],
+                    direct_child_count=len(grand),
+                    tick_wall_ms=budget.elapsed(),
+                    cumulative_rows_attached=int(sess.get("cumulative_rows_attached") or 0),
+                )
+
+            kind_r, pay_r = self._destination_incremental_merge_row_attach_spec(model_nodes, root_path)
+
+            if uses_mv:
+                if kind_r == "full":
+                    pl_r, nk_r = pay_r
+                    new_ix = dmodel.append_nested_child(parent_item, (dict(pl_r), []))
+                    if new_ix is not None and new_ix.isValid():
+                        child_map[root_path] = new_ix
+                        sess["cumulative_rows_attached"] = int(sess.get("cumulative_rows_attached") or 0) + 1
+                        _note_row_attached()
+                        if nk_r:
+                            fill_stack.append({"parent_ix": new_ix, "nested_specs": list(nk_r), "next_i": 0})
+                        elif grand:
+                            fill_stack.append({"parent_ix": new_ix, "child_paths": grand, "next_i": 0})
+                        else:
+                            self._destination_incremental_merge_finish_merge_root(sess, parent_item, uses_mv)
+                    else:
+                        self._destination_incremental_merge_finish_merge_root(sess, parent_item, uses_mv)
+                else:
+                    new_ix = dmodel.append_nested_child(parent_item, (pay_r, []))
+                    if new_ix is not None and new_ix.isValid():
+                        child_map[root_path] = new_ix
+                        sess["cumulative_rows_attached"] = int(sess.get("cumulative_rows_attached") or 0) + 1
+                        _note_row_attached()
+                        if grand:
+                            fill_stack.append({"parent_ix": new_ix, "child_paths": grand, "next_i": 0})
+                        else:
+                            self._destination_incremental_merge_finish_merge_root(sess, parent_item, uses_mv)
+                    else:
+                        self._destination_incremental_merge_finish_merge_root(sess, parent_item, uses_mv)
+            else:
+                if kind_r == "full":
+                    pl_r, nk_r = pay_r
+                    new_w = _widget_append_payload_one_level(parent_item, pl_r)
+                    child_map[root_path] = new_w
+                    sess["cumulative_rows_attached"] = int(sess.get("cumulative_rows_attached") or 0) + 1
+                    _note_row_attached()
+                    if nk_r:
+                        fill_stack.append({"parent_item": new_w, "nested_specs": list(nk_r), "next_i": 0})
+                    elif grand:
+                        fill_stack.append({"parent_item": new_w, "child_paths": grand, "next_i": 0})
+                    else:
+                        self._destination_incremental_merge_finish_merge_root(sess, parent_item, uses_mv)
+                else:
+                    new_w = self._build_destination_future_tree_item_shallow(model_nodes, root_path)
+                    parent_item.addChild(new_w)
+                    child_map[root_path] = new_w
+                    sess["cumulative_rows_attached"] = int(sess.get("cumulative_rows_attached") or 0) + 1
+                    _note_row_attached()
+                    if grand:
+                        fill_stack.append({"parent_item": new_w, "child_paths": grand, "next_i": 0})
+                    else:
+                        self._destination_incremental_merge_finish_merge_root(sess, parent_item, uses_mv)
+
+        if fill_stack and sess.get("current_merge_root_path"):
+            log_info(
+                "destination_incremental_merge_root_attach_resume",
+                root_path=str(sess.get("current_merge_root_path") or "")[:500],
+                parent_path=str(sess.get("pending_sort_parent_path_str") or "")[:500],
+                rows_attached_this_tick=int(sess.get("attach_rows_this_tick_counter") or 0),
+                subtree_items_processed_this_tick=int(sess.get("attach_subtree_items_tick") or 0),
+                tick_wall_ms=budget.elapsed(),
+                fill_stack_depth=len(fill_stack),
+                frame_kind=(
+                    "nested_specs"
+                    if fill_stack[-1].get("nested_specs") is not None
+                    else "child_paths"
+                ),
+                frame_progress=int(fill_stack[-1].get("next_i") or 0),
+                frame_total=len(
+                    fill_stack[-1].get("nested_specs") or fill_stack[-1].get("child_paths") or []
+                ),
+                pass_tail=True,
+            )
 
     def _destination_incremental_merge_session_tick_visibility(self, sess: dict) -> None:
         per_tick = int(getattr(self, "_destination_merge_visibility_rows_per_tick", 8) or 8)
@@ -26749,7 +26988,154 @@ class MainWindow(QMainWindow):
                 self._refresh_destination_item_visibility(top_item, expand=True)
             sess["vis_r"] = end
 
-    def _destination_incremental_merge_session_run_finalize(self, sess: dict) -> None:
+    def _destination_merge_expand_paths_ordered_for_session(self, expanded_paths) -> list:
+        target_paths = {path for path in (expanded_paths or set()) if path}
+        target_paths.add("Root")
+        normalized_targets = set(target_paths)
+        for path in list(target_paths):
+            k = self._destination_expansion_state_key(path)
+            if k:
+                normalized_targets.add(k)
+        return sorted(
+            (p for p in normalized_targets if p),
+            key=lambda p: len(self._path_segments(p)),
+        )
+
+    def _destination_merge_restore_expanded_slice_model(self, tree, model, paths_ordered: list, start: int, count: int) -> None:
+        end = min(start + count, len(paths_ordered))
+        for idx in range(start, end):
+            target_path = paths_ordered[idx]
+            variants: set[str] = set()
+            if target_path:
+                variants.add(str(target_path).strip())
+            sk = self._destination_expansion_state_key(target_path)
+            if sk:
+                variants.add(str(sk).strip())
+            expanded = False
+            for variant in variants:
+                if not variant:
+                    continue
+                ck = self._canonical_destination_projection_path(variant) or self.normalize_memory_path(variant)
+                if not ck:
+                    continue
+                for ix in model.find_indices_for_canonical_destination_path(ck):
+                    if ix.isValid():
+                        tree.expand(ix)
+                        expanded = True
+            if not expanded:
+                item = self._find_visible_destination_item_by_path(target_path)
+                if item is not None and isinstance(item, QModelIndex) and item.isValid():
+                    tree.expand(item)
+
+    def _destination_incremental_merge_progress_phase_log(self, sess: dict, tick_idx: int) -> None:
+        phase = str(sess.get("phase") or "")
+        fsub = str(sess.get("finalize_subphase") or "")
+        key = f"{phase}|{fsub}"
+        if key == str(sess.get("last_progress_phase_logged") or ""):
+            return
+        sess["last_progress_phase_logged"] = key
+        log_info(
+            "destination_incremental_merge_progress_phase",
+            tick_index=tick_idx,
+            phase=phase,
+            finalize_subphase=fsub or None,
+            merge_roots_completed=int(sess.get("merge_roots_completed") or 0),
+            total_root_ops=int(sess.get("total_root_ops") or 0),
+            parent_sort_i=int(sess.get("parent_sort_i") or 0),
+            parent_sort_total=len(sess.get("parents_sort_queue") or []),
+            vis_r=int(sess.get("vis_r") or 0),
+            vis_total=int(sess.get("vis_total") or 0),
+        )
+
+    def _destination_incremental_merge_status_message(self, sess: dict) -> str:
+        tr = int(sess.get("total_root_ops") or 0)
+        mr = int(sess.get("merge_roots_completed") or 0)
+        rows = int(sess.get("cumulative_rows_attached") or 0)
+        phase = str(sess.get("phase") or "")
+        if phase == "attach":
+            return (
+                f"Merging destination — phase 1/4 attach — merge roots {mr:,}/{tr:,} "
+                f"(not final) — model rows {rows:,}…"
+            )
+        if phase == "post_attach_sort":
+            pi = int(sess.get("parent_sort_i") or 0)
+            qlen = len(sess.get("parents_sort_queue") or [])
+            return f"Merging destination — phase 2/4 order folders — {pi:,}/{max(qlen, 1):,} parents…"
+        if phase == "visibility":
+            vr = int(sess.get("vis_r") or 0)
+            vt = int(sess.get("vis_total") or 0)
+            return f"Merging destination — phase 3/4 visibility — rows {vr:,}/{max(vt, 1):,}…"
+        if phase == "finalize":
+            sub = str(sess.get("finalize_subphase") or "…")
+            return f"Merging destination — phase 4/4 finalize — {sub}…"
+        return "Merging destination…"
+
+    def _destination_incremental_merge_session_tick_post_attach_sort(self, sess: dict) -> bool:
+        """Return True when all deferred merge-parent sorts are done (one parent per tick)."""
+        q = sess.get("parents_sort_queue") or []
+        if not q:
+            return True
+        i = int(sess.get("parent_sort_i") or 0)
+        if i >= len(q):
+            return True
+        pp = q[i]
+        sess["parent_sort_i"] = i + 1
+        pit = self._find_visible_destination_item_by_path(pp)
+        tick_idx = int(sess.get("tick_index") or 0)
+        if pit is not None:
+            op = QElapsedTimer()
+            op.start()
+            try:
+                if sess["uses_model_view"]:
+                    self._sort_destination_future_children_index_shallow(pit)
+                else:
+                    self._sort_destination_future_children_shallow(pit)
+            except Exception:
+                pass
+            wall = op.elapsed()
+            dm_sort = sess.get("dmodel") or getattr(self, "destination_planning_model", None)
+            direct_children = 0
+            if sess["uses_model_view"] and dm_sort is not None and isinstance(pit, QModelIndex) and pit.isValid():
+                direct_children = int(dm_sort.rowCount(pit))
+            elif pit is not None and hasattr(pit, "childCount"):
+                try:
+                    direct_children = int(pit.childCount())
+                except Exception:
+                    direct_children = 0
+            log_info(
+                "destination_incremental_merge_parent_sort_cost",
+                tick_index=tick_idx,
+                parent_path=str(pp)[:500],
+                rows_attached_this_tick=0,
+                subtree_items_processed_this_tick=direct_children,
+                tick_wall_ms=wall,
+                cumulative_in_phase=int(sess.get("parent_sort_i") or 0),
+                total_in_phase=len(q),
+            )
+            log_info(
+                "destination_incremental_merge_finalize_tick",
+                tick_index=tick_idx,
+                pipeline_stage="post_attach_sort",
+                parent_path_excerpt=str(pp)[:260],
+                cumulative_in_phase=int(sess.get("parent_sort_i") or 0),
+                total_in_phase=len(q),
+                tick_wall_ms=wall,
+            )
+            max_ms = int(getattr(self, "_destination_merge_tick_max_ms", 12) or 12)
+            if wall > max_ms + 15:
+                log_info(
+                    "destination_incremental_merge_tick_heavy_operation",
+                    tick_index=tick_idx,
+                    phase="post_attach_sort",
+                    operation="sort_destination_future_children_shallow",
+                    root_path=str(pp)[:500],
+                    tick_wall_ms=wall,
+                    cumulative_rows_attached=int(sess.get("cumulative_rows_attached") or 0),
+                )
+        return int(sess.get("parent_sort_i") or 0) >= len(q)
+
+    def _destination_incremental_merge_session_tick_finalize(self, sess: dict) -> bool:
+        """Run one finalize sub-step per call. Return True when session should complete."""
         tree = sess["tree"]
         model = sess["model"]
         merge_group_t0 = float(sess.get("merge_group_t0") or time.perf_counter())
@@ -26758,64 +27144,244 @@ class MainWindow(QMainWindow):
         entry_roots = sess["entry_roots"]
         by_parent = sess["by_parent"]
         visible_future_branch_count = sess["visible_future_branch_count"]
-        merge_ctx = sess["merge_ctx"]
-
-        self._log_restore_phase(
-            "destination_future_incremental_merge_parent_batch",
-            wall_ms=round((time.perf_counter() - merge_group_t0) * 1000.0, 2),
-            entry_roots=len(entry_roots),
-            parent_batch_count=len(by_parent),
-        )
-
-        visible_descendant_count = self._apply_visible_destination_allocation_descendants(
-            destination_expanded_paths=destination_expanded_paths
-        )
-        if visible_descendant_count > 150:
-            _dirty = getattr(self, "_destination_indicator_dirty_semantic_paths", None)
-            if _dirty is not None:
-                _dirty.clear()
-        elif entry_roots and self._destination_tree_uses_model_view():
-            self._mark_destination_indicator_dirty_paths(set(entry_roots) | set(by_parent.keys()))
-        self._schedule_refresh_destination_tree_indicators()
-        self._restore_expanded_tree_paths("destination", destination_expanded_paths)
-        self._restore_selected_tree_path("destination", destination_selected_path)
-        self._refresh_expand_all_button_for_panel("destination")
-
-        top_n = self._planning_tree_top_level_count(tree)
-        self._log_restore_phase(
-            "destination_future_incremental_merge_complete",
-            root_path=model.get("root_path", "Root"),
-            top_level_count=top_n,
-            visible_descendant_count=visible_descendant_count,
-            entry_roots=len(entry_roots),
-        )
-        self._log_restore_phase(
-            "destination_future_model_visible_summary",
-            root_path=model.get("root_path", "Root"),
-            total_real_nodes=model.get("total_real_nodes", 0),
-            total_proposed_nodes=model.get("total_proposed_nodes", 0),
-            total_allocation_nodes=model.get("total_allocation_nodes", 0),
-            top_level_count=top_n,
-            visible_future_branch_count=visible_future_branch_count,
-            merge_mode="incremental_timer_sliced",
-        )
-        self._schedule_workspace_ui_persist(panel_key="destination")
-        self._reconcile_destination_semantic_duplicates("destination_incremental_merge_complete")
-
         tick_idx = int(sess.get("tick_index") or 0)
-        wall_total_ms = round((time.perf_counter() - float(sess.get("session_wall_t0") or time.perf_counter())) * 1000.0, 1)
-        log_info(
-            "destination_incremental_merge_session_complete",
-            tick_index=tick_idx,
-            roots_processed=int(sess.get("roots_considered") or 0),
-            total_root_ops=int(sess.get("total_root_ops") or 0),
-            cumulative_rows_attached=int(sess.get("cumulative_rows_attached") or 0),
-            wall_ms_total=wall_total_ms,
-            cancelled=False,
-        )
+        sub = str(sess.get("finalize_subphase") or "begin")
 
+        if sub == "begin":
+            log_info(
+                "destination_incremental_merge_finalize_begin",
+                tick_index=tick_idx,
+                merge_roots_completed=int(sess.get("merge_roots_completed") or 0),
+                total_root_ops=int(sess.get("total_root_ops") or 0),
+                cumulative_rows_attached=int(sess.get("cumulative_rows_attached") or 0),
+            )
+            self._log_restore_phase(
+                "destination_future_incremental_merge_parent_batch",
+                wall_ms=round((time.perf_counter() - merge_group_t0) * 1000.0, 2),
+                entry_roots=len(entry_roots),
+                parent_batch_count=len(by_parent),
+            )
+            sess["finalize_subphase"] = "alloc"
+            self._destination_incremental_merge_progress_phase_log(sess, tick_idx)
+            return False
+
+        if sub == "alloc":
+            op = QElapsedTimer()
+            op.start()
+            visible_descendant_count = self._apply_visible_destination_allocation_descendants(
+                destination_expanded_paths=destination_expanded_paths
+            )
+            wall = op.elapsed()
+            sess["finalize_visible_descendant_count"] = int(visible_descendant_count)
+            log_info(
+                "destination_incremental_merge_finalize_tick",
+                tick_index=tick_idx,
+                pipeline_stage="alloc_descendants",
+                tick_wall_ms=wall,
+                visible_descendant_count=int(visible_descendant_count),
+            )
+            if wall > 50:
+                log_info(
+                    "destination_incremental_merge_tick_heavy_operation",
+                    tick_index=tick_idx,
+                    phase="finalize",
+                    operation="apply_visible_destination_allocation_descendants",
+                    tick_wall_ms=wall,
+                    cumulative_rows_attached=int(sess.get("cumulative_rows_attached") or 0),
+                )
+            sess["finalize_subphase"] = "indicators"
+            return False
+
+        if sub == "indicators":
+            op = QElapsedTimer()
+            op.start()
+            visible_descendant_count = int(sess.get("finalize_visible_descendant_count") or 0)
+            if visible_descendant_count > 150:
+                _dirty = getattr(self, "_destination_indicator_dirty_semantic_paths", None)
+                if _dirty is not None:
+                    _dirty.clear()
+            elif entry_roots and self._destination_tree_uses_model_view():
+                self._mark_destination_indicator_dirty_paths(set(entry_roots) | set(by_parent.keys()))
+            self._schedule_refresh_destination_tree_indicators()
+            wall = op.elapsed()
+            log_info(
+                "destination_incremental_merge_finalize_tick",
+                tick_index=tick_idx,
+                pipeline_stage="indicators",
+                tick_wall_ms=wall,
+            )
+            sess["finalize_subphase"] = "expand_init"
+            return False
+
+        if sub == "expand_init":
+            uses_mv = sess["uses_model_view"]
+            dmodel = sess.get("dmodel")
+            if uses_mv and dmodel is not None:
+                sess["expand_paths_ordered"] = self._destination_merge_expand_paths_ordered_for_session(
+                    destination_expanded_paths
+                )
+            else:
+                sess["expand_paths_ordered"] = []
+            sess["expand_path_idx"] = 0
+            sess["finalize_subphase"] = "expand_step"
+            return False
+
+        if sub == "expand_step":
+            uses_mv = sess["uses_model_view"]
+            dmodel = sess.get("dmodel")
+            tree_w = tree
+            op = QElapsedTimer()
+            op.start()
+            per = 4
+            if uses_mv and dmodel is not None:
+                paths = sess.get("expand_paths_ordered") or []
+                i = int(sess.get("expand_path_idx") or 0)
+                self._destination_idle_materialize_reentrancy_block += 1
+                try:
+                    self._destination_merge_restore_expanded_slice_model(tree_w, dmodel, paths, i, per)
+                finally:
+                    self._destination_idle_materialize_reentrancy_block -= 1
+                ni = min(i + per, len(paths))
+                sess["expand_path_idx"] = ni
+                wall = op.elapsed()
+                log_info(
+                    "destination_incremental_merge_finalize_tick",
+                    tick_index=tick_idx,
+                    pipeline_stage="expand_paths",
+                    tick_wall_ms=wall,
+                    cumulative_in_phase=ni,
+                    total_in_phase=len(paths),
+                )
+                if ni < len(paths):
+                    return False
+            else:
+                self._destination_idle_materialize_reentrancy_block += 1
+                try:
+                    self._restore_expanded_destination_paths_body(destination_expanded_paths)
+                finally:
+                    self._destination_idle_materialize_reentrancy_block -= 1
+                log_info(
+                    "destination_incremental_merge_finalize_tick",
+                    tick_index=tick_idx,
+                    pipeline_stage="expand_paths_widget",
+                    tick_wall_ms=op.elapsed(),
+                )
+            if op.elapsed() > 50:
+                log_info(
+                    "destination_incremental_merge_tick_heavy_operation",
+                    tick_index=tick_idx,
+                    phase="finalize",
+                    operation="restore_expanded_paths_slice",
+                    tick_wall_ms=op.elapsed(),
+                    cumulative_rows_attached=int(sess.get("cumulative_rows_attached") or 0),
+                )
+            sess["finalize_subphase"] = "select_btn"
+            return False
+
+        if sub == "select_btn":
+            op = QElapsedTimer()
+            op.start()
+            self._restore_selected_tree_path("destination", destination_selected_path)
+            self._refresh_expand_all_button_for_panel("destination")
+            wall = op.elapsed()
+            log_info(
+                "destination_incremental_merge_finalize_tick",
+                tick_index=tick_idx,
+                pipeline_stage="select_and_expand_button",
+                tick_wall_ms=wall,
+            )
+            sess["finalize_subphase"] = "persist"
+            return False
+
+        if sub == "persist":
+            op = QElapsedTimer()
+            op.start()
+            self._schedule_workspace_ui_persist(panel_key="destination")
+            wall = op.elapsed()
+            log_info(
+                "destination_incremental_merge_finalize_tick",
+                tick_index=tick_idx,
+                pipeline_stage="persist",
+                tick_wall_ms=wall,
+            )
+            sess["finalize_subphase"] = "reconcile"
+            return False
+
+        if sub == "reconcile":
+            op = QElapsedTimer()
+            op.start()
+            self._reconcile_destination_semantic_duplicates("destination_incremental_merge_complete")
+            wall = op.elapsed()
+            log_info(
+                "destination_incremental_merge_finalize_tick",
+                tick_index=tick_idx,
+                pipeline_stage="reconcile_semantic_duplicates",
+                tick_wall_ms=wall,
+            )
+            if wall > 80:
+                log_info(
+                    "destination_incremental_merge_tick_heavy_operation",
+                    tick_index=tick_idx,
+                    phase="finalize",
+                    operation="reconcile_destination_semantic_duplicates",
+                    tick_wall_ms=wall,
+                    cumulative_rows_attached=int(sess.get("cumulative_rows_attached") or 0),
+                )
+            sess["finalize_subphase"] = "summary"
+            return False
+
+        if sub == "summary":
+            visible_descendant_count = int(sess.get("finalize_visible_descendant_count") or 0)
+            top_n = self._planning_tree_top_level_count(tree)
+            self._log_restore_phase(
+                "destination_future_incremental_merge_complete",
+                root_path=model.get("root_path", "Root"),
+                top_level_count=top_n,
+                visible_descendant_count=visible_descendant_count,
+                entry_roots=len(entry_roots),
+            )
+            self._log_restore_phase(
+                "destination_future_model_visible_summary",
+                root_path=model.get("root_path", "Root"),
+                total_real_nodes=model.get("total_real_nodes", 0),
+                total_proposed_nodes=model.get("total_proposed_nodes", 0),
+                total_allocation_nodes=model.get("total_allocation_nodes", 0),
+                top_level_count=top_n,
+                visible_future_branch_count=visible_future_branch_count,
+                merge_mode="incremental_timer_sliced",
+            )
+            wall_total_ms = round(
+                (time.perf_counter() - float(sess.get("session_wall_t0") or time.perf_counter())) * 1000.0, 1
+            )
+            log_info(
+                "destination_incremental_merge_finalize_complete",
+                tick_index=tick_idx,
+                wall_ms_total=wall_total_ms,
+                merge_roots_completed=int(sess.get("merge_roots_completed") or 0),
+                total_root_ops=int(sess.get("total_root_ops") or 0),
+                cumulative_rows_attached=int(sess.get("cumulative_rows_attached") or 0),
+            )
+            log_info(
+                "destination_incremental_merge_session_complete",
+                tick_index=tick_idx,
+                roots_processed=int(sess.get("merge_roots_completed") or sess.get("roots_considered") or 0),
+                total_root_ops=int(sess.get("total_root_ops") or 0),
+                cumulative_rows_attached=int(sess.get("cumulative_rows_attached") or 0),
+                wall_ms_total=wall_total_ms,
+                cancelled=False,
+            )
+            sess["finalize_subphase"] = "done"
+            return True
+
+        return False
+
+    def _destination_incremental_merge_session_complete_session(self, sess: dict) -> None:
+        tree = sess.get("tree")
+        visible_future_branch_count = sess["visible_future_branch_count"]
+        merge_ctx = sess["merge_ctx"]
         try:
-            tree.blockSignals(False)
+            if tree is not None:
+                tree.blockSignals(False)
         except Exception:
             pass
         self._destination_incremental_merge_session = None
@@ -26833,8 +27399,65 @@ class MainWindow(QMainWindow):
         rows_before = int(sess.get("cumulative_rows_attached") or 0)
         try:
             if sess.get("phase") == "attach":
+                attach_t = QElapsedTimer()
+                attach_t.start()
                 self._destination_incremental_merge_session_tick_attach(sess)
-                if sess["parent_i"] >= len(sess["parent_order"]):
+                attach_ms = attach_t.elapsed()
+                heavy_thr_run = int(getattr(self, "_destination_merge_attach_heavy_log_ms", 45) or 45)
+                if attach_ms >= heavy_thr_run:
+                    log_info(
+                        "destination_incremental_merge_tick_heavy_attach",
+                        tick_index=tick_idx,
+                        root_path=str(sess.get("current_merge_root_path") or "")[:500],
+                        parent_path=str(sess.get("pending_sort_parent_path_str") or "")[:500],
+                        rows_attached_this_tick=int(sess.get("attach_rows_this_tick_counter") or 0),
+                        subtree_items_processed_this_tick=int(sess.get("attach_subtree_items_tick") or 0),
+                        tick_wall_ms=attach_ms,
+                        fill_stack_depth=len(sess.get("fill_stack") or []),
+                        hard_cap_ms=int(getattr(self, "_destination_merge_attach_hard_cap_ms", 28) or 28),
+                        max_nodes_budget=max(
+                            1,
+                            min(
+                                int(getattr(self, "_destination_merge_tick_max_rows", 5) or 5),
+                                int(getattr(self, "_destination_merge_attach_max_nodes_per_tick", 4) or 4),
+                            ),
+                        ),
+                        scope="attach_timer_callback",
+                    )
+                max_ms = int(getattr(self, "_destination_merge_tick_max_ms", 12) or 12)
+                if attach_ms > max_ms + 2:
+                    log_info(
+                        "destination_incremental_merge_tick_over_budget",
+                        tick_index=tick_idx,
+                        phase="attach",
+                        tick_wall_ms=attach_ms,
+                        budget_ms=max_ms,
+                        cumulative_rows_attached=int(sess.get("cumulative_rows_attached") or 0),
+                        merge_roots_completed=int(sess.get("merge_roots_completed") or 0),
+                        fill_stack_depth=len(sess.get("fill_stack") or []),
+                        current_merge_root=str(sess.get("current_merge_root_path") or ""),
+                    )
+                    log_info(
+                        "destination_incremental_merge_tick_heavy_operation",
+                        tick_index=tick_idx,
+                        phase="attach",
+                        operation="attach_tick_aggregate",
+                        tick_wall_ms=attach_ms,
+                        root_path=str(sess.get("current_merge_root_path") or ""),
+                        cumulative_rows_attached=int(sess.get("cumulative_rows_attached") or 0),
+                    )
+                if sess["parent_i"] >= len(sess["parent_order"]) and not sess.get("fill_stack"):
+                    pending = sess.get("parent_sort_pending") or set()
+                    if pending:
+                        sess["parents_sort_queue"] = list(dict.fromkeys(sorted(pending)))
+                    else:
+                        sess["parents_sort_queue"] = list(dict.fromkeys(sess["parent_order"]))
+                    sess["parent_sort_i"] = 0
+                    sess["phase"] = "post_attach_sort"
+                    self._destination_incremental_merge_progress_phase_log(sess, tick_idx)
+            elif sess.get("phase") == "post_attach_sort":
+                done_sort = self._destination_incremental_merge_session_tick_post_attach_sort(sess)
+                if done_sort:
                     sess["phase"] = "visibility"
                     sess["vis_r"] = 0
                     dmodel = sess.get("dmodel")
@@ -26843,13 +27466,18 @@ class MainWindow(QMainWindow):
                         sess["vis_total"] = dmodel.rowCount(QModelIndex())
                     else:
                         sess["vis_total"] = tree.topLevelItemCount() if tree is not None else 0
+                    self._destination_incremental_merge_progress_phase_log(sess, tick_idx)
             elif sess.get("phase") == "visibility":
                 self._destination_incremental_merge_session_tick_visibility(sess)
                 if sess["vis_r"] >= sess.get("vis_total", 0):
                     sess["phase"] = "finalize"
+                    sess["finalize_subphase"] = "begin"
+                    self._destination_incremental_merge_progress_phase_log(sess, tick_idx)
             if sess.get("phase") == "finalize" and getattr(self, "_destination_incremental_merge_session", None):
-                self._destination_incremental_merge_session_run_finalize(sess)
-                return
+                fin_done = self._destination_incremental_merge_session_tick_finalize(sess)
+                if fin_done:
+                    self._destination_incremental_merge_session_complete_session(sess)
+                    return
         except Exception as exc:
             log_error(
                 "destination_incremental_merge_tick_failed",
@@ -26863,7 +27491,7 @@ class MainWindow(QMainWindow):
         wall_session_ms = round((time.perf_counter() - float(sess.get("session_wall_t0") or time.perf_counter())) * 1000.0, 1)
         tick_wall_ms = tick_local.elapsed()
         total_ops = int(sess.get("total_root_ops") or 0)
-        roots_done = int(sess.get("roots_considered") or 0)
+        roots_done = int(sess.get("merge_roots_completed") or sess.get("roots_considered") or 0)
         cum_rows = int(sess.get("cumulative_rows_attached") or 0)
         phase = str(sess.get("phase") or "")
         log_info(
@@ -26887,12 +27515,9 @@ class MainWindow(QMainWindow):
             total_root_ops=total_ops,
             wall_ms_since_session_start=wall_session_ms,
         )
-        sched = int(sess.get("total_root_ops") or 0)
-        done = min(roots_done, sched) if sched else roots_done
-        pct = (100 * done // sched) if sched else 0
         self._set_tree_status_message(
             "destination",
-            f"Merging destination — projected branches {done:,}/{sched:,} ({pct}%) — rows attached {cum_rows:,}…",
+            self._destination_incremental_merge_status_message(sess),
             loading=True,
         )
         if getattr(self, "_destination_incremental_merge_session", None) is not None:
@@ -27680,6 +28305,20 @@ class MainWindow(QMainWindow):
             parent_item.addChild(child)
             self._sort_destination_future_children(child)
 
+    def _sort_destination_future_children_shallow(self, parent_item) -> None:
+        """Sort direct children only (incremental merge post-attach; avoids recursive subtree resort)."""
+        if parent_item is None or parent_item.childCount() <= 1:
+            return
+        children = [parent_item.takeChild(0) for _ in range(parent_item.childCount())]
+        children.sort(
+            key=lambda child: (
+                not bool((child.data(0, Qt.UserRole) or {}).get("is_folder", False)),
+                str((child.data(0, Qt.UserRole) or {}).get("name", child.text(0))).lower(),
+            )
+        )
+        for child in children:
+            parent_item.addChild(child)
+
     def _sort_destination_future_children_index(self, parent_ix: QModelIndex) -> None:
         dmodel = getattr(self, "destination_planning_model", None)
         if dmodel is None:
@@ -27707,6 +28346,31 @@ class MainWindow(QMainWindow):
             dmodel.append_nested_child(parent, spec)
         for r in range(dmodel.rowCount(parent)):
             self._sort_destination_future_children_index(dmodel.index(r, 0, parent))
+
+    def _sort_destination_future_children_index_shallow(self, parent_ix: QModelIndex) -> None:
+        """Sort direct child rows only under parent_ix (no recursion into descendants)."""
+        dmodel = getattr(self, "destination_planning_model", None)
+        if dmodel is None:
+            return
+        parent = parent_ix if parent_ix.isValid() else QModelIndex()
+        n = dmodel.rowCount(parent)
+        if n <= 1:
+            return
+        specs: List[NestedSpec] = []
+        while dmodel.rowCount(parent) > 0:
+            ix0 = dmodel.index(0, 0, parent)
+            spec = dmodel.remove_node_at(ix0)
+            if spec is not None:
+                specs.append(spec)
+
+        def _spec_sort_key(spec: NestedSpec):
+            pl = spec[0]
+            nm = pl.get("name") or str(pl.get("base_display_label", ""))
+            return (not bool(pl.get("is_folder", False)), str(nm).lower())
+
+        specs.sort(key=_spec_sort_key)
+        for spec in specs:
+            dmodel.append_nested_child(parent, spec)
 
     def _sort_destination_future_tree(self):
         tree = getattr(self, "destination_tree_widget", None)
@@ -28110,6 +28774,140 @@ class MainWindow(QMainWindow):
             self._destination_future_state_rank(node["node_state"]),
             str(node["name"]).lower(),
         )
+
+    def _build_destination_future_nested_shallow_payload(self, model_nodes, semantic_path) -> dict:
+        """Single-row UserRole payload for incremental merge (no child recursion)."""
+        node = model_nodes[semantic_path]
+        data = dict(node["data"])
+        name = data.get("name") or node["name"] or self._path_segments(semantic_path)[-1]
+        is_folder = bool(data.get("is_folder", False))
+        node_state = node["node_state"]
+        if node_state == "allocated":
+            data.setdefault("planned_allocation", True)
+        elif node_state == "proposed":
+            data.setdefault("proposed", True)
+        destination_full_tree_ready = self._destination_full_tree_ready()
+
+        if node_state == "allocated":
+            label = self._tree_name_column_label(name, tag="[Allocated]")
+        elif node_state == "proposed":
+            label = self._tree_name_column_label(name, tag="(Proposed)")
+        elif node_state == "projected_descendant":
+            label = self._tree_name_column_label(name)
+        else:
+            label = self._tree_name_column_label(name)
+
+        data.setdefault("tree_role", "destination")
+        data.setdefault("name", name)
+        data.setdefault("real_name", name)
+        data.setdefault("display_path", semantic_path)
+        data.setdefault("item_path", semantic_path)
+        data.setdefault("destination_path", semantic_path)
+        data.setdefault("base_display_label", label)
+        self._apply_tree_item_visual_state(None, data)
+
+        if not is_folder:
+            return data
+
+        child_paths = list(node.get("children") or [])
+        if child_paths:
+            return data
+
+        if (
+            node_state == "real"
+            and destination_full_tree_ready
+            and bool(data.get("children_loaded"))
+        ):
+            return data
+        if (
+            node_state == "real"
+            and not destination_full_tree_ready
+            and not bool(data.get("children_loaded"))
+            and not bool(data.get("load_failed"))
+            and data.get("id")
+        ):
+            return data
+
+        should_show_for_allocation = bool(
+            node_state in ("allocated", "proposed", "projected_descendant")
+            or data.get("planned_allocation")
+            or (data.get("planned_allocation_descendant") and bool(data.get("is_folder")))
+        )
+        if self._destination_has_future_descendants(data) or should_show_for_allocation:
+            data = dict(data)
+            data["_destination_expand_affordance"] = True
+        return data
+
+    def _destination_incremental_merge_row_attach_spec(self, model_nodes, semantic_path):
+        """Return (\"shallow\", payload_dict) or (\"full\", NestedSpec) for one overlay row."""
+        node = model_nodes[semantic_path]
+        child_paths = list(node.get("children") or [])
+        is_folder = bool(node["data"].get("is_folder", False))
+        if is_folder and not child_paths:
+            node_state = node["node_state"]
+            destination_full_tree_ready = self._destination_full_tree_ready()
+            raw = dict(node["data"])
+            if (
+                node_state == "real"
+                and destination_full_tree_ready
+                and bool(raw.get("children_loaded"))
+            ):
+                return ("full", self._build_destination_future_nested(model_nodes, semantic_path))
+            if (
+                node_state == "real"
+                and not destination_full_tree_ready
+                and not bool(raw.get("children_loaded"))
+                and not bool(raw.get("load_failed"))
+                and raw.get("id")
+            ):
+                return ("full", self._build_destination_future_nested(model_nodes, semantic_path))
+        return ("shallow", self._build_destination_future_nested_shallow_payload(model_nodes, semantic_path))
+
+    def _build_destination_future_tree_item_shallow(self, model_nodes, semantic_path) -> QTreeWidgetItem:
+        """QTreeWidgetItem for one future row without building descendants (incremental merge)."""
+        data = self._build_destination_future_nested_shallow_payload(model_nodes, semantic_path)
+        label = str(data.get("base_display_label") or "")
+        item = QTreeWidgetItem([label, "", "", ""])
+        item.setData(0, Qt.UserRole, data)
+        self._apply_tree_item_visual_state(item, data)
+        node = model_nodes[semantic_path]
+        is_folder = bool(data.get("is_folder", False))
+        node_state = node["node_state"]
+        child_paths = list(node.get("children") or [])
+        if is_folder:
+            if child_paths:
+                item.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
+            else:
+                should_show_for_allocation = bool(
+                    node_state in ("allocated", "proposed", "projected_descendant")
+                    or data.get("planned_allocation")
+                    or (data.get("planned_allocation_descendant") and bool(data.get("is_folder")))
+                )
+                item.setChildIndicatorPolicy(
+                    QTreeWidgetItem.ShowIndicator
+                    if (self._destination_has_future_descendants(data) or should_show_for_allocation)
+                    else QTreeWidgetItem.DontShowIndicator
+                )
+        else:
+            item.setChildIndicatorPolicy(QTreeWidgetItem.DontShowIndicator)
+        return item
+
+    def _destination_tree_item_from_nested_spec(self, spec: NestedSpec) -> QTreeWidgetItem:
+        """Build a QTreeWidgetItem subtree from NestedSpec (small specs only; e.g. terminal placeholders)."""
+        pl, kids = spec
+        label = str(pl.get("base_display_label") or "")
+        item = QTreeWidgetItem([label, "", "", ""])
+        item.setData(0, Qt.UserRole, dict(pl))
+        self._apply_tree_item_visual_state(item, pl)
+        for sub in kids:
+            item.addChild(self._destination_tree_item_from_nested_spec(sub))
+        if pl.get("is_folder") and item.childCount() > 0:
+            item.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
+        elif pl.get("is_folder"):
+            item.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
+        else:
+            item.setChildIndicatorPolicy(QTreeWidgetItem.DontShowIndicator)
+        return item
 
     def _build_destination_tree_item_from_future_model(self, model_nodes, semantic_path):
         self._future_bind_nodes_built = getattr(self, "_future_bind_nodes_built", 0) + 1
@@ -29806,6 +30604,19 @@ class MainWindow(QMainWindow):
                     "tick_index": 0,
                     "cumulative_rows_attached": 0,
                     "roots_considered": 0,
+                    "merge_roots_completed": 0,
+                    "fill_stack": [],
+                    "current_merge_root_path": "",
+                    "pending_merge_root_sort_target": None,
+                    "heavy_logged_roots": set(),
+                    "parent_sort_pending": set(),
+                    "pending_sort_parent_path_str": "",
+                    "parents_sort_queue": [],
+                    "parent_sort_i": 0,
+                    "finalize_subphase": "",
+                    "expand_paths_ordered": None,
+                    "expand_path_idx": 0,
+                    "last_progress_phase_logged": "",
                     "total_root_ops": total_root_ops,
                     "entry_roots": entry_roots,
                     "destination_expanded_paths": destination_expanded_paths,
