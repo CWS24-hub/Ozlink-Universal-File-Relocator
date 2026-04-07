@@ -2733,6 +2733,7 @@ class MainWindow(QMainWindow):
         self._destination_materialize_pending_after_async_projection = ""
         self._destination_incremental_merge_in_progress = False
         self._destination_incremental_merge_session = None
+        self._destination_semantic_reconcile_deferred_after_merge = False
         self._destination_incremental_merge_timer = QTimer(self)
         self._destination_incremental_merge_timer.setSingleShot(True)
         self._destination_incremental_merge_timer.timeout.connect(self._run_destination_incremental_merge_session_tick)
@@ -26982,6 +26983,7 @@ class MainWindow(QMainWindow):
                 tick_index=sess.get("tick_index", 0),
                 cumulative_rows_attached=sess.get("cumulative_rows_attached", 0),
             )
+        self._flush_deferred_destination_semantic_reconcile_after_merge()
 
     def _destination_incremental_merge_finish_merge_root(self, sess: dict, sort_target, uses_mv: bool) -> None:
         """Bump merge-root counters. Parent sorts are deferred to ``post_attach_sort`` (one folder per tick)."""
@@ -28394,6 +28396,7 @@ class MainWindow(QMainWindow):
         self._finish_destination_future_async_projection_tail(visible_future_branch_count, merge_ctx)
         if self._destination_expand_user_deferred_queue:
             self._schedule_destination_expand_user_deferred_drain()
+        self._flush_deferred_destination_semantic_reconcile_after_merge()
 
     def _run_destination_incremental_merge_session_tick(self) -> None:
         sess = getattr(self, "_destination_incremental_merge_session", None)
@@ -34074,11 +34077,53 @@ class MainWindow(QMainWindow):
             self._refresh_destination_item_visibility(parent_item, expand=True)
         return moved_count
 
+    _FINALIZE_SUBPHASES_BLOCK_FULL_SEMANTIC_RECONCILE = frozenset(
+        {"reconcile_init", "reconcile_semantic", "reconcile_sibling"}
+    )
+
+    def _destination_incremental_merge_blocks_full_semantic_reconcile(self) -> bool:
+        sess = getattr(self, "_destination_incremental_merge_session", None)
+        if sess is None:
+            return False
+        if str(sess.get("phase") or "") != "finalize":
+            return False
+        return str(sess.get("finalize_subphase") or "") in self._FINALIZE_SUBPHASES_BLOCK_FULL_SEMANTIC_RECONCILE
+
+    def _flush_deferred_destination_semantic_reconcile_after_merge(self) -> None:
+        if not getattr(self, "_destination_semantic_reconcile_deferred_after_merge", False):
+            return
+        self._destination_semantic_reconcile_deferred_after_merge = False
+
+        def _run():
+            try:
+                self._reconcile_destination_semantic_duplicates("deferred_after_incremental_merge_finalize")
+            except Exception as exc:
+                self._log_restore_exception("deferred_after_incremental_merge_finalize_reconcile", exc)
+
+        QTimer.singleShot(0, lambda: self._safe_invoke("deferred_semantic_reconcile_after_merge", _run))
+
     def _reconcile_destination_semantic_duplicates(self, reason):
         prev_depth = int(getattr(self, "_destination_semantic_reconcile_guard_depth", 0) or 0)
         self._destination_semantic_reconcile_guard_depth = prev_depth + 1
         try:
             if self._destination_tree_uses_model_view():
+                r = str(reason or "")
+                if (
+                    r != "deferred_after_incremental_merge_finalize"
+                    and self._destination_incremental_merge_blocks_full_semantic_reconcile()
+                ):
+                    self._destination_semantic_reconcile_deferred_after_merge = True
+                    self._log_restore_phase(
+                        "destination_semantic_reconcile_deferred_until_merge_complete",
+                        blocked_reason=r,
+                        finalize_subphase=str(
+                            (getattr(self, "_destination_incremental_merge_session", None) or {}).get(
+                                "finalize_subphase"
+                            )
+                            or ""
+                        ),
+                    )
+                    return 0
                 return self._reconcile_destination_semantic_duplicates_index(reason)
             return self._reconcile_destination_semantic_duplicates_widget_path(reason)
         finally:
