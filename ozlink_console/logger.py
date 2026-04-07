@@ -225,6 +225,12 @@ def resolve_log_stream(record: logging.LogRecord) -> str:
         return _STREAM_DEST_RECONCILE
     if "destination_projection_reconcile" in ml or "destination_semantic" in ml:
         return _STREAM_DEST_RECONCILE
+    if ml.startswith("destination_reconcile_"):
+        return _STREAM_DEST_RECONCILE
+
+    # Standalone finalize-phase diagnostics (timer-sliced merge tail).
+    if "destination_finalize_expand_progress" in ml or "destination_alloc_descendants_tick" in ml:
+        return _STREAM_DEST_FINALIZE
 
     # Incremental merge finalize phase (after reconcile, before merge-tick + generic preview routing).
     if "destination_incremental_merge_session_complete" in ml:

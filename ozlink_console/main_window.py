@@ -27027,6 +27027,30 @@ class MainWindow(QMainWindow):
                 if item is not None and isinstance(item, QModelIndex) and item.isValid():
                     tree.expand(item)
 
+    def _destination_merge_restore_expanded_slice_widget(self, tree, paths_ordered: list, start: int, count: int) -> None:
+        """QTreeWidget: expand up to ``count`` paths starting at ``start`` (shallow path lookup per path)."""
+        end = min(start + count, len(paths_ordered))
+        for idx in range(start, end):
+            target_path = paths_ordered[idx]
+            variants: set[str] = set()
+            if target_path:
+                variants.add(str(target_path).strip())
+            sk = self._destination_expansion_state_key(target_path)
+            if sk:
+                variants.add(str(sk).strip())
+            expanded = False
+            for variant in variants:
+                if not variant:
+                    continue
+                item = self._find_visible_destination_item_by_path(variant)
+                if item is not None and not isinstance(item, QModelIndex):
+                    tree.expandItem(item)
+                    expanded = True
+            if not expanded:
+                item = self._find_visible_destination_item_by_path(target_path)
+                if item is not None and not isinstance(item, QModelIndex):
+                    tree.expandItem(item)
+
     def _destination_incremental_merge_progress_phase_log(self, sess: dict, tick_idx: int) -> None:
         phase = str(sess.get("phase") or "")
         fsub = str(sess.get("finalize_subphase") or "")
@@ -27134,6 +27158,206 @@ class MainWindow(QMainWindow):
                 )
         return int(sess.get("parent_sort_i") or 0) >= len(q)
 
+    def _destination_incremental_merge_finalize_alloc_step(self, sess: dict, tick_idx: int) -> bool:
+        """Timer-sliced allocation-descendants during merge finalize. Returns True when phase is complete."""
+        destination_expanded_paths = sess["destination_expanded_paths"]
+        tree = sess["tree"]
+        dmodel = sess.get("dmodel")
+        uses_mv = sess["uses_model_view"]
+        op = QElapsedTimer()
+        op.start()
+        budget_ms = int(getattr(self, "_destination_finalize_alloc_budget_ms", 22) or 22)
+        hard_ms = int(getattr(self, "_destination_finalize_alloc_hard_cap_ms", 95) or 95)
+        if not uses_mv or dmodel is None:
+            if not sess.get("finalize_alloc_widget_done"):
+                visible = self._apply_visible_destination_allocation_descendants(
+                    destination_expanded_paths=destination_expanded_paths
+                )
+                sess["finalize_visible_descendant_count"] = int(visible)
+                sess["finalize_alloc_widget_done"] = True
+            log_info(
+                "destination_alloc_descendants_tick",
+                tick_index=tick_idx,
+                mode="widget_full",
+                tick_wall_ms=op.elapsed(),
+                slice_done=True,
+            )
+            return True
+        nt = self._destination_bind_normalized_expanded_targets(set(destination_expanded_paths or set()))
+        mode = sess.get("finalize_alloc_mode")
+        applied_session = int(sess.get("finalize_alloc_applied_session", 0) or 0)
+
+        if mode == "eager":
+            pairs = sess.get("finalize_alloc_pairs") or []
+            i = int(sess.get("finalize_alloc_idx", 0) or 0)
+            max_pairs = int(getattr(self, "_destination_finalize_alloc_max_pairs_per_tick", 2) or 2)
+            n_done = 0
+            while i < len(pairs) and n_done < max_pairs and op.elapsed() < budget_ms and op.elapsed() < hard_ms:
+                ix, move = pairs[i]
+                i += 1
+                if not ix.isValid() or not dmodel.is_index_live(ix):
+                    continue
+                node_data = ix.data(Qt.UserRole) or {}
+                if not self.node_is_planned_allocation(node_data):
+                    continue
+                if not bool(node_data.get("is_folder", False)):
+                    continue
+                if bool(node_data.get("allocation_descendants_applied")):
+                    nd = dict(node_data)
+                    if not bool(nd.get("children_loaded")):
+                        nd["children_loaded"] = True
+                        nd["projection_unresolved_terminal"] = False
+
+                        def _mut(p):
+                            p.clear()
+                            p.update(nd)
+
+                        dmodel.update_payload_for_index(ix, _mut)
+                else:
+                    sem = self._destination_semantic_path(node_data)
+                    if self._destination_bind_should_apply_allocation_descendants_now(sem, nt):
+                        applied_session += self._apply_allocation_descendants_to_item(ix, move)
+                n_done += 1
+                if op.elapsed() >= budget_ms:
+                    break
+            sess["finalize_alloc_idx"] = i
+            sess["finalize_alloc_applied_session"] = applied_session
+            done = i >= len(pairs)
+            log_info(
+                "destination_alloc_descendants_tick",
+                tick_index=tick_idx,
+                mode="eager",
+                pair_index=i,
+                pairs_total=len(pairs),
+                tick_wall_ms=op.elapsed(),
+                applied_session=applied_session,
+                slice_done=done,
+            )
+            if op.elapsed() > 80:
+                log_info(
+                    "destination_incremental_merge_tick_heavy_operation",
+                    tick_index=tick_idx,
+                    phase="finalize",
+                    operation="alloc_descendants_eager_slice",
+                    tick_wall_ms=op.elapsed(),
+                    cumulative_rows_attached=int(sess.get("cumulative_rows_attached") or 0),
+                )
+            if done and applied_session:
+                try:
+                    tree.viewport().update()
+                except Exception:
+                    pass
+            sess["finalize_visible_descendant_count"] = int(applied_session)
+            return done
+
+        if mode == "lazy_ap":
+            pm_lookup = sess.get("finalize_alloc_pm_lookup") or {}
+            keys = sess.get("finalize_alloc_lazy_ap_keys") or []
+            j = int(sess.get("finalize_alloc_lazy_ap_i", 0) or 0)
+            per = int(getattr(self, "_destination_finalize_lazy_ap_keys_per_tick", 6) or 6)
+            touched = int(sess.get("finalize_alloc_lazy_touched", 0) or 0)
+            end = min(j + per, len(keys))
+            for ki in range(j, end):
+                ap = keys[ki]
+                if not ap:
+                    continue
+                for ix in dmodel.find_indices_for_canonical_destination_path(ap):
+                    node_data = ix.data(Qt.UserRole) or {}
+                    if not self.node_is_planned_allocation(node_data):
+                        continue
+                    if not bool(node_data.get("is_folder", False)):
+                        continue
+                    if not bool(node_data.get("allocation_descendants_applied")):
+                        continue
+                    if bool(node_data.get("children_loaded")):
+                        continue
+                    nd = dict(node_data)
+                    nd["children_loaded"] = True
+                    nd["projection_unresolved_terminal"] = False
+
+                    def _mut(p, repl=nd):
+                        p.clear()
+                        p.update(repl)
+
+                    dmodel.update_payload_for_index(ix, _mut)
+                    touched += 1
+            sess["finalize_alloc_lazy_ap_i"] = end
+            sess["finalize_alloc_lazy_touched"] = touched
+            log_info(
+                "destination_alloc_descendants_tick",
+                tick_index=tick_idx,
+                mode="lazy_ap",
+                key_index=end,
+                keys_total=len(keys),
+                touched_total=touched,
+                tick_wall_ms=op.elapsed(),
+                slice_done=end >= len(keys),
+            )
+            if end < len(keys):
+                return False
+            if touched:
+                sess["finalize_visible_descendant_count"] = 0
+                return True
+            sess["finalize_alloc_mode"] = "lazy_df"
+            sess["finalize_lazy_df_i"] = 0
+            sess["finalize_lazy_df_snapshot"] = None
+            return False
+
+        if mode == "lazy_df":
+            snapshot = sess.get("finalize_lazy_df_snapshot")
+            if snapshot is None:
+                snapshot = list(dmodel.iter_depth_first())
+                sess["finalize_lazy_df_snapshot"] = snapshot
+            i = int(sess.get("finalize_lazy_df_i", 0) or 0)
+            per = int(getattr(self, "_destination_finalize_lazy_df_nodes_per_tick", 24) or 24)
+            end = min(i + per, len(snapshot))
+            for idx in range(i, end):
+                ix = snapshot[idx]
+                if not ix.isValid() or not dmodel.is_index_live(ix):
+                    continue
+                node_data = ix.data(Qt.UserRole) or {}
+                if not self.node_is_planned_allocation(node_data):
+                    continue
+                if not bool(node_data.get("is_folder", False)):
+                    continue
+                if not bool(node_data.get("allocation_descendants_applied")):
+                    continue
+                if bool(node_data.get("children_loaded")):
+                    continue
+                nd = dict(node_data)
+                nd["children_loaded"] = True
+                nd["projection_unresolved_terminal"] = False
+
+                def _mut(p):
+                    p.clear()
+                    p.update(nd)
+
+                dmodel.update_payload_for_index(ix, _mut)
+            sess["finalize_lazy_df_i"] = end
+            done = end >= len(snapshot)
+            log_info(
+                "destination_alloc_descendants_tick",
+                tick_index=tick_idx,
+                mode="lazy_df",
+                node_index=end,
+                nodes_total=len(snapshot),
+                tick_wall_ms=op.elapsed(),
+                slice_done=done,
+            )
+            if op.elapsed() > 80:
+                log_info(
+                    "destination_incremental_merge_tick_heavy_operation",
+                    tick_index=tick_idx,
+                    phase="finalize",
+                    operation="alloc_descendants_lazy_df_slice",
+                    tick_wall_ms=op.elapsed(),
+                    cumulative_rows_attached=int(sess.get("cumulative_rows_attached") or 0),
+                )
+            sess["finalize_visible_descendant_count"] = 0
+            return done
+
+        return True
+
     def _destination_incremental_merge_session_tick_finalize(self, sess: dict) -> bool:
         """Run one finalize sub-step per call. Return True when session should complete."""
         tree = sess["tree"]
@@ -27161,34 +27385,62 @@ class MainWindow(QMainWindow):
                 entry_roots=len(entry_roots),
                 parent_batch_count=len(by_parent),
             )
-            sess["finalize_subphase"] = "alloc"
+            sess["finalize_subphase"] = "alloc_init"
             self._destination_incremental_merge_progress_phase_log(sess, tick_idx)
             return False
 
-        if sub == "alloc":
+        if sub == "alloc_init":
+            for k in (
+                "finalize_alloc_pairs",
+                "finalize_alloc_idx",
+                "finalize_alloc_applied_session",
+                "finalize_alloc_mode",
+                "finalize_alloc_pm_lookup",
+                "finalize_alloc_lazy_ap_keys",
+                "finalize_alloc_lazy_ap_i",
+                "finalize_alloc_lazy_touched",
+                "finalize_lazy_df_i",
+                "finalize_lazy_df_snapshot",
+                "finalize_alloc_widget_done",
+            ):
+                sess.pop(k, None)
+            uses_mv = sess["uses_model_view"]
+            dmodel = sess.get("dmodel")
+            if uses_mv and dmodel is not None:
+                if not self._destination_bind_allocation_descendants_eager_active():
+                    pm_lookup = self._build_planned_move_destination_lookup()
+                    alloc_by_path = pm_lookup.get("alloc_by_path") or {}
+                    sess["finalize_alloc_pm_lookup"] = pm_lookup
+                    sess["finalize_alloc_lazy_ap_keys"] = [ap for ap in alloc_by_path.keys() if ap]
+                    sess["finalize_alloc_lazy_ap_i"] = 0
+                    sess["finalize_alloc_lazy_touched"] = 0
+                    sess["finalize_alloc_mode"] = "lazy_ap"
+                else:
+                    pm_lookup = self._build_planned_move_destination_lookup()
+                    sess["finalize_alloc_pairs"] = self._destination_model_build_allocation_apply_pairs(
+                        dmodel, pm_lookup
+                    )
+                    sess["finalize_alloc_idx"] = 0
+                    sess["finalize_alloc_applied_session"] = 0
+                    sess["finalize_alloc_mode"] = "eager"
+            sess["finalize_subphase"] = "alloc_step"
+            return False
+
+        if sub == "alloc_step":
             op = QElapsedTimer()
             op.start()
-            visible_descendant_count = self._apply_visible_destination_allocation_descendants(
-                destination_expanded_paths=destination_expanded_paths
-            )
+            done_alloc = self._destination_incremental_merge_finalize_alloc_step(sess, tick_idx)
             wall = op.elapsed()
-            sess["finalize_visible_descendant_count"] = int(visible_descendant_count)
             log_info(
                 "destination_incremental_merge_finalize_tick",
                 tick_index=tick_idx,
                 pipeline_stage="alloc_descendants",
                 tick_wall_ms=wall,
-                visible_descendant_count=int(visible_descendant_count),
+                visible_descendant_count=int(sess.get("finalize_visible_descendant_count") or 0),
+                alloc_slice_done=bool(done_alloc),
             )
-            if wall > 50:
-                log_info(
-                    "destination_incremental_merge_tick_heavy_operation",
-                    tick_index=tick_idx,
-                    phase="finalize",
-                    operation="apply_visible_destination_allocation_descendants",
-                    tick_wall_ms=wall,
-                    cumulative_rows_attached=int(sess.get("cumulative_rows_attached") or 0),
-                )
+            if not done_alloc:
+                return False
             sess["finalize_subphase"] = "indicators"
             return False
 
@@ -27214,14 +27466,9 @@ class MainWindow(QMainWindow):
             return False
 
         if sub == "expand_init":
-            uses_mv = sess["uses_model_view"]
-            dmodel = sess.get("dmodel")
-            if uses_mv and dmodel is not None:
-                sess["expand_paths_ordered"] = self._destination_merge_expand_paths_ordered_for_session(
-                    destination_expanded_paths
-                )
-            else:
-                sess["expand_paths_ordered"] = []
+            sess["expand_paths_ordered"] = self._destination_merge_expand_paths_ordered_for_session(
+                destination_expanded_paths
+            )
             sess["expand_path_idx"] = 0
             sess["finalize_subphase"] = "expand_step"
             return False
@@ -27232,47 +27479,62 @@ class MainWindow(QMainWindow):
             tree_w = tree
             op = QElapsedTimer()
             op.start()
-            per = 4
-            if uses_mv and dmodel is not None:
-                paths = sess.get("expand_paths_ordered") or []
-                i = int(sess.get("expand_path_idx") or 0)
-                self._destination_idle_materialize_reentrancy_block += 1
-                try:
-                    self._destination_merge_restore_expanded_slice_model(tree_w, dmodel, paths, i, per)
-                finally:
-                    self._destination_idle_materialize_reentrancy_block -= 1
-                ni = min(i + per, len(paths))
-                sess["expand_path_idx"] = ni
-                wall = op.elapsed()
-                log_info(
-                    "destination_incremental_merge_finalize_tick",
-                    tick_index=tick_idx,
-                    pipeline_stage="expand_paths",
-                    tick_wall_ms=wall,
-                    cumulative_in_phase=ni,
-                    total_in_phase=len(paths),
-                )
-                if ni < len(paths):
-                    return False
-            else:
-                self._destination_idle_materialize_reentrancy_block += 1
-                try:
-                    self._restore_expanded_destination_paths_body(destination_expanded_paths)
-                finally:
-                    self._destination_idle_materialize_reentrancy_block -= 1
-                log_info(
-                    "destination_incremental_merge_finalize_tick",
-                    tick_index=tick_idx,
-                    pipeline_stage="expand_paths_widget",
-                    tick_wall_ms=op.elapsed(),
-                )
-            if op.elapsed() > 50:
+            budget_ms = int(getattr(self, "_destination_finalize_expand_budget_ms", 22) or 22)
+            hard_ms = int(getattr(self, "_destination_finalize_expand_hard_cap_ms", 95) or 95)
+            max_paths = int(getattr(self, "_destination_finalize_expand_max_paths_per_tick", 32) or 32)
+            paths = sess.get("expand_paths_ordered") or []
+            i = int(sess.get("expand_path_idx") or 0)
+            processed = 0
+            self._destination_idle_materialize_reentrancy_block += 1
+            try:
+                if uses_mv and dmodel is not None:
+                    while i < len(paths) and processed < max_paths:
+                        self._destination_merge_restore_expanded_slice_model(tree_w, dmodel, paths, i, 1)
+                        i += 1
+                        processed += 1
+                        if op.elapsed() >= budget_ms:
+                            break
+                        if op.elapsed() >= hard_ms:
+                            break
+                else:
+                    while i < len(paths) and processed < max_paths:
+                        self._destination_merge_restore_expanded_slice_widget(tree_w, paths, i, 1)
+                        i += 1
+                        processed += 1
+                        if op.elapsed() >= budget_ms:
+                            break
+                        if op.elapsed() >= hard_ms:
+                            break
+            finally:
+                self._destination_idle_materialize_reentrancy_block -= 1
+            sess["expand_path_idx"] = i
+            wall = op.elapsed()
+            log_info(
+                "destination_finalize_expand_progress",
+                tick_index=tick_idx,
+                expand_index=i,
+                expand_total=len(paths),
+                paths_this_tick=processed,
+                tick_wall_ms=wall,
+                uses_model_view=bool(uses_mv and dmodel is not None),
+            )
+            log_info(
+                "destination_incremental_merge_finalize_tick",
+                tick_index=tick_idx,
+                pipeline_stage="expand_paths" if (uses_mv and dmodel is not None) else "expand_paths_widget",
+                tick_wall_ms=wall,
+                cumulative_in_phase=i,
+                total_in_phase=len(paths),
+            )
+            if i < len(paths):
+                return False
+            if wall > 50:
                 log_info(
                     "destination_incremental_merge_tick_heavy_operation",
                     tick_index=tick_idx,
                     phase="finalize",
                     operation="restore_expanded_paths_slice",
-                    tick_wall_ms=op.elapsed(),
+                    tick_wall_ms=wall,
                     cumulative_rows_attached=int(sess.get("cumulative_rows_attached") or 0),
                 )
             sess["finalize_subphase"] = "select_btn"
@@ -27304,20 +27566,102 @@ class MainWindow(QMainWindow):
                 pipeline_stage="persist",
                 tick_wall_ms=wall,
             )
-            sess["finalize_subphase"] = "reconcile"
+            sess["finalize_subphase"] = "reconcile_init"
             return False
 
-        if sub == "reconcile":
+        if sub == "reconcile_init":
+            sess["finalize_reconcile_start_logged"] = False
+            sess["finalize_sibling_reconcile_logged"] = False
+            sess["finalize_reconcile_merged_groups_total"] = 0
+            sess["finalize_reconcile_moved_total"] = 0
+            for _rk in (
+                "rec_sem_snapshot",
+                "rec_sem_snap_gen",
+                "rec_sem_scan_i",
+                "rec_sem_groups",
+                "rec_sem_invalidate",
+                "rec_sem_cumulative_nodes_scanned",
+                "rec_sem_cumulative_merges",
+                "rec_sem_merge_sp",
+                "rec_sem_merge_items",
+                "rec_sem_merge_snap_gen",
+                "rec_sib_snapshot",
+                "rec_sib_snap_gen",
+                "rec_sib_scan_i",
+                "rec_sib_invalidate",
+                "rec_sib_cumulative_parents_scanned",
+                "rec_sib_cumulative_fixes",
+            ):
+                sess.pop(_rk, None)
+            sess["finalize_subphase"] = "reconcile_semantic"
+            return False
+
+        if sub == "reconcile_semantic":
             op = QElapsedTimer()
             op.start()
-            self._reconcile_destination_semantic_duplicates("destination_incremental_merge_complete")
+            if not sess.get("finalize_reconcile_start_logged") and self._destination_tree_uses_model_view():
+                dmodel = getattr(self, "destination_planning_model", None)
+                if dmodel is not None:
+                    snapshot_probe = list(dmodel.iter_depth_first())
+                    self._log_restore_phase(
+                        "reconcile_start",
+                        reason="destination_incremental_merge_complete",
+                        reconcile_surface="destination_semantic_duplicates_index",
+                        node_count=len(snapshot_probe),
+                        snapshot_size=len(snapshot_probe),
+                        model_signature=int(dmodel.structure_generation()),
+                    )
+                sess["finalize_reconcile_start_logged"] = True
+            mg = 0
+            more = False
+            moved = 0
+            rec = {}
+            if self._destination_tree_uses_model_view():
+                rec = self._destination_finalize_reconcile_semantic_tick(
+                    sess, "destination_incremental_merge_complete", tick_idx
+                )
+                moved = int(rec.get("moved") or 0)
+                mg = int(rec.get("merged_groups") or 0)
+                more = bool(rec.get("more"))
+                sem_done = bool(rec.get("semantic_phase_done"))
+                sess["finalize_reconcile_moved_total"] = int(sess.get("finalize_reconcile_moved_total") or 0) + moved
+                sess["finalize_reconcile_merged_groups_total"] = int(
+                    sess.get("finalize_reconcile_merged_groups_total") or 0
+                ) + int(mg)
+            else:
+                moved = self._reconcile_destination_semantic_duplicates("destination_incremental_merge_complete")
+                sess["finalize_reconcile_moved_total"] = int(sess.get("finalize_reconcile_moved_total") or 0) + int(
+                    moved
+                )
+                more = False
+                sem_done = True
             wall = op.elapsed()
-            log_info(
-                "destination_incremental_merge_finalize_tick",
-                tick_index=tick_idx,
+            self._destination_finalize_reconcile_log_tick_bundle(
+                sess,
+                tick_idx,
+                wall,
+                rec if self._destination_tree_uses_model_view() else {},
+                moved,
+                mg,
+                more,
                 pipeline_stage="reconcile_semantic_duplicates",
-                tick_wall_ms=wall,
             )
+            if wall > 100:
+                log_info(
+                    "destination_reconcile_heavy_tick",
+                    tick_index=tick_idx,
+                    reconcile_phase=(rec.get("reconcile_phase") if rec else "semantic_widget"),
+                    tick_wall_ms=wall,
+                    threshold_ms=100,
+                )
+            elif wall > 80:
+                log_info(
+                    "destination_reconcile_heavy_tick",
+                    tick_index=tick_idx,
+                    reconcile_phase=(rec.get("reconcile_phase") if rec else "semantic_widget"),
+                    tick_wall_ms=wall,
+                    threshold_ms=80,
+                )
             if wall > 80:
                 log_info(
                     "destination_incremental_merge_tick_heavy_operation",
@@ -27327,10 +27671,137 @@ class MainWindow(QMainWindow):
                     tick_wall_ms=wall,
                     cumulative_rows_attached=int(sess.get("cumulative_rows_attached") or 0),
                 )
+            if self._destination_tree_uses_model_view() and more:
+                return False
+            if not self._destination_tree_uses_model_view():
+                sess["finalize_subphase"] = "summary"
+                return False
+            if not sem_done:
+                return False
+            log_info(
+                "destination_reconcile_complete",
+                tick_index=tick_idx,
+                reconcile_phase="semantic",
+                cumulative_nodes_scanned=int(sess.get("rec_sem_cumulative_nodes_scanned") or 0),
+                cumulative_merges=int(sess.get("rec_sem_cumulative_merges") or 0),
+                cumulative_merged_groups_total=int(sess.get("finalize_reconcile_merged_groups_total") or 0),
+                cumulative_moved_total=int(sess.get("finalize_reconcile_moved_total") or 0),
+                done=True,
+            )
+            sess["finalize_subphase"] = "reconcile_sibling"
+            return False
+
+        if sub == "reconcile_sibling":
+            op = QElapsedTimer()
+            op.start()
+            moved = 0
+            mg = 0
+            more = False
+            rec = {}
+            if self._destination_tree_uses_model_view():
+                if not sess.get("finalize_sibling_reconcile_logged"):
+                    dmodel = getattr(self, "destination_planning_model", None)
+                    if dmodel is not None:
+                        snapshot_parents = list(dmodel.iter_depth_first())
+                        self._log_restore_phase(
+                            "reconcile_start",
+                            reason="destination_incremental_merge_complete",
+                            reconcile_surface="destination_sibling_folder_name_collisions_index",
+                            node_count=len(snapshot_parents),
+                            snapshot_size=len(snapshot_parents),
+                            model_signature=int(dmodel.structure_generation()),
+                        )
+                    sess["finalize_sibling_reconcile_logged"] = True
+                rec = self._destination_finalize_reconcile_sibling_tick(
+                    sess, "destination_incremental_merge_complete", tick_idx
+                )
+                moved = int(rec.get("moved") or 0)
+                mg = int(rec.get("merged_groups") or 0)
+                more = bool(rec.get("more"))
+                sib_done = bool(rec.get("sibling_phase_done"))
+                sess["finalize_reconcile_moved_total"] = int(sess.get("finalize_reconcile_moved_total") or 0) + int(
+                    moved
+                )
+                sess["finalize_reconcile_merged_groups_total"] = int(
+                    sess.get("finalize_reconcile_merged_groups_total") or 0
+                ) + int(mg)
+            else:
+                sw, sg = self._reconcile_destination_sibling_folder_name_collisions_widget(
+                    "destination_incremental_merge_complete"
+                )
+                moved = int(sw)
+                mg = int(sg)
+                sib_done = True
+                sess["finalize_reconcile_moved_total"] = int(sess.get("finalize_reconcile_moved_total") or 0) + int(
+                    moved
+                )
+                sess["finalize_reconcile_merged_groups_total"] = int(
+                    sess.get("finalize_reconcile_merged_groups_total") or 0
+                ) + int(mg)
+            wall = op.elapsed()
+            self._destination_finalize_reconcile_log_tick_bundle(
+                sess,
+                tick_idx,
+                wall,
+                rec if self._destination_tree_uses_model_view() else {},
+                moved,
+                mg,
+                more,
+                pipeline_stage="reconcile_sibling_collisions",
+            )
+            if wall > 100:
+                log_info(
+                    "destination_reconcile_heavy_tick",
+                    tick_index=tick_idx,
+                    reconcile_phase=(rec.get("reconcile_phase") if rec else "sibling_widget"),
+                    tick_wall_ms=wall,
+                    threshold_ms=100,
+                )
+            elif wall > 80:
+                log_info(
+                    "destination_reconcile_heavy_tick",
+                    tick_index=tick_idx,
+                    reconcile_phase=(rec.get("reconcile_phase") if rec else "sibling_widget"),
+                    tick_wall_ms=wall,
+                    threshold_ms=80,
+                )
+            if wall > 80:
+                log_info(
+                    "destination_incremental_merge_tick_heavy_operation",
+                    tick_index=tick_idx,
+                    phase="finalize",
+                    operation="reconcile_sibling_folder_collisions",
+                    tick_wall_ms=wall,
+                    cumulative_rows_attached=int(sess.get("cumulative_rows_attached") or 0),
+                )
+            if self._destination_tree_uses_model_view() and more:
+                return False
+            if self._destination_tree_uses_model_view() and not sib_done:
+                return False
+            if sib_done and self._destination_tree_uses_model_view():
+                log_info(
+                    "destination_reconcile_complete",
+                    tick_index=tick_idx,
+                    reconcile_phase="sibling",
+                    cumulative_parents_scanned=int(sess.get("rec_sib_cumulative_parents_scanned") or 0),
+                    cumulative_sibling_fixes=int(sess.get("rec_sib_cumulative_fixes") or 0),
+                    cumulative_merged_groups_total=int(sess.get("finalize_reconcile_merged_groups_total") or 0),
+                    cumulative_moved_total=int(sess.get("finalize_reconcile_moved_total") or 0),
+                    done=True,
+                )
             sess["finalize_subphase"] = "summary"
             return False
 
         if sub == "summary":
+            merged_total = int(sess.get("finalize_reconcile_merged_groups_total") or 0)
+            moved_total = int(sess.get("finalize_reconcile_moved_total") or 0)
+            if merged_total > 0:
+                self._log_restore_phase(
+                    "destination_projection_reconciled",
+                    reason="destination_incremental_merge_complete",
+                    merged_group_count=merged_total,
+                    child_count_moved=moved_total,
+                )
             visible_descendant_count = int(sess.get("finalize_visible_descendant_count") or 0)
             top_n = self._planning_tree_top_level_count(tree)
             self._log_restore_phase(
@@ -31591,6 +32062,460 @@ class MainWindow(QMainWindow):
                 break
             moved_count += self._merge_nested_spec_into_parent_index(target_ix, nested)
         return moved_count
+
+    def _destination_finalize_reconcile_log_tick_bundle(
+        self,
+        sess: dict,
+        tick_idx: int,
+        wall_ms: int,
+        rec: dict,
+        moved: int,
+        merged_groups: int,
+        more: bool,
+        *,
+        pipeline_stage: str,
+    ) -> None:
+        """Structured reconcile logs for finalize (destination_reconcile.log via routing)."""
+        base = {
+            "tick_index": tick_idx,
+            "tick_wall_ms": wall_ms,
+            "moved": int(moved),
+            "merged_groups": int(merged_groups),
+            "more": bool(more),
+            "cumulative_semantic_merges": int(sess.get("rec_sem_cumulative_merges") or 0),
+            "cumulative_merges": int(sess.get("rec_sem_cumulative_merges") or 0)
+            + int(sess.get("rec_sib_cumulative_fixes") or 0),
+            "cumulative_nodes_scanned": int(sess.get("rec_sem_cumulative_nodes_scanned") or 0),
+            "cumulative_parents_scanned": int(sess.get("rec_sib_cumulative_parents_scanned") or 0),
+            "cumulative_sibling_fixes": int(sess.get("rec_sib_cumulative_fixes") or 0),
+            "cumulative_merged_groups_total": int(sess.get("finalize_reconcile_merged_groups_total") or 0),
+            "cumulative_moved_total": int(sess.get("finalize_reconcile_moved_total") or 0),
+        }
+        if rec:
+            base.update(
+                {
+                    "reconcile_phase": rec.get("reconcile_phase"),
+                    "nodes_scanned_this_tick": rec.get("nodes_scanned_this_tick", 0),
+                    "groups_built_this_tick": rec.get("groups_built_this_tick", 0),
+                    "merges_applied_this_tick": rec.get("merges_applied_this_tick", 0),
+                    "parents_scanned_this_tick": rec.get("parents_scanned_this_tick", 0),
+                    "sibling_fixes_this_tick": rec.get("sibling_fixes_this_tick", 0),
+                }
+            )
+        log_info("destination_reconcile_progress", **base)
+        _phase = str(rec.get("reconcile_phase") or "")
+        _stage = (
+            "semantic"
+            if _phase.startswith("semantic")
+            else "sibling"
+            if _phase.startswith("sibling")
+            else str(pipeline_stage)
+        )
+        log_info(
+            "destination_reconcile_tick",
+            tick_index=tick_idx,
+            stage=_stage,
+            reconcile_phase=rec.get("reconcile_phase"),
+            tick_wall_ms=wall_ms,
+            moved=int(moved),
+            merged_groups=int(merged_groups),
+            more=bool(more),
+            nodes_scanned_this_tick=rec.get("nodes_scanned_this_tick", 0),
+            parents_scanned_this_tick=rec.get("parents_scanned_this_tick", 0),
+            sibling_fixes_this_tick=rec.get("sibling_fixes_this_tick", 0),
+        )
+        log_info(
+            "destination_incremental_merge_finalize_tick",
+            tick_index=tick_idx,
+            pipeline_stage=pipeline_stage,
+            tick_wall_ms=wall_ms,
+        )
+
+    def _destination_finalize_reconcile_semantic_tick(self, sess: dict, reason: str, tick_idx: int) -> dict:
+        """Resumable semantic duplicate reconcile for merge-finalize (planning model).
+
+        Tunables: ``_destination_finalize_reconcile_budget_ms``,
+        ``_destination_finalize_reconcile_hard_cap_ms``,
+        ``_destination_finalize_reconcile_max_nodes_per_tick``.
+        Semantic merge runs on a following tick (at most one merge per tick).
+        """
+        out: dict = {
+            "reconcile_phase": "semantic_scan",
+            "moved": 0,
+            "merged_groups": 0,
+            "more": False,
+            "semantic_phase_done": False,
+            "nodes_scanned_this_tick": 0,
+            "groups_built_this_tick": 0,
+            "merges_applied_this_tick": 0,
+            "parents_scanned_this_tick": 0,
+            "sibling_fixes_this_tick": 0,
+        }
+        dmodel = getattr(self, "destination_planning_model", None)
+        if dmodel is None:
+            out["semantic_phase_done"] = True
+            return out
+
+        budget_ms = int(getattr(self, "_destination_finalize_reconcile_budget_ms", 32) or 32)
+        hard_ms = int(getattr(self, "_destination_finalize_reconcile_hard_cap_ms", 98) or 98)
+        max_nodes = int(getattr(self, "_destination_finalize_reconcile_max_nodes_per_tick", 28) or 28)
+        op = QElapsedTimer()
+        op.start()
+
+        def _invalidate_semantic():
+            sess["rec_sem_snapshot"] = None
+            sess["rec_sem_groups"] = {}
+            sess["rec_sem_scan_i"] = 0
+            sess.pop("rec_sem_snap_gen", None)
+
+        if sess.get("rec_sem_invalidate"):
+            _invalidate_semantic()
+            sess["rec_sem_invalidate"] = False
+
+        merge_snap_gen = sess.pop("rec_sem_merge_snap_gen", None)
+        pending_sp = sess.pop("rec_sem_merge_sp", None)
+        pending_items = sess.pop("rec_sem_merge_items", None)
+        if pending_sp and pending_items:
+            out["reconcile_phase"] = "semantic_merge"
+            semantic_path = str(pending_sp)
+            items = list(pending_items)
+            if int(dmodel.structure_generation()) != int(merge_snap_gen or 0):
+                _invalidate_semantic()
+                out["more"] = True
+                return out
+            canonical_ix = self._select_canonical_destination_item(items)
+            if canonical_ix is None or not canonical_ix.isValid():
+                _invalidate_semantic()
+                out["more"] = True
+                return out
+            duplicates = [ix for ix in items if ix != canonical_ix]
+            if not duplicates:
+                _invalidate_semantic()
+                out["more"] = True
+                return out
+            duplicate_ix = duplicates[0]
+            if not dmodel.is_index_live(canonical_ix) or not dmodel.is_index_live(duplicate_ix):
+                _invalidate_semantic()
+                out["more"] = True
+                return out
+            canonical_data = canonical_ix.data(Qt.UserRole) or {}
+            canonical_state = self._destination_node_state(canonical_data)
+            dup_labels = "; ".join(
+                self._tree_item_path(ix.data(Qt.UserRole) or {})
+                for ix in duplicates
+                if ix.isValid() and dmodel.is_index_live(ix)
+            )
+            self._log_restore_phase(
+                "destination_semantic_duplicate_detected",
+                semantic_path=semantic_path,
+                projected_tree_path=dup_labels,
+                real_tree_path=self._tree_item_path(canonical_data),
+                child_count_moved=0,
+                node_origin_before="duplicate_group",
+                node_origin_after=canonical_data.get("node_origin", ""),
+            )
+            if canonical_state == "real":
+                self._log_restore_phase(
+                    "destination_real_parent_promoted_canonical",
+                    semantic_path=semantic_path,
+                    projected_tree_path=dup_labels,
+                    real_tree_path=self._tree_item_path(canonical_data),
+                    child_count_moved=0,
+                    node_origin_before="duplicate_group",
+                    node_origin_after=canonical_data.get("node_origin", ""),
+                )
+            duplicate_data = duplicate_ix.data(Qt.UserRole) or {}
+            self._log_restore_phase(
+                "destination_projected_parent_merge_started",
+                semantic_path=semantic_path,
+                projected_tree_path=self._tree_item_path(duplicate_data),
+                real_tree_path=self._tree_item_path(canonical_data),
+                child_count_moved=dmodel.rowCount(duplicate_ix),
+                node_origin_before=duplicate_data.get("node_origin", ""),
+                node_origin_after=canonical_data.get("node_origin", ""),
+            )
+            moved_count = self._merge_destination_projection_children_index(
+                duplicate_ix, canonical_ix, semantic_path
+            )
+            removed = dmodel.remove_node_at(duplicate_ix)
+            if removed is None:
+                _invalidate_semantic()
+                out["more"] = True
+                return out
+            self._log_restore_phase(
+                "destination_projected_parent_retired",
+                semantic_path=semantic_path,
+                projected_tree_path=self._tree_item_path(duplicate_data),
+                real_tree_path=self._tree_item_path(canonical_data),
+                child_count_moved=moved_count,
+                node_origin_before=duplicate_data.get("node_origin", ""),
+                node_origin_after=canonical_data.get("node_origin", ""),
+            )
+            out["moved"] = int(moved_count)
+            out["merged_groups"] = 1
+            out["merges_applied_this_tick"] = 1
+            sess["rec_sem_cumulative_merges"] = int(sess.get("rec_sem_cumulative_merges", 0) or 0) + 1
+            _invalidate_semantic()
+            out["more"] = True
+            return out
+
+        if sess.get("rec_sem_snapshot") is None:
+            try:
+                snap = list(dmodel.iter_depth_first())
+            except Exception:
+                snap = []
+            sess["rec_sem_snapshot"] = snap
+            sess["rec_sem_snap_gen"] = int(dmodel.structure_generation())
+            sess["rec_sem_scan_i"] = 0
+            sess["rec_sem_groups"] = {}
+
+        snap = sess["rec_sem_snapshot"]
+        snap_gen = int(sess.get("rec_sem_snap_gen") or 0)
+        groups: dict = sess["rec_sem_groups"]
+        i = int(sess.get("rec_sem_scan_i", 0) or 0)
+
+        if int(dmodel.structure_generation()) != snap_gen:
+            self._log_restore_phase(
+                "reconcile_skip_due_to_stale_model",
+                reason=reason,
+                reconcile_stage="destination_finalize_semantic_tick_gen",
+                expected_generation=snap_gen,
+                current_generation=int(dmodel.structure_generation()),
+            )
+            _invalidate_semantic()
+            out["more"] = True
+            return out
+
+        nodes_scanned = 0
+        entries_added = 0
+        while i < len(snap) and nodes_scanned < max_nodes:
+            if op.elapsed() >= budget_ms and nodes_scanned > 0:
+                break
+            if op.elapsed() >= hard_ms:
+                break
+            ix = snap[i]
+            i += 1
+            nodes_scanned += 1
+            if int(dmodel.structure_generation()) != snap_gen:
+                _invalidate_semantic()
+                out["more"] = True
+                return out
+            if not ix.isValid() or not dmodel.is_index_live(ix):
+                continue
+            node_data = ix.data(Qt.UserRole) or {}
+            if not isinstance(node_data, dict) or node_data.get("placeholder"):
+                continue
+            sp = self._destination_semantic_path(node_data)
+            if sp:
+                groups.setdefault(sp, []).append(ix)
+                entries_added += 1
+
+        sess["rec_sem_groups"] = groups
+        sess["rec_sem_scan_i"] = i
+        sess["rec_sem_cumulative_nodes_scanned"] = int(sess.get("rec_sem_cumulative_nodes_scanned", 0) or 0) + int(
+            nodes_scanned
+        )
+        out["nodes_scanned_this_tick"] = int(nodes_scanned)
+        out["groups_built_this_tick"] = int(entries_added)
+
+        if i < len(snap):
+            out["more"] = True
+            out["reconcile_phase"] = "semantic_scan"
+            return out
+
+        semantic_path = None
+        items = None
+        for sp, ix_list in groups.items():
+            if len(ix_list) >= 2:
+                semantic_path = sp
+                items = ix_list
+                break
+        if not semantic_path or not items:
+            sess.pop("rec_sem_snapshot", None)
+            sess.pop("rec_sem_groups", None)
+            sess.pop("rec_sem_scan_i", None)
+            sess.pop("rec_sem_snap_gen", None)
+            out["semantic_phase_done"] = True
+            out["reconcile_phase"] = "semantic_scan"
+            return out
+
+        sess["rec_sem_merge_sp"] = semantic_path
+        sess["rec_sem_merge_items"] = list(items)
+        sess["rec_sem_merge_snap_gen"] = int(snap_gen)
+        sess.pop("rec_sem_snapshot", None)
+        sess.pop("rec_sem_groups", None)
+        sess.pop("rec_sem_scan_i", None)
+        sess.pop("rec_sem_snap_gen", None)
+        out["reconcile_phase"] = "semantic_merge_pending"
+        out["more"] = True
+        return out
+
+    def _destination_finalize_reconcile_sibling_tick(self, sess: dict, reason: str, tick_idx: int) -> dict:
+        """Resumable sibling folder-name collision reconcile for merge-finalize.
+
+        Tunables: ``_destination_finalize_reconcile_budget_ms``,
+        ``_destination_finalize_reconcile_hard_cap_ms``,
+        ``_destination_finalize_reconcile_max_sibling_parents_per_tick``,
+        ``_destination_finalize_reconcile_max_sibling_fixes_per_tick``.
+        """
+        out: dict = {
+            "reconcile_phase": "sibling_scan",
+            "moved": 0,
+            "merged_groups": 0,
+            "more": False,
+            "sibling_phase_done": False,
+            "nodes_scanned_this_tick": 0,
+            "groups_built_this_tick": 0,
+            "merges_applied_this_tick": 0,
+            "parents_scanned_this_tick": 0,
+            "sibling_fixes_this_tick": 0,
+        }
+        dmodel = getattr(self, "destination_planning_model", None)
+        if dmodel is None:
+            out["sibling_phase_done"] = True
+            return out
+
+        budget_ms = int(getattr(self, "_destination_finalize_reconcile_budget_ms", 32) or 32)
+        hard_ms = int(getattr(self, "_destination_finalize_reconcile_hard_cap_ms", 98) or 98)
+        max_folders = int(
+            getattr(self, "_destination_finalize_reconcile_max_sibling_parents_per_tick", 14) or 14
+        )
+        max_fixes = int(getattr(self, "_destination_finalize_reconcile_max_sibling_fixes_per_tick", 1) or 1)
+
+        op = QElapsedTimer()
+        op.start()
+
+        def _invalidate_sibling():
+            sess["rec_sib_snapshot"] = None
+            sess["rec_sib_scan_i"] = 0
+            sess.pop("rec_sib_snap_gen", None)
+
+        if sess.get("rec_sib_invalidate"):
+            _invalidate_sibling()
+            sess["rec_sib_invalidate"] = False
+
+        if sess.get("rec_sib_snapshot") is None:
+            try:
+                snap = list(dmodel.iter_depth_first())
+            except Exception:
+                snap = []
+            sess["rec_sib_snapshot"] = snap
+            sess["rec_sib_snap_gen"] = int(dmodel.structure_generation())
+            sess["rec_sib_scan_i"] = 0
+
+        snap = sess["rec_sib_snapshot"]
+        snap_gen = int(sess.get("rec_sib_snap_gen") or 0)
+        i = int(sess.get("rec_sib_scan_i", 0) or 0)
+
+        if int(dmodel.structure_generation()) != snap_gen:
+            self._log_restore_phase(
+                "reconcile_skip_due_to_stale_model",
+                reason=reason,
+                reconcile_stage="destination_finalize_sibling_tick_gen",
+                expected_generation=snap_gen,
+                current_generation=int(dmodel.structure_generation()),
+            )
+            _invalidate_sibling()
+            out["more"] = True
+            return out
+
+        fixes = 0
+        folders_scanned = 0
+        nodes_walked = 0
+        while i < len(snap) and fixes < max_fixes:
+            if op.elapsed() >= budget_ms and (folders_scanned > 0 or fixes > 0 or nodes_walked > 0):
+                break
+            if op.elapsed() >= hard_ms:
+                break
+            if folders_scanned >= max_folders and fixes == 0:
+                break
+            parent_ix = snap[i]
+            i += 1
+            nodes_walked += 1
+            if int(dmodel.structure_generation()) != snap_gen:
+                sess["rec_sib_invalidate"] = True
+                out["more"] = True
+                return out
+            if not parent_ix.isValid() or not dmodel.is_index_live(parent_ix):
+                continue
+            pnd = parent_ix.data(Qt.UserRole) or {}
+            if not isinstance(pnd, dict) or not pnd.get("is_folder"):
+                continue
+            folders_scanned += 1
+            out["parents_scanned_this_tick"] = int(out["parents_scanned_this_tick"]) + 1
+            child_groups = self._destination_folder_children_grouped_by_sibling_name_key(parent_ix)
+            for _name_key, items in child_groups.items():
+                if len(items) < 2:
+                    continue
+                canonical_ix = self._select_canonical_destination_item(items)
+                if canonical_ix is None or not canonical_ix.isValid():
+                    continue
+                duplicates = [ix for ix in items if ix != canonical_ix]
+                if not duplicates:
+                    continue
+                duplicate_ix = duplicates[0]
+                if not duplicate_ix.isValid():
+                    continue
+                if not dmodel.is_index_live(canonical_ix) or not dmodel.is_index_live(duplicate_ix):
+                    self._log_restore_phase(
+                        "reconcile_invalid_index_detected",
+                        reason=reason,
+                        reconcile_stage="sibling_folder_name_collision_tick",
+                        name_key=_name_key,
+                    )
+                    continue
+                canonical_data = canonical_ix.data(Qt.UserRole) or {}
+                duplicate_data = duplicate_ix.data(Qt.UserRole) or {}
+                sem_hint = self._destination_semantic_path(canonical_data) or self._destination_semantic_path(
+                    duplicate_data
+                )
+                self._log_restore_phase(
+                    "destination_sibling_folder_name_collision",
+                    reason=reason,
+                    parent_path=self._tree_item_path(pnd),
+                    name_key=_name_key,
+                    kept_path=self._tree_item_path(canonical_data),
+                    merged_path=self._tree_item_path(duplicate_data),
+                )
+                moved_count = self._merge_destination_projection_children_index(
+                    duplicate_ix, canonical_ix, sem_hint
+                )
+                removed = dmodel.remove_node_at(duplicate_ix)
+                if removed is None:
+                    continue
+                out["moved"] = int(moved_count)
+                out["merged_groups"] = 1
+                fixes += 1
+                out["sibling_fixes_this_tick"] = 1
+                sess["rec_sib_cumulative_fixes"] = int(sess.get("rec_sib_cumulative_fixes", 0) or 0) + 1
+                sess["rec_sib_cumulative_parents_scanned"] = int(
+                    sess.get("rec_sib_cumulative_parents_scanned", 0) or 0
+                ) + int(folders_scanned)
+                sess["rec_sib_invalidate"] = True
+                sess["rec_sib_scan_i"] = i
+                out["reconcile_phase"] = "sibling_fix"
+                out["more"] = True
+                return out
+
+        sess["rec_sib_scan_i"] = i
+        sess["rec_sib_cumulative_parents_scanned"] = int(sess.get("rec_sib_cumulative_parents_scanned", 0) or 0) + int(
+            folders_scanned
+        )
+        out["nodes_scanned_this_tick"] = int(nodes_walked)
+
+        if fixes:
+            out["more"] = True
+            return out
+
+        if i >= len(snap):
+            _invalidate_sibling()
+            out["sibling_phase_done"] = True
+            out["reconcile_phase"] = "sibling_scan"
+            return out
+
+        out["more"] = True
+        out["reconcile_phase"] = "sibling_scan"
+        return out
 
     def _reconcile_destination_semantic_duplicates_index(self, reason):
         """Merge duplicate destination rows that share the same semantic path (QTreeView / planning model)."""
