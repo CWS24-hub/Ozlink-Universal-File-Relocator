@@ -27588,6 +27588,10 @@ class MainWindow(QMainWindow):
                 "rec_sib_snapshot",
                 "rec_sib_snap_gen",
                 "rec_sib_scan_i",
+                "rec_sib_dfs_stack",
+                "rec_sib_stack_gen",
+                "rec_sib_drain",
+                "rec_sib_drain_from_scan",
                 "rec_sib_invalidate",
                 "rec_sib_cumulative_parents_scanned",
                 "rec_sib_cumulative_fixes",
@@ -27749,23 +27753,19 @@ class MainWindow(QMainWindow):
                 more,
                 pipeline_stage="reconcile_sibling_collisions",
             )
-            if wall > 100:
+            if wall > 50:
                 log_info(
                     "destination_reconcile_heavy_tick",
                     tick_index=tick_idx,
                     reconcile_phase=(rec.get("reconcile_phase") if rec else "sibling_widget"),
                     tick_wall_ms=wall,
-                    threshold_ms=100,
+                    threshold_ms=50,
+                    parent_path_excerpt=str((rec or {}).get("parent_path_excerpt") or "")[:240],
+                    worklist_remaining=int((rec or {}).get("worklist_remaining") or 0),
+                    indexing_ms=(rec or {}).get("indexing_ms"),
+                    resolve_ms=(rec or {}).get("resolve_ms"),
                 )
-            elif wall > 80:
-                log_info(
-                    "destination_reconcile_heavy_tick",
-                    tick_index=tick_idx,
-                    reconcile_phase=(rec.get("reconcile_phase") if rec else "sibling_widget"),
-                    tick_wall_ms=wall,
-                    threshold_ms=80,
-                )
-            if wall > 80:
+            if wall > 50:
                 log_info(
                     "destination_incremental_merge_tick_heavy_operation",
                     tick_index=tick_idx,
@@ -32100,6 +32100,13 @@ class MainWindow(QMainWindow):
                     "merges_applied_this_tick": rec.get("merges_applied_this_tick", 0),
                     "parents_scanned_this_tick": rec.get("parents_scanned_this_tick", 0),
                     "sibling_fixes_this_tick": rec.get("sibling_fixes_this_tick", 0),
+                    "parent_path_excerpt": rec.get("parent_path_excerpt"),
+                    "active_parent_children_count": rec.get("active_parent_children_count"),
+                    "collision_groups_built_this_tick": rec.get("collision_groups_built_this_tick"),
+                    "worklist_remaining": rec.get("worklist_remaining"),
+                    "indexing_ms": rec.get("indexing_ms"),
+                    "resolve_ms": rec.get("resolve_ms"),
+                    "reconcile_total_ms": rec.get("reconcile_total_ms"),
                 }
             )
         log_info("destination_reconcile_progress", **base)
@@ -32350,8 +32357,62 @@ class MainWindow(QMainWindow):
         out["more"] = True
         return out
 
+    def _destination_planning_dfs_next_preorder_index(
+        self, dmodel: DestinationPlanningTreeModel, stack: list
+    ) -> Optional[QModelIndex]:
+        """Advance iterative preorder stack; next index matches :meth:`DestinationPlanningTreeModel.iter_depth_first` order.
+
+        Stack entries are ``[parent: QModelIndex, next_r: int]`` (mutable sublists).
+        """
+        while stack:
+            parent = stack[-1][0]
+            r = int(stack[-1][1])
+            rc = dmodel.rowCount(parent)
+            if r < rc:
+                ix = dmodel.index(r, 0, parent)
+                stack[-1][1] = r + 1
+                stack.append([ix, 0])
+                return ix
+            stack.pop()
+        return None
+
+    def _destination_finalize_sibling_first_actionable_from_groups(
+        self,
+        dmodel: DestinationPlanningTreeModel,
+        groups: dict,
+        *,
+        tick_reason: str,
+    ) -> Optional[tuple[Any, list]]:
+        """First merge candidate in dict iteration order (matches legacy nested loop)."""
+        for name_key, items in groups.items():
+            if len(items) < 2:
+                continue
+            canonical_ix = self._select_canonical_destination_item(items)
+            if canonical_ix is None or not canonical_ix.isValid():
+                continue
+            duplicates = [ix for ix in items if ix != canonical_ix]
+            if not duplicates:
+                continue
+            duplicate_ix = duplicates[0]
+            if not duplicate_ix.isValid():
+                continue
+            if not dmodel.is_index_live(canonical_ix) or not dmodel.is_index_live(duplicate_ix):
+                self._log_restore_phase(
+                    "reconcile_invalid_index_detected",
+                    reason=tick_reason,
+                    reconcile_stage="sibling_folder_name_collision_tick",
+                    name_key=name_key,
+                )
+                continue
+            return (name_key, items)
+        return None
+
     def _destination_finalize_reconcile_sibling_tick(self, sess: dict, reason: str, tick_idx: int) -> dict:
         """Resumable sibling folder-name collision reconcile for merge-finalize.
+
+        Scan uses incremental DFS (no full ``iter_depth_first`` list). Active parents with
+        collisions enter *drain* mode: O(children) re-index per fix without rebuilding a
+        full-tree snapshot each time.
 
         Tunables: ``_destination_finalize_reconcile_budget_ms``,
         ``_destination_finalize_reconcile_hard_cap_ms``,
@@ -32369,6 +32430,12 @@ class MainWindow(QMainWindow):
             "merges_applied_this_tick": 0,
             "parents_scanned_this_tick": 0,
             "sibling_fixes_this_tick": 0,
+            "collision_groups_built_this_tick": 0,
+            "worklist_remaining": 0,
+            "indexing_ms": 0.0,
+            "resolve_ms": 0.0,
+            "parent_path_excerpt": "",
+            "active_parent_children_count": 0,
         }
         dmodel = getattr(self, "destination_planning_model", None)
         if dmodel is None:
@@ -32382,88 +32449,106 @@ class MainWindow(QMainWindow):
         )
         max_fixes = int(getattr(self, "_destination_finalize_reconcile_max_sibling_fixes_per_tick", 1) or 1)
 
-        op = QElapsedTimer()
-        op.start()
+        wall_op = QElapsedTimer()
+        wall_op.start()
+        indexing_ms_acc = 0.0
+        resolve_ms_acc = 0.0
 
         def _invalidate_sibling():
-            sess["rec_sib_snapshot"] = None
-            sess["rec_sib_scan_i"] = 0
+            sess["rec_sib_dfs_stack"] = None
+            sess.pop("rec_sib_stack_gen", None)
+            sess.pop("rec_sib_drain", None)
+            sess.pop("rec_sib_drain_from_scan", None)
+            sess.pop("rec_sib_snapshot", None)
+            sess.pop("rec_sib_scan_i", None)
             sess.pop("rec_sib_snap_gen", None)
 
         if sess.get("rec_sib_invalidate"):
             _invalidate_sibling()
             sess["rec_sib_invalidate"] = False
 
-        if sess.get("rec_sib_snapshot") is None:
-            try:
-                snap = list(dmodel.iter_depth_first())
-            except Exception:
-                snap = []
-            sess["rec_sib_snapshot"] = snap
-            sess["rec_sib_snap_gen"] = int(dmodel.structure_generation())
-            sess["rec_sib_scan_i"] = 0
-
-        snap = sess["rec_sib_snapshot"]
-        snap_gen = int(sess.get("rec_sib_snap_gen") or 0)
-        i = int(sess.get("rec_sib_scan_i", 0) or 0)
-
-        if int(dmodel.structure_generation()) != snap_gen:
-            self._log_restore_phase(
-                "reconcile_skip_due_to_stale_model",
-                reason=reason,
-                reconcile_stage="destination_finalize_sibling_tick_gen",
-                expected_generation=snap_gen,
-                current_generation=int(dmodel.structure_generation()),
+        def _emit_timing():
+            out["indexing_ms"] = round(indexing_ms_acc, 3)
+            out["resolve_ms"] = round(resolve_ms_acc, 3)
+            total_ms = float(wall_op.elapsed())
+            out["reconcile_total_ms"] = round(total_ms, 3)
+            log_info(
+                "destination_reconcile_sibling_timing",
+                tick_index=tick_idx,
+                reconcile_phase=out.get("reconcile_phase"),
+                total_ms=round(total_ms, 3),
+                indexing_ms=round(indexing_ms_acc, 3),
+                resolve_ms=round(resolve_ms_acc, 3),
+                parents_scanned_this_tick=int(out.get("parents_scanned_this_tick") or 0),
+                sibling_fixes_this_tick=int(out.get("sibling_fixes_this_tick") or 0),
+                cumulative_sibling_fixes=int(sess.get("rec_sib_cumulative_fixes") or 0),
+                worklist_remaining=int(out.get("worklist_remaining") or 0),
             )
-            _invalidate_sibling()
-            out["more"] = True
-            return out
+        # --- drain: collision fixes under one parent (index pass is non-mutating per round) ---
+        drain = sess.get("rec_sib_drain")
+        if isinstance(drain, dict) and drain.get("parent_persist") is not None:
+            op_d = QElapsedTimer()
+            op_d.start()
+            fixes_applied = 0
+            total_moved = 0
+            while fixes_applied < max_fixes:
+                if op_d.elapsed() >= budget_ms and fixes_applied > 0:
+                    break
+                if op_d.elapsed() >= hard_ms:
+                    break
+                pp_cur = drain["parent_persist"]
+                parent_ix = QModelIndex(pp_cur) if isinstance(pp_cur, QPersistentModelIndex) else pp_cur
+                if not parent_ix.isValid() or not dmodel.is_index_live(parent_ix):
+                    sess.pop("rec_sib_drain", None)
+                    sess["rec_sib_dfs_stack"] = None
+                    sess["rec_sib_stack_gen"] = int(dmodel.structure_generation())
+                    sess["rec_sib_dfs_stack"] = [[QModelIndex(), 0]]
+                    out["moved"] = int(total_moved)
+                    out["merged_groups"] = int(fixes_applied)
+                    out["sibling_fixes_this_tick"] = int(fixes_applied)
+                    out["reconcile_phase"] = "sibling_scan"
+                    out["more"] = True
+                    _emit_timing()
+                    return out
 
-        fixes = 0
-        folders_scanned = 0
-        nodes_walked = 0
-        while i < len(snap) and fixes < max_fixes:
-            if op.elapsed() >= budget_ms and (folders_scanned > 0 or fixes > 0 or nodes_walked > 0):
-                break
-            if op.elapsed() >= hard_ms:
-                break
-            if folders_scanned >= max_folders and fixes == 0:
-                break
-            parent_ix = snap[i]
-            i += 1
-            nodes_walked += 1
-            if int(dmodel.structure_generation()) != snap_gen:
-                sess["rec_sib_invalidate"] = True
-                out["more"] = True
-                return out
-            if not parent_ix.isValid() or not dmodel.is_index_live(parent_ix):
-                continue
-            pnd = parent_ix.data(Qt.UserRole) or {}
-            if not isinstance(pnd, dict) or not pnd.get("is_folder"):
-                continue
-            folders_scanned += 1
-            out["parents_scanned_this_tick"] = int(out["parents_scanned_this_tick"]) + 1
-            child_groups = self._destination_folder_children_grouped_by_sibling_name_key(parent_ix)
-            for _name_key, items in child_groups.items():
-                if len(items) < 2:
-                    continue
+                pnd = parent_ix.data(Qt.UserRole) or {}
+                path_excerpt = self._tree_item_path(pnd) if isinstance(pnd, dict) else ""
+                out["parent_path_excerpt"] = (path_excerpt or "")[:240]
+                out["active_parent_children_count"] = int(dmodel.rowCount(parent_ix))
+
+                t_idx = QElapsedTimer()
+                t_idx.start()
+                child_groups = self._destination_folder_children_grouped_by_sibling_name_key(parent_ix)
+                indexing_ms_acc += float(t_idx.elapsed())
+                coll_n = sum(1 for _k, it in child_groups.items() if len(it) >= 2)
+                out["collision_groups_built_this_tick"] = int(coll_n)
+                out["worklist_remaining"] = int(coll_n)
+
+                first_act = self._destination_finalize_sibling_first_actionable_from_groups(
+                    dmodel, child_groups, tick_reason=reason
+                )
+                if first_act is None:
+                    sess.pop("rec_sib_drain", None)
+                    sess["rec_sib_dfs_stack"] = None
+                    sess["rec_sib_stack_gen"] = int(dmodel.structure_generation())
+                    sess["rec_sib_dfs_stack"] = [[QModelIndex(), 0]]
+                    out["reconcile_phase"] = "sibling_scan"
+                    out["more"] = True
+                    if not sess.pop("rec_sib_drain_from_scan", False):
+                        sess["rec_sib_cumulative_parents_scanned"] = int(
+                            sess.get("rec_sib_cumulative_parents_scanned", 0) or 0
+                        ) + 1
+                    out["moved"] = int(total_moved)
+                    out["merged_groups"] = int(fixes_applied)
+                    out["sibling_fixes_this_tick"] = int(fixes_applied)
+                    _emit_timing()
+                    return out
+
+                _name_key, items = first_act
                 canonical_ix = self._select_canonical_destination_item(items)
-                if canonical_ix is None or not canonical_ix.isValid():
-                    continue
                 duplicates = [ix for ix in items if ix != canonical_ix]
-                if not duplicates:
-                    continue
                 duplicate_ix = duplicates[0]
-                if not duplicate_ix.isValid():
-                    continue
-                if not dmodel.is_index_live(canonical_ix) or not dmodel.is_index_live(duplicate_ix):
-                    self._log_restore_phase(
-                        "reconcile_invalid_index_detected",
-                        reason=reason,
-                        reconcile_stage="sibling_folder_name_collision_tick",
-                        name_key=_name_key,
-                    )
-                    continue
+                stable_parent_ix = duplicate_ix.parent()
                 canonical_data = canonical_ix.data(Qt.UserRole) or {}
                 duplicate_data = duplicate_ix.data(Qt.UserRole) or {}
                 sem_hint = self._destination_semantic_path(canonical_data) or self._destination_semantic_path(
@@ -32477,44 +32562,145 @@ class MainWindow(QMainWindow):
                     kept_path=self._tree_item_path(canonical_data),
                     merged_path=self._tree_item_path(duplicate_data),
                 )
+                t_res = QElapsedTimer()
+                t_res.start()
                 moved_count = self._merge_destination_projection_children_index(
                     duplicate_ix, canonical_ix, sem_hint
                 )
                 removed = dmodel.remove_node_at(duplicate_ix)
+                resolve_ms_acc += float(t_res.elapsed())
                 if removed is None:
-                    continue
-                out["moved"] = int(moved_count)
-                out["merged_groups"] = 1
-                fixes += 1
-                out["sibling_fixes_this_tick"] = 1
+                    sess.pop("rec_sib_drain", None)
+                    sess["rec_sib_dfs_stack"] = None
+                    sess["rec_sib_stack_gen"] = int(dmodel.structure_generation())
+                    sess["rec_sib_dfs_stack"] = [[QModelIndex(), 0]]
+                    out["more"] = True
+                    out["reconcile_phase"] = "sibling_scan"
+                    out["moved"] = int(total_moved)
+                    out["merged_groups"] = int(fixes_applied)
+                    out["sibling_fixes_this_tick"] = int(fixes_applied)
+                    _emit_timing()
+                    return out
+
+                total_moved += int(moved_count)
+                fixes_applied += 1
+                out["sibling_fixes_this_tick"] = int(fixes_applied)
                 sess["rec_sib_cumulative_fixes"] = int(sess.get("rec_sib_cumulative_fixes", 0) or 0) + 1
+                if (
+                    not stable_parent_ix.isValid()
+                    or not dmodel.is_index_live(stable_parent_ix)
+                ):
+                    sess.pop("rec_sib_drain", None)
+                    sess["rec_sib_dfs_stack"] = None
+                    sess["rec_sib_stack_gen"] = int(dmodel.structure_generation())
+                    sess["rec_sib_dfs_stack"] = [[QModelIndex(), 0]]
+                    out["moved"] = int(total_moved)
+                    out["merged_groups"] = int(fixes_applied)
+                    out["reconcile_phase"] = "sibling_fix"
+                    out["more"] = True
+                    _emit_timing()
+                    return out
+                drain["parent_persist"] = QPersistentModelIndex(stable_parent_ix)
+
+            out["moved"] = int(total_moved)
+            out["merged_groups"] = int(fixes_applied)
+            out["reconcile_phase"] = "sibling_fix"
+            out["more"] = True
+            _emit_timing()
+            return out
+
+        # --- scan: incremental preorder (no full iter_depth_first list allocation) ---
+        if sess.get("rec_sib_dfs_stack") is None:
+            sess["rec_sib_dfs_stack"] = [[QModelIndex(), 0]]
+            sess["rec_sib_stack_gen"] = int(dmodel.structure_generation())
+        elif int(sess.get("rec_sib_stack_gen") or -1) != int(dmodel.structure_generation()):
+            self._log_restore_phase(
+                "reconcile_skip_due_to_stale_model",
+                reason=reason,
+                reconcile_stage="destination_finalize_sibling_tick_gen",
+                expected_generation=int(sess.get("rec_sib_stack_gen") or 0),
+                current_generation=int(dmodel.structure_generation()),
+            )
+            _invalidate_sibling()
+            sess["rec_sib_dfs_stack"] = [[QModelIndex(), 0]]
+            sess["rec_sib_stack_gen"] = int(dmodel.structure_generation())
+            out["more"] = True
+            _emit_timing()
+            return out
+
+        stack = sess["rec_sib_dfs_stack"]
+        folders_scanned = 0
+        nodes_walked = 0
+        op = QElapsedTimer()
+        op.start()
+
+        while True:
+            if op.elapsed() >= budget_ms and (folders_scanned > 0 or nodes_walked > 0):
+                break
+            if op.elapsed() >= hard_ms:
+                break
+            if folders_scanned >= max_folders:
+                break
+            parent_ix = self._destination_planning_dfs_next_preorder_index(dmodel, stack)
+            if parent_ix is None:
+                _invalidate_sibling()
+                out["sibling_phase_done"] = True
+                out["reconcile_phase"] = "sibling_scan"
                 sess["rec_sib_cumulative_parents_scanned"] = int(
                     sess.get("rec_sib_cumulative_parents_scanned", 0) or 0
                 ) + int(folders_scanned)
-                sess["rec_sib_invalidate"] = True
-                sess["rec_sib_scan_i"] = i
-                out["reconcile_phase"] = "sibling_fix"
-                out["more"] = True
+                out["nodes_scanned_this_tick"] = int(nodes_walked)
+                _emit_timing()
                 return out
+            nodes_walked += 1
+            if not parent_ix.isValid() or not dmodel.is_index_live(parent_ix):
+                continue
+            pnd = parent_ix.data(Qt.UserRole) or {}
+            if not isinstance(pnd, dict) or not pnd.get("is_folder"):
+                continue
 
-        sess["rec_sib_scan_i"] = i
+            folders_scanned += 1
+            out["parents_scanned_this_tick"] = int(out["parents_scanned_this_tick"]) + 1
+
+            t_idx = QElapsedTimer()
+            t_idx.start()
+            child_groups = self._destination_folder_children_grouped_by_sibling_name_key(parent_ix)
+            indexing_ms_acc += float(t_idx.elapsed())
+            coll_n = sum(1 for _k, it in child_groups.items() if len(it) >= 2)
+            if coll_n == 0:
+                continue
+
+            first_act = self._destination_finalize_sibling_first_actionable_from_groups(
+                dmodel, child_groups, tick_reason=reason
+            )
+            if first_act is None:
+                continue
+
+            path_excerpt = self._tree_item_path(pnd) if isinstance(pnd, dict) else ""
+            out["parent_path_excerpt"] = (path_excerpt or "")[:240]
+            out["active_parent_children_count"] = int(dmodel.rowCount(parent_ix))
+            out["collision_groups_built_this_tick"] = int(coll_n)
+            out["worklist_remaining"] = int(coll_n)
+
+            sess["rec_sib_drain"] = {"parent_persist": QPersistentModelIndex(parent_ix)}
+            sess["rec_sib_drain_from_scan"] = True
+            sess["rec_sib_cumulative_parents_scanned"] = int(
+                sess.get("rec_sib_cumulative_parents_scanned", 0) or 0
+            ) + int(folders_scanned)
+            sess["rec_sib_dfs_stack"] = None
+            out["more"] = True
+            out["reconcile_phase"] = "sibling_scan"
+            out["nodes_scanned_this_tick"] = int(nodes_walked)
+            _emit_timing()
+            return out
+
         sess["rec_sib_cumulative_parents_scanned"] = int(sess.get("rec_sib_cumulative_parents_scanned", 0) or 0) + int(
             folders_scanned
         )
         out["nodes_scanned_this_tick"] = int(nodes_walked)
-
-        if fixes:
-            out["more"] = True
-            return out
-
-        if i >= len(snap):
-            _invalidate_sibling()
-            out["sibling_phase_done"] = True
-            out["reconcile_phase"] = "sibling_scan"
-            return out
-
         out["more"] = True
         out["reconcile_phase"] = "sibling_scan"
+        _emit_timing()
         return out
 
     def _reconcile_destination_semantic_duplicates_index(self, reason):
