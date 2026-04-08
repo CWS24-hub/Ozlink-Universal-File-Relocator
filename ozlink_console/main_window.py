@@ -41303,29 +41303,13 @@ class MainWindow(QMainWindow):
             override_move["allocation_method"] = "Manual - Override"
             override_move["target_name"] = target_name
             self.planned_moves.append(override_move)
-            self.planned_moves_status.setText("Planned item moved.")
-            self.refresh_planned_moves_table()
-            old_dest_audit = str(
-                self._allocation_projection_path(inherited_move)
-                or self._move_destination_target_path(inherited_move)
-                or ""
-            )[:500]
-            new_dest_audit = str(self._allocation_projection_path(override_move) or "")[:500]
-            self._finalize_destination_move_planning_consistency(
-                override_move,
-                rewritten_related=[],
-                old_destination_projection=old_dest_audit,
-                new_destination_projection=new_dest_audit,
-                table_refreshed=True,
-                incremental_lightweight=False,
-                move_origin=move_origin,
-            )  # return ignored; full persist follows
-            self._schedule_deferred_destination_materialization("planned_item_moved", delay_ms=220)
-            _ov_paths = self._expand_source_projection_paths_with_parents(
-                self._collect_source_projection_paths_for_move_networks(override_move, [])
-            )
-            self._persist_planning_change("planned_item_moved", source_projection_paths=_ov_paths)
-            return True
+            # First manual drag for inherited rows should follow the same incremental/manual quick
+            # pipeline as explicit planned moves. Keep override creation semantics, then continue
+            # through the common move path below (lightweight finalize + lightweight persist).
+            if (from_paste_here or from_manual_planning_drag):
+                old_snap = copy.deepcopy(inherited_move)
+            move = override_move
+            inherited_move = None
 
         move["destination_path"] = target_path
         move["destination_id"] = destination_node.get("id", "")
