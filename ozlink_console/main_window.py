@@ -2729,6 +2729,16 @@ class MainWindow(QMainWindow):
         self._lazy_destination_projection_timer = QTimer(self)
         self._lazy_destination_projection_timer.setSingleShot(True)
         self._lazy_destination_projection_timer.timeout.connect(self._run_lazy_destination_projection_refresh)
+        self._destination_expand_burst_queue: list[dict] = []
+        self._destination_expand_burst_timer = QTimer(self)
+        self._destination_expand_burst_timer.setSingleShot(True)
+        self._destination_expand_burst_timer.timeout.connect(self._on_destination_expand_burst_timer_fired)
+        self._destination_expand_burst_debounce_ms = 160
+        self._destination_expand_burst_ctx: Optional[dict] = None
+        self._destination_expand_burst_run_id: int = 0
+        self._destination_materialize_active_reason: str = ""
+        self._destination_interactive_expand_idle_full_tree_lockout_until: float = 0.0
+        self._destination_deferred_uncovered_overlay_paths: set[str] = set()
         self._destination_future_projection_async_state = None
         self._destination_materialize_pending_after_async_projection = ""
         self._destination_incremental_merge_in_progress = False
@@ -2737,6 +2747,8 @@ class MainWindow(QMainWindow):
         self._destination_incremental_merge_timer = QTimer(self)
         self._destination_incremental_merge_timer.setSingleShot(True)
         self._destination_incremental_merge_timer.timeout.connect(self._run_destination_incremental_merge_session_tick)
+        # Nonzero spacing yields the Qt event loop between ticks; start(0) chains many ticks in one wall‑clock slice.
+        self._destination_incremental_merge_tick_spacing_ms = 1
         self._destination_merge_tick_max_ms = 12
         self._destination_merge_tick_max_rows = 5
         self._destination_merge_visibility_rows_per_tick = 8
@@ -10566,6 +10578,917 @@ class MainWindow(QMainWindow):
         out |= set(getattr(self, "_destination_drfws_affected_paths", None) or set())
         return {x for x in out if x}
 
+    def _destination_bump_interactive_expand_idle_full_tree_lockout(self, delay_ms: float = 3500) -> None:
+        until = time.monotonic() + max(0.0, float(delay_ms) or 0.0) / 1000.0
+        cur = float(getattr(self, "_destination_interactive_expand_idle_full_tree_lockout_until", 0) or 0)
+        self._destination_interactive_expand_idle_full_tree_lockout_until = max(cur, until)
+
+    def _destination_should_block_idle_full_tree_materialize(self) -> bool:
+        # Interactive folder loads still clear from pending before burst/deferred pipeline finishes;
+        # keep idle full-tree off the UI thread until lockout / burst state says otherwise.
+        if self.pending_folder_loads.get("destination"):
+            return True
+        if self._destination_expand_burst_ctx is not None:
+            return True
+        if self._destination_expand_burst_queue:
+            return True
+        t = getattr(self, "_destination_expand_burst_timer", None)
+        if t is not None and t.isActive():
+            return True
+        if time.monotonic() < float(getattr(self, "_destination_interactive_expand_idle_full_tree_lockout_until", 0) or 0):
+            return True
+        # Burst/lockout can clear while destination preview bind or merge is still active; fp-mismatch
+        # would otherwise admit destination_full_tree_idle_success into a full build (materialize_allowed_fp_mismatch).
+        if getattr(self, "_destination_chunked_bind_state", None) is not None:
+            return True
+        if getattr(self, "_destination_future_projection_async_state", None) is not None:
+            return True
+        if getattr(self, "_destination_incremental_merge_in_progress", False):
+            return True
+        return False
+
+    def _expand_idle_path_diag(self) -> dict:
+        lock_ms = max(
+            0,
+            int(
+                (
+                    float(getattr(self, "_destination_interactive_expand_idle_full_tree_lockout_until", 0) or 0)
+                    - time.monotonic()
+                )
+                * 1000
+            ),
+        )
+        return {
+            "lockout_remaining_ms": lock_ms,
+            "burst_ctx_active": bool(self._destination_expand_burst_ctx is not None),
+            "burst_queue_len": len(self._destination_expand_burst_queue or []),
+            "burst_timer_active": bool(
+                getattr(self, "_destination_expand_burst_timer", None) is not None
+                and self._destination_expand_burst_timer.isActive()
+            ),
+            "pending_destination_folder_loads": len(self.pending_folder_loads.get("destination") or set()),
+        }
+
+    def _destination_expand_burst_should_coalesce(self, semantic_path_captured: str) -> bool:
+        """True when the heavy folder_worker_success pipeline can be merged into a debounced burst."""
+        if self._expand_all_pending.get("destination"):
+            return False
+        # Root during post-login memory restore must run the immediate deferred pipeline (handoff + restore
+        # queue), not merge into a burst — same as lazy Root; avoids multi-second overlay/replay inline.
+        if getattr(self, "_memory_restore_in_progress", False) and semantic_path_captured == "Root":
+            return False
+        if getattr(self, "_sharepoint_lazy_mode", False):
+            if getattr(self, "_destination_root_prime_pending", False) and semantic_path_captured != "Root":
+                return False
+            if semantic_path_captured == "Root":
+                return False
+        return True
+
+    def _destination_expand_burst_schedule(self, entry: dict) -> None:
+        self._destination_expand_burst_queue.append(entry)
+        self._destination_bump_interactive_expand_idle_full_tree_lockout(4000)
+        n = len(self._destination_expand_burst_queue)
+        timer = self._destination_expand_burst_timer
+        had_active = timer.isActive()
+        if had_active:
+            timer.stop()
+        ms = int(getattr(self, "_destination_expand_burst_debounce_ms", 160) or 160)
+        timer.start(ms)
+        if is_dev_mode():
+            log_info(
+                "EXPAND_BURST_DEBOUNCE_COALESCED" if had_active else "EXPAND_BURST_DEBOUNCE_SCHEDULED",
+                queue_len=n,
+                debounce_ms=ms,
+                timer_reused=bool(had_active),
+            )
+
+    def _on_destination_expand_burst_timer_fired(self) -> None:
+        self._safe_invoke("destination_expand_burst_pipeline", self._run_destination_expand_burst_pipeline)
+
+    def _run_destination_expand_burst_pipeline(self) -> None:
+        entries = self._destination_expand_burst_queue
+        self._destination_expand_burst_queue = []
+        if not entries:
+            return
+        self._destination_expand_burst_run_id += 1
+        run_id = self._destination_expand_burst_run_id
+        t_burst_0 = time.perf_counter()
+        panel_key = "destination"
+        n_entries = len(entries)
+        last_trigger_fallback = str(entries[-1].get("trigger_path_captured") or "")
+
+        def _footer(trigger_for_nav: str) -> None:
+            if self._expand_all_pending.get("destination"):
+                self._schedule_destination_expand_all_continue()
+            else:
+                self._continue_expand_all("destination", None)
+            self._refresh_tree_column_width("destination")
+            self._process_pending_destination_navigation("folder_load", trigger_path=trigger_for_nav)
+            self._schedule_workspace_ui_persist(panel_key=panel_key)
+            if self._pending_snapshot_branch_refresh.get(panel_key) and not self._expand_all_pending.get(panel_key):
+                self._schedule_snapshot_branch_refresh(panel_key, delay_ms=0)
+            self._schedule_progress_summary_refresh()
+
+        model_now = getattr(self, "destination_planning_model", None)
+        tree_now = getattr(self, "destination_tree_widget", None)
+        if model_now is None or tree_now is None:
+            if is_dev_mode():
+                log_info("EXPAND_BURST_PIPELINE_RUN", skipped=True, reason="destination_model_or_tree_missing")
+            _footer(last_trigger_fallback)
+            return
+
+        if is_dev_mode():
+            log_info(
+                "EXPAND_BURST_PIPELINE_RUN",
+                burst_entry_count=n_entries,
+                debounce_ms=int(getattr(self, "_destination_expand_burst_debounce_ms", 160) or 160),
+                run_id=run_id,
+            )
+            log_info(
+                "EXPAND_BURST_STAGE_START",
+                stage="A_per_folder_slice",
+                run_id=run_id,
+                item_count=n_entries,
+                scope_count=0,
+            )
+
+        self._destination_bump_interactive_expand_idle_full_tree_lockout(5000)
+        self._destination_expand_burst_ctx = {
+            "run_id": run_id,
+            "t_burst_0": t_burst_0,
+            "panel_key": panel_key,
+            "entries": entries,
+            "entry_index": 0,
+            "n_entries": n_entries,
+            "model_now": model_now,
+            "tree_now": tree_now,
+            "all_semantic_paths": [],
+            "sum_handoff": 0,
+            "sum_direct": 0,
+            "sum_alloc": 0,
+            "root_drive_id": "",
+            "root_item_id": "",
+            "last_trigger": last_trigger_fallback,
+        }
+        QTimer.singleShot(
+            0,
+            lambda rid=run_id: self._safe_invoke(
+                "destination_expand_burst_stage_a",
+                lambda: self._destination_expand_burst_stage_a_tick(rid),
+            ),
+        )
+
+    def _destination_expand_burst_stage_a_tick(self, run_id: int) -> None:
+        ctx = self._destination_expand_burst_ctx
+        if ctx is None or int(ctx.get("run_id") or 0) != int(run_id):
+            return
+        t_slice_0 = time.perf_counter()
+        panel_key = str(ctx.get("panel_key") or "destination")
+        model_now = ctx.get("model_now")
+        entries = ctx.get("entries") or []
+        idx = int(ctx.get("entry_index") or 0)
+        if idx >= len(entries):
+            if is_dev_mode():
+                log_info(
+                    "EXPAND_BURST_STAGE_DONE",
+                    stage="A_per_folder_slice",
+                    run_id=run_id,
+                    wall_ms=int((time.perf_counter() - t_slice_0) * 1000),
+                    items_processed=len(ctx.get("all_semantic_paths") or []),
+                )
+            asp = list(ctx.get("all_semantic_paths") or [])
+            if not asp:
+                if is_dev_mode():
+                    log_info(
+                        "EXPAND_BURST_STAGE_NEXT",
+                        run_id=run_id,
+                        from_stage="A",
+                        to_stage="E_skip_empty",
+                    )
+                QTimer.singleShot(
+                    0,
+                    lambda rid=run_id: self._safe_invoke(
+                        "destination_expand_burst_stage_e",
+                        lambda: self._destination_expand_burst_stage_e(rid),
+                    ),
+                )
+            else:
+                if is_dev_mode():
+                    log_info("EXPAND_BURST_STAGE_NEXT", run_id=run_id, from_stage="A", to_stage="B")
+                QTimer.singleShot(
+                    0,
+                    lambda rid=run_id: self._safe_invoke(
+                        "destination_expand_burst_stage_b",
+                        lambda: self._destination_expand_burst_stage_b(rid),
+                    ),
+                )
+            return
+        ent = entries[idx]
+        ctx["entry_index"] = idx + 1
+        drive_id_captured = str(ent.get("drive_id") or "")
+        item_id_captured = str(ent.get("item_id") or "")
+        semantic_path_captured = str(ent.get("semantic_path_captured") or "")
+        preserved_nested = ent.get("preserved_nested") or []
+        previous_child_paths = ent.get("previous_child_paths") or set()
+
+        parent_index_now = QModelIndex()
+        if drive_id_captured and item_id_captured and model_now is not None:
+            parent_index_now = model_now.find_index_by_drive_item(drive_id_captured, item_id_captured)
+        if (not parent_index_now.isValid()) and semantic_path_captured and model_now is not None:
+            idxs = model_now.find_indices_for_canonical_destination_path(semantic_path_captured)
+            if idxs:
+                parent_index_now = idxs[0]
+        if (
+            model_now is None
+            or not parent_index_now.isValid()
+            or (hasattr(model_now, "is_index_live") and not model_now.is_index_live(parent_index_now))
+        ):
+            self._log_restore_phase(
+                "destination_folder_worker_success_deferred_skipped",
+                reason="burst_parent_index_not_resolved_or_stale",
+                semantic_path=str(semantic_path_captured or "")[:240],
+                drive_id=str(drive_id_captured or "")[:80],
+                item_id=str(item_id_captured or "")[:80],
+            )
+            QTimer.singleShot(
+                0,
+                lambda rid=run_id: self._safe_invoke(
+                    "destination_expand_burst_stage_a",
+                    lambda: self._destination_expand_burst_stage_a_tick(rid),
+                ),
+            )
+            return
+        nd_now = dict(parent_index_now.data(Qt.UserRole) or {})
+        sp_resolved = self._destination_semantic_path(nd_now)
+        if semantic_path_captured and sp_resolved:
+            c0 = self._canonical_destination_projection_path(semantic_path_captured)
+            c1 = self._canonical_destination_projection_path(sp_resolved)
+            if c0 and c1 and c0 != c1:
+                self._log_restore_phase(
+                    "destination_folder_worker_success_deferred_skipped",
+                    reason="burst_semantic_path_mismatch_after_resolve",
+                    semantic_path_captured=str(c0)[:240],
+                    semantic_path_resolved=str(c1)[:240],
+                )
+                QTimer.singleShot(
+                    0,
+                    lambda rid=run_id: self._safe_invoke(
+                        "destination_expand_burst_stage_a",
+                        lambda: self._destination_expand_burst_stage_a_tick(rid),
+                    ),
+                )
+                return
+        semantic_path = sp_resolved
+        ctx.setdefault("all_semantic_paths", []).append(semantic_path)
+        current_child_paths = self._capture_child_path_set_for_destination_model_index(parent_index_now)
+        if previous_child_paths:
+            added_count = len(current_child_paths - previous_child_paths)
+            removed_count = len(previous_child_paths - current_child_paths)
+            if added_count or removed_count:
+                self._set_tree_status_message(
+                    panel_key,
+                    f"Refreshing saved branches... {added_count} added, {removed_count} removed in {nd_now.get('name', 'folder')}.",
+                    loading=bool(self._pending_snapshot_branch_refresh.get(panel_key)),
+                )
+        if semantic_path == "Root":
+            self._destination_root_prime_pending = False
+            ctx["root_drive_id"] = str(nd_now.get("drive_id") or drive_id_captured or "")
+            ctx["root_item_id"] = str(nd_now.get("id") or item_id_captured or "")
+        ctx["sum_handoff"] = int(ctx.get("sum_handoff") or 0) + self._restore_destination_future_state_children_model(
+            parent_index_now, preserved_nested
+        )
+        ctx["sum_direct"] = int(ctx.get("sum_direct") or 0) + self._apply_proposed_children_to_item(parent_index_now)
+        ctx["sum_alloc"] = int(ctx.get("sum_alloc") or 0) + self._apply_allocation_children_to_item(parent_index_now)
+
+        if is_dev_mode():
+            log_info(
+                "EXPAND_BURST_STAGE_DONE",
+                stage="A_per_folder_slice",
+                run_id=run_id,
+                wall_ms=int((time.perf_counter() - t_slice_0) * 1000),
+                entry_index_done=idx,
+                more_entries_remain=ctx["entry_index"] < len(entries),
+            )
+        QTimer.singleShot(
+            0,
+            lambda rid=run_id: self._safe_invoke(
+                "destination_expand_burst_stage_a",
+                lambda: self._destination_expand_burst_stage_a_tick(rid),
+            ),
+        )
+
+    def _log_expand_burst_stage_timing(
+        self,
+        *,
+        stage: str,
+        run_id: int,
+        wall_ms: int,
+        semantic_path_count: int,
+        scope_count: int,
+        replay_applied: int = 0,
+        allocation_replay: int = 0,
+        merge_moved: Optional[int] = None,
+        future_model_applied: Optional[int] = None,
+        more_work_remains: bool = True,
+    ) -> None:
+        if not is_dev_mode():
+            return
+        payload: dict = {
+            "stage": stage,
+            "run_id": run_id,
+            "wall_ms": wall_ms,
+            "semantic_path_count": semantic_path_count,
+            "scope_count": scope_count,
+            "replay_applied": replay_applied,
+            "allocation_replay": allocation_replay,
+            "more_work_remains": more_work_remains,
+        }
+        if merge_moved is not None:
+            payload["merge_moved"] = merge_moved
+        if future_model_applied is not None:
+            payload["future_model_applied"] = future_model_applied
+        log_info("EXPAND_BURST_STAGE_TIMING", **payload)
+
+    def _destination_expand_burst_stage_b(self, run_id: int) -> None:
+        ctx = self._destination_expand_burst_ctx
+        if ctx is None or int(ctx.get("run_id") or 0) != int(run_id):
+            return
+        t0 = time.perf_counter()
+        all_semantic_paths = list(ctx.get("all_semantic_paths") or [])
+        last_trigger = str(ctx.get("last_trigger") or "")
+        if is_dev_mode():
+            log_info(
+                "EXPAND_BURST_STAGE_START",
+                stage="B_replay_overlays",
+                run_id=run_id,
+                item_count=len(all_semantic_paths),
+                scope_count=len(all_semantic_paths),
+            )
+        uqp = self._unresolved_proposed_queue_size()
+        uqa = self._unresolved_allocation_queue_size()
+        ctx["replay_applied_count"] = (
+            self._replay_unresolved_proposed_overlay("folder_worker_success", trigger_path=last_trigger) if uqp else 0
+        )
+        ctx["allocation_replay_count"] = (
+            self._replay_unresolved_allocation_overlay("folder_worker_success", trigger_path=last_trigger) if uqa else 0
+        )
+        wall_ms_b = int((time.perf_counter() - t0) * 1000)
+        rap = int(ctx.get("replay_applied_count") or 0)
+        ral = int(ctx.get("allocation_replay_count") or 0)
+        if is_dev_mode():
+            log_info(
+                "EXPAND_BURST_STAGE_DONE",
+                stage="B_replay_overlays",
+                run_id=run_id,
+                wall_ms=wall_ms_b,
+            )
+            self._log_expand_burst_stage_timing(
+                stage="B_replay_overlays",
+                run_id=run_id,
+                wall_ms=wall_ms_b,
+                semantic_path_count=len(all_semantic_paths),
+                scope_count=len(all_semantic_paths),
+                replay_applied=rap,
+                allocation_replay=ral,
+                more_work_remains=True,
+            )
+            log_info("EXPAND_BURST_STAGE_NEXT", run_id=run_id, from_stage="B", to_stage="C")
+        QTimer.singleShot(
+            0,
+            lambda rid=run_id: self._safe_invoke(
+                "destination_expand_burst_stage_c",
+                lambda: self._destination_expand_burst_stage_c(rid),
+            ),
+        )
+
+    def _destination_expand_burst_stage_c(self, run_id: int) -> None:
+        """Yield one event-loop turn before heavy reconcile (same semantics as C_run)."""
+        ctx = self._destination_expand_burst_ctx
+        if ctx is None or int(ctx.get("run_id") or 0) != int(run_id):
+            return
+        t_yield = time.perf_counter()
+        all_semantic_paths = list(ctx.get("all_semantic_paths") or [])
+        if is_dev_mode():
+            log_info(
+                "EXPAND_BURST_LATE_STAGE_START",
+                stage="C_reconcile_yield",
+                run_id=run_id,
+                semantic_path_count=len(all_semantic_paths),
+                sliced_continuation_scheduled=True,
+            )
+            log_info("EXPAND_BURST_STAGE_NEXT", run_id=run_id, from_stage="C_entry", to_stage="C_run")
+        QTimer.singleShot(
+            0,
+            lambda rid=run_id: self._safe_invoke(
+                "destination_expand_burst_stage_c_run",
+                lambda: self._destination_expand_burst_stage_c_run(rid),
+            ),
+        )
+        if is_dev_mode():
+            log_info(
+                "EXPAND_BURST_LATE_STAGE_DONE",
+                stage="C_reconcile_yield",
+                run_id=run_id,
+                wall_ms=int((time.perf_counter() - t_yield) * 1000),
+                sliced_continuation_scheduled=True,
+            )
+
+    def _destination_expand_burst_stage_c_run(self, run_id: int) -> None:
+        ctx = self._destination_expand_burst_ctx
+        if ctx is None or int(ctx.get("run_id") or 0) != int(run_id):
+            return
+        t0 = time.perf_counter()
+        all_semantic_paths = list(ctx.get("all_semantic_paths") or [])
+        if is_dev_mode():
+            log_info(
+                "EXPAND_BURST_LATE_STAGE_START",
+                stage="C_reconcile",
+                run_id=run_id,
+                semantic_path_count=len(all_semantic_paths),
+            )
+            log_info(
+                "EXPAND_BURST_STAGE_START",
+                stage="C_reconcile",
+                run_id=run_id,
+                item_count=len(all_semantic_paths),
+                scope_count=len(all_semantic_paths),
+            )
+        ctx["merge_moved_count"] = self._reconcile_destination_semantic_duplicates_maybe_deferred(
+            "folder_worker_success",
+            affected_destination_paths=tuple(p for p in all_semantic_paths if p),
+        )
+        wall_ms_c = int((time.perf_counter() - t0) * 1000)
+        mmc = int(ctx.get("merge_moved_count") or 0)
+        if is_dev_mode():
+            log_info(
+                "EXPAND_BURST_LATE_STAGE_DONE",
+                stage="C_reconcile",
+                run_id=run_id,
+                wall_ms=wall_ms_c,
+                sliced_continuation_scheduled=True,
+            )
+            log_info(
+                "EXPAND_BURST_STAGE_DONE",
+                stage="C_reconcile",
+                run_id=run_id,
+                wall_ms=wall_ms_c,
+            )
+            self._log_expand_burst_stage_timing(
+                stage="C_reconcile",
+                run_id=run_id,
+                wall_ms=wall_ms_c,
+                semantic_path_count=len(all_semantic_paths),
+                scope_count=len(all_semantic_paths),
+                merge_moved=mmc,
+                more_work_remains=True,
+            )
+            log_info(
+                "EXPAND_BURST_LATE_STAGE_NEXT",
+                run_id=run_id,
+                from_stage="C_reconcile",
+                to_stage="D_prepare_scope",
+            )
+            log_info("EXPAND_BURST_STAGE_NEXT", run_id=run_id, from_stage="C", to_stage="D_prepare_scope")
+        QTimer.singleShot(
+            0,
+            lambda rid=run_id: self._safe_invoke(
+                "destination_expand_burst_stage_d_prepare",
+                lambda: self._destination_expand_burst_stage_d_prepare(rid),
+            ),
+        )
+
+    def _destination_expand_burst_stage_d_prepare(self, run_id: int) -> None:
+        """Compute combined materialize scope on one tick; materialize runs next tick."""
+        ctx = self._destination_expand_burst_ctx
+        if ctx is None or int(ctx.get("run_id") or 0) != int(run_id):
+            return
+        t0 = time.perf_counter()
+        all_semantic_paths = list(ctx.get("all_semantic_paths") or [])
+        combined_scope: set[str] = set()
+        for sp in all_semantic_paths:
+            combined_scope |= self._destination_folder_worker_materialize_scope_paths(sp)
+        ctx["combined_scope"] = combined_scope
+        ctx["fw_mat_scope_n"] = len(combined_scope)
+        wall_ms_dp = int((time.perf_counter() - t0) * 1000)
+        if is_dev_mode():
+            log_info(
+                "EXPAND_BURST_LATE_STAGE_START",
+                stage="D_prepare_scope",
+                run_id=run_id,
+                semantic_path_count=len(all_semantic_paths),
+                scope_count=len(combined_scope),
+            )
+            log_info(
+                "EXPAND_BURST_STAGE_START",
+                stage="D_prepare_scope",
+                run_id=run_id,
+                item_count=len(all_semantic_paths),
+                scope_count=len(combined_scope),
+            )
+            log_info(
+                "EXPAND_BURST_SCOPE_COUNT",
+                scope_path_count=len(combined_scope),
+                scope_paths_preview=sorted(list(combined_scope))[:12],
+                semantic_path_count=len(all_semantic_paths),
+            )
+            log_info(
+                "EXPAND_BURST_LATE_STAGE_DONE",
+                stage="D_prepare_scope",
+                run_id=run_id,
+                wall_ms=wall_ms_dp,
+                sliced_continuation_scheduled=True,
+                remaining_scope_work=len(combined_scope),
+            )
+            log_info(
+                "EXPAND_BURST_STAGE_DONE",
+                stage="D_prepare_scope",
+                run_id=run_id,
+                wall_ms=wall_ms_dp,
+            )
+            self._log_expand_burst_stage_timing(
+                stage="D_prepare_scope",
+                run_id=run_id,
+                wall_ms=wall_ms_dp,
+                semantic_path_count=len(all_semantic_paths),
+                scope_count=len(combined_scope),
+                more_work_remains=True,
+            )
+            log_info(
+                "EXPAND_BURST_LATE_STAGE_NEXT",
+                run_id=run_id,
+                from_stage="D_prepare_scope",
+                to_stage="D_materialize",
+            )
+            log_info("EXPAND_BURST_STAGE_NEXT", run_id=run_id, from_stage="D_prepare_scope", to_stage="D_materialize")
+        QTimer.singleShot(
+            0,
+            lambda rid=run_id: self._safe_invoke(
+                "destination_expand_burst_stage_d_materialize",
+                lambda: self._destination_expand_burst_stage_d_materialize(rid),
+            ),
+        )
+
+    def _destination_expand_burst_stage_d_materialize(self, run_id: int) -> None:
+        ctx = self._destination_expand_burst_ctx
+        if ctx is None or int(ctx.get("run_id") or 0) != int(run_id):
+            return
+        t0 = time.perf_counter()
+        all_semantic_paths = list(ctx.get("all_semantic_paths") or [])
+        combined_scope = set(ctx.get("combined_scope") or set())
+        fw_n = int(ctx.get("fw_mat_scope_n") or len(combined_scope))
+        if is_dev_mode():
+            log_info(
+                "EXPAND_BURST_LATE_STAGE_START",
+                stage="D_materialize",
+                run_id=run_id,
+                semantic_path_count=len(all_semantic_paths),
+                scope_count=fw_n,
+            )
+            log_info(
+                "EXPAND_BURST_STAGE_START",
+                stage="D_materialize",
+                run_id=run_id,
+                item_count=len(all_semantic_paths),
+                scope_count=len(combined_scope),
+            )
+        if getattr(self, "_sharepoint_lazy_mode", False):
+            ctx["future_model_applied_count"] = 0
+            ctx["fw_mat_scope_n"] = 0
+        else:
+            ctx["future_model_applied_count"] = self._destination_materialize_with_optional_overlay_scope(
+                "folder_worker_success",
+                allow_defer=True,
+                prefer_chunked_projection=True,
+                scope_paths=combined_scope,
+            )
+        fmac = int(ctx.get("future_model_applied_count") or 0)
+        wall_ms_dm = int((time.perf_counter() - t0) * 1000)
+        if is_dev_mode():
+            log_info(
+                "EXPAND_BURST_LATE_STAGE_DONE",
+                stage="D_materialize",
+                run_id=run_id,
+                wall_ms=wall_ms_dm,
+                sliced_continuation_scheduled=True,
+            )
+            log_info(
+                "EXPAND_BURST_STAGE_DONE",
+                stage="D_materialize",
+                run_id=run_id,
+                wall_ms=wall_ms_dm,
+            )
+            self._log_expand_burst_stage_timing(
+                stage="D_materialize",
+                run_id=run_id,
+                wall_ms=wall_ms_dm,
+                semantic_path_count=len(all_semantic_paths),
+                scope_count=fw_n,
+                future_model_applied=fmac,
+                more_work_remains=True,
+            )
+            log_info(
+                "EXPAND_BURST_LATE_STAGE_NEXT",
+                run_id=run_id,
+                from_stage="D_materialize",
+                to_stage="E_finalize_body",
+            )
+            log_info("EXPAND_BURST_STAGE_NEXT", run_id=run_id, from_stage="D_materialize", to_stage="E")
+        QTimer.singleShot(
+            0,
+            lambda rid=run_id: self._safe_invoke(
+                "destination_expand_burst_stage_e",
+                lambda: self._destination_expand_burst_stage_e(rid),
+            ),
+        )
+
+    def _destination_expand_burst_stage_e(self, run_id: int) -> None:
+        ctx = self._destination_expand_burst_ctx
+        if ctx is None or int(ctx.get("run_id") or 0) != int(run_id):
+            return
+        t0 = time.perf_counter()
+        t_burst_0 = float(ctx.get("t_burst_0") or time.perf_counter())
+        panel_key = str(ctx.get("panel_key") or "destination")
+        n_entries = int(ctx.get("n_entries") or 0)
+        all_semantic_paths = list(ctx.get("all_semantic_paths") or [])
+        last_trigger = str(ctx.get("last_trigger") or "")
+        model_now = ctx.get("model_now")
+        tree_now = ctx.get("tree_now")
+        sum_handoff = int(ctx.get("sum_handoff") or 0)
+        sum_direct = int(ctx.get("sum_direct") or 0)
+        sum_alloc = int(ctx.get("sum_alloc") or 0)
+        replay_applied_count = int(ctx.get("replay_applied_count") or 0)
+        allocation_replay_count = int(ctx.get("allocation_replay_count") or 0)
+        merge_moved_count = int(ctx.get("merge_moved_count") or 0)
+        future_model_applied_count = int(ctx.get("future_model_applied_count") or 0)
+        fw_mat_scope_n = int(ctx.get("fw_mat_scope_n") or 0)
+
+        def _footer(trigger_for_nav: str) -> None:
+            if self._expand_all_pending.get("destination"):
+                self._schedule_destination_expand_all_continue()
+            else:
+                self._continue_expand_all("destination", None)
+            self._refresh_tree_column_width("destination")
+            self._process_pending_destination_navigation("folder_load", trigger_path=trigger_for_nav)
+            self._schedule_workspace_ui_persist(panel_key=panel_key)
+            if self._pending_snapshot_branch_refresh.get(panel_key) and not self._expand_all_pending.get(panel_key):
+                self._schedule_snapshot_branch_refresh(panel_key, delay_ms=0)
+            self._schedule_progress_summary_refresh()
+
+        if not all_semantic_paths:
+            if is_dev_mode():
+                log_info("EXPAND_BURST_PIPELINE_RUN", skipped=True, reason="no_valid_entries_after_stage_a")
+            wall_ms_e0 = int((time.perf_counter() - t0) * 1000)
+            self._destination_expand_burst_ctx = None
+            _footer(last_trigger)
+            if is_dev_mode():
+                self._log_expand_burst_stage_timing(
+                    stage="E_empty_skip",
+                    run_id=run_id,
+                    wall_ms=wall_ms_e0,
+                    semantic_path_count=0,
+                    scope_count=0,
+                    replay_applied=replay_applied_count,
+                    allocation_replay=allocation_replay_count,
+                    more_work_remains=False,
+                )
+                log_info(
+                    "EXPAND_BURST_TOTAL_DONE",
+                    run_id=run_id,
+                    burst_wall_ms=int((time.perf_counter() - t_burst_0) * 1000),
+                    stage_E_wall_ms=wall_ms_e0,
+                )
+                log_info(
+                    "EXPAND_BURST_LATE_STAGE_TOTAL_DONE",
+                    run_id=run_id,
+                    burst_wall_ms=int((time.perf_counter() - t_burst_0) * 1000),
+                    footer_deferred=False,
+                )
+            return
+
+        if is_dev_mode():
+            log_info(
+                "EXPAND_BURST_STAGE_START",
+                stage="E_finalize_body",
+                run_id=run_id,
+                item_count=len(all_semantic_paths),
+                scope_count=fw_mat_scope_n,
+            )
+
+        try:
+            self._log_restore_phase(
+                "destination_replay_attachment_applied",
+                trigger_path=self.normalize_memory_path(last_trigger),
+                handoff_moved_count=sum_handoff,
+                direct_applied_count=sum_direct,
+                replay_applied_count=replay_applied_count,
+                allocation_applied_count=sum_alloc,
+                allocation_replay_count=allocation_replay_count,
+                merge_moved_count=merge_moved_count,
+                future_model_applied_count=future_model_applied_count,
+                queue_size=self._unresolved_proposed_queue_size(),
+                folder_worker_materialize_scope_count=fw_mat_scope_n,
+                burst_coalesced_entry_count=n_entries,
+            )
+            t_fw_diag = time.perf_counter()
+            dest_worker_slots = sum(
+                1 for k in (self.folder_load_workers or {}) if str(k).startswith("destination:")
+            )
+            mat_mode = (
+                "scoped_overlay"
+                if fw_mat_scope_n
+                else ("none_or_deferred" if not future_model_applied_count else "applied_unscoped")
+            )
+            self._log_restore_phase(
+                "folder_worker_success_destination_diag",
+                worker_id="burst_sliced",
+                drive_id_excerpt="",
+                trigger_path=self.normalize_memory_path(last_trigger),
+                semantic_path_excerpt="; ".join(str(p) for p in all_semantic_paths[:6])[:240],
+                elapsed_children_replace_ms=0,
+                elapsed_overlay_block_ms=int((t_fw_diag - t_burst_0) * 1000),
+                burst_wall_ms=int((t_fw_diag - t_burst_0) * 1000),
+                pending_destination_folder_loads=len(self.pending_folder_loads.get("destination", set())),
+                active_destination_worker_slots=dest_worker_slots,
+                unresolved_proposed_after=self._unresolved_proposed_queue_size(),
+                unresolved_allocation_after=self._unresolved_allocation_queue_size(),
+                bind_scope_active=bool(getattr(self, "_destination_bind_scope_paths", None)),
+                destination_bind_sync_active=bool(getattr(self, "_destination_future_bind_sync_active", False)),
+                chunked_bind_active=bool(getattr(self, "_destination_chunked_bind_state", None) is not None),
+                full_tree_worker_running=bool(
+                    self._destination_full_tree_worker is not None
+                    and self._destination_full_tree_worker.isRunning()
+                ),
+                expand_all_pending_destination=bool(self._expand_all_pending.get("destination")),
+                memory_restore_in_progress=bool(getattr(self, "_memory_restore_in_progress", False)),
+                restore_destination_overlay_pending=bool(
+                    getattr(self, "_restore_destination_overlay_pending", False)
+                ),
+                materialize_mode=mat_mode,
+                materialize_applied_count=future_model_applied_count,
+                materialize_scope_path_count=fw_mat_scope_n,
+                burst_entry_count=n_entries,
+            )
+            if not self._expand_all_pending.get("destination"):
+                if not getattr(self, "_destination_restore_completed_once", False):
+                    if any((sp or "") == "Root" for sp in all_semantic_paths) and (
+                        getattr(self, "_sharepoint_lazy_mode", False)
+                        or getattr(self, "_memory_restore_in_progress", False)
+                    ):
+                        self._start_destination_restore_materialization()
+                    if not getattr(self, "_destination_root_prime_pending", False):
+                        self._schedule_destination_restore_materialization_queue(
+                            "folder_load",
+                            trigger_path=last_trigger,
+                        )
+                if tree_now is not None:
+                    self._schedule_refresh_destination_tree_indicators()
+                    tree_now.viewport().update()
+                if (
+                    self._unresolved_proposed_queue_size() == 0
+                    and self._unresolved_allocation_queue_size() == 0
+                    and getattr(self, "_memory_restore_in_progress", False)
+                ):
+                    self._finalize_memory_restore_if_ready(f"folder_load_burst:{len(all_semantic_paths)}")
+            rd = str(ctx.get("root_drive_id") or "")
+            ri = str(ctx.get("root_item_id") or "")
+            if (
+                getattr(self, "_sharepoint_lazy_mode", False)
+                and rd
+                and ri
+                and model_now is not None
+                and not self._expand_all_pending.get("destination")
+            ):
+                root_ix = model_now.find_index_by_drive_item(rd, ri)
+                if root_ix.isValid():
+                    self._set_tree_status_message(
+                        "destination",
+                        f"{model_now.rowCount(root_ix)} top-level destination folder(s) loaded.",
+                        loading=False,
+                    )
+        except Exception as exc:
+            self._log_restore_exception("destination_overlay_folder_load_success_burst", exc)
+        wall_ms_e_body = int((time.perf_counter() - t0) * 1000)
+        self._destination_expand_burst_ctx = None
+        if is_dev_mode():
+            log_info(
+                "EXPAND_BURST_STAGE_DONE",
+                stage="E_finalize_body",
+                run_id=run_id,
+                wall_ms=wall_ms_e_body,
+            )
+            self._log_expand_burst_stage_timing(
+                stage="E_finalize_body",
+                run_id=run_id,
+                wall_ms=wall_ms_e_body,
+                semantic_path_count=len(all_semantic_paths),
+                scope_count=fw_mat_scope_n,
+                replay_applied=replay_applied_count,
+                allocation_replay=allocation_replay_count,
+                merge_moved=merge_moved_count,
+                future_model_applied=future_model_applied_count,
+                more_work_remains=True,
+            )
+            log_info(
+                "EXPAND_BURST_LATE_STAGE_NEXT",
+                run_id=run_id,
+                from_stage="E_finalize_body",
+                to_stage="E_footer",
+            )
+        QTimer.singleShot(
+            0,
+            lambda rid=run_id,
+            pk=panel_key,
+            lt=last_trigger,
+            tb=t_burst_0,
+            nsp=len(all_semantic_paths),
+            fwn=fw_mat_scope_n,
+            wb=wall_ms_e_body: self._safe_invoke(
+                "destination_expand_burst_stage_e_footer",
+                lambda: self._destination_expand_burst_stage_e_footer(
+                    rid,
+                    panel_key=pk,
+                    last_trigger=lt,
+                    t_burst_0=tb,
+                    n_semantic=nsp,
+                    fw_mat_scope_n=fwn,
+                    t_body_wall_ms=wb,
+                ),
+            ),
+        )
+
+    def _destination_expand_burst_stage_e_footer(
+        self,
+        run_id: int,
+        *,
+        panel_key: str,
+        last_trigger: str,
+        t_burst_0: float,
+        n_semantic: int,
+        fw_mat_scope_n: int,
+        t_body_wall_ms: int,
+    ) -> None:
+        t0 = time.perf_counter()
+        if is_dev_mode():
+            log_info(
+                "EXPAND_BURST_LATE_STAGE_START",
+                stage="E_footer",
+                run_id=run_id,
+                semantic_path_count=n_semantic,
+                scope_count=fw_mat_scope_n,
+            )
+
+        def _footer(trigger_for_nav: str) -> None:
+            if self._expand_all_pending.get("destination"):
+                self._schedule_destination_expand_all_continue()
+            else:
+                self._continue_expand_all("destination", None)
+            self._refresh_tree_column_width("destination")
+            self._process_pending_destination_navigation("folder_load", trigger_path=trigger_for_nav)
+            self._schedule_workspace_ui_persist(panel_key=panel_key)
+            if self._pending_snapshot_branch_refresh.get(panel_key) and not self._expand_all_pending.get(panel_key):
+                self._schedule_snapshot_branch_refresh(panel_key, delay_ms=0)
+            self._schedule_progress_summary_refresh()
+
+        _footer(last_trigger)
+        self._destination_bump_interactive_expand_idle_full_tree_lockout(4500)
+        wall_ms_ef = int((time.perf_counter() - t0) * 1000)
+        if is_dev_mode():
+            log_info(
+                "EXPAND_BURST_LATE_STAGE_DONE",
+                stage="E_footer",
+                run_id=run_id,
+                wall_ms=wall_ms_ef,
+                sliced_continuation_scheduled=False,
+            )
+            log_info(
+                "EXPAND_BURST_STAGE_DONE",
+                stage="E_footer",
+                run_id=run_id,
+                wall_ms=wall_ms_ef,
+            )
+            self._log_expand_burst_stage_timing(
+                stage="E_footer",
+                run_id=run_id,
+                wall_ms=wall_ms_ef,
+                semantic_path_count=n_semantic,
+                scope_count=fw_mat_scope_n,
+                more_work_remains=False,
+            )
+            log_info(
+                "EXPAND_BURST_TOTAL_DONE",
+                run_id=run_id,
+                burst_wall_ms=int((time.perf_counter() - t_burst_0) * 1000),
+                semantic_paths=n_semantic,
+                stage_E_body_wall_ms=t_body_wall_ms,
+                stage_E_footer_wall_ms=wall_ms_ef,
+            )
+            log_info(
+                "EXPAND_BURST_LATE_STAGE_TOTAL_DONE",
+                run_id=run_id,
+                burst_wall_ms=int((time.perf_counter() - t_burst_0) * 1000),
+                footer_deferred=True,
+            )
+
     def _destination_materialize_with_optional_overlay_scope(
         self,
         reason: str,
@@ -10698,7 +11621,12 @@ class MainWindow(QMainWindow):
     def _normalize_destination_bind_scope_model_roots_for_bind(
         self, paths: Optional[set[str]], model_nodes: dict
     ) -> Optional[list[str]]:
-        """Normalize overlay bind scope, or return None to use full-tree bind when scope would hide projected nodes."""
+        """Normalize overlay bind scope, extending with uncovered projected nodes instead of full-tree bind.
+
+        When the initial scope does not cover every projected (non-real) node, we merge those semantic
+        paths into the bind-scope candidate set and recompute minimal roots. This keeps incremental /
+        scoped binds instead of escalating to a full-tree materialization pass.
+        """
         norm = self._normalize_destination_bind_scope_model_roots(paths, model_nodes)
         if not norm:
             return None
@@ -10706,6 +11634,7 @@ class MainWindow(QMainWindow):
             return norm
         miss = 0
         miss_samples: list[str] = []
+        extended: set[str] = set(paths or set())
         for sem_path, node in model_nodes.items():
             if not isinstance(node, dict):
                 continue
@@ -10718,11 +11647,27 @@ class MainWindow(QMainWindow):
                 miss += 1
                 if len(miss_samples) < 6:
                     miss_samples.append(sp[:160])
+                c = self._canonical_destination_projection_path(sp) or sp
+                if c:
+                    extended.add(c)
+        norm2 = self._normalize_destination_bind_scope_model_roots(extended, model_nodes)
+        if norm2 and self._destination_bind_scope_roots_cover_all_overlay_nodes(model_nodes, norm2):
+            self._log_restore_phase(
+                "destination_bind_scope_extended_for_uncovered_overlay_nodes",
+                reason="incremental_overlay_attach",
+                model_node_count=len(model_nodes),
+                bind_scope_root_count_before=len(norm),
+                bind_scope_root_count_after=len(norm2),
+                uncovered_overlay_node_count=miss,
+                uncovered_overlay_samples=miss_samples,
+            )
+            return norm2
         self._log_restore_phase(
-            "destination_bind_scope_promoted_to_full_tree",
-            reason="non_real_nodes_outside_scope_roots",
+            "destination_bind_scope_extend_failed_fallback_full_tree",
+            reason="non_real_nodes_outside_scope_roots_after_extend",
             model_node_count=len(model_nodes),
             bind_scope_root_count=len(norm),
+            extended_candidate_count=len(extended),
             uncovered_overlay_node_count=miss,
             uncovered_overlay_samples=miss_samples,
         )
@@ -10760,14 +11705,65 @@ class MainWindow(QMainWindow):
 
         walk(root_ix)
 
+    def _destination_planning_index_for_scoped_bind_root(self, dm, semantic_path: str) -> QModelIndex:
+        """QModelIndex for a bind-scope root; falls back to a shallow DFS when the path hash map misses the row.
+
+        Placeholders and some edge payloads are omitted from ``_path_to_nodes``; scoped subtree replace must still
+        locate the visible row by canonical semantic path.
+        """
+        canon = self._canonical_destination_projection_path(semantic_path) or str(semantic_path or "").strip()
+        if not canon:
+            return QModelIndex()
+        idxs = dm.find_indices_for_canonical_destination_path(canon)
+        for cand in idxs:
+            if not cand.isValid():
+                continue
+            ix0 = cand.siblingAtColumn(0) if cand.column() != 0 else cand
+            if dm.is_index_live(ix0):
+                return ix0
+
+        def _walk_first_match(parent: QModelIndex) -> QModelIndex:
+            rows = dm.rowCount(parent)
+            for r in range(rows):
+                ix = dm.index(r, 0, parent)
+                if not ix.isValid():
+                    continue
+                node_data = ix.data(Qt.UserRole) or {}
+                vis = self._destination_row_semantic_path(node_data)
+                if vis and self._destination_parent_match_details(canon, vis).get("exact_match"):
+                    return ix
+                sub = _walk_first_match(ix)
+                if sub.isValid():
+                    return sub
+            return QModelIndex()
+
+        return _walk_first_match(QModelIndex())
+
     def _destination_planning_apply_scoped_nested_rebuild(self, dm, model_nodes: dict, norm_roots: list[str]) -> bool:
-        """Replace each bind-scope root row with a freshly built nested subtree. False → caller must full reset_nested."""
-        for sem in norm_roots:
-            idxs = dm.find_indices_for_canonical_destination_path(sem)
-            if not idxs or not idxs[0].isValid():
+        """Replace each bind-scope root row with a freshly built nested subtree. False → caller must full reset_nested.
+
+        ``norm_roots`` is filtered in place to roots that currently resolve to a live QModelIndex. Overlay-derived
+        scope lists can include semantic paths not yet materialized under Root; requiring every root up front
+        forced full reset_nested + full-tree flat collect. Disjoint minimal roots are replaced in listed order;
+        each replace re-resolves the index so sibling rows stay addressable after prior replacements.
+        """
+        if not norm_roots:
+            return False
+        before_n = len(norm_roots)
+        resolved = [sem for sem in norm_roots if self._destination_planning_index_for_scoped_bind_root(dm, sem).isValid()]
+        if not resolved:
+            return False
+        if len(resolved) < before_n:
+            self._log_restore_phase(
+                "destination_scoped_nested_rebuild_scope_roots_filtered",
+                scope_roots_requested=before_n,
+                scope_roots_resolved=len(resolved),
+            )
+        norm_roots[:] = resolved
+        for sem in resolved:
+            ix = self._destination_planning_index_for_scoped_bind_root(dm, sem)
+            if not ix.isValid():
                 return False
-        for sem in norm_roots:
-            ix = dm.find_indices_for_canonical_destination_path(sem)[0]
             nested = self._build_destination_future_nested(model_nodes, sem)
             dm.replace_row_with_nested(ix, nested)
         return True
@@ -11173,6 +12169,36 @@ class MainWindow(QMainWindow):
     def _maybe_materialize_destination_full_tree_snapshot(self):
         if not self._destination_full_tree_materialization_pending:
             return
+        if is_dev_mode():
+            d = self._expand_idle_path_diag()
+            log_info(
+                "EXPAND_IDLE_PATH_ENTER",
+                function="_maybe_materialize_destination_full_tree_snapshot",
+                reason="destination_full_tree_idle_success",
+                **d,
+            )
+        if self._destination_should_block_idle_full_tree_materialize():
+            self._schedule_destination_full_tree_materialization(2800)
+            if is_dev_mode():
+                d = self._expand_idle_path_diag()
+                log_info(
+                    "EXPAND_BLOCK_IDLE_FULL_TREE",
+                    reason="destination_full_tree_idle_success",
+                    **d,
+                )
+                log_info(
+                    "EXPAND_IDLE_PATH_BLOCKED",
+                    function="_maybe_materialize_destination_full_tree_snapshot",
+                    bypass_source="interactive_expand_guard",
+                    intended_guard_checked=True,
+                    **d,
+                )
+                log_info(
+                    "EXPAND_IDLE_PATH_RESCHEDULED",
+                    function="_maybe_materialize_destination_full_tree_snapshot",
+                    delay_ms=2800,
+                )
+            return
         if self._expand_all_pending.get("destination"):
             self._schedule_destination_full_tree_materialization(2500)
             return
@@ -11198,8 +12224,18 @@ class MainWindow(QMainWindow):
         ):
             self._schedule_destination_full_tree_materialization(2000)
             return
+        if is_dev_mode():
+            d = self._expand_idle_path_diag()
+            log_info(
+                "EXPAND_IDLE_PATH_ALLOWED",
+                function="_maybe_materialize_destination_full_tree_snapshot",
+                reason="destination_full_tree_idle_success",
+                intended_guard_checked=True,
+                **d,
+            )
         self._destination_full_tree_materialization_pending = False
         if not self._destination_steady_state_full_materialize_redundant():
+            self._destination_deferred_uncovered_overlay_paths.clear()
             overlay_scope = self._destination_collect_overlay_replay_bind_scope_paths()
             if overlay_scope:
                 self._destination_materialize_with_optional_overlay_scope(
@@ -16744,6 +17780,22 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(max(0, int(delay_ms)), _run)
 
+    def _prewarm_source_path_lookup_cache_after_source_root_bind(self) -> None:
+        """Bulk-resolve planned-move source paths once root rows exist so first drag avoids cold misses."""
+        if not self._source_tree_uses_model_view():
+            return
+        paths: set[str] = set()
+        for m in self.planned_moves or []:
+            sp = self._canonical_source_projection_path(str(m.get("source_path", "") or "").strip())
+            if sp:
+                paths.add(sp)
+        if not paths:
+            return
+        try:
+            self._map_visible_source_items_by_canonical_paths(paths)
+        except Exception as exc:
+            self._log_restore_exception("prewarm_source_path_lookup_cache_after_root_bind", exc)
+
     def _map_visible_source_items_by_canonical_paths(self, normalized_paths: set[str]) -> tuple[dict[str, Any], dict[str, int]]:
         """Resolve many canonical source paths with at most one full tree walk (per view mode).
 
@@ -17240,7 +18292,20 @@ class MainWindow(QMainWindow):
             for ck in canonical_paths:
                 neg.discard(ck)
 
-    def _invalidate_projection_lookup_caches(self, *, bump_generation=False, clear_source_path_cache=True):
+    def _invalidate_projection_lookup_caches(
+        self,
+        *,
+        bump_generation=False,
+        clear_source_path_cache=True,
+        source_eviction_paths=None,
+    ):
+        """Invalidate projection-related lookup caches.
+
+        When ``source_eviction_paths`` is set, only those canonical source paths are evicted from the
+        positive/negative source lookup stores (via :meth:`_evict_source_path_lookup_cache_entries`).
+        Otherwise, ``clear_source_path_cache`` controls a full source cache flush (and negative-cache
+        clear when combined with ``bump_generation`` per the legacy rules below).
+        """
         if bump_generation:
             self._planning_cache_generation = int(getattr(self, "_planning_cache_generation", 0) or 0) + 1
             _dind = getattr(self, "_destination_indicator_dirty_semantic_paths", None)
@@ -17248,12 +18313,21 @@ class MainWindow(QMainWindow):
                 _dind.clear()
             self._destination_future_model_overlay_cache = None
             self._destination_last_materialized_overlay_fp = ""
-        if bump_generation or clear_source_path_cache:
-            neg = getattr(self, "_source_path_lookup_negative", None)
-            if neg is not None:
-                neg.clear()
-        if clear_source_path_cache:
-            self._source_path_lookup_cache = {}
+        if source_eviction_paths is not None:
+            ev = {
+                self._canonical_source_projection_path(p)
+                for p in source_eviction_paths
+                if self._canonical_source_projection_path(p)
+            }
+            ev.discard("")
+            self._evict_source_path_lookup_cache_entries(ev)
+        else:
+            if bump_generation or clear_source_path_cache:
+                neg = getattr(self, "_source_path_lookup_negative", None)
+                if neg is not None:
+                    neg.clear()
+            if clear_source_path_cache:
+                self._source_path_lookup_cache = {}
         self._destination_path_lookup_cache = {}
         self._destination_path_to_index_map = self._destination_path_lookup_cache
         self._planned_move_by_source_path_cache = {}
@@ -17334,6 +18408,12 @@ class MainWindow(QMainWindow):
             neg.discard(normalized_target)
 
     def _find_visible_source_item_by_path(self, source_path):
+        """Resolve a visible source row by canonical path without tree scans.
+
+        Uses the positive cache, the negative cache (terminal), current selection, and the model's
+        O(1) path index only. There is no depth-first or widget-tree walk (bulk resolution uses
+        :meth:`_map_visible_source_items_by_canonical_paths`).
+        """
         perf = QElapsedTimer()
         dev = is_dev_mode()
         if dev:
@@ -17393,6 +18473,7 @@ class MainWindow(QMainWindow):
             if model is None:
                 if dev:
                     _perf_explorer_log("find_visible_source_item_by_path", elapsed_ms=perf.elapsed(), match="no_model")
+                neg.add(normalized_target)
                 return None
             path_ix = model.find_index_for_canonical_source_path(normalized_target)
             if path_ix.isValid():
@@ -17405,29 +18486,12 @@ class MainWindow(QMainWindow):
                         scanned_nodes=0,
                     )
                 return path_ix
-            scanned_nodes = 0
-            for ix in model.iter_depth_first():
-                scanned_nodes += 1
-                node_data = self.get_tree_item_node_data(ix) or {}
-                if node_data.get("placeholder"):
-                    continue
-                visible_path = self._canonical_source_projection_path(self._tree_item_path(node_data))
-                if visible_path and visible_path == normalized_target:
-                    self._source_lookup_cache_put(normalized_target, ix)
-                    if dev:
-                        _perf_explorer_log(
-                            "find_visible_source_item_by_path",
-                            elapsed_ms=perf.elapsed(),
-                            match="depth_first",
-                            scanned_nodes=scanned_nodes,
-                        )
-                    return ix
             if dev:
                 _perf_explorer_log(
                     "find_visible_source_item_by_path",
                     elapsed_ms=perf.elapsed(),
-                    match="depth_first_miss",
-                    scanned_nodes=scanned_nodes,
+                    match="no_scan_miss",
+                    scanned_nodes=0,
                 )
             neg.add(normalized_target)
             return None
@@ -17446,39 +18510,22 @@ class MainWindow(QMainWindow):
                             scanned_nodes=0,
                         )
                     return cur
-        scanned_nodes = 0
-        for index in range(tree.topLevelItemCount()):
-            for item in self._iter_tree_items(tree.topLevelItem(index)):
-                scanned_nodes += 1
-                node_data = item.data(0, Qt.UserRole) or {}
-                if node_data.get("placeholder"):
-                    continue
-                visible_path = self._canonical_source_projection_path(self._tree_item_path(node_data))
-                if visible_path and visible_path == normalized_target:
-                    self._source_lookup_cache_put(normalized_target, item)
-                    if dev:
-                        _perf_explorer_log(
-                            "find_visible_source_item_by_path",
-                            elapsed_ms=perf.elapsed(),
-                            match="widget_walk",
-                            scanned_nodes=scanned_nodes,
-                        )
-                    return item
         if dev:
             _perf_explorer_log(
                 "find_visible_source_item_by_path",
                 elapsed_ms=perf.elapsed(),
-                match="widget_walk_miss",
-                scanned_nodes=scanned_nodes,
+                match="no_scan_miss",
+                scanned_nodes=0,
             )
         neg.add(normalized_target)
         return None
 
-    def _find_source_item_for_planned_move(self, move):
+    def _find_source_item_for_planned_move(self, move, *, _skip_visible_lookup: bool = False):
         source_path = self._canonical_source_projection_path(move.get("source_path", ""))
-        source_item = self._find_visible_source_item_by_path(source_path)
-        if source_item is not None:
-            return source_item
+        if not _skip_visible_lookup:
+            source_item = self._find_visible_source_item_by_path(source_path)
+            if source_item is not None:
+                return source_item
 
         source_node = move.get("source", {})
         expected_key = self.build_node_key(source_node, "source")
@@ -18121,17 +19168,23 @@ class MainWindow(QMainWindow):
             return 0
         model.remove_placeholder_children(parent_ix)
         moved = 0
+        child_map = self._destination_children_semantic_map_index(parent_ix)
+        yield_every = 32
         for pl, kids in specs:
+            if moved and moved % yield_every == 0:
+                QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
             sem = self._destination_semantic_path(pl)
-            existing_ix = self._find_destination_child_by_semantic_path_index(parent_ix, sem)
-            if existing_ix is not None:
+            existing_ix = child_map.get(sem) if sem else None
+            if existing_ix is not None and existing_ix.isValid():
                 existing_data = existing_ix.data(Qt.UserRole) or {}
                 if self._destination_node_state(existing_data) == "real":
                     if kids:
                         moved += self._restore_destination_future_state_children_model(existing_ix, kids)
                     continue
-            model.append_nested_child(parent_ix, (pl, kids))
+            new_ix = model.append_nested_child(parent_ix, (pl, kids))
             moved += 1
+            if sem and new_ix.isValid():
+                child_map[sem] = new_ix
         return moved
 
     def _on_destination_planning_model_collapsed(self, index):
@@ -18372,6 +19425,7 @@ class MainWindow(QMainWindow):
                 payloads.append(pl)
             model.reset_root_payloads(payloads)
             self._set_tree_status_message(panel_key, f"{len(items)} root item(s) loaded.", loading=False)
+            self._prewarm_source_path_lookup_cache_after_source_root_bind()
         finally:
             tree.setUpdatesEnabled(True)
             tree.blockSignals(False)
@@ -19693,13 +20747,17 @@ class MainWindow(QMainWindow):
         entire visible relationship surface.
         """
         rewritten_related = rewritten_related or []
-        self._invalidate_projection_lookup_caches(bump_generation=False)
         paths: set[str] = set()
         paths |= self._expand_source_projection_paths_for_move_network(primary_move)
         for m in rewritten_related:
             paths |= self._expand_source_projection_paths_for_move_network(m)
         normalized_paths = {self._canonical_source_projection_path(p) for p in paths if p}
         normalized_paths.discard("")
+        self._invalidate_projection_lookup_caches(
+            bump_generation=False,
+            clear_source_path_cache=False,
+            source_eviction_paths=normalized_paths,
+        )
         source_traceability_updated = False
         tw = getattr(self, "source_tree_widget", None)
         if normalized_paths and tw is not None:
@@ -19744,9 +20802,13 @@ class MainWindow(QMainWindow):
         self, paths_to_refresh: set, *, old_path: str, new_path: str, table_refreshed: bool = False
     ) -> None:
         """After :meth:`_rewrite_proposed_branch_runtime_paths`, refresh source relationship state synchronously."""
-        self._invalidate_projection_lookup_caches(bump_generation=False)
         normalized = {self._canonical_source_projection_path(p) for p in (paths_to_refresh or set()) if p}
         normalized.discard("")
+        self._invalidate_projection_lookup_caches(
+            bump_generation=False,
+            clear_source_path_cache=False,
+            source_eviction_paths=normalized,
+        )
         tw = getattr(self, "source_tree_widget", None)
         trace_updated = False
         if normalized and tw is not None:
@@ -27130,7 +28192,6 @@ class MainWindow(QMainWindow):
         proj_t0 = float(state.get("projection_wall_t0") or time.perf_counter())
         pending_after = str(getattr(self, "_destination_materialize_pending_after_async_projection", "") or "").strip()
         self._destination_materialize_pending_after_async_projection = ""
-        self._destination_future_projection_async_state = None
         reason = state.get("reason", "background_projection")
         model = self._package_destination_future_model(
             state["model_nodes"],
@@ -27164,6 +28225,7 @@ class MainWindow(QMainWindow):
             merge_all_projected_roots=True,
             merge_session_completion_context=merge_completion_ctx,
         )
+        self._destination_future_projection_async_state = None
         if not merge_completion_ctx.get("_deferred_incremental_merge_session"):
             self._finish_destination_future_async_projection_tail(visible_future_branch_count, merge_completion_ctx)
 
@@ -27336,9 +28398,17 @@ class MainWindow(QMainWindow):
         budget.start()
         max_ms = int(getattr(self, "_destination_merge_tick_max_ms", 12) or 12)
         hard_cap_ms = int(getattr(self, "_destination_merge_attach_hard_cap_ms", 28) or 28)
-        max_nodes = max(1, int(getattr(self, "_destination_merge_tick_max_rows", 5) or 5))
+        base_max_nodes = max(1, int(getattr(self, "_destination_merge_tick_max_rows", 5) or 5))
         cap_nodes = int(getattr(self, "_destination_merge_attach_max_nodes_per_tick", 4) or 4)
-        max_nodes = max(1, min(max_nodes, cap_nodes))
+        dyn = sess.get("merge_attach_dynamic_max_nodes")
+        if dyn is None:
+            dyn = base_max_nodes
+        else:
+            try:
+                dyn = int(dyn)
+            except (TypeError, ValueError):
+                dyn = base_max_nodes
+        max_nodes = max(1, min(dyn, cap_nodes))
         nodes_this_tick = 0
         sess["attach_rows_this_tick_counter"] = 0
         sess["attach_subtree_items_tick"] = 0
@@ -27648,9 +28718,30 @@ class MainWindow(QMainWindow):
                 ),
                 pass_tail=True,
             )
+        elapsed_ms = int(budget.elapsed())
+        if elapsed_ms > max_ms:
+            new_dyn = max(1, max_nodes - 1)
+            sess["merge_attach_dynamic_max_nodes"] = new_dyn
+            log_info(
+                "destination_incremental_merge_throttle_down",
+                tick_wall_ms=elapsed_ms,
+                budget_ms=max_ms,
+                merge_attach_dynamic_max_nodes=new_dyn,
+            )
 
     def _destination_incremental_merge_session_tick_visibility(self, sess: dict) -> None:
-        per_tick = int(getattr(self, "_destination_merge_visibility_rows_per_tick", 8) or 8)
+        base_vis = int(getattr(self, "_destination_merge_visibility_rows_per_tick", 8) or 8)
+        dyn_vis = sess.get("merge_visibility_rows_per_tick")
+        if dyn_vis is not None:
+            try:
+                per_tick = max(1, int(dyn_vis))
+            except (TypeError, ValueError):
+                per_tick = base_vis
+        else:
+            per_tick = base_vis
+        vis_t = QElapsedTimer()
+        vis_t.start()
+        vis_ms = int(getattr(self, "_destination_merge_visibility_budget_ms", 14) or 14)
         tree = sess.get("tree")
         dmodel = sess.get("dmodel")
         uses_mv = sess["uses_model_view"]
@@ -27670,6 +28761,15 @@ class MainWindow(QMainWindow):
                 top_item = tree.topLevelItem(index)
                 self._refresh_destination_item_visibility(top_item, expand=True)
             sess["vis_r"] = end
+        wall = int(vis_t.elapsed())
+        if wall > vis_ms and per_tick > 1:
+            sess["merge_visibility_rows_per_tick"] = max(1, per_tick - 1)
+            log_info(
+                "destination_incremental_merge_visibility_throttle_down",
+                tick_wall_ms=wall,
+                visibility_budget_ms=vis_ms,
+                merge_visibility_rows_per_tick=sess["merge_visibility_rows_per_tick"],
+            )
 
     def _destination_merge_expand_paths_ordered_for_session(self, expanded_paths) -> list:
         """Build shallow→deep expand list without a global O(n log n) sort (depth buckets only).
@@ -28886,7 +29986,8 @@ class MainWindow(QMainWindow):
             loading=True,
         )
         if getattr(self, "_destination_incremental_merge_session", None) is not None:
-            self._destination_incremental_merge_timer.start(0)
+            spacing = max(1, int(getattr(self, "_destination_incremental_merge_tick_spacing_ms", 1) or 1))
+            self._destination_incremental_merge_timer.start(spacing)
 
     def _run_destination_future_projection_chunk(self):
         state = self._destination_future_projection_async_state
@@ -29451,10 +30552,43 @@ class MainWindow(QMainWindow):
         projection; they must never hit a fp-based skip afterward or we drop the full rebind that
         restores folder-level [Allocated] chrome on real rows.
         """
+        r = str(reason or "")
+        if r == "destination_full_tree_idle_success" and self._destination_should_block_idle_full_tree_materialize():
+            self._destination_full_tree_materialization_pending = True
+            self._schedule_destination_full_tree_materialization(3200)
+            if is_dev_mode():
+                log_info(
+                    "destination_double_render_guard",
+                    phase="idle_full_tree_deferred_interactive_expand",
+                    incoming_reason=r,
+                    note="blocked_before_fp_mismatch_admission",
+                )
+            return 0
+        if r == "deferred_reconcile_folder_worker_success" and self._destination_should_block_idle_full_tree_materialize():
+            self._destination_idle_materialize_pending_reason = r
+            idle_timer = getattr(self, "_destination_idle_materialize_timer", None)
+            if idle_timer is not None:
+                idle_timer.stop()
+                idle_timer.start(max(0, 3200))
+            else:
+                QTimer.singleShot(
+                    3200,
+                    lambda: self._safe_invoke(
+                        "deferred_destination_materialization_interactive_expand_retry",
+                        self._run_deferred_destination_materialization,
+                    ),
+                )
+            if is_dev_mode():
+                log_info(
+                    "destination_double_render_guard",
+                    phase="drfws_deferred_interactive_expand",
+                    incoming_reason=r,
+                    note="blocked_before_fp_mismatch_admission",
+                )
+            return 0
         tree = getattr(self, "destination_tree_widget", None)
         if tree is None or self._planning_tree_top_level_count(tree) <= 0:
             return None
-        r = str(reason or "")
         benign = self._destination_materialize_reason_may_skip_without_interrupting_async(r)
         try:
             current_full_fp = self._current_destination_full_overlay_fingerprint()
@@ -31253,9 +32387,9 @@ class MainWindow(QMainWindow):
                         )
                     if scoped_sync_ok:
                         for sem in norm_sync:
-                            idxs = dmodel.find_indices_for_canonical_destination_path(sem)
-                            if idxs and idxs[0].isValid():
-                                self._destination_refresh_visibility_subtree_index(dmodel, idxs[0])
+                            s_ix = self._destination_planning_index_for_scoped_bind_root(dmodel, sem)
+                            if s_ix.isValid():
+                                self._destination_refresh_visibility_subtree_index(dmodel, s_ix)
                     else:
                         self._destination_bind_run_incremental_append_model(
                             dmodel, model_nodes, top_level_paths
@@ -31625,6 +32759,14 @@ class MainWindow(QMainWindow):
         nodes = (model.get("nodes") or {}) if isinstance(model, dict) else {}
         node_count = len(nodes)
         bsp = getattr(self, "_destination_bind_scope_paths", None)
+        if not bsp:
+            bsp = self._destination_collect_overlay_replay_bind_scope_paths()
+            if bsp:
+                self._log_restore_phase(
+                    "destination_chunked_bind_schedule_overlay_replay_scope_fallback",
+                    bind_generation=gen,
+                    overlay_replay_candidate_paths=len(bsp),
+                )
         norm_scope = self._normalize_destination_bind_scope_model_roots_for_bind(bsp, nodes) if bsp else None
         scoped_model_node_count = (
             self._destination_chunked_bind_count_scoped_model_nodes(nodes, norm_scope)
@@ -31794,6 +32936,10 @@ class MainWindow(QMainWindow):
                             dm, model_nodes, norm_scope
                         )
                     st["bind_scoped_reset_ok"] = scoped_reset_ok
+                    if scoped_reset_ok and norm_scope:
+                        st["scoped_model_node_count"] = int(
+                            self._destination_chunked_bind_count_scoped_model_nodes(model_nodes, norm_scope)
+                        )
                     visible_future_branch_count = sum(
                         1 for _p, n in model_nodes.items() if n.get("node_state") != "real"
                     )
@@ -31801,9 +32947,9 @@ class MainWindow(QMainWindow):
                     if scoped_reset_ok and norm_scope:
                         qix = deque()
                         for sem in norm_scope:
-                            idxs = dm.find_indices_for_canonical_destination_path(sem)
-                            if idxs and idxs[0].isValid():
-                                qix.append(idxs[0])
+                            s_ix = self._destination_planning_index_for_scoped_bind_root(dm, sem)
+                            if s_ix.isValid():
+                                qix.append(s_ix)
                         if len(qix) == len(norm_scope):
                             st["bind_scoped_collect"] = True
                             st["scoped_model_root_queue"] = qix
@@ -31814,9 +32960,9 @@ class MainWindow(QMainWindow):
                                 scoped_model_node_count=int(st.get("scoped_model_node_count", 0) or 0),
                             )
                             for sem in norm_scope:
-                                idxs = dm.find_indices_for_canonical_destination_path(sem)
-                                if idxs and idxs[0].isValid():
-                                    self._destination_refresh_visibility_subtree_index(dm, idxs[0])
+                                s_ix = self._destination_planning_index_for_scoped_bind_root(dm, sem)
+                                if s_ix.isValid():
+                                    self._destination_refresh_visibility_subtree_index(dm, s_ix)
                         else:
                             st["bind_scoped_collect"] = False
                             for r in range(dm.rowCount(QModelIndex())):
@@ -32402,7 +33548,8 @@ class MainWindow(QMainWindow):
                     merge_all_projected_roots=True,
                     uses_model_view=uses_mv,
                 )
-                self._destination_incremental_merge_timer.start(0)
+                spacing = max(1, int(getattr(self, "_destination_incremental_merge_tick_spacing_ms", 1) or 1))
+                self._destination_incremental_merge_timer.start(spacing)
                 return visible_future_branch_count
 
         self._destination_incremental_merge_in_progress = True
@@ -32544,7 +33691,14 @@ class MainWindow(QMainWindow):
                 merge_mode="incremental",
             )
             self._schedule_workspace_ui_persist(panel_key="destination")
-            self._reconcile_destination_semantic_duplicates("destination_incremental_merge_complete")
+
+            def _rec_sync():
+                try:
+                    self._reconcile_destination_semantic_duplicates("destination_incremental_merge_complete")
+                except Exception as exc:
+                    self._log_restore_exception("destination_incremental_merge_complete_reconcile", exc)
+
+            QTimer.singleShot(200, lambda: self._safe_invoke("destination_incremental_merge_sync_reconcile", _rec_sync))
             return visible_future_branch_count
         finally:
             tree.blockSignals(False)
@@ -32565,6 +33719,36 @@ class MainWindow(QMainWindow):
                 skip_reason="steady_state_overlay_fingerprint_unchanged",
             )
             return 0
+        if r == "destination_full_tree_idle_success" and self._destination_should_block_idle_full_tree_materialize():
+            self._destination_full_tree_materialization_pending = True
+            self._schedule_destination_full_tree_materialization(3200)
+            if is_dev_mode():
+                d = self._expand_idle_path_diag()
+                log_info(
+                    "EXPAND_IDLE_PATH_ENTER",
+                    function="_materialize_destination_future_model",
+                    reason=r,
+                    **d,
+                )
+                log_info(
+                    "EXPAND_IDLE_PATH_BLOCKED",
+                    function="_materialize_destination_future_model",
+                    reason=r,
+                    bypass_source="materialize_entry_race_or_bypass",
+                    intended_guard_checked=True,
+                    active_materialize_reason=str(getattr(self, "_destination_materialize_active_reason", "") or ""),
+                    **d,
+                )
+                log_info(
+                    "EXPAND_IDLE_PATH_BYPASS_SOURCE",
+                    detail="idle_success reached _materialize_destination_future_model while interactive_expand_guard still true",
+                )
+                log_info(
+                    "EXPAND_IDLE_PATH_RESCHEDULED",
+                    function="_materialize_destination_future_model",
+                    delay_ms=3200,
+                )
+            return 0
         _timing_probe = (
             r.startswith("draft_reset")
             or "destination_reconcile" in r
@@ -32582,6 +33766,18 @@ class MainWindow(QMainWindow):
             }
         )
         _t0 = time.perf_counter()
+        prev_active = str(getattr(self, "_destination_materialize_active_reason", "") or "")
+        self._destination_materialize_active_reason = r
+        if is_dev_mode() and r == "destination_full_tree_idle_success":
+            d = self._expand_idle_path_diag()
+            log_info(
+                "EXPAND_IDLE_PATH_ALLOWED",
+                function="_materialize_destination_future_model",
+                reason=r,
+                intended_guard_checked=True,
+                active_materialize_reason=r,
+                **d,
+            )
         try:
             return self._materialize_destination_future_model_body(
                 reason,
@@ -32590,6 +33786,7 @@ class MainWindow(QMainWindow):
                 narrow_restore_real_snapshot=narrow_restore_real_snapshot,
             )
         finally:
+            self._destination_materialize_active_reason = prev_active
             if dev:
                 _perf_explorer_log(
                     "materialize_destination_future_model",
@@ -34564,7 +35761,7 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self._log_restore_exception("deferred_after_incremental_merge_finalize_reconcile", exc)
 
-        QTimer.singleShot(0, lambda: self._safe_invoke("deferred_semantic_reconcile_after_merge", _run))
+        QTimer.singleShot(200, lambda: self._safe_invoke("deferred_semantic_reconcile_after_merge", _run))
 
     def _reconcile_destination_semantic_duplicates(self, reason):
         prev_depth = int(getattr(self, "_destination_semantic_reconcile_guard_depth", 0) or 0)
@@ -36804,7 +38001,9 @@ class MainWindow(QMainWindow):
             if not source_path and move is not None:
                 source_path = self._canonical_source_projection_path(move.get("source_path", ""))
             if source_path:
-                source_item = self._find_visible_source_item_by_path(source_path) or self._find_source_item_for_planned_move(move or {})
+                source_item = self._find_visible_source_item_by_path(source_path)
+                if source_item is None:
+                    source_item = self._find_source_item_for_planned_move(move or {}, _skip_visible_lookup=True)
                 if source_item is not None:
                     source_node = self._source_tree_row_payload(source_item)
 
@@ -38925,191 +40124,289 @@ class MainWindow(QMainWindow):
                     model.update_payload_for_index(parent_index, _mut_partial)
                 t_after_children_replace = time.perf_counter()
                 self._mark_destination_real_tree_snapshot_stale()
-                node_data = dict(parent_index.data(Qt.UserRole) or {})
-                trigger_path = node_data.get("item_path") or node_data.get("display_path") or ""
-                current_child_paths = self._capture_child_path_set_for_destination_model_index(parent_index)
-                if previous_child_paths:
-                    added_count = len(current_child_paths - previous_child_paths)
-                    removed_count = len(previous_child_paths - current_child_paths)
-                    if added_count or removed_count:
-                        self._set_tree_status_message(
-                            panel_key,
-                            f"Refreshing saved branches... {added_count} added, {removed_count} removed in {node_data.get('name', 'folder')}.",
-                            loading=bool(self._pending_snapshot_branch_refresh.get(panel_key)),
-                        )
-                semantic_path = self._destination_semantic_path(node_data)
-                if semantic_path == "Root":
-                    self._destination_root_prime_pending = False
-                fw_mat_scope_n = 0
-                materialize_skipped_upstream_busy = False
+                node_data_pre = dict(parent_index.data(Qt.UserRole) or {})
+                semantic_path_captured = self._destination_semantic_path(node_data_pre)
+                trigger_path_captured = node_data_pre.get("item_path") or node_data_pre.get("display_path") or ""
+                drive_id_captured = str(drive_id or "")
+                item_id_captured = str(item_id or "")
                 try:
-                    if self._expand_all_pending.get("destination"):
-                        self._expand_all_deferred_refresh["destination"] = True
-                        tree = self.destination_tree_widget
-                        tree.expand(parent_index)
-                        handoff_moved_count = 0
-                        direct_applied_count = 0
-                        replay_applied_count = 0
-                        allocation_applied_count = 0
-                        allocation_replay_count = 0
-                        merge_moved_count = 0
-                        future_model_applied_count = 0
-                    elif (
-                        getattr(self, "_sharepoint_lazy_mode", False)
-                        and getattr(self, "_destination_root_prime_pending", False)
-                        and semantic_path != "Root"
+                    tw = self.destination_tree_widget
+                    if tw is not None:
+                        tw.viewport().update()
+                except Exception:
+                    pass
+
+                def _deferred_destination_folder_worker_success_pipeline() -> None:
+                    self._destination_bump_interactive_expand_idle_full_tree_lockout(5000)
+
+                    def _footer(trigger_for_nav: str) -> None:
+                        if self._expand_all_pending.get("destination"):
+                            self._schedule_destination_expand_all_continue()
+                        else:
+                            self._continue_expand_all("destination", None)
+                        self._refresh_tree_column_width("destination")
+                        self._process_pending_destination_navigation("folder_load", trigger_path=trigger_for_nav)
+                        self._schedule_workspace_ui_persist(panel_key=panel_key)
+                        if self._pending_snapshot_branch_refresh.get(panel_key) and not self._expand_all_pending.get(panel_key):
+                            self._schedule_snapshot_branch_refresh(panel_key, delay_ms=0)
+                        self._schedule_progress_summary_refresh()
+
+                    model_now = getattr(self, "destination_planning_model", None)
+                    tree_now = getattr(self, "destination_tree_widget", None)
+                    if model_now is None or tree_now is None:
+                        self._log_restore_phase(
+                            "destination_folder_worker_success_deferred_skipped",
+                            reason="destination_model_or_tree_missing",
+                            semantic_path=str(semantic_path_captured or "")[:240],
+                            drive_id=str(drive_id_captured or "")[:80],
+                            item_id=str(item_id_captured or "")[:80],
+                        )
+                        _footer(trigger_path_captured)
+                        return
+                    parent_index_now = QModelIndex()
+                    if drive_id_captured and item_id_captured:
+                        parent_index_now = model_now.find_index_by_drive_item(
+                            drive_id_captured, item_id_captured
+                        )
+                    if (not parent_index_now.isValid()) and semantic_path_captured:
+                        idxs = model_now.find_indices_for_canonical_destination_path(
+                            semantic_path_captured
+                        )
+                        if idxs:
+                            parent_index_now = idxs[0]
+                    if not parent_index_now.isValid() or (
+                        hasattr(model_now, "is_index_live")
+                        and not model_now.is_index_live(parent_index_now)
                     ):
-                        handoff_moved_count = self._restore_destination_future_state_children_model(
-                            parent_index, preserved_nested
+                        self._log_restore_phase(
+                            "destination_folder_worker_success_deferred_skipped",
+                            reason="parent_index_not_resolved_or_stale",
+                            semantic_path=str(semantic_path_captured or "")[:240],
+                            drive_id=str(drive_id_captured or "")[:80],
+                            item_id=str(item_id_captured or "")[:80],
                         )
-                        direct_applied_count = 0
-                        replay_applied_count = 0
-                        allocation_applied_count = 0
-                        allocation_replay_count = 0
-                        merge_moved_count = 0
-                        future_model_applied_count = 0
-                    elif getattr(self, "_sharepoint_lazy_mode", False) and semantic_path == "Root":
-                        handoff_moved_count = self._restore_destination_future_state_children_model(
-                            parent_index, preserved_nested
-                        )
-                        direct_applied_count = 0
-                        replay_applied_count = 0
-                        allocation_applied_count = 0
-                        allocation_replay_count = 0
-                        merge_moved_count = 0
-                        future_model_applied_count = 0
-                    else:
-                        handoff_moved_count = self._restore_destination_future_state_children_model(
-                            parent_index, preserved_nested
-                        )
-                        direct_applied_count = self._apply_proposed_children_to_item(parent_index)
-                        allocation_applied_count = self._apply_allocation_children_to_item(parent_index)
-                        uqp = self._unresolved_proposed_queue_size()
-                        uqa = self._unresolved_allocation_queue_size()
-                        replay_applied_count = (
-                            self._replay_unresolved_proposed_overlay(
-                                "folder_worker_success",
-                                trigger_path=trigger_path,
+                        _footer(trigger_path_captured)
+                        return
+                    nd_now = dict(parent_index_now.data(Qt.UserRole) or {})
+                    trigger_path = nd_now.get("item_path") or nd_now.get("display_path") or ""
+                    sp_resolved = self._destination_semantic_path(nd_now)
+                    if semantic_path_captured and sp_resolved:
+                        c0 = self._canonical_destination_projection_path(semantic_path_captured)
+                        c1 = self._canonical_destination_projection_path(sp_resolved)
+                        if c0 and c1 and c0 != c1:
+                            self._log_restore_phase(
+                                "destination_folder_worker_success_deferred_skipped",
+                                reason="semantic_path_mismatch_after_resolve",
+                                semantic_path_captured=str(c0)[:240],
+                                semantic_path_resolved=str(c1)[:240],
                             )
-                            if uqp
-                            else 0
-                        )
-                        allocation_replay_count = (
-                            self._replay_unresolved_allocation_overlay(
-                                "folder_worker_success",
-                                trigger_path=trigger_path,
+                            _footer(trigger_path_captured)
+                            return
+                    semantic_path = sp_resolved
+                    current_child_paths = self._capture_child_path_set_for_destination_model_index(
+                        parent_index_now
+                    )
+                    if previous_child_paths:
+                        added_count = len(current_child_paths - previous_child_paths)
+                        removed_count = len(previous_child_paths - current_child_paths)
+                        if added_count or removed_count:
+                            self._set_tree_status_message(
+                                panel_key,
+                                f"Refreshing saved branches... {added_count} added, {removed_count} removed in {nd_now.get('name', 'folder')}.",
+                                loading=bool(self._pending_snapshot_branch_refresh.get(panel_key)),
                             )
-                            if uqa
-                            else 0
-                        )
-                        merge_moved_count = self._reconcile_destination_semantic_duplicates_maybe_deferred(
-                            "folder_worker_success",
-                            affected_destination_paths=(semantic_path,),
-                        )
-                        if getattr(self, "_sharepoint_lazy_mode", False):
+                    if semantic_path == "Root":
+                        self._destination_root_prime_pending = False
+                    fw_mat_scope_n = 0
+                    materialize_skipped_upstream_busy = False
+                    try:
+                        if self._expand_all_pending.get("destination"):
+                            self._expand_all_deferred_refresh["destination"] = True
+                            tree_now.expand(parent_index_now)
+                            handoff_moved_count = 0
+                            direct_applied_count = 0
+                            replay_applied_count = 0
+                            allocation_applied_count = 0
+                            allocation_replay_count = 0
+                            merge_moved_count = 0
+                            future_model_applied_count = 0
+                        elif (
+                            getattr(self, "_sharepoint_lazy_mode", False)
+                            and getattr(self, "_destination_root_prime_pending", False)
+                            and semantic_path != "Root"
+                        ):
+                            handoff_moved_count = self._restore_destination_future_state_children_model(
+                                parent_index_now, preserved_nested
+                            )
+                            direct_applied_count = 0
+                            replay_applied_count = 0
+                            allocation_applied_count = 0
+                            allocation_replay_count = 0
+                            merge_moved_count = 0
+                            future_model_applied_count = 0
+                        elif semantic_path == "Root" and (
+                            getattr(self, "_sharepoint_lazy_mode", False)
+                            or getattr(self, "_memory_restore_in_progress", False)
+                        ):
+                            handoff_moved_count = self._restore_destination_future_state_children_model(
+                                parent_index_now, preserved_nested
+                            )
+                            direct_applied_count = 0
+                            replay_applied_count = 0
+                            allocation_applied_count = 0
+                            allocation_replay_count = 0
+                            merge_moved_count = 0
                             future_model_applied_count = 0
                         else:
-                            fw_scope = self._destination_folder_worker_materialize_scope_paths(semantic_path)
-                            fw_mat_scope_n = len(fw_scope)
-                            future_model_applied_count = self._destination_materialize_with_optional_overlay_scope(
-                                "folder_worker_success",
-                                allow_defer=True,
-                                prefer_chunked_projection=True,
-                                scope_paths=fw_scope,
+                            handoff_moved_count = self._restore_destination_future_state_children_model(
+                                parent_index_now, preserved_nested
                             )
-                    self._log_restore_phase(
-                        "destination_replay_attachment_applied",
-                        trigger_path=self.normalize_memory_path(trigger_path),
-                        handoff_moved_count=handoff_moved_count,
-                        direct_applied_count=direct_applied_count,
-                        replay_applied_count=replay_applied_count,
-                        allocation_applied_count=allocation_applied_count,
-                        allocation_replay_count=allocation_replay_count,
-                        merge_moved_count=merge_moved_count,
-                        future_model_applied_count=future_model_applied_count,
-                        queue_size=self._unresolved_proposed_queue_size(),
-                        folder_worker_materialize_scope_count=fw_mat_scope_n,
-                    )
-                    t_fw_diag = time.perf_counter()
-                    dest_worker_slots = sum(
-                        1 for k in (self.folder_load_workers or {}) if str(k).startswith("destination:")
-                    )
-                    mat_mode = (
-                        "scoped_overlay"
-                        if fw_mat_scope_n
-                        else (
-                            "none_or_deferred"
-                            if not future_model_applied_count
-                            else "applied_unscoped"
-                        )
-                    )
-                    self._log_restore_phase(
-                        "folder_worker_success_destination_diag",
-                        worker_id=str(worker_id or "")[:80],
-                        drive_id_excerpt=str(drive_id or "")[:80],
-                        trigger_path=self.normalize_memory_path(trigger_path),
-                        semantic_path_excerpt=str(semantic_path or "")[:240],
-                        elapsed_children_replace_ms=int((t_after_children_replace - t_fw_bundle_0) * 1000),
-                        elapsed_overlay_block_ms=int((t_fw_diag - t_fw_bundle_0) * 1000),
-                        pending_destination_folder_loads=len(self.pending_folder_loads.get("destination", set())),
-                        active_destination_worker_slots=dest_worker_slots,
-                        unresolved_proposed_after=self._unresolved_proposed_queue_size(),
-                        unresolved_allocation_after=self._unresolved_allocation_queue_size(),
-                        bind_scope_active=bool(getattr(self, "_destination_bind_scope_paths", None)),
-                        destination_bind_sync_active=bool(getattr(self, "_destination_future_bind_sync_active", False)),
-                        chunked_bind_active=bool(getattr(self, "_destination_chunked_bind_state", None) is not None),
-                        full_tree_worker_running=bool(
-                            self._destination_full_tree_worker is not None
-                            and self._destination_full_tree_worker.isRunning()
-                        ),
-                        expand_all_pending_destination=bool(self._expand_all_pending.get("destination")),
-                        memory_restore_in_progress=bool(getattr(self, "_memory_restore_in_progress", False)),
-                        restore_destination_overlay_pending=bool(
-                            getattr(self, "_restore_destination_overlay_pending", False)
-                        ),
-                        materialize_mode=mat_mode,
-                        materialize_applied_count=future_model_applied_count,
-                        materialize_scope_path_count=fw_mat_scope_n,
-                    )
-                    if not self._expand_all_pending.get("destination"):
-                        if not getattr(self, "_destination_restore_completed_once", False):
-                            if getattr(self, "_sharepoint_lazy_mode", False) and semantic_path == "Root":
-                                self._start_destination_restore_materialization()
-                            if not getattr(self, "_destination_root_prime_pending", False):
-                                self._schedule_destination_restore_materialization_queue(
-                                    "folder_load",
+                            direct_applied_count = self._apply_proposed_children_to_item(parent_index_now)
+                            allocation_applied_count = self._apply_allocation_children_to_item(parent_index_now)
+                            uqp = self._unresolved_proposed_queue_size()
+                            uqa = self._unresolved_allocation_queue_size()
+                            replay_applied_count = (
+                                self._replay_unresolved_proposed_overlay(
+                                    "folder_worker_success",
                                     trigger_path=trigger_path,
                                 )
-                        self._schedule_refresh_destination_tree_indicators()
-                        self.destination_tree_widget.viewport().update()
-                        if (
-                            self._unresolved_proposed_queue_size() == 0
-                            and self._unresolved_allocation_queue_size() == 0
-                            and getattr(self, "_memory_restore_in_progress", False)
-                        ):
-                            self._finalize_memory_restore_if_ready(f"folder_load:{semantic_path}")
-                    if (
-                        getattr(self, "_sharepoint_lazy_mode", False)
-                        and semantic_path == "Root"
-                        and not self._expand_all_pending.get("destination")
-                    ):
-                        self._set_tree_status_message(
-                            "destination",
-                            f"{model.rowCount(parent_index)} top-level destination folder(s) loaded.",
-                            loading=False,
+                                if uqp
+                                else 0
+                            )
+                            allocation_replay_count = (
+                                self._replay_unresolved_allocation_overlay(
+                                    "folder_worker_success",
+                                    trigger_path=trigger_path,
+                                )
+                                if uqa
+                                else 0
+                            )
+                            merge_moved_count = self._reconcile_destination_semantic_duplicates_maybe_deferred(
+                                "folder_worker_success",
+                                affected_destination_paths=(semantic_path,),
+                            )
+                            if getattr(self, "_sharepoint_lazy_mode", False):
+                                future_model_applied_count = 0
+                            else:
+                                fw_scope = self._destination_folder_worker_materialize_scope_paths(semantic_path)
+                                fw_mat_scope_n = len(fw_scope)
+                                future_model_applied_count = self._destination_materialize_with_optional_overlay_scope(
+                                    "folder_worker_success",
+                                    allow_defer=True,
+                                    prefer_chunked_projection=True,
+                                    scope_paths=fw_scope,
+                                )
+                        self._log_restore_phase(
+                            "destination_replay_attachment_applied",
+                            trigger_path=self.normalize_memory_path(trigger_path),
+                            handoff_moved_count=handoff_moved_count,
+                            direct_applied_count=direct_applied_count,
+                            replay_applied_count=replay_applied_count,
+                            allocation_applied_count=allocation_applied_count,
+                            allocation_replay_count=allocation_replay_count,
+                            merge_moved_count=merge_moved_count,
+                            future_model_applied_count=future_model_applied_count,
+                            queue_size=self._unresolved_proposed_queue_size(),
+                            folder_worker_materialize_scope_count=fw_mat_scope_n,
                         )
-                except Exception as exc:
-                    self._log_restore_exception("destination_overlay_folder_load_success", exc)
-                if self._expand_all_pending.get("destination"):
-                    self._schedule_destination_expand_all_continue()
+                        t_fw_diag = time.perf_counter()
+                        dest_worker_slots = sum(
+                            1 for k in (self.folder_load_workers or {}) if str(k).startswith("destination:")
+                        )
+                        mat_mode = (
+                            "scoped_overlay"
+                            if fw_mat_scope_n
+                            else (
+                                "none_or_deferred"
+                                if not future_model_applied_count
+                                else "applied_unscoped"
+                            )
+                        )
+                        self._log_restore_phase(
+                            "folder_worker_success_destination_diag",
+                            worker_id=str(worker_id or "")[:80],
+                            drive_id_excerpt=str(drive_id or "")[:80],
+                            trigger_path=self.normalize_memory_path(trigger_path),
+                            semantic_path_excerpt=str(semantic_path or "")[:240],
+                            elapsed_children_replace_ms=int((t_after_children_replace - t_fw_bundle_0) * 1000),
+                            elapsed_overlay_block_ms=int((t_fw_diag - t_fw_bundle_0) * 1000),
+                            pending_destination_folder_loads=len(self.pending_folder_loads.get("destination", set())),
+                            active_destination_worker_slots=dest_worker_slots,
+                            unresolved_proposed_after=self._unresolved_proposed_queue_size(),
+                            unresolved_allocation_after=self._unresolved_allocation_queue_size(),
+                            bind_scope_active=bool(getattr(self, "_destination_bind_scope_paths", None)),
+                            destination_bind_sync_active=bool(getattr(self, "_destination_future_bind_sync_active", False)),
+                            chunked_bind_active=bool(getattr(self, "_destination_chunked_bind_state", None) is not None),
+                            full_tree_worker_running=bool(
+                                self._destination_full_tree_worker is not None
+                                and self._destination_full_tree_worker.isRunning()
+                            ),
+                            expand_all_pending_destination=bool(self._expand_all_pending.get("destination")),
+                            memory_restore_in_progress=bool(getattr(self, "_memory_restore_in_progress", False)),
+                            restore_destination_overlay_pending=bool(
+                                getattr(self, "_restore_destination_overlay_pending", False)
+                            ),
+                            materialize_mode=mat_mode,
+                            materialize_applied_count=future_model_applied_count,
+                            materialize_scope_path_count=fw_mat_scope_n,
+                        )
+                        if not self._expand_all_pending.get("destination"):
+                            if not getattr(self, "_destination_restore_completed_once", False):
+                                if semantic_path == "Root" and (
+                                    getattr(self, "_sharepoint_lazy_mode", False)
+                                    or getattr(self, "_memory_restore_in_progress", False)
+                                ):
+                                    self._start_destination_restore_materialization()
+                                if not getattr(self, "_destination_root_prime_pending", False):
+                                    self._schedule_destination_restore_materialization_queue(
+                                        "folder_load",
+                                        trigger_path=trigger_path,
+                                    )
+                            self._schedule_refresh_destination_tree_indicators()
+                            tree_now.viewport().update()
+                            if (
+                                self._unresolved_proposed_queue_size() == 0
+                                and self._unresolved_allocation_queue_size() == 0
+                                and getattr(self, "_memory_restore_in_progress", False)
+                            ):
+                                self._finalize_memory_restore_if_ready(f"folder_load:{semantic_path}")
+                        if (
+                            getattr(self, "_sharepoint_lazy_mode", False)
+                            and semantic_path == "Root"
+                            and not self._expand_all_pending.get("destination")
+                        ):
+                            self._set_tree_status_message(
+                                "destination",
+                                f"{model_now.rowCount(parent_index_now)} top-level destination folder(s) loaded.",
+                                loading=False,
+                            )
+                    except Exception as exc:
+                        self._log_restore_exception("destination_overlay_folder_load_success", exc)
+                    _footer(trigger_path)
+
+                if self._destination_expand_burst_should_coalesce(semantic_path_captured):
+                    self._destination_expand_burst_schedule(
+                        {
+                            "panel_key": panel_key,
+                            "worker_id": worker_id,
+                            "drive_id": drive_id_captured,
+                            "item_id": item_id_captured,
+                            "semantic_path_captured": semantic_path_captured,
+                            "trigger_path_captured": trigger_path_captured,
+                            "preserved_nested": preserved_nested,
+                            "previous_child_paths": previous_child_paths,
+                            "t_fw_bundle_0": t_fw_bundle_0,
+                            "t_after_children_replace": t_after_children_replace,
+                        }
+                    )
                 else:
-                    self._continue_expand_all("destination", None)
-                self._refresh_tree_column_width("destination")
-                self._process_pending_destination_navigation("folder_load", trigger_path=trigger_path)
-                self._schedule_workspace_ui_persist(panel_key=panel_key)
-                if self._pending_snapshot_branch_refresh.get(panel_key) and not self._expand_all_pending.get(panel_key):
-                    self._schedule_snapshot_branch_refresh(panel_key, delay_ms=0)
-                self._schedule_progress_summary_refresh()
+                    QTimer.singleShot(
+                        0,
+                        lambda: self._safe_invoke(
+                            "destination_folder_worker_success_deferred_pipeline",
+                            _deferred_destination_folder_worker_success_pipeline,
+                        ),
+                    )
                 return
 
             if not self._tree_item_is_alive(item):
@@ -39223,9 +40520,9 @@ class MainWindow(QMainWindow):
                             trigger_path=self.normalize_memory_path(trigger_path),
                             destination_path=semantic_path,
                         )
-                    elif (
+                    elif semantic_path == "Root" and (
                         getattr(self, "_sharepoint_lazy_mode", False)
-                        and semantic_path == "Root"
+                        or getattr(self, "_memory_restore_in_progress", False)
                     ):
                         handoff_moved_count = self._restore_destination_future_state_children(item, preserved_destination_children)
                         direct_applied_count = 0
@@ -39291,9 +40588,9 @@ class MainWindow(QMainWindow):
                     )
                     if not self._expand_all_pending.get("destination"):
                         if not getattr(self, "_destination_restore_completed_once", False):
-                            if (
+                            if semantic_path == "Root" and (
                                 getattr(self, "_sharepoint_lazy_mode", False)
-                                and semantic_path == "Root"
+                                or getattr(self, "_memory_restore_in_progress", False)
                             ):
                                 self._start_destination_restore_materialization()
                             if not getattr(self, "_destination_root_prime_pending", False):
