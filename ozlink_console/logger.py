@@ -58,6 +58,9 @@ _ROTATE_BACKUPS = 4
 _SESSION_DIR: Optional[Path] = None
 _SESSION_LOCK = threading.Lock()
 
+_DEST_SCROLL_PROFILE_FILE_LOGGER: Optional[logging.Logger] = None
+_DEST_SCROLL_PROFILE_FILE_LOGGER_LOCK = threading.Lock()
+
 _STREAM_APP = "app"
 _STREAM_DEST_PREVIEW = "destination_preview"
 _STREAM_DEST_FINALIZE = "destination_finalize"
@@ -364,6 +367,41 @@ def get_logger() -> logging.Logger:
         return _LOGGER
 
 
+def log_dest_scroll_profile_json(payload: dict) -> None:
+    """Append one JSON object per line to ``dest_scroll_profile.log`` under the session folder.
+
+    Uses a single rotating file handler (no duplicates). Safe to call from the GUI thread;
+    failures are swallowed so profiling cannot break the app.
+    """
+    global _DEST_SCROLL_PROFILE_FILE_LOGGER
+    try:
+        safe = _make_json_safe(payload)
+        line = json.dumps(safe, ensure_ascii=False, default=str)
+    except Exception:
+        return
+    with _DEST_SCROLL_PROFILE_FILE_LOGGER_LOCK:
+        if _DEST_SCROLL_PROFILE_FILE_LOGGER is None:
+            lg = logging.getLogger("ozlink.dest_scroll_profile_file")
+            lg.setLevel(logging.INFO)
+            lg.propagate = False
+            if not lg.handlers:
+                path = get_session_logs_dir() / "dest_scroll_profile.log"
+                h = RotatingFileHandler(
+                    str(path),
+                    maxBytes=_ROTATE_BYTES,
+                    backupCount=_ROTATE_BACKUPS,
+                    encoding="utf-8",
+                )
+                h.setLevel(logging.INFO)
+                h.setFormatter(logging.Formatter("%(message)s"))
+                lg.addHandler(h)
+            _DEST_SCROLL_PROFILE_FILE_LOGGER = lg
+        try:
+            _DEST_SCROLL_PROFILE_FILE_LOGGER.info(line)
+        except Exception:
+            pass
+
+
 def log_info(message: str, **data: Any) -> None:
     stream = data.pop("_ozlink_stream", None)
     if stream:
@@ -417,11 +455,27 @@ def flush_logger() -> None:
                 handler.flush()
             except Exception:
                 pass
+    with _DEST_SCROLL_PROFILE_FILE_LOGGER_LOCK:
+        if _DEST_SCROLL_PROFILE_FILE_LOGGER is not None:
+            for handler in _DEST_SCROLL_PROFILE_FILE_LOGGER.handlers:
+                try:
+                    handler.flush()
+                except Exception:
+                    pass
 
 
 def reset_logging_for_tests() -> None:
     """Tear down module logging state (unit tests only)."""
-    global _LOGGER, _SESSION_DIR, _CRASH_SINK
+    global _LOGGER, _SESSION_DIR, _CRASH_SINK, _DEST_SCROLL_PROFILE_FILE_LOGGER
+    with _DEST_SCROLL_PROFILE_FILE_LOGGER_LOCK:
+        if _DEST_SCROLL_PROFILE_FILE_LOGGER is not None:
+            for handler in list(_DEST_SCROLL_PROFILE_FILE_LOGGER.handlers):
+                try:
+                    handler.close()
+                except Exception:
+                    pass
+                _DEST_SCROLL_PROFILE_FILE_LOGGER.removeHandler(handler)
+            _DEST_SCROLL_PROFILE_FILE_LOGGER = None
     if _LOGGER is not None:
         for handler in list(_LOGGER.handlers):
             try:
@@ -442,7 +496,7 @@ def reset_logging_for_tests() -> None:
 def log_session_diagnostics_initialized() -> None:
     """Log session paths once handlers exist (call after get_logger first use)."""
     sd = get_session_logs_dir()
-    files = sorted([*_STREAM_FILES.values(), "crash.log"])
+    files = sorted([*_STREAM_FILES.values(), "crash.log", "dest_scroll_profile.log"])
     log_info(
         "Diagnostics initialized.",
         session_log_dir=str(sd),
@@ -460,6 +514,7 @@ __all__ = [
     "get_logger",
     "get_session_logs_dir",
     "init_session_logging",
+    "log_dest_scroll_profile_json",
     "log_error",
     "log_info",
     "log_session_diagnostics_initialized",

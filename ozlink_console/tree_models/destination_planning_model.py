@@ -89,27 +89,33 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
 
     def is_index_live(self, index: QModelIndex) -> bool:
         """True if ``index`` still points at a row attached under its parent (safe for model access)."""
-        if not index.isValid():
+        try:
+            if not index.isValid():
+                return False
+            node = self._node(index)
+            if node is None:
+                return False
+            parent_ix = index.parent()
+            parent_node = self._invisible if not parent_ix.isValid() else self._node(parent_ix)
+            if parent_node is None:
+                return False
+            children = parent_node._children
+            if not children:
+                return False
+            row = index.row()
+            if row < 0 or row >= len(children):
+                return False
+            return children[row] is node
+        except RuntimeError:
             return False
-        node = self._node(index)
-        if node is None:
-            return False
-        parent_ix = index.parent()
-        parent_node = self._invisible if not parent_ix.isValid() else self._node(parent_ix)
-        if parent_node is None:
-            return False
-        children = parent_node._children
-        if not children:
-            return False
-        row = index.row()
-        if row < 0 or row >= len(children):
-            return False
-        return children[row] is node
 
     def _node(self, index: QModelIndex) -> Optional[_Node]:
-        if not index.isValid():
+        try:
+            if not index.isValid():
+                return None
+            p = index.internalPointer()
+        except RuntimeError:
             return None
-        p = index.internalPointer()
         if p is None:
             return None
         if not isinstance(p, _Node):

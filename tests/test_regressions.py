@@ -203,6 +203,16 @@ class _DeletedTreeItemStub:
         raise RuntimeError("Internal C++ object (PySide6.QtWidgets.QTreeWidgetItem) already deleted.")
 
 
+class _FolderWorkerThreadStub:
+    """Minimal QThread stand-in for folder worker lifecycle tests."""
+
+    def isRunning(self):
+        return False
+
+    def deleteLater(self):
+        pass
+
+
 class _TimerStub:
     def __init__(self):
         self.active = False
@@ -854,7 +864,15 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window = MainWindow.__new__(MainWindow)
         worker_key = "destination:item-1"
         window.pending_folder_loads = {"destination": {"drive-1:item-1"}}
-        window.folder_load_workers = {worker_key: {"id": "folder-1", "item": _DeletedTreeItemStub()}}
+        window.folder_load_retired_workers = {}
+        window.folder_load_workers = {
+            worker_key: {
+                "id": "folder-1",
+                "item": _DeletedTreeItemStub(),
+                "pending_key": "drive-1:item-1",
+                "worker": _FolderWorkerThreadStub(),
+            }
+        }
         window._snapshot_branch_refresh_baseline_by_worker = {worker_key: {"Root\\Finance\\Payroll"}}
         window._destination_preserved_children_by_worker = {worker_key: ["kept"]}
         lifecycle = []
@@ -869,6 +887,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         }
 
         window.on_folder_load_success(payload, "folder-1")
+        window.on_folder_worker_finished(worker_key, "folder-1")
 
         self.assertEqual(window.pending_folder_loads["destination"], set())
         self.assertNotIn(worker_key, window._snapshot_branch_refresh_baseline_by_worker)
