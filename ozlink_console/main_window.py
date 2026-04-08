@@ -2748,11 +2748,18 @@ class MainWindow(QMainWindow):
         self._destination_incremental_merge_timer.setSingleShot(True)
         self._destination_incremental_merge_timer.timeout.connect(self._run_destination_incremental_merge_session_tick)
         # Nonzero spacing yields the Qt event loop between ticks; start(0) chains many ticks in one wall‑clock slice.
-        self._destination_incremental_merge_tick_spacing_ms = 1
+        self._destination_incremental_merge_tick_spacing_ms = 3
         self._destination_merge_tick_max_ms = 12
         self._destination_merge_tick_max_rows = 5
         self._destination_merge_visibility_rows_per_tick = 8
         self._destination_merge_heavy_root_child_threshold = 48
+        # Incremental merge finalize: tighter per-tick caps so the GUI thread returns to the
+        # event loop often (avoids Windows "not responding" during expand_paths + reconcile).
+        # Code paths use getattr(..., default); these instance attrs override the in-function defaults.
+        self._destination_finalize_expand_hard_cap_ms = 28
+        self._destination_finalize_expand_max_paths_per_tick = 10
+        self._destination_finalize_reconcile_hard_cap_ms = 22
+        self._destination_finalize_reconcile_max_nodes_per_tick = 48
         self._destination_future_projection_timer = QTimer(self)
         self._destination_future_projection_timer.setSingleShot(True)
         self._destination_future_projection_timer.timeout.connect(self._run_destination_future_projection_chunk)
@@ -7281,6 +7288,78 @@ class MainWindow(QMainWindow):
             return loaded_signature == active_signature
         return bool(loaded_signature)
 
+    def _destination_parent_has_future_state_children_model(self, parent_ix: QModelIndex) -> bool:
+        model = getattr(self, "destination_planning_model", None)
+        if model is None or not parent_ix.isValid():
+            return False
+        for r in range(model.rowCount(parent_ix)):
+            pl = model.index(r, 0, parent_ix).data(Qt.UserRole) or {}
+            if self._destination_is_future_state_node(pl):
+                return True
+        return False
+
+    def _destination_parent_has_future_state_children_widget(self, parent_item) -> bool:
+        if parent_item is None:
+            return False
+        for i in range(parent_item.childCount()):
+            d = parent_item.child(i).data(0, Qt.UserRole) or {}
+            if self._destination_is_future_state_node(d):
+                return True
+        return False
+
+    def _destination_visible_subtree_merge_priority(self, semantic_path: str, expanded_paths, selected_path: str) -> int:
+        sp = self.normalize_memory_path(str(semantic_path or "").strip()).casefold()
+        if not sp:
+            return 0
+        best = 0
+        paths = expanded_paths or set()
+        for ep in paths:
+            e = self.normalize_memory_path(str(ep).strip()).casefold()
+            if not e:
+                continue
+            if sp == e or sp.startswith(e + "\\"):
+                best = max(best, len(e))
+            if e.startswith(sp + "\\"):
+                best = max(best, len(sp))
+        sel = self.normalize_memory_path(str(selected_path or "").strip()).casefold()
+        if sel:
+            if sp == sel or sp.startswith(sel + "\\"):
+                best = max(best, len(sel))
+            if sel.startswith(sp + "\\"):
+                best = max(best, len(sp))
+        return best
+
+    def _destination_replay_parent_path_priority_score(self, parent_path: str, trigger_path: str) -> int:
+        pp = self.normalize_memory_path(str(parent_path or "").strip()).casefold()
+        if not pp:
+            return 0
+        best = 0
+        tp = self.normalize_memory_path(str(trigger_path or "").strip()).casefold()
+        if tp:
+            if pp == tp or pp.startswith(tp + "\\"):
+                best = max(best, len(tp) + 2000)
+            if tp == pp or tp.startswith(pp + "\\"):
+                best = max(best, len(pp) + 1000)
+        try:
+            ui = self._capture_workspace_tree_state()
+            for ep in ui.get("destination_expanded_paths") or set():
+                e = self.normalize_memory_path(str(ep).strip()).casefold()
+                if not e:
+                    continue
+                if pp == e or pp.startswith(e + "\\"):
+                    best = max(best, len(e))
+                if e == pp or e.startswith(pp + "\\"):
+                    best = max(best, len(pp))
+            sp = self.normalize_memory_path(str(ui.get("destination_selected_path") or "").strip()).casefold()
+            if sp:
+                if pp == sp or pp.startswith(sp + "\\"):
+                    best = max(best, len(sp))
+                if sp == pp or sp.startswith(pp + "\\"):
+                    best = max(best, len(pp))
+        except Exception:
+            pass
+        return best
+
     def _count_visible_destination_future_state_nodes(self):
         count = 0
         for top in self._iter_destination_top_level_rows():
@@ -10578,7 +10657,7 @@ class MainWindow(QMainWindow):
         out |= set(getattr(self, "_destination_drfws_affected_paths", None) or set())
         return {x for x in out if x}
 
-    def _destination_bump_interactive_expand_idle_full_tree_lockout(self, delay_ms: float = 3500) -> None:
+    def _destination_bump_interactive_expand_idle_full_tree_lockout(self, delay_ms: float = 1350) -> None:
         until = time.monotonic() + max(0.0, float(delay_ms) or 0.0) / 1000.0
         cur = float(getattr(self, "_destination_interactive_expand_idle_full_tree_lockout_until", 0) or 0)
         self._destination_interactive_expand_idle_full_tree_lockout_until = max(cur, until)
@@ -10646,7 +10725,7 @@ class MainWindow(QMainWindow):
 
     def _destination_expand_burst_schedule(self, entry: dict) -> None:
         self._destination_expand_burst_queue.append(entry)
-        self._destination_bump_interactive_expand_idle_full_tree_lockout(4000)
+        self._destination_bump_interactive_expand_idle_full_tree_lockout(1400)
         n = len(self._destination_expand_burst_queue)
         timer = self._destination_expand_burst_timer
         had_active = timer.isActive()
@@ -10712,7 +10791,7 @@ class MainWindow(QMainWindow):
                 scope_count=0,
             )
 
-        self._destination_bump_interactive_expand_idle_full_tree_lockout(5000)
+        self._destination_bump_interactive_expand_idle_full_tree_lockout(1500)
         self._destination_expand_burst_ctx = {
             "run_id": run_id,
             "t_burst_0": t_burst_0,
@@ -11450,7 +11529,7 @@ class MainWindow(QMainWindow):
             self._schedule_progress_summary_refresh()
 
         _footer(last_trigger)
-        self._destination_bump_interactive_expand_idle_full_tree_lockout(4500)
+        self._destination_bump_interactive_expand_idle_full_tree_lockout(1300)
         wall_ms_ef = int((time.perf_counter() - t0) * 1000)
         if is_dev_mode():
             log_info(
@@ -12261,6 +12340,24 @@ class MainWindow(QMainWindow):
                 "destination_full_tree_skipped_bind_sync_active",
                 drive_id=str(drive_id or "")[:80],
                 hint="avoid_overlapping_full_tree_snapshot_with_destination_bind",
+            )
+            return
+
+        if getattr(self, "_memory_restore_in_progress", False) or self._destination_expand_burst_ctx is not None:
+            did = str(drive_id or "")
+            log_info(
+                "destination_full_tree_deferred_restore_or_burst",
+                drive_id=did[:80],
+                memory_restore_in_progress=bool(getattr(self, "_memory_restore_in_progress", False)),
+                expand_burst_ctx_active=self._destination_expand_burst_ctx is not None,
+            )
+            QTimer.singleShot(
+                280,
+                lambda d=did: self._safe_invoke(
+                    "destination_full_tree.retry_after_restore_burst",
+                    self.start_destination_full_tree_worker,
+                    d,
+                ),
             )
             return
 
@@ -19291,6 +19388,18 @@ class MainWindow(QMainWindow):
 
         self.pending_folder_loads[panel_key].add(pending_key)
         worker_key = f"{panel_key}:{item_id}"
+        model = self.destination_planning_model
+        has_future_children = self._destination_parent_has_future_state_children_model(index)
+        if not has_future_children:
+            model.set_loading_children(index)
+            sp_early = self._destination_semantic_path(node_data) or self._tree_item_path(node_data) or ""
+            log_info(
+                "destination_expand_loading_placeholder_set",
+                path_kind="model_view",
+                early=True,
+                semantic_path_excerpt=str(sp_early)[:240],
+                worker_key=worker_key,
+            )
         item_path = self._tree_item_path(node_data)
         if item_path and item_path in self._pending_snapshot_branch_refresh.get(panel_key, set()):
             self._snapshot_branch_refresh_baseline_by_worker[worker_key] = (
@@ -19299,9 +19408,16 @@ class MainWindow(QMainWindow):
         preserved_children = self._preserve_destination_future_state_children_model(index)
         if preserved_children:
             self._destination_preserved_children_by_worker[worker_key] = preserved_children
-
-        model = self.destination_planning_model
-        model.set_loading_children(index)
+        if has_future_children:
+            model.set_loading_children(index)
+            sp_late = self._destination_semantic_path(node_data) or self._tree_item_path(node_data) or ""
+            log_info(
+                "destination_expand_loading_placeholder_set",
+                path_kind="model_view",
+                early=False,
+                semantic_path_excerpt=str(sp_late)[:240],
+                worker_key=worker_key,
+            )
 
         use_cache_only = bool(
             (
@@ -29986,7 +30102,7 @@ class MainWindow(QMainWindow):
             loading=True,
         )
         if getattr(self, "_destination_incremental_merge_session", None) is not None:
-            spacing = max(1, int(getattr(self, "_destination_incremental_merge_tick_spacing_ms", 1) or 1))
+            spacing = max(2, int(getattr(self, "_destination_incremental_merge_tick_spacing_ms", 3) or 3))
             self._destination_incremental_merge_timer.start(spacing)
 
     def _run_destination_future_projection_chunk(self):
@@ -33486,13 +33602,25 @@ class MainWindow(QMainWindow):
         if merge_all_projected_roots and merge_session_completion_context is not None:
             if (uses_mv and dmodel is not None) or not uses_mv:
                 by_parent = group_paths_by_parent_semantic(entry_roots, model_nodes)
-                parent_order = sorted(
-                    by_parent.keys(),
-                    key=lambda p: (
+
+                def _incr_merge_parent_sort_key(p: str) -> tuple:
+                    return (
+                        -self._destination_visible_subtree_merge_priority(
+                            p, destination_expanded_paths, destination_selected_path
+                        ),
                         len(self._path_segments(p)) if p else 0,
                         [s.lower() for s in self._path_segments(p)],
-                    ),
-                )
+                    )
+
+                parent_order = sorted(by_parent.keys(), key=_incr_merge_parent_sort_key)
+                if parent_order and self._destination_visible_subtree_merge_priority(
+                    parent_order[0], destination_expanded_paths, destination_selected_path
+                ) > 0:
+                    log_info(
+                        "destination_incremental_merge_visible_parent_order",
+                        first_parent_excerpt=str(parent_order[0])[:240],
+                        expanded_count=len(destination_expanded_paths),
+                    )
                 total_root_ops = sum(len(by_parent[p]) for p in parent_order)
                 merge_session_completion_context["_deferred_incremental_merge_session"] = True
                 self._future_bind_nodes_built = 0
@@ -33548,7 +33676,7 @@ class MainWindow(QMainWindow):
                     merge_all_projected_roots=True,
                     uses_model_view=uses_mv,
                 )
-                spacing = max(1, int(getattr(self, "_destination_incremental_merge_tick_spacing_ms", 1) or 1))
+                spacing = max(2, int(getattr(self, "_destination_incremental_merge_tick_spacing_ms", 3) or 3))
                 self._destination_incremental_merge_timer.start(spacing)
                 return visible_future_branch_count
 
@@ -33559,13 +33687,26 @@ class MainWindow(QMainWindow):
             self._future_bind_nodes_built = 0
             dmodel = getattr(self, "destination_planning_model", None)
             by_parent = group_paths_by_parent_semantic(entry_roots, model_nodes)
-            parent_order = sorted(
-                by_parent.keys(),
-                key=lambda p: (
+
+            def _incr_merge_parent_sort_key_sync(p: str) -> tuple:
+                return (
+                    -self._destination_visible_subtree_merge_priority(
+                        p, destination_expanded_paths, destination_selected_path
+                    ),
                     len(self._path_segments(p)) if p else 0,
                     [s.lower() for s in self._path_segments(p)],
-                ),
-            )
+                )
+
+            parent_order = sorted(by_parent.keys(), key=_incr_merge_parent_sort_key_sync)
+            if parent_order and self._destination_visible_subtree_merge_priority(
+                parent_order[0], destination_expanded_paths, destination_selected_path
+            ) > 0:
+                log_info(
+                    "destination_incremental_merge_visible_parent_order",
+                    first_parent_excerpt=str(parent_order[0])[:240],
+                    expanded_count=len(destination_expanded_paths),
+                    sync_path=True,
+                )
             merge_yield_counter = 0
 
             def _maybe_yield_incremental_merge_ui() -> None:
@@ -37481,6 +37622,26 @@ class MainWindow(QMainWindow):
         for bucket in self.unresolved_proposed_by_parent_path.values():
             pending_candidates.extend(bucket.values())
 
+        if pending_candidates:
+            pending_candidates.sort(
+                key=lambda pf: (
+                    -self._destination_replay_parent_path_priority_score(
+                        self._proposed_parent_path(pf), trigger_path
+                    ),
+                    self._proposed_parent_path(pf).lower(),
+                )
+            )
+            top_pp = self._proposed_parent_path(pending_candidates[0])
+            if self._destination_replay_parent_path_priority_score(top_pp, trigger_path) > 0:
+                log_info(
+                    "destination_replay_visible_subtree_prioritized",
+                    replay_kind="proposed",
+                    reason=reason,
+                    trigger_path_excerpt=str(self.normalize_memory_path(trigger_path))[:240],
+                    first_parent_excerpt=str(top_pp)[:240],
+                    queue_size=len(pending_candidates),
+                )
+
         # During restore/folder-load callbacks, replay in small parent-path chunks so one
         # callback does not monopolize the UI thread.
         parent_budget = 0
@@ -37507,6 +37668,23 @@ class MainWindow(QMainWindow):
                 max_slice_ms = 12
         else:
             max_slice_ms = 36 if reason in {"folder_worker_success", "folder_load"} else 24
+        if reason in {"folder_worker_success", "folder_load"} and str(trigger_path or "").strip():
+            tp = self.normalize_memory_path(str(trigger_path).strip()).casefold()
+            if tp:
+                try:
+                    ui = self._capture_workspace_tree_state()
+                    exp = ui.get("destination_expanded_paths") or set()
+                    sel = str(ui.get("destination_selected_path") or "")
+                    if self._destination_visible_subtree_merge_priority(tp, exp, sel) > 0:
+                        max_slice_ms = min(80, max_slice_ms + 12)
+                        log_info(
+                            "destination_replay_slice_budget_visible_boost",
+                            replay_kind="proposed",
+                            trigger_path_excerpt=str(tp)[:240],
+                            max_slice_ms=max_slice_ms,
+                        )
+                except Exception:
+                    pass
         budget_exhausted = False
         for proposed_folder in pending_candidates:
             if slice_timer.elapsed() > max_slice_ms:
@@ -37583,6 +37761,26 @@ class MainWindow(QMainWindow):
         for bucket in self.unresolved_allocations_by_parent_path.values():
             pending_moves.extend(bucket.values())
 
+        if pending_moves:
+            pending_moves.sort(
+                key=lambda mv: (
+                    -self._destination_replay_parent_path_priority_score(
+                        self._allocation_parent_path(mv), trigger_path
+                    ),
+                    self._allocation_parent_path(mv).lower(),
+                )
+            )
+            top_ap = self._allocation_parent_path(pending_moves[0])
+            if self._destination_replay_parent_path_priority_score(top_ap, trigger_path) > 0:
+                log_info(
+                    "destination_replay_visible_subtree_prioritized",
+                    replay_kind="allocation",
+                    reason=reason,
+                    trigger_path_excerpt=str(self.normalize_memory_path(trigger_path))[:240],
+                    first_parent_excerpt=str(top_ap)[:240],
+                    queue_size=len(pending_moves),
+                )
+
         # During restore/folder-load callbacks, replay in small parent-path chunks so one
         # callback does not monopolize the UI thread.
         parent_budget = 0
@@ -37608,6 +37806,23 @@ class MainWindow(QMainWindow):
                 max_slice_ms = 12
         else:
             max_slice_ms = 36 if reason in {"folder_worker_success", "folder_load"} else 24
+        if reason in {"folder_worker_success", "folder_load"} and str(trigger_path or "").strip():
+            tp = self.normalize_memory_path(str(trigger_path).strip()).casefold()
+            if tp:
+                try:
+                    ui = self._capture_workspace_tree_state()
+                    exp = ui.get("destination_expanded_paths") or set()
+                    sel = str(ui.get("destination_selected_path") or "")
+                    if self._destination_visible_subtree_merge_priority(tp, exp, sel) > 0:
+                        max_slice_ms = min(80, max_slice_ms + 12)
+                        log_info(
+                            "destination_replay_slice_budget_visible_boost",
+                            replay_kind="allocation",
+                            trigger_path_excerpt=str(tp)[:240],
+                            max_slice_ms=max_slice_ms,
+                        )
+                except Exception:
+                    pass
         budget_exhausted = False
         for move in pending_moves:
             if slice_timer.elapsed() > max_slice_ms:
@@ -39288,23 +39503,40 @@ class MainWindow(QMainWindow):
         item_path = self._tree_item_path(node_data)
         if item_path and item_path in self._pending_snapshot_branch_refresh.get(panel_key, set()):
             self._snapshot_branch_refresh_baseline_by_worker[worker_key] = self._capture_child_path_set(item)
+        has_future_dest = panel_key == "destination" and self._destination_parent_has_future_state_children_widget(item)
+
+        def _widget_show_folder_loading(*, log_destination: bool, early_flag: bool) -> None:
+            if self._full_trace_enabled():
+                self._ui_trace(
+                    "tree",
+                    "folder_load_take_children",
+                    panel_key=panel_key,
+                    item=item,
+                    worker_key=worker_key,
+                    prior_child_count_hint="cleared",
+                )
+            item.takeChildren()
+            item.addChild(self.build_loading_placeholder_item("Loading...", role="loading_in_progress"))
+            if log_destination:
+                sp_w = self._destination_semantic_path(node_data) or self._tree_item_path(node_data) or ""
+                log_info(
+                    "destination_expand_loading_placeholder_set",
+                    path_kind="widget",
+                    early=early_flag,
+                    semantic_path_excerpt=str(sp_w)[:240],
+                    worker_key=worker_key,
+                )
+
         if panel_key == "destination":
+            if not has_future_dest:
+                _widget_show_folder_loading(log_destination=True, early_flag=True)
             preserved_children = self._preserve_destination_future_state_children(item)
             if preserved_children:
                 self._destination_preserved_children_by_worker[worker_key] = preserved_children
-        if self._full_trace_enabled():
-            self._ui_trace(
-                "tree",
-                "folder_load_take_children",
-                panel_key=panel_key,
-                item=item,
-                worker_key=worker_key,
-                prior_child_count_hint="cleared",
-            )
-        item.takeChildren()
-        item.addChild(
-            self.build_loading_placeholder_item("Loading folder contents...", role="loading_in_progress")
-        )
+            if has_future_dest:
+                _widget_show_folder_loading(log_destination=True, early_flag=False)
+        else:
+            _widget_show_folder_loading(log_destination=False, early_flag=False)
 
         use_cache_only = bool(
             (
@@ -40122,6 +40354,15 @@ class MainWindow(QMainWindow):
                         p["load_failed"] = False
 
                     model.update_payload_for_index(parent_index, _mut_partial)
+                log_info(
+                    "destination_expand_loading_placeholder_cleared",
+                    path_kind="model_view",
+                    worker_key=worker_key,
+                    skipped_replace=skip_destination_child_replace,
+                    semantic_path_excerpt=str(
+                        self._destination_semantic_path(dict(parent_index.data(Qt.UserRole) or {})) or ""
+                    )[:240],
+                )
                 t_after_children_replace = time.perf_counter()
                 self._mark_destination_real_tree_snapshot_stale()
                 node_data_pre = dict(parent_index.data(Qt.UserRole) or {})
@@ -40137,7 +40378,7 @@ class MainWindow(QMainWindow):
                     pass
 
                 def _deferred_destination_folder_worker_success_pipeline() -> None:
-                    self._destination_bump_interactive_expand_idle_full_tree_lockout(5000)
+                    self._destination_bump_interactive_expand_idle_full_tree_lockout(1500)
 
                     def _footer(trigger_for_nav: str) -> None:
                         if self._expand_all_pending.get("destination"):
@@ -40465,6 +40706,16 @@ class MainWindow(QMainWindow):
                     item.addChild(
                         self.build_loading_placeholder_item("This folder is empty.", role="terminal_empty")
                     )
+            if panel_key == "destination":
+                log_info(
+                    "destination_expand_loading_placeholder_cleared",
+                    path_kind="widget",
+                    worker_key=worker_key,
+                    skipped_replace=skip_destination_child_replace,
+                    semantic_path_excerpt=str(
+                        self._destination_semantic_path(dict(item.data(0, Qt.UserRole) or {})) or ""
+                    )[:240],
+                )
 
             node_data = item.data(0, Qt.UserRole) or {}
             trigger_path = node_data.get("item_path") or node_data.get("display_path") or ""

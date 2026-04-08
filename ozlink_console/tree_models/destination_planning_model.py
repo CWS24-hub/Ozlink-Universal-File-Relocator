@@ -411,6 +411,15 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         if parent_node is None:
             return
         old_count = self.rowCount(parent)
+        if old_count == 1:
+            only = parent_node._children[0] if parent_node._children else None
+            opl = getattr(only, "payload", None) if only is not None else None
+            if (
+                isinstance(opl, dict)
+                and opl.get("placeholder")
+                and str(opl.get("placeholder_role") or "") == "loading_in_progress"
+            ):
+                return
         if old_count:
             for old_child in list(parent_node._children or []):
                 self._unregister_subtree_paths(old_child)
@@ -420,7 +429,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         load_pl = {
             "placeholder": True,
             "placeholder_role": "loading_in_progress",
-            "base_display_label": "Loading folder contents...",
+            "base_display_label": "Loading...",
             "tree_role": "destination",
         }
         self.beginInsertRows(parent, 0, 0)
@@ -428,21 +437,37 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         self._reindex(parent_node)
         self.endInsertRows()
         self._notify_structure_changed()
+        log_info(
+            "destination_loading_placeholder_model",
+            action="set",
+            parent_row=parent.row(),
+        )
 
     def remove_placeholder_children(self, parent: QModelIndex) -> None:
         parent_node = self._node(parent)
         if parent_node is None or not parent_node._children:
             return
+        removed_roles: List[str] = []
         for row in range(len(parent_node._children) - 1, -1, -1):
             ch_pl = getattr(parent_node._children[row], "payload", None)
             if isinstance(ch_pl, dict) and ch_pl.get("placeholder"):
+                role = str(ch_pl.get("placeholder_role") or "")
                 victim = parent_node._children[row]
                 self._unregister_subtree_paths(victim)
                 self.beginRemoveRows(parent, row, row)
                 parent_node._children.pop(row)
                 self.endRemoveRows()
+                if role:
+                    removed_roles.append(role)
         self._reindex(parent_node)
         self._notify_structure_changed()
+        if removed_roles:
+            log_info(
+                "destination_loading_placeholder_model",
+                action="remove_placeholder",
+                parent_row=parent.row(),
+                roles=removed_roles,
+            )
 
     def append_child_payloads(self, parent: QModelIndex, payloads: List[Dict[str, Any]]) -> None:
         parent_node = self._invisible if not parent.isValid() else self._node(parent)
