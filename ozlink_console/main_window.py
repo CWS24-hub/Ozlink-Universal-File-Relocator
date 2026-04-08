@@ -2859,6 +2859,10 @@ class MainWindow(QMainWindow):
         self._snapshot_pipeline_ephemeral_bundle_dir = None
         self._import_rehydration_verify_pending = False
         self._import_tree_reload_retry_used = False
+        # Post-import Graph enrichment: generator advanced one step per event-loop tick (import UX).
+        self._post_import_graph_enrich_run_id: int = 0
+        self._post_import_graph_enrich_generator: Any = None
+        self._post_import_graph_enrich_source_description: str = ""
         self._graph_linkage_context_retry_count = 0
         self._graph_linkage_enrich_busy_skips = 0
         self._graph_linkage_audit_ui_snapshot: dict[str, Any] | None = None
@@ -8763,6 +8767,20 @@ class MainWindow(QMainWindow):
             f"Workspace reset complete. Backup saved to:\n{backup_path}",
         )
 
+    def _show_non_modal_import_success_message(self, text: str) -> None:
+        """Non-modal confirmation so the event loop keeps servicing timers (Graph enrichment, trees)."""
+        box = QMessageBox(self)
+        box.setWindowTitle("Import Draft")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText(text)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.setWindowModality(Qt.WindowModality.NonModal)
+        try:
+            box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        except Exception:
+            pass
+        box.show()
+
     def _handle_import_draft(self):
         if self.memory_manager is None:
             QMessageBox.information(self, "Import Draft", "Draft import is not available right now.")
@@ -8791,6 +8809,8 @@ class MainWindow(QMainWindow):
                 source_description = source_folder
             self._import_rehydration_verify_pending = True
             self._import_tree_reload_retry_used = False
+            self._close_post_import_graph_enrichment_generator()
+            self._post_import_graph_enrich_run_id += 1
             self._load_draft_shell_into_runtime()
             _cand = self._memory_restore_candidate if isinstance(self._memory_restore_candidate, dict) else {}
             log_info(
@@ -8809,32 +8829,22 @@ class MainWindow(QMainWindow):
                 **self._graph_linkage_audit_for_log(_audit_import),
             )
             self._apply_graph_linkage_banner_from_audit(_audit_import, phase="import_after_shell_load")
+            _import_graph_enrich_async = False
             if self.current_session_context.get("connected"):
                 self._apply_restored_selector_state()
-                # Canonical Gary-draft intake: enrich imported records with missing Graph ids
-                # immediately so execution/manifests are reliable without manual rework.
+                # Enrich missing Graph ids using the same logic as ensure_planned_moves_resolved_via_graph,
+                # but sliced across event-loop ticks so the UI stays responsive (see _schedule_post_import_graph_enrichment).
                 try:
-                    if (
+                    _missing_graph = (
                         int(_audit_import.get("rows_missing_graph_ids") or 0)
                         + int(_audit_import.get("proposed_rows_missing_graph_ids") or 0)
-                        > 0
-                    ):
-                        self._graph_linkage_progress_session_begin()
-                    self.ensure_planned_moves_resolved_via_graph(
-                        persist=True,
-                        quiet=False,
-                        refresh_sources=False,
                     )
+                    if _missing_graph > 0:
+                        self._graph_linkage_progress_session_begin()
+                        self._schedule_post_import_graph_enrichment(source_description=source_description)
+                        _import_graph_enrich_async = True
                 except Exception as exc:
-                    self._log_restore_exception("import_draft_graph_enrich", exc)
-                _audit_post = self._audit_planned_moves_graph_destination_identity()
-                log_info(
-                    "graph_linkage_audit",
-                    phase="import_after_inline_graph_enrich",
-                    source=source_description,
-                    **self._graph_linkage_audit_for_log(_audit_post),
-                )
-                self._apply_graph_linkage_banner_from_audit(_audit_post, phase="import_after_inline_graph_enrich")
+                    self._log_restore_exception("import_draft_graph_enrich_schedule", exc)
             else:
                 self._import_rehydration_verify_pending = False
             log_info(
@@ -8856,7 +8866,21 @@ class MainWindow(QMainWindow):
             self._finalize_import_workspace_snapshot_hydration(_audit_final, source=source_description)
             log_info("Draft import completed.", source=source_description)
             self.refresh_requests_page()
-            QMessageBox.information(self, "Import Draft", "Draft bundle imported.")
+            if _import_graph_enrich_async:
+                _import_ok_msg = (
+                    "Draft bundle imported.\n\n"
+                    "Microsoft 365 folder links are still being resolved in the background; "
+                    "watch the planning header for progress."
+                )
+                if hasattr(self, "planned_moves_status") and self.planned_moves_status is not None:
+                    self.planned_moves_status.setText(
+                        "Draft imported. Resolving Microsoft 365 folder links in the background…"
+                    )
+            else:
+                _import_ok_msg = "Draft bundle imported."
+                if hasattr(self, "planned_moves_status") and self.planned_moves_status is not None:
+                    self.planned_moves_status.setText("Draft imported.")
+            self._show_non_modal_import_success_message(_import_ok_msg)
         except Exception as exc:
             self._import_rehydration_verify_pending = False
             log_error("Draft import failed.", error=str(exc), source=source_file if 'source_file' in locals() else source_folder)
@@ -14964,6 +14988,14 @@ class MainWindow(QMainWindow):
             return
         if self._can_fast_bulk_expand(panel_key):
             self._fast_expand_all_loaded_tree(panel_key)
+            return
+        # Destination QTreeView + planning model: _continue_expand_all + _process_expand_all_queue
+        # do not drive expansion (widget queue is unused). Use the same progressive model path as
+        # manual expand-all, otherwise status stays on "Expanding branches..." forever.
+        if panel_key == "destination" and self._destination_tree_uses_model_view():
+            if getattr(self, "_destination_root_prime_pending", False):
+                return
+            self._begin_destination_model_expand_all()
             return
         self._expand_all_pending[panel_key] = True
         self._reset_expand_all_progress(panel_key)
@@ -28911,6 +28943,104 @@ class MainWindow(QMainWindow):
         if current_state is None or self._destination_future_state_rank(node_state) > self._destination_future_state_rank(current_state):
             branches[normalized_branch] = node_state
 
+    def _merge_destination_future_duplicate_folder_nodes(self, into, fr):
+        """Merge two in-memory destination model nodes that represent the same folder (mutate into, discard fr)."""
+        if into is None or fr is None or into is fr:
+            return
+        fs, cs = fr["node_state"], into["node_state"]
+        new_pri = self._destination_model_state_priority(fs)
+        old_pri = self._destination_model_state_priority(cs)
+        if new_pri > old_pri:
+            if fs == "allocated" and cs == "real":
+                into["data"] = self._merge_real_destination_row_with_allocation_node_data(into["data"], fr["data"])
+                into["node_state"] = fs
+            else:
+                into["node_state"] = fs
+                into["data"] = dict(fr["data"])
+
+    def _rewrite_destination_model_node_paths_for_key_change(self, node, old_key, new_key):
+        node["semantic_path"] = new_key
+        od = node.get("data")
+        if not isinstance(od, dict):
+            return
+        ok = self.normalize_memory_path(old_key)
+        nk = self.normalize_memory_path(new_key)
+        for dk in ("display_path", "item_path", "destination_path"):
+            v = str(od.get(dk) or "").strip()
+            if not v:
+                continue
+            vn = self.normalize_memory_path(v)
+            if vn == ok:
+                od[dk] = nk
+
+    def _remap_destination_model_subtree_paths(self, model_nodes, old_prefix, new_prefix):
+        """Re-key descendants of old_prefix onto new_prefix; merge colliding keys."""
+        sep = "\\"
+        op = self.normalize_memory_path(old_prefix)
+        nprefix = self.normalize_memory_path(new_prefix)
+        keys = []
+        for k in list(model_nodes.keys()):
+            kn = self.normalize_memory_path(k)
+            if kn.startswith(op + sep):
+                keys.append(k)
+        keys.sort(key=lambda x: (-self.normalize_memory_path(x).count(sep), -len(x)))
+        for k in keys:
+            kn = self.normalize_memory_path(k)
+            nk = self.normalize_memory_path(nprefix + kn[len(op) :])
+            node = model_nodes.pop(k)
+            self._rewrite_destination_model_node_paths_for_key_change(node, k, nk)
+            pp = str(node.get("parent_semantic_path") or "")
+            if pp:
+                ppn = self.normalize_memory_path(pp)
+                if ppn == op:
+                    node["parent_semantic_path"] = nprefix
+                elif ppn.startswith(op + sep):
+                    node["parent_semantic_path"] = self.normalize_memory_path(nprefix + ppn[len(op) :])
+            existing = model_nodes.get(nk)
+            if existing is None:
+                model_nodes[nk] = node
+            else:
+                self._merge_destination_future_duplicate_folder_nodes(existing, node)
+
+    def _coalesce_destination_future_orphan_root_siblings(self, model_nodes):
+        """Fold single-segment, parentless rows onto Root\\Name so they do not duplicate Root's children."""
+        root_key = "Root"
+        if root_key not in model_nodes:
+            return
+        candidates = []
+        for p, node in list(model_nodes.items()):
+            if p == root_key:
+                continue
+            if node.get("parent_semantic_path"):
+                continue
+            segs = self._path_segments(p)
+            if len(segs) != 1:
+                continue
+            leaf = segs[0]
+            if str(leaf).strip().lower() == "root":
+                continue
+            root_child = self.normalize_memory_path(f"{root_key}\\{leaf}")
+            if root_child == self.normalize_memory_path(p):
+                continue
+            candidates.append((self.normalize_memory_path(p), root_child))
+        for p, root_child in sorted(candidates, key=lambda x: (len(x[0]), x[0].lower())):
+            if p not in model_nodes:
+                continue
+            dup = model_nodes.get(p)
+            if dup is None:
+                continue
+            canon = model_nodes.get(root_child)
+            if canon is None:
+                node = model_nodes.pop(p)
+                self._rewrite_destination_model_node_paths_for_key_change(node, p, root_child)
+                node["parent_semantic_path"] = root_key
+                model_nodes[root_child] = node
+                self._remap_destination_model_subtree_paths(model_nodes, p, root_child)
+                continue
+            self._merge_destination_future_duplicate_folder_nodes(canon, dup)
+            del model_nodes[p]
+            self._remap_destination_model_subtree_paths(model_nodes, p, root_child)
+
     def _package_destination_future_model(
         self,
         model_nodes,
@@ -28970,6 +29100,8 @@ class MainWindow(QMainWindow):
             merged_child_count=len(model_nodes),
             replaced_incorrectly=False,
         )
+
+        self._coalesce_destination_future_orphan_root_siblings(model_nodes)
 
         for node in model_nodes.values():
             node["children"] = []
@@ -42543,10 +42675,14 @@ class MainWindow(QMainWindow):
             self._planned_move_source_sharepoint_refresh_in_progress = False
             self._planned_move_source_sharepoint_refresh_last_mono = time.monotonic()
 
-    def ensure_planned_moves_resolved_via_graph(
+    def _graph_enrichment_run_generator(
         self, *, persist: bool, quiet: bool, refresh_sources: bool = True
-    ) -> tuple[int, int]:
-        """Refresh source metadata by id, then fill missing Graph ids from paths. Returns (moves_updated, proposed_updated)."""
+    ):
+        """Single implementation for Graph id enrichment; yields to the event loop between steps.
+
+        Completes with ``return (moves_touch_count, proposed_touch_count)`` consumed via
+        ``StopIteration.value``. Finalization (progress strip, reentrancy guard) runs in ``finally``.
+        """
         ctx = self._graph_resolve_planning_context()
         if not ctx:
             if bool(getattr(self, "_graph_linkage_progress_session_arm", False)):
@@ -42637,8 +42773,7 @@ class MainWindow(QMainWindow):
                         self._graph_linkage_progress_strip_tick(
                             processed_missing, total_graph_enrich, resolved_missing
                         )
-                if i % 8 == 0:
-                    QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+                yield None
 
             pu = 0
             for pi, pf in enumerate(self.proposed_folders or []):
@@ -42661,6 +42796,7 @@ class MainWindow(QMainWindow):
                         self._graph_linkage_progress_strip_tick(
                             processed_missing, total_graph_enrich, resolved_missing
                         )
+                yield None
 
             real_missing_paths, retry_real_missing_m, retry_real_missing_p = (
                 self._graph_resolve_collect_real_missing_parent_mkdir_targets(
@@ -42691,6 +42827,7 @@ class MainWindow(QMainWindow):
                         dest_site_name=ctx["dest_site_name"],
                         mkdir_session_verified_prefixes=mkdir_session_verified,
                     )
+                    yield None
                 rm_m = set(retry_real_missing_m)
                 rm_p = set(retry_real_missing_p)
                 graph_dest_unresolved_forensics[:] = [
@@ -42732,8 +42869,7 @@ class MainWindow(QMainWindow):
                     if ok_rm:
                         mu += 1
                         graph_touch.update(self._narrow_source_projection_paths_for_move(move_rm))
-                    if ri % 8 == 0:
-                        QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+                    yield None
                 for pi in sorted(retry_real_missing_p):
                     prop_list = list(self.proposed_folders or [])
                     if pi < 0 or pi >= len(prop_list):
@@ -42750,8 +42886,7 @@ class MainWindow(QMainWindow):
                     )
                     if ok_pr:
                         pu += 1
-                    if pi % 8 == 0:
-                        QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+                    yield None
 
             retry_move_indices = sorted(
                 {
@@ -42796,6 +42931,7 @@ class MainWindow(QMainWindow):
                     if ok_r:
                         mu += 1
                         graph_touch.update(self._narrow_source_projection_paths_for_move(move_r))
+                    yield None
 
             if (su or mu or pu) and persist:
                 narrow_paths = self._expand_source_projection_paths_with_parents(src_touch | graph_touch)
@@ -42866,6 +43002,107 @@ class MainWindow(QMainWindow):
                 self._graph_linkage_progress_strip_finalize(audit_done)
                 self._graph_linkage_progress_session_arm = False
             self._destination_idle_materialize_reentrancy_block -= 1
+
+    def ensure_planned_moves_resolved_via_graph(
+        self, *, persist: bool, quiet: bool, refresh_sources: bool = True
+    ) -> tuple[int, int]:
+        """Refresh source metadata by id, then fill missing Graph ids from paths. Returns (moves_updated, proposed_updated)."""
+        gen = self._graph_enrichment_run_generator(
+            persist=persist, quiet=quiet, refresh_sources=refresh_sources
+        )
+        n = 0
+        try:
+            while True:
+                next(gen)
+                n += 1
+                if n % 8 == 0:
+                    QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        except StopIteration as e:
+            val = e.value
+            return val if isinstance(val, tuple) and len(val) == 2 else (0, 0)
+
+    def _close_post_import_graph_enrichment_generator(self) -> None:
+        """Abandon an in-flight post-import enrichment run (runs generator finally)."""
+        g = self._post_import_graph_enrich_generator
+        self._post_import_graph_enrich_generator = None
+        if g is not None:
+            try:
+                g.close()
+            except Exception:
+                pass
+
+    def _schedule_post_import_graph_enrichment(self, *, source_description: str) -> None:
+        """Run the same Graph enrichment as ``ensure_planned_moves_resolved_via_graph`` across event-loop ticks."""
+        self._close_post_import_graph_enrichment_generator()
+        self._post_import_graph_enrich_run_id += 1
+        run_id = int(self._post_import_graph_enrich_run_id)
+        self._post_import_graph_enrich_source_description = str(source_description or "")
+        self._post_import_graph_enrich_generator = self._graph_enrichment_run_generator(
+            persist=True, quiet=False, refresh_sources=False
+        )
+        log_info(
+            "graph_resolve_post_import_async_scheduled",
+            run_id=run_id,
+            source=self._post_import_graph_enrich_source_description,
+        )
+        QTimer.singleShot(0, partial(self._advance_post_import_graph_enrichment_tick, run_id))
+
+    def _advance_post_import_graph_enrichment_tick(self, run_id: int) -> None:
+        if run_id != int(self._post_import_graph_enrich_run_id):
+            return
+        g = self._post_import_graph_enrich_generator
+        if g is None:
+            return
+        try:
+            next(g)
+        except StopIteration as e:
+            self._post_import_graph_enrich_generator = None
+            self._on_post_import_graph_enrichment_finished(run_id, e.value)
+            return
+        except Exception as exc:
+            self._post_import_graph_enrich_generator = None
+            try:
+                g.close()
+            except Exception:
+                pass
+            self._log_restore_exception("post_import_graph_enrichment_tick", exc)
+            self._on_post_import_graph_enrichment_finished(run_id, None, error=str(exc))
+            return
+        if run_id != int(self._post_import_graph_enrich_run_id):
+            return
+        QTimer.singleShot(0, partial(self._advance_post_import_graph_enrichment_tick, run_id))
+
+    def _on_post_import_graph_enrichment_finished(
+        self, run_id: int, result: Any, *, error: str = ""
+    ) -> None:
+        if run_id != int(self._post_import_graph_enrich_run_id):
+            return
+        src = str(self._post_import_graph_enrich_source_description or "")
+        if error:
+            log_warn(
+                "graph_resolve_post_import_async_failed",
+                run_id=run_id,
+                source=src,
+                error=str(error)[:400],
+            )
+        else:
+            log_info(
+                "graph_resolve_post_import_async_complete",
+                run_id=run_id,
+                source=src,
+                result=result,
+            )
+        try:
+            _audit_post = self._audit_planned_moves_graph_destination_identity()
+            log_info(
+                "graph_linkage_audit",
+                phase="import_after_async_graph_enrich",
+                source=src,
+                **self._graph_linkage_audit_for_log(_audit_post),
+            )
+            self._apply_graph_linkage_banner_from_audit(_audit_post, phase="import_after_async_graph_enrich")
+        except Exception as exc:
+            self._log_restore_exception("import_after_async_graph_enrich_audit", exc)
 
     def _try_refresh_planned_move_sources_after_source_root(self) -> None:
         """Best-effort: align stored source paths with SharePoint after the source library loads."""
