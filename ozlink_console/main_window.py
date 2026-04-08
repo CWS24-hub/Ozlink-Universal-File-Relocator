@@ -2814,6 +2814,10 @@ class MainWindow(QMainWindow):
         self._destination_descendant_apply_timer.setSingleShot(True)
         self._destination_descendant_apply_timer.timeout.connect(self._run_destination_descendant_apply_tick)
         self._destination_descendant_apply_paused_for_finalize_alloc = False
+        # When an allocation has more than this many collected descendants, file-level
+        # projected_descendant rows are deferred until the user expands the allocation
+        # (folders still projected eagerly for structure). planned_moves stays authoritative.
+        self._destination_projection_defer_files_descendant_threshold = 256
         self.current_profile = None
         self.discovered_sites = []
         self.planned_moves = []
@@ -26584,6 +26588,107 @@ class MainWindow(QMainWindow):
         )
         return descendants
 
+    def _destination_projection_defer_files_threshold(self) -> int:
+        return max(32, int(getattr(self, "_destination_projection_defer_files_descendant_threshold", 256) or 256))
+
+    def _destination_partition_descendants_for_projection_files(self, descendants_full: list) -> tuple[list, bool, int, int]:
+        """Split collected descendants into eager (folders only when deferring) vs deferred files.
+
+        Returns ``(eager_list, defer_files_mode, deferred_file_count, total_count)``.
+        Small allocations (total <= threshold) keep prior behavior: all descendants eager.
+        """
+        total = len(descendants_full or [])
+        if not total:
+            return [], False, 0, 0
+        thr = self._destination_projection_defer_files_threshold()
+        file_n = sum(1 for d in descendants_full if not bool(d.get("is_folder", False)))
+        defer = total > thr and file_n > 0
+        if not defer:
+            return list(descendants_full), False, 0, total
+        eager = [d for d in descendants_full if bool(d.get("is_folder", False))]
+        return eager, True, int(file_n), total
+
+    def _destination_lazy_files_summary_semantic_path(self, allocation_destination_path: str) -> str:
+        suf = ".ozlink_deferred_files_summary"
+        base = self.normalize_memory_path(allocation_destination_path or "")
+        if not base:
+            return suf
+        return self.normalize_memory_path(base + "\\" + suf)
+
+    def _destination_add_lazy_files_summary_to_future_model(self, chunk: dict, model_nodes: dict) -> None:
+        if not chunk.get("defer_files_mode"):
+            return
+        n = int(chunk.get("deferred_file_count") or 0)
+        if n <= 0:
+            return
+        allocation_destination_path = chunk["allocation_destination_path"]
+        alloc_node = chunk.get("allocation_node")
+        parent_data = alloc_node["data"] if alloc_node else {}
+        summary_sem = self._destination_lazy_files_summary_semantic_path(allocation_destination_path)
+        if self._destination_preview_descendant_exists(model_nodes, summary_sem):
+            return
+        label = f"{n:,} files — expand folder to load preview"
+        synthetic = {
+            "name": label,
+            "real_name": label,
+            "is_folder": False,
+            "item_path": "",
+            "display_path": summary_sem,
+        }
+        nc = dict(
+            self._build_destination_allocation_descendant_node_data(synthetic, summary_sem, parent_data)
+        )
+        nc["ozlink_deferred_files_summary"] = True
+        nc["base_display_label"] = self._tree_name_column_label(label)
+        self._upsert_destination_model_node(
+            model_nodes,
+            summary_sem,
+            name=label,
+            node_state="projected_descendant",
+            data=nc,
+            parent_semantic_path=allocation_destination_path,
+        )
+        self._attach_destination_model_child(model_nodes, allocation_destination_path, summary_sem)
+
+    def _destination_patch_allocation_deferred_file_projection_flags(
+        self, model_nodes: dict, allocation_path: str, deferred_file_count: int
+    ) -> None:
+        node = model_nodes.get(allocation_path)
+        if node is None:
+            return
+        data = dict(node.get("data") or {})
+        data["projected_file_descendants_deferred"] = True
+        data["projected_file_descendants_deferred_count"] = int(deferred_file_count)
+        if bool(data.get("is_folder", True)):
+            data["children_loaded"] = False
+        node["data"] = data
+
+    def _destination_remove_deferred_file_summary_children_index(self, parent_ix: QModelIndex) -> None:
+        dm = getattr(self, "destination_planning_model", None)
+        if dm is None or not parent_ix.isValid():
+            return
+        remove_at = getattr(dm, "remove_node_at", None)
+        if remove_at is None:
+            return
+        for row in range(dm.rowCount(parent_ix) - 1, -1, -1):
+            ch = dm.index(row, 0, parent_ix)
+            if not ch.isValid():
+                continue
+            d = ch.data(Qt.UserRole) or {}
+            if d.get("ozlink_deferred_files_summary"):
+                remove_at(ch)
+
+    def _destination_remove_deferred_file_summary_widget_children(self, parent_item) -> None:
+        if parent_item is None or isinstance(parent_item, QModelIndex):
+            return
+        idx = parent_item.childCount() - 1
+        while idx >= 0:
+            ch = parent_item.child(idx)
+            d = ch.data(0, Qt.UserRole) or {}
+            if d.get("ozlink_deferred_files_summary"):
+                parent_item.takeChild(idx)
+            idx -= 1
+
     def _try_add_single_allocation_descendant_to_future_model(
         self,
         move,
@@ -26724,14 +26829,29 @@ class MainWindow(QMainWindow):
         source_root_path = self._canonical_source_projection_path(self._tree_item_path(source_root_data))
         source_root_segments = self._path_segments(source_root_path)
         added_count = 0
+        descendants_full = self._collect_source_descendants_for_projection(source_root_data, move)
+        eager, defer_mode, deferred_file_n, total_n = self._destination_partition_descendants_for_projection_files(
+            descendants_full
+        )
+        if defer_mode:
+            self._log_restore_phase(
+                "destination_projection_deferred_file_mode",
+                allocation_destination_path=allocation_destination_path,
+                source_path=source_root_path,
+                threshold=self._destination_projection_defer_files_threshold(),
+                total_descendants=int(total_n),
+                deferred_file_count=int(deferred_file_n),
+                eager_folder_descendants=len(eager),
+            )
         self._log_restore_phase(
             "destination_allocation_descendant_projection_started",
             allocation_destination_path=allocation_destination_path,
             source_path=source_root_path,
             added_count=0,
+            defer_files_mode=bool(defer_mode),
         )
 
-        for descendant_data in self._collect_source_descendants_for_projection(source_root_data, move):
+        for descendant_data in eager:
             if self._try_add_single_allocation_descendant_to_future_model(
                 move,
                 model_nodes,
@@ -26745,11 +26865,25 @@ class MainWindow(QMainWindow):
             ):
                 added_count += 1
 
+        if defer_mode:
+            faux_chunk = {
+                "defer_files_mode": True,
+                "deferred_file_count": deferred_file_n,
+                "allocation_destination_path": allocation_destination_path,
+                "allocation_node": allocation_node,
+            }
+            self._destination_add_lazy_files_summary_to_future_model(faux_chunk, model_nodes)
+            self._destination_patch_allocation_deferred_file_projection_flags(
+                model_nodes, allocation_path, deferred_file_n
+            )
+
         self._log_restore_phase(
             "destination_allocation_descendant_projection_complete",
             allocation_destination_path=allocation_destination_path,
             source_path=source_root_path,
             added_count=added_count,
+            defer_files_mode=bool(defer_mode),
+            deferred_file_count=int(deferred_file_n) if defer_mode else 0,
         )
         return added_count
 
@@ -26800,12 +26934,26 @@ class MainWindow(QMainWindow):
         allocation_destination_path = self._canonical_destination_projection_path(allocation_path)
         source_root_path = self._canonical_source_projection_path(self._tree_item_path(source_root_data))
         source_root_segments = self._path_segments(source_root_path)
-        descendants = self._collect_source_descendants_for_projection(source_root_data, move)
+        descendants_full = self._collect_source_descendants_for_projection(source_root_data, move)
+        eager, defer_mode, deferred_file_n, total_n = self._destination_partition_descendants_for_projection_files(
+            descendants_full
+        )
+        if defer_mode:
+            self._log_restore_phase(
+                "destination_projection_deferred_file_mode",
+                allocation_destination_path=allocation_destination_path,
+                source_path=source_root_path,
+                threshold=self._destination_projection_defer_files_threshold(),
+                total_descendants=int(total_n),
+                deferred_file_count=int(deferred_file_n),
+                eager_folder_descendants=len(eager),
+            )
         self._log_restore_phase(
             "destination_allocation_descendant_projection_started",
             allocation_destination_path=allocation_destination_path,
             source_path=source_root_path,
             added_count=0,
+            defer_files_mode=bool(defer_mode),
         )
         return {
             "move": move,
@@ -26814,8 +26962,11 @@ class MainWindow(QMainWindow):
             "allocation_destination_path": allocation_destination_path,
             "source_root_path": source_root_path,
             "source_root_segments": source_root_segments,
-            "descendants": descendants,
+            "descendants": eager,
             "added_count": 0,
+            "defer_files_mode": bool(defer_mode),
+            "deferred_file_count": int(deferred_file_n),
+            "total_descendant_count": int(total_n),
         }
 
     def _cancel_destination_future_async_projection(self, reason=""):
@@ -28699,11 +28850,20 @@ class MainWindow(QMainWindow):
                 i += 1
                 items_this_tick += 1
 
+            if chunk.get("defer_files_mode"):
+                self._destination_add_lazy_files_summary_to_future_model(chunk, state["model_nodes"])
+                self._destination_patch_allocation_deferred_file_projection_flags(
+                    state["model_nodes"], chunk["allocation_path"], int(chunk.get("deferred_file_count") or 0)
+                )
             self._log_restore_phase(
                 "destination_allocation_descendant_projection_complete",
                 allocation_destination_path=chunk["allocation_destination_path"],
                 source_path=chunk["source_root_path"],
                 added_count=move_added,
+                defer_files_mode=bool(chunk.get("defer_files_mode")),
+                deferred_file_count=(
+                    int(chunk.get("deferred_file_count") or 0) if chunk.get("defer_files_mode") else 0
+                ),
             )
             state["move_index"] += 1
             state["current_chunk"] = None
@@ -37872,7 +38032,7 @@ class MainWindow(QMainWindow):
             if tree is not None:
                 tree.viewport().update()
             return
-        if bool(node_data.get("planned_allocation_descendant")):
+        if bool(node_data.get("planned_allocation_descendant")) and not node_data.get("ozlink_deferred_files_summary"):
 
             def _mut_desc(p):
                 p["children_loaded"] = True
@@ -37915,6 +38075,15 @@ class MainWindow(QMainWindow):
                 self._refresh_destination_item_visibility_index(ix)
             return
         self._remove_placeholder_children(ix)
+        self._destination_remove_deferred_file_summary_children_index(ix)
+        _def_fc = int(node_data.get("projected_file_descendants_deferred_count") or 0)
+        _had_deferred_files = bool(node_data.get("projected_file_descendants_deferred"))
+        if _had_deferred_files:
+            self._log_restore_phase(
+                "destination_projection_deferred_file_hydration_started",
+                item_path=self._tree_item_path(node_data)[:500],
+                deferred_file_count=_def_fc,
+            )
 
         def _on_projected_descendants_applied(applied_count: int) -> None:
             dm = getattr(self, "destination_planning_model", None)
@@ -37954,6 +38123,8 @@ class MainWindow(QMainWindow):
             def _mut_ok(p):
                 p["children_loaded"] = True
                 p["projection_unresolved_terminal"] = False
+                p.pop("projected_file_descendants_deferred", None)
+                p.pop("projected_file_descendants_deferred_count", None)
 
             dm.update_payload_for_index(ix, _mut_ok)
             self._stamp_allocation_projection_cache_metadata_index(ix, dict(ix.data(Qt.UserRole) or {}), move)
@@ -37961,6 +38132,13 @@ class MainWindow(QMainWindow):
             self._apply_tree_item_visual_state(None, ix.data(Qt.UserRole) or {})
             if tw is not None:
                 tw.viewport().update()
+            if _had_deferred_files:
+                self._log_restore_phase(
+                    "destination_projection_deferred_file_hydration_complete",
+                    item_path=self._tree_item_path(dict(ix.data(Qt.UserRole) or {}))[:500],
+                    applied_descendant_rows=int(applied_count),
+                    deferred_file_count_expected=_def_fc,
+                )
 
         if not self._enqueue_destination_descendant_apply_to_model(ix, move, _on_projected_descendants_applied):
             move_src = move.get("source", {}) or {}
@@ -38035,7 +38213,7 @@ class MainWindow(QMainWindow):
                     updated = self._stamp_allocation_projection_cache_metadata(item, dict(node_data), move_for_row)
                     self._apply_tree_item_visual_state(item, updated)
             return
-        if bool(node_data.get("planned_allocation_descendant")):
+        if bool(node_data.get("planned_allocation_descendant")) and not node_data.get("ozlink_deferred_files_summary"):
             node_data["children_loaded"] = True
             item.setData(0, Qt.UserRole, node_data)
             self._refresh_destination_item_visibility(item)
@@ -38105,6 +38283,16 @@ class MainWindow(QMainWindow):
             self._refresh_destination_item_visibility(item)
             return
         self._remove_placeholder_children(item)
+        self._destination_remove_deferred_file_summary_widget_children(item)
+        w_nd = item.data(0, Qt.UserRole) or {}
+        w_had_deferred = bool(w_nd.get("projected_file_descendants_deferred"))
+        w_def_fc = int(w_nd.get("projected_file_descendants_deferred_count") or 0)
+        if w_had_deferred:
+            self._log_restore_phase(
+                "destination_projection_deferred_file_hydration_started",
+                item_path=self._tree_item_path(w_nd)[:500],
+                deferred_file_count=w_def_fc,
+            )
         applied_count = self._apply_allocation_descendants_to_item(item, move)
         move_src = move.get("source", {}) or {}
         canonical_move_source = self._canonical_source_projection_path(move.get("source_path", ""))
@@ -38166,11 +38354,20 @@ class MainWindow(QMainWindow):
             return
         updated_node_data["children_loaded"] = True
         updated_node_data["projection_unresolved_terminal"] = False
+        updated_node_data.pop("projected_file_descendants_deferred", None)
+        updated_node_data.pop("projected_file_descendants_deferred_count", None)
         updated_node_data = self._stamp_allocation_projection_cache_metadata(item, updated_node_data, move)
         item.setData(0, Qt.UserRole, updated_node_data)
         self._refresh_destination_item_visibility(item)
         self._apply_tree_item_visual_state(item, updated_node_data)
         self.destination_tree_widget.viewport().update()
+        if w_had_deferred:
+            self._log_restore_phase(
+                "destination_projection_deferred_file_hydration_complete",
+                item_path=self._tree_item_path(updated_node_data)[:500],
+                applied_descendant_rows=int(applied_count),
+                deferred_file_count_expected=w_def_fc,
+            )
         self._log_destination_projection_ui(
             "destination_projection_ui_load_outcome",
             item=item,
