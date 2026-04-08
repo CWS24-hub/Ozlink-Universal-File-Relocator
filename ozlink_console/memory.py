@@ -10,8 +10,13 @@ from pathlib import Path
 from typing import Any
 
 from .logger import log_info, log_trace, log_warn
+from .version_info import APP_VERSION
 from .models import AllocationRow, ProposedFolder, SessionState, MemoryManifest
+
+# Optional sidecar written with exports / full workspace saves; older bundles omit this file.
+WORKSPACE_SNAPSHOT_SCHEMA_VERSION = 2
 from .paths import (
+    ensure_app_storage_directories,
     memory_root,
     legacy_memory_root,
     backups_root,
@@ -20,6 +25,26 @@ from .paths import (
     legacy_compatibility_root,
     user_scoped_storage_root,
 )
+
+
+def _restore_candidate_preference_score(name: str) -> int:
+    """Higher score wins when sorting fallback candidates (non-authoritative live paths)."""
+    n = str(name or "")
+    order = (
+        "python_global_primary",
+        "python_global_recovery",
+        "python_backup_latest",
+        "python_global_backup_latest",
+        "legacy_live_primary",
+        "legacy_live_recovery",
+        "legacy_backup_latest",
+    )
+    try:
+        idx = order.index(n)
+    except ValueError:
+        return 0
+    return len(order) - idx
+
 
 class MemoryManager:
     def __init__(self, *, tenant_domain: str = "", operator_upn: str = "") -> None:
@@ -49,6 +74,7 @@ class MemoryManager:
             "session": self.root / "Draft-SessionState.json",
             "session_recovery": self.root / "Draft-SessionState.recovery.json",
             "manifest": self.root / "MemoryManifest.json",
+            "workspace_snapshot": self.root / "WorkspaceSnapshot.json",
         }
         self.legacy_paths = {
             "allocations": self.legacy_root / "Draft-AllocationQueue.json",
@@ -59,9 +85,8 @@ class MemoryManager:
             "session_recovery": self.legacy_root / "Draft-SessionState.recovery.json",
             "manifest": self.legacy_root / "MemoryManifest.json",
         }
-        self.backups.mkdir(parents=True, exist_ok=True)
-        self.quarantine.mkdir(parents=True, exist_ok=True)
-        self.exports.mkdir(parents=True, exist_ok=True)
+        ensure_app_storage_directories()
+        self._ensure_memory_directories()
         self.initialize_store()
         log_info(
             "Memory roots configured.",
@@ -71,6 +96,30 @@ class MemoryManager:
             memory_scope_root=str(self.storage_scope_root),
             expected_fingerprint=self.expected_fingerprint,
         )
+
+    @property
+    def workspace_reset_backups_dir(self) -> Path:
+        """Folder for ``DraftReset_*.json`` (Backup && Reset Workspace). Kept separate from manifest rotation files in ``Backups``."""
+        return self.backups / "WorkspaceReset"
+
+    def _ensure_memory_directories(self) -> None:
+        """Ensure this manager's scope (user/tenant Memory, backups, exports, legacy read path) exists on disk."""
+        try:
+            self.storage_scope_root.mkdir(parents=True, exist_ok=True)
+            self.root.mkdir(parents=True, exist_ok=True)
+            self.backups.mkdir(parents=True, exist_ok=True)
+            self.workspace_reset_backups_dir.mkdir(parents=True, exist_ok=True)
+            self.quarantine.mkdir(parents=True, exist_ok=True)
+            self.exports.mkdir(parents=True, exist_ok=True)
+            self.legacy_root.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            log_warn(
+                "Memory directory ensure failed.",
+                error=str(exc),
+                storage_scope_root=str(self.storage_scope_root),
+                memory_root=str(self.root),
+            )
+            raise
 
     def _read_json_path(self, path: Path, fallback: Any) -> Any:
         try:
@@ -173,7 +222,10 @@ class MemoryManager:
     def _latest_backup_file(self, backup_root: Path, prefixes: tuple[str, ...], *, require_populated: bool = False) -> Path | None:
         candidates: list[Path] = []
         for prefix in prefixes:
-            candidates.extend(sorted(backup_root.glob(f"{prefix}_*.json"), key=lambda item: item.stat().st_mtime, reverse=True))
+            candidates.extend(backup_root.glob(f"{prefix}_*.json"))
+        # Backup file names are timestamped (`<prefix>_YYYYMMDD-HHMMSS-fff.json`), so name sort
+        # is enough and avoids thousands of expensive stat() calls on slow/cloud-backed folders.
+        candidates.sort(key=lambda item: item.name, reverse=True)
 
         for path in candidates:
             if not require_populated:
@@ -267,6 +319,22 @@ class MemoryManager:
                 backup_allocations,
                 backup_proposed,
             ))
+
+        # Startup fast-path: if active Python-scope memory already has a populated candidate,
+        # skip global/legacy scans. Those scans are only needed for migration/fallback and can
+        # be very slow on large OneDrive-backed backup folders.
+        has_local_populated = any(
+            bool(c.get("populated")) and str(c.get("name", "")).startswith("python_live_")
+            for c in candidates
+        )
+        if has_local_populated:
+            log_trace(
+                "memory",
+                "discover_restore_candidates_fast_path",
+                candidate_count=len(candidates),
+                candidate_names=[str(c.get("name", "")) for c in candidates],
+            )
+            return candidates
 
         global_root = memory_root()
         if self.root != global_root:
@@ -368,20 +436,62 @@ class MemoryManager:
                     )
                     return None, f"no user-scoped memory candidates for {self.expected_fingerprint}"
 
+        primary = next((c for c in inspected if str(c.get("name", "")) == "python_live_primary"), None)
+        recovery = next((c for c in inspected if str(c.get("name", "")) == "python_live_recovery"), None)
+
+        if primary and primary.get("valid"):
+            selected = primary
+            reason = (
+                "authoritative_python_live_primary "
+                f"valid={selected.get('valid')} populated={selected.get('populated')} "
+                f"allocations={selected.get('allocation_count', 0)} "
+                f"proposed={selected.get('proposed_count', 0)} "
+                f"timestamp_sort_value={selected.get('timestamp_sort_value', float('-inf'))}"
+            )
+            log_info(
+                "Restore candidate selected (live primary is authoritative).",
+                selected_name=str(selected.get("name", "")),
+                allocation_count=int(selected.get("allocation_count", 0) or 0),
+                proposed_count=int(selected.get("proposed_count", 0) or 0),
+                populated=bool(selected.get("populated")),
+                stale_backup_skipped=True,
+            )
+            log_trace("memory", "select_restore_candidate", selected_name="python_live_primary", reason_excerpt=reason[:400])
+            return selected, reason
+
+        if recovery and recovery.get("valid"):
+            selected = recovery
+            reason = (
+                "authoritative_python_live_recovery "
+                f"valid={selected.get('valid')} populated={selected.get('populated')} "
+                f"allocations={selected.get('allocation_count', 0)} "
+                f"proposed={selected.get('proposed_count', 0)} "
+                f"timestamp_sort_value={selected.get('timestamp_sort_value', float('-inf'))}"
+            )
+            log_info(
+                "Restore candidate selected (live recovery is authoritative).",
+                selected_name=str(selected.get("name", "")),
+                allocation_count=int(selected.get("allocation_count", 0) or 0),
+                proposed_count=int(selected.get("proposed_count", 0) or 0),
+                populated=bool(selected.get("populated")),
+                stale_backup_skipped=True,
+            )
+            log_trace("memory", "select_restore_candidate", selected_name="python_live_recovery", reason_excerpt=reason[:400])
+            return selected, reason
+
         ranked = sorted(
             inspected,
             key=lambda candidate: (
                 1 if candidate.get("valid") else 0,
                 1 if candidate.get("populated") else 0,
-                candidate.get("allocation_count", 0) + candidate.get("proposed_count", 0),
-                1 if candidate.get("draft_id") else 0,
+                _restore_candidate_preference_score(str(candidate.get("name", ""))),
                 candidate.get("timestamp_sort_value", float("-inf")),
             ),
             reverse=True,
         )
         selected = ranked[0]
         reason = (
-            f"selected={selected.get('name')} valid={selected.get('valid')} "
+            f"fallback_selected={selected.get('name')} valid={selected.get('valid')} "
             f"populated={selected.get('populated')} "
             f"allocations={selected.get('allocation_count', 0)} "
             f"proposed={selected.get('proposed_count', 0)} "
@@ -389,6 +499,14 @@ class MemoryManager:
             f"timestamp={selected.get('timestamp')} "
             f"timestamp_kind={selected.get('timestamp_kind', 'unknown')} "
             f"timestamp_sort_value={selected.get('timestamp_sort_value', float('-inf'))}"
+        )
+        log_info(
+            "Restore candidate selected (fallback; live paths invalid or missing).",
+            selected_name=str(selected.get("name", "")),
+            allocation_count=int(selected.get("allocation_count", 0) or 0),
+            proposed_count=int(selected.get("proposed_count", 0) or 0),
+            populated=bool(selected.get("populated")),
+            stale_backup_skipped=False,
         )
         log_trace(
             "memory",
@@ -644,11 +762,7 @@ class MemoryManager:
         return state
 
     def save_session(self, state: SessionState) -> None:
-        existing_raw = self._read_json_path(self.paths["session"], {})
         payload = state.to_dict()
-        if isinstance(existing_raw, dict):
-            existing_raw.update(payload)
-            payload = existing_raw
 
         self._write_json_safely(
             self.paths["session"],
@@ -659,6 +773,29 @@ class MemoryManager:
             label="SessionState",
         )
         log_trace("memory", "save_session", draft_id_excerpt=str(getattr(state, "DraftId", "") or "")[:40])
+
+    def write_workspace_snapshot(self, payload: dict[str, Any]) -> None:
+        """Replace ``WorkspaceSnapshot.json`` entirely (no merge with any prior JSON on disk)."""
+        if not isinstance(payload, dict):
+            raise TypeError("workspace snapshot payload must be a dict")
+        data = dict(payload)
+        data.setdefault("schema_version", WORKSPACE_SNAPSHOT_SCHEMA_VERSION)
+        text = json.dumps(data, indent=2, ensure_ascii=False)
+        json.loads(text)
+        path = self.paths["workspace_snapshot"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._atomic_write_text(path, text)
+        log_trace("memory", "write_workspace_snapshot", schema_version=data.get("schema_version"))
+
+    def read_workspace_snapshot_optional(self) -> dict[str, Any] | None:
+        path = self.paths["workspace_snapshot"]
+        if not path.is_file():
+            return None
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        return raw if isinstance(raw, dict) else None
 
     def save_manifest(self, manifest: MemoryManifest) -> None:
         self._backup_file(self.paths["manifest"], self.paths["manifest"].stem)
@@ -683,6 +820,103 @@ class MemoryManager:
             SessionStatePath=str(self.paths["session"]),
         )
         self.save_manifest(manifest)
+
+    def save_draft_reset_backup(self, payload: dict[str, Any]) -> Path:
+        """Persist a single verified JSON snapshot under ``Memory/Backups/WorkspaceReset`` (used before draft reset).
+
+        Stored outside ``Backups`` root so automatic ``MemoryManifest_*.json`` rotation does not bury these files.
+
+        Raises if serialization, write, or post-read verification fails so callers can abort reset.
+        """
+        if not isinstance(payload, dict):
+            raise TypeError("draft reset backup payload must be a dict")
+        payload = dict(payload)
+        payload.setdefault("schema_version", 1)
+        text = json.dumps(payload, indent=2, ensure_ascii=False)
+        json.loads(text)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+        dest_dir = self.workspace_reset_backups_dir
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        backup_path = dest_dir / f"DraftReset_{stamp}.json"
+        self._atomic_write_text(backup_path, text)
+        if not backup_path.is_file() or backup_path.stat().st_size <= 0:
+            raise OSError(f"Draft reset backup missing or empty: {backup_path}")
+        roundtrip = json.loads(backup_path.read_text(encoding="utf-8"))
+        if int(roundtrip.get("schema_version", 0) or 0) != int(payload.get("schema_version", 1) or 1):
+            raise ValueError("Draft reset backup verification failed (schema_version mismatch)")
+        log_trace(
+            "memory",
+            "draft_reset_backup_written",
+            path=str(backup_path),
+            byte_size=backup_path.stat().st_size,
+        )
+        return backup_path
+
+    def apply_draft_reset_backup(
+        self, source_path: Path
+    ) -> tuple[SessionState, list[AllocationRow], list[ProposedFolder], dict[str, Any], list[dict[str, Any]] | None]:
+        """Load a ``DraftReset_*.json`` written by :meth:`save_draft_reset_backup` and persist to active memory files.
+
+        Returns runtime-ready objects plus optional ``planned_moves`` snapshots when the backup lists them
+        (preferred over rows-only reconstruction for UI fidelity).
+        """
+        source_path = Path(source_path)
+        if not source_path.is_file():
+            raise FileNotFoundError(f"Draft reset backup not found: {source_path}")
+        raw_text = source_path.read_text(encoding="utf-8")
+        payload = json.loads(raw_text)
+        if not isinstance(payload, dict):
+            raise ValueError("Draft reset backup must be a JSON object")
+        if str(payload.get("kind", "")) != "draft_reset_backup":
+            raise ValueError(
+                f"Not a workspace reset backup (expected kind 'draft_reset_backup', got {payload.get('kind')!r})"
+            )
+        if int(payload.get("schema_version", 0) or 0) != 1:
+            raise ValueError(f"Unsupported draft reset backup schema_version: {payload.get('schema_version')!r}")
+
+        session_payload = payload.get("session")
+        if not isinstance(session_payload, dict):
+            raise ValueError("Draft reset backup missing 'session' object")
+
+        session_dict = dict(self._normalize_imported_session_payload(session_payload))
+        if self.expected_fingerprint:
+            session_dict["SessionFingerprint"] = self.expected_fingerprint
+        if not str(session_dict.get("LastSavedUtc", "") or "").strip():
+            session_dict["LastSavedUtc"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+        session_state = SessionState.from_dict(session_dict)
+
+        alloc_raw = self._normalize_imported_allocations_payload(payload.get("allocations") or [])
+        if not isinstance(alloc_raw, list):
+            alloc_raw = []
+        allocations = [AllocationRow.from_dict(x) for x in alloc_raw if isinstance(x, dict)]
+
+        proposed_raw = self._normalize_imported_proposed_payload(payload.get("proposed_folders") or [])
+        if not isinstance(proposed_raw, list):
+            proposed_raw = []
+        proposed = [ProposedFolder.from_dict(x) for x in proposed_raw if isinstance(x, dict)]
+
+        self.save_session(session_state)
+        self.save_allocations(allocations, allow_empty=True)
+        self.save_proposed(proposed, allow_empty=True)
+        fp = str(session_state.SessionFingerprint or self.expected_fingerprint or "")
+        self.refresh_manifest(draft_id=str(session_state.DraftId or ""), fingerprint=fp, status="Healthy")
+
+        pm = payload.get("planned_moves")
+        planned_moves_out: list[dict[str, Any]] | None = None
+        if isinstance(pm, list) and pm:
+            planned_moves_out = [x for x in pm if isinstance(x, dict)]
+
+        log_info(
+            "Memory draft reset backup applied to active store.",
+            source=str(source_path),
+            draft_id=str(session_state.DraftId or ""),
+            allocation_count=len(allocations),
+            proposed_count=len(proposed),
+            planned_moves_snapshot_count=len(planned_moves_out or []),
+        )
+        log_trace("memory", "apply_draft_reset_backup", source_excerpt=str(source_path)[-100:])
+        return session_state, allocations, proposed, session_dict, planned_moves_out
 
     def export_bundle(self, reason: str = "Manual", destination: Path | None = None) -> Path:
         if destination is None:
@@ -745,6 +979,19 @@ class MemoryManager:
                     payload = self._normalize_imported_proposed_payload(payload)
                 self._atomic_write_text(target, json.dumps(payload, indent=2))
 
+        ws_src = source_folder / "WorkspaceSnapshot.json"
+        if ws_src.is_file():
+            try:
+                ws_payload = json.loads(ws_src.read_text(encoding="utf-8"))
+                if isinstance(ws_payload, dict):
+                    self._atomic_write_text(
+                        self.paths["workspace_snapshot"],
+                        json.dumps(ws_payload, indent=2, ensure_ascii=False),
+                    )
+                    log_info("WorkspaceSnapshot.json imported with bundle.", source=str(ws_src))
+            except Exception as exc:
+                log_warn("WorkspaceSnapshot.json import skipped.", error=str(exc))
+
         session_payload = self._read_json_path(self.paths["session"], {})
         if isinstance(session_payload, dict):
             if self.expected_fingerprint:
@@ -801,6 +1048,7 @@ class MemoryManager:
             "CreatedOn": datetime.now().isoformat(timespec="seconds"),
             "LastUpdatedOn": datetime.now().isoformat(timespec="seconds"),
             "Version": "Python-PySide6-v1",
+            "AppVersion": APP_VERSION,
         }
         from .paths import requests_root
         out = requests_root() / f"{request_id}.json"

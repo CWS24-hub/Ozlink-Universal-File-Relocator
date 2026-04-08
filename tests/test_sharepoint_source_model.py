@@ -18,7 +18,7 @@ class SharePointSourceTreeModelTests(unittest.TestCase):
         m = SharePointSourceTreeModel()
         m.reset_root_payloads(
             [
-                {"id": "r1", "name": "Root", "is_folder": True, "drive_id": "d1", "tree_role": "source", "base_display_label": "Folder: Root"},
+                {"id": "r1", "name": "Root", "is_folder": True, "drive_id": "d1", "tree_role": "source", "base_display_label": "Root"},
             ]
         )
         ix = m.find_index_by_drive_item("d1", "r1")
@@ -36,7 +36,7 @@ class SharePointSourceTreeModelTests(unittest.TestCase):
                     "is_folder": True,
                     "drive_id": "d",
                     "tree_role": "source",
-                    "base_display_label": "Folder: P",
+                    "base_display_label": "P",
                 },
             ]
         )
@@ -50,7 +50,7 @@ class SharePointSourceTreeModelTests(unittest.TestCase):
                     "is_folder": False,
                     "drive_id": "d",
                     "tree_role": "source",
-                    "base_display_label": "File: C",
+                    "base_display_label": "C",
                 },
             ],
         )
@@ -59,6 +59,47 @@ class SharePointSourceTreeModelTests(unittest.TestCase):
         self.assertEqual(m.rowCount(p), 1)
         pl0 = m.index(0, 0, p).data(Qt.UserRole) or {}
         self.assertTrue(pl0.get("placeholder"))
+
+    def test_canonical_path_index_lookup(self):
+        def key_fn(pl):
+            return str(pl.get("item_path", "") or "").strip()
+
+        m = SharePointSourceTreeModel(source_index_key_fn=key_fn)
+        m.reset_root_payloads(
+            [
+                {
+                    "id": "root",
+                    "name": "Root",
+                    "is_folder": True,
+                    "drive_id": "d",
+                    "tree_role": "source",
+                    "base_display_label": "Root",
+                    "item_path": "Sites\\Lib\\Root",
+                },
+            ]
+        )
+        ix = m.find_index_for_canonical_source_path("Sites\\Lib\\Root")
+        self.assertTrue(ix.isValid())
+        self.assertEqual((ix.data(Qt.UserRole) or {}).get("id"), "root")
+
+        p = m.index(0, 0, QModelIndex())
+        m.replace_all_children(
+            p,
+            [
+                {
+                    "id": "c1",
+                    "name": "Child",
+                    "is_folder": False,
+                    "drive_id": "d",
+                    "tree_role": "source",
+                    "base_display_label": "Child",
+                    "item_path": "Sites\\Lib\\Root\\Child",
+                },
+            ],
+        )
+        cix = m.find_index_for_canonical_source_path("Sites\\Lib\\Root\\Child")
+        self.assertTrue(cix.isValid())
+        self.assertEqual((cix.data(Qt.UserRole) or {}).get("id"), "c1")
 
 
 if __name__ == "__main__":
