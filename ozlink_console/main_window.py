@@ -8767,6 +8767,49 @@ class MainWindow(QMainWindow):
             f"Workspace reset complete. Backup saved to:\n{backup_path}",
         )
 
+    def _import_ok_trace_enabled(self) -> bool:
+        v = str(os.environ.get("OZLINK_IMPORT_OK_TRACE", "") or "").strip().lower()
+        return v in ("1", "true", "yes", "on")
+
+    def _import_ok_trace(self, phase: str, **extra) -> None:
+        if not self._import_ok_trace_enabled():
+            return
+        log_info("IMPORT_OK_TRACE", phase=phase, **extra)
+
+    def _import_ok_timing(self, phase: str, t0: float, **extra) -> None:
+        if not self._import_ok_trace_enabled():
+            return
+        ms = round((time.perf_counter() - t0) * 1000.0, 3)
+        log_info("IMPORT_OK_TIMING", phase=phase, elapsed_ms=ms, **extra)
+
+    def _run_after_import_success_dialog_idle(
+        self,
+        callback_name: str,
+        fn,
+        *,
+        delay_ms: int = 50,
+    ) -> None:
+        """Run callback after a short delay and only once the import success dialog is closed."""
+        delay_ms = max(1, int(delay_ms))
+        t0 = time.perf_counter()
+
+        def _tick() -> None:
+            if bool(getattr(self, "_import_success_dialog_active", False)):
+                self._import_ok_trace(
+                    "deferred_work_waiting_for_import_dialog_close",
+                    callback=callback_name,
+                )
+                QTimer.singleShot(delay_ms, _tick)
+                return
+            self._import_ok_trace(
+                "deferred_work_dispatch",
+                callback=callback_name,
+                ms_since_schedule=round((time.perf_counter() - t0) * 1000.0, 3),
+            )
+            self._safe_invoke(callback_name, fn)
+
+        QTimer.singleShot(delay_ms, _tick)
+
     def _show_non_modal_import_success_message(self, text: str) -> None:
         """Non-modal confirmation so the event loop keeps servicing timers (Graph enrichment, trees)."""
         box = QMessageBox(self)
@@ -8779,6 +8822,25 @@ class MainWindow(QMainWindow):
             box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         except Exception:
             pass
+        t_show = time.perf_counter()
+        self._import_success_dialog_active = True
+        self._import_ok_trace("success_dialog_show")
+
+        def _on_finished(result: int) -> None:
+            self._import_success_dialog_active = False
+            self._import_ok_timing(
+                "success_dialog_finished",
+                t_show,
+                result=int(result),
+                seconds_since_import_t0=(
+                    round(time.perf_counter() - float(self._import_ok_trace_import_t0), 4)
+                    if getattr(self, "_import_ok_trace_import_t0", None) is not None
+                    else None
+                ),
+            )
+            self._import_ok_trace("success_dialog_closed", result=int(result))
+
+        box.finished.connect(_on_finished)
         box.show()
 
     def _handle_import_draft(self):
@@ -8790,6 +8852,10 @@ class MainWindow(QMainWindow):
         self._graph_linkage_enrich_busy_skips = 0
         self._destination_deferred_reconcile_burst_pending = False
         self._reset_projection_delta_coalesce_state()
+        _import_t0 = time.perf_counter()
+        self._import_ok_trace_import_t0 = _import_t0
+        self._import_ok_trace_graph_tick_logged = False
+        self._import_ok_trace("import_handler_enter")
         try:
             source_file, _ = QFileDialog.getOpenFileName(
                 self,
@@ -8804,14 +8870,17 @@ class MainWindow(QMainWindow):
             else:
                 source_folder = QFileDialog.getExistingDirectory(self, "Import Draft Bundle Folder")
                 if not source_folder:
+                    self._import_ok_trace("import_handler_cancelled_no_folder")
                     return
                 self.memory_manager.import_bundle(Path(source_folder))
                 source_description = source_folder
+            self._import_ok_timing("after_bundle_import_io", _import_t0)
             self._import_rehydration_verify_pending = True
             self._import_tree_reload_retry_used = False
             self._close_post_import_graph_enrichment_generator()
             self._post_import_graph_enrich_run_id += 1
             self._load_draft_shell_into_runtime()
+            self._import_ok_timing("after_load_draft_shell_into_runtime", _import_t0)
             _cand = self._memory_restore_candidate if isinstance(self._memory_restore_candidate, dict) else {}
             log_info(
                 "planning_state_snapshot",
@@ -8829,9 +8898,12 @@ class MainWindow(QMainWindow):
                 **self._graph_linkage_audit_for_log(_audit_import),
             )
             self._apply_graph_linkage_banner_from_audit(_audit_import, phase="import_after_shell_load")
+            self._import_ok_timing("after_import_shell_load_audit_banner", _import_t0)
             _import_graph_enrich_async = False
             if self.current_session_context.get("connected"):
+                _t_sel = time.perf_counter()
                 self._apply_restored_selector_state()
+                self._import_ok_timing("after_apply_restored_selector_state", _import_t0, block_ms=round((time.perf_counter() - _t_sel) * 1000.0, 3))
                 # Enrich missing Graph ids using the same logic as ensure_planned_moves_resolved_via_graph,
                 # but sliced across event-loop ticks so the UI stays responsive (see _schedule_post_import_graph_enrichment).
                 try:
@@ -8863,9 +8935,13 @@ class MainWindow(QMainWindow):
                 **self._graph_linkage_audit_for_log(_audit_final),
             )
             self._apply_graph_linkage_banner_from_audit(_audit_final, phase="import_after_rehydration")
+            _t_fin = time.perf_counter()
             self._finalize_import_workspace_snapshot_hydration(_audit_final, source=source_description)
+            self._import_ok_timing("after_finalize_import_workspace_snapshot_hydration", _import_t0, block_ms=round((time.perf_counter() - _t_fin) * 1000.0, 3))
             log_info("Draft import completed.", source=source_description)
+            _t_req = time.perf_counter()
             self.refresh_requests_page()
+            self._import_ok_timing("after_refresh_requests_page", _import_t0, block_ms=round((time.perf_counter() - _t_req) * 1000.0, 3))
             if _import_graph_enrich_async:
                 _import_ok_msg = (
                     "Draft bundle imported.\n\n"
@@ -8880,9 +8956,12 @@ class MainWindow(QMainWindow):
                 _import_ok_msg = "Draft bundle imported."
                 if hasattr(self, "planned_moves_status") and self.planned_moves_status is not None:
                     self.planned_moves_status.setText("Draft imported.")
+            self._import_ok_trace("before_show_success_dialog", graph_enrich_async=bool(_import_graph_enrich_async))
             self._show_non_modal_import_success_message(_import_ok_msg)
+            self._import_ok_timing("import_handler_exit_after_show_success_dialog", _import_t0)
         except Exception as exc:
             self._import_rehydration_verify_pending = False
+            self._import_ok_trace("import_handler_exception", error=str(exc))
             log_error("Draft import failed.", error=str(exc), source=source_file if 'source_file' in locals() else source_folder)
             QMessageBox.warning(self, "Import Draft", "Could not import the selected draft bundle.")
 
@@ -13937,10 +14016,12 @@ class MainWindow(QMainWindow):
                     planned_moves_count=len(self.planned_moves or []),
                     proposed_folders_count=len(self.proposed_folders or []),
                 )
-            # Phase 4 must not use QTimer.singleShot(0): long synchronous post-restore work
-            # (expanded-path replay, allocation projection Graph calls on the UI thread) can
-            # starve the timer for minutes, leaving restore_in_progress stuck and the app frozen.
-            self._safe_invoke("phase4_destination_overlay_immediate", self._post_login_restore_phase4)
+            # Defer phase-4 to keep the success dialog responsive while visible.
+            self._run_after_import_success_dialog_idle(
+                "phase4_destination_overlay_deferred",
+                self._post_login_restore_phase4,
+                delay_ms=50,
+            )
             self._log_restore_phase("phase2_post_login_restore_exit")
 
     def _schedule_post_login_restore_phase4_if_pending(self) -> None:
@@ -13951,94 +14032,108 @@ class MainWindow(QMainWindow):
             return
         if self._restore_abort_active():
             return
-        self._safe_invoke(
-            "phase4_destination_overlay_after_destination_ui",
-            self._post_login_restore_phase4,
+        t0 = time.perf_counter()
+        imp_t0 = getattr(self, "_import_ok_trace_import_t0", None)
+        self._import_ok_trace(
+            "phase4_reschedule_scheduled",
+            seconds_since_import_start=round(t0 - float(imp_t0), 4) if imp_t0 is not None else None,
         )
 
-    def _post_login_restore_phase4(self):
-        if self._restore_abort_active():
-            self._log_restore_phase(
-                "phase4_destination_overlay skipped",
-                reason="restore_abort_mode",
-                restore_abort_reason=str(getattr(self, "_restore_abort_reason", "") or ""),
-            )
-            self._finalize_memory_restore_if_ready("phase4_skipped_restore_abort")
-            return
-        if not self._restore_destination_overlay_pending:
-            self._log_restore_phase("phase4_destination_overlay skipped", reason="no proposed folders pending")
-            self._finalize_memory_restore_if_ready("phase4_no_overlay_pending")
-            return
+        self._run_after_import_success_dialog_idle(
+            "phase4_destination_overlay_after_destination_ui",
+            self._post_login_restore_phase4,
+            delay_ms=50,
+        )
+        self._import_ok_timing("phase4_reschedule_deferred_tick_exit", t0)
 
+    def _post_login_restore_phase4(self):
+        _ph4_t0 = time.perf_counter()
+        self._import_ok_trace("post_login_restore_phase4_enter")
         try:
-            dest_tree = getattr(self, "destination_tree_widget", None)
-            destination_ready = bool(dest_tree is not None and self._planning_tree_top_level_count(dest_tree) > 0)
-            if not destination_ready:
+            if self._restore_abort_active():
                 self._log_restore_phase(
                     "phase4_destination_overlay skipped",
-                    reason="destination tree not ready",
-                    top_level_count=self._planning_tree_top_level_count(dest_tree),
+                    reason="restore_abort_mode",
+                    restore_abort_reason=str(getattr(self, "_restore_abort_reason", "") or ""),
                 )
+                self._finalize_memory_restore_if_ready("phase4_skipped_restore_abort")
                 return
-            if not self._destination_root_bind_is_authoritative():
-                self._restore_destination_overlay_pending = True
-                self._log_restore_phase(
-                    "destination_replay_deferred_until_final_root_bind",
-                    reason="destination_root_bind_not_authoritative_yet",
-                    planned_moves_count=len(self.planned_moves),
-                    proposed_folders_count=len(self.proposed_folders),
-                    active_request_signature=self.active_root_request_signatures.get("destination"),
-                    loaded_request_signature=self.loaded_root_request_signatures.get("destination"),
-                )
+            if not self._restore_destination_overlay_pending:
+                self._log_restore_phase("phase4_destination_overlay skipped", reason="no proposed folders pending")
+                self._finalize_memory_restore_if_ready("phase4_no_overlay_pending")
                 return
 
-            applied_count = 0
-            if getattr(self, "_sharepoint_lazy_mode", False):
+            try:
+                dest_tree = getattr(self, "destination_tree_widget", None)
+                destination_ready = bool(dest_tree is not None and self._planning_tree_top_level_count(dest_tree) > 0)
+                if not destination_ready:
+                    self._log_restore_phase(
+                        "phase4_destination_overlay skipped",
+                        reason="destination tree not ready",
+                        top_level_count=self._planning_tree_top_level_count(dest_tree),
+                    )
+                    return
+                if not self._destination_root_bind_is_authoritative():
+                    self._restore_destination_overlay_pending = True
+                    self._log_restore_phase(
+                        "destination_replay_deferred_until_final_root_bind",
+                        reason="destination_root_bind_not_authoritative_yet",
+                        planned_moves_count=len(self.planned_moves),
+                        proposed_folders_count=len(self.proposed_folders),
+                        active_request_signature=self.active_root_request_signatures.get("destination"),
+                        loaded_request_signature=self.loaded_root_request_signatures.get("destination"),
+                    )
+                    return
+
+                applied_count = 0
+                if getattr(self, "_sharepoint_lazy_mode", False):
+                    self._sync_restore_destination_overlay_pending_from_unresolved_queues()
+                    self._log_restore_phase(
+                        "phase4_destination_overlay skipped",
+                        reason="lazy_mode_uses_restore_queue",
+                        top_level_count=self._planning_tree_top_level_count(dest_tree),
+                        queue_size=self._unresolved_proposed_queue_size(),
+                        allocation_queue_size=self._unresolved_allocation_queue_size(),
+                    )
+                    self._finalize_memory_restore_if_ready("phase4_lazy_mode_queue")
+                    return
+                for top_row in self._iter_destination_top_level_rows():
+                    applied_count += self._apply_proposed_children_to_item(top_row)
+                applied_count += self._replay_unresolved_proposed_overlay("phase4_destination_overlay")
+                applied_count += self._replay_unresolved_allocation_overlay("phase4_destination_allocation_overlay")
+                applied_count += self._reconcile_destination_semantic_duplicates_maybe_deferred(
+                    "phase4_destination_overlay"
+                )
+                if not getattr(self, "_sharepoint_lazy_mode", False):
+                    # Prefer chunked projection/bind during restore to avoid long UI
+                    # blocking "merge/materialize" work on the main thread.
+                    applied_count += self._materialize_destination_future_model(
+                        "phase4_destination_overlay",
+                        allow_defer=True,
+                        prefer_chunked_projection=True,
+                        narrow_restore_real_snapshot=getattr(
+                            self, "_restore_narrow_destination_future_snapshot_once", False
+                        ),
+                    )
                 self._sync_restore_destination_overlay_pending_from_unresolved_queues()
                 self._log_restore_phase(
-                    "phase4_destination_overlay skipped",
-                    reason="lazy_mode_uses_restore_queue",
-                    top_level_count=self._planning_tree_top_level_count(dest_tree),
-                    queue_size=self._unresolved_proposed_queue_size(),
-                    allocation_queue_size=self._unresolved_allocation_queue_size(),
+                    "phase4_destination_overlay applied",
+                    proposed_folders=len(self.proposed_folders),
+                    applied_count=applied_count,
+                    visible_proposed_count=self._count_visible_destination_proposed_nodes(),
                 )
-                self._finalize_memory_restore_if_ready("phase4_lazy_mode_queue")
-                return
-            for top_row in self._iter_destination_top_level_rows():
-                applied_count += self._apply_proposed_children_to_item(top_row)
-            applied_count += self._replay_unresolved_proposed_overlay("phase4_destination_overlay")
-            applied_count += self._replay_unresolved_allocation_overlay("phase4_destination_allocation_overlay")
-            applied_count += self._reconcile_destination_semantic_duplicates_maybe_deferred(
-                "phase4_destination_overlay"
-            )
-            if not getattr(self, "_sharepoint_lazy_mode", False):
-                # Prefer chunked projection/bind during restore to avoid long UI
-                # blocking "merge/materialize" work on the main thread.
-                applied_count += self._materialize_destination_future_model(
-                    "phase4_destination_overlay",
-                    allow_defer=True,
-                    prefer_chunked_projection=True,
-                    narrow_restore_real_snapshot=getattr(
-                        self, "_restore_narrow_destination_future_snapshot_once", False
-                    ),
+                self._log_restore_state_snapshot(
+                    "restore_post_bind_counts",
+                    destination_replay_invoked=True,
+                    applied_count=applied_count,
+                    visible_proposed_count=self._count_visible_destination_proposed_nodes(),
                 )
-            self._sync_restore_destination_overlay_pending_from_unresolved_queues()
-            self._log_restore_phase(
-                "phase4_destination_overlay applied",
-                proposed_folders=len(self.proposed_folders),
-                applied_count=applied_count,
-                visible_proposed_count=self._count_visible_destination_proposed_nodes(),
-            )
-            self._log_restore_state_snapshot(
-                "restore_post_bind_counts",
-                destination_replay_invoked=True,
-                applied_count=applied_count,
-                visible_proposed_count=self._count_visible_destination_proposed_nodes(),
-            )
-        except Exception as exc:
-            self._log_restore_exception("phase4_destination_overlay", exc)
+            except Exception as exc:
+                self._log_restore_exception("phase4_destination_overlay", exc)
+            finally:
+                self._finalize_memory_restore_if_ready("phase4_complete")
         finally:
-            self._finalize_memory_restore_if_ready("phase4_complete")
+            self._import_ok_timing("post_login_restore_phase4_exit", _ph4_t0)
 
     def _memory_restore_apply_finalize_success(self, reason: str = "") -> None:
         """Apply the normal success-path side effects of memory restore finalize."""
@@ -43045,11 +43140,23 @@ class MainWindow(QMainWindow):
             run_id=run_id,
             source=self._post_import_graph_enrich_source_description,
         )
-        QTimer.singleShot(0, partial(self._advance_post_import_graph_enrichment_tick, run_id))
+        self._run_after_import_success_dialog_idle(
+            f"post_import_graph_enrichment_first_tick_{run_id}",
+            partial(self._advance_post_import_graph_enrichment_tick, run_id),
+            delay_ms=50,
+        )
 
     def _advance_post_import_graph_enrichment_tick(self, run_id: int) -> None:
         if run_id != int(self._post_import_graph_enrich_run_id):
             return
+        if self._import_ok_trace_enabled() and not getattr(self, "_import_ok_trace_graph_tick_logged", False):
+            self._import_ok_trace_graph_tick_logged = True
+            imp_t0 = getattr(self, "_import_ok_trace_import_t0", None)
+            self._import_ok_trace(
+                "post_import_graph_enrichment_first_tick",
+                run_id=run_id,
+                seconds_since_import_start=round(time.perf_counter() - float(imp_t0), 4) if imp_t0 is not None else None,
+            )
         g = self._post_import_graph_enrich_generator
         if g is None:
             return
