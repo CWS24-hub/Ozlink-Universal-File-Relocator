@@ -2804,6 +2804,10 @@ class MainWindow(QMainWindow):
         self._destination_tree_scroll_idle_timer.setSingleShot(True)
         self._destination_tree_scroll_idle_timer.timeout.connect(self._destination_on_destination_tree_scroll_idle)
         self._destination_indicator_refresh_deferred_for_scroll = False
+        # Selective deferral: destination folder-load structural replace during scroll (off-screen only).
+        self._destination_scroll_defer_user_expand_keys = set()
+        self._destination_deferred_folder_structural_by_key = {}
+        self._destination_deferred_folder_structural_order = []
         self._dest_scroll_profile_enabled = QSettings().value("debug/dest_scroll_profile", True, type=bool)
         self._dest_scroll_profiler = None
         try:
@@ -2830,6 +2834,16 @@ class MainWindow(QMainWindow):
         self._source_expand_all_folder_load_log_counter = 0
         self._expand_all_status_last_update_ms = {"source": 0, "destination": 0}
         self._destination_expand_all_after_full_tree = False
+        # Destination model-view expand-all: sequential projection-aware mode (single active folder).
+        # Set False to use the legacy BFS tick (multiple inflight loads per tick).
+        self._destination_expand_all_sequential_mode = True
+        self._destination_expand_all_seq_active_sp = ""
+        self._destination_expand_all_seq_expand_dispatched = False
+        self._destination_expand_all_seq_wait_started = None
+        self._destination_expand_all_seq_last_wait_log_key = None
+        self._destination_expand_all_dfs_roots_deque = deque()
+        self._destination_expand_all_dfs_stack = []
+        self._destination_expand_all_seq_run_id = 0
         self._workspace_restore_expanded_all_intent = {"source": False, "destination": False}
         # Destination expand-all / loaded-branch state: avoid full-tree BFS on the GUI thread (see
         # _destination_tick_loaded_branch_state_recompute).
@@ -2886,6 +2900,7 @@ class MainWindow(QMainWindow):
         # projected_descendant rows are deferred until the user expands the allocation
         # (folders still projected eagerly for structure). planned_moves stays authoritative.
         self._destination_projection_defer_files_descendant_threshold = 256
+        self._destination_structure_blocked_reason = ""
         self.current_profile = None
         self.discovered_sites = []
         self.planned_moves = []
@@ -6475,6 +6490,7 @@ class MainWindow(QMainWindow):
                 "Building destination preview",
                 "Merging destination",
                 "Destination preview",
+                "This document library is empty",
             )
             if not any(message_text.startswith(prefix) for prefix in allowed_prefixes):
                 return
@@ -10636,6 +10652,30 @@ class MainWindow(QMainWindow):
             and self._destination_full_tree_completed_drive_id == current_drive_id
         )
 
+    def _destination_structure_ready(self, reason: str = "", *, log_waiting: bool = False) -> bool:
+        """Structural readiness invariant: destination topology must be complete before publish/expand traversal."""
+        blocked_reason = str(getattr(self, "_destination_structure_blocked_reason", "") or "")
+        ready = bool(self._destination_full_tree_ready()) and not bool(blocked_reason)
+        if ready:
+            if is_dev_mode():
+                log_info(
+                    "destination_structure_ready",
+                    reason=str(reason or "")[:160],
+                    full_tree_ready=True,
+                    completed_drive_id=str(getattr(self, "_destination_full_tree_completed_drive_id", "") or "")[:80],
+                )
+            return True
+        if log_waiting:
+            log_info(
+                "destination_structure_waiting",
+                reason=str(reason or "")[:160],
+                full_tree_ready=False,
+                blocked_reason=blocked_reason[:200],
+                requested_drive_id=str(getattr(self, "_destination_full_tree_requested_drive_id", "") or "")[:80],
+                completed_drive_id=str(getattr(self, "_destination_full_tree_completed_drive_id", "") or "")[:80],
+            )
+        return False
+
     def _should_park_deferred_materialize_for_full_tree(self, reason) -> bool:
         """True while destination full-tree snapshot is loading; idle timer retries would only re-hit waiting_for_full_tree."""
         r = str(reason or "")
@@ -10793,6 +10833,43 @@ class MainWindow(QMainWindow):
             "pending_destination_folder_loads": len(self.pending_folder_loads.get("destination") or set()),
         }
 
+    def _destination_expand_burst_cancel_for_strict_sequential(
+        self, *, reason: str, schedule_continue: bool = True
+    ) -> None:
+        """Stop debounced burst and abandon an in-flight burst ctx so sequential expand-all owns progression."""
+        if not bool(self._expand_all_pending.get("destination")):
+            return
+        if not bool(getattr(self, "_destination_expand_all_sequential_mode", True)):
+            return
+        t = getattr(self, "_destination_expand_burst_timer", None)
+        if isinstance(t, QTimer) and t.isActive():
+            t.stop()
+        self._destination_expand_burst_queue.clear()
+        if self._destination_expand_burst_ctx is None:
+            return
+        ctx = self._destination_expand_burst_ctx
+        self._destination_expand_burst_ctx = None
+        run_id = int((ctx or {}).get("run_id") or 0)
+        last_trigger = str((ctx or {}).get("last_trigger") or "")
+        panel_key = "destination"
+        self._destination_expand_all_seq_log(
+            "burst_suppressed_due_to_strict_sequential",
+            reason=str(reason)[:160],
+            burst_run_id=run_id,
+            cancelled_in_flight=True,
+        )
+        if schedule_continue:
+            if self._expand_all_pending.get("destination"):
+                self._schedule_destination_expand_all_continue()
+            else:
+                self._continue_expand_all("destination", None)
+        self._refresh_tree_column_width("destination")
+        self._process_pending_destination_navigation("folder_load", trigger_path=last_trigger)
+        self._schedule_workspace_ui_persist(panel_key=panel_key)
+        if self._pending_snapshot_branch_refresh.get(panel_key) and not self._expand_all_pending.get(panel_key):
+            self._schedule_snapshot_branch_refresh(panel_key, delay_ms=0)
+        self._schedule_progress_summary_refresh()
+
     def _destination_expand_burst_should_coalesce(self, semantic_path_captured: str) -> bool:
         """True when the heavy folder_worker_success pipeline can be merged into a debounced burst."""
         if self._expand_all_pending.get("destination"):
@@ -10809,6 +10886,14 @@ class MainWindow(QMainWindow):
         return True
 
     def _destination_expand_burst_schedule(self, entry: dict) -> None:
+        if bool(self._expand_all_pending.get("destination")) and bool(
+            getattr(self, "_destination_expand_all_sequential_mode", True)
+        ):
+            self._destination_expand_all_seq_log(
+                "burst_suppressed_due_to_strict_sequential",
+                trigger_path_excerpt=str(entry.get("trigger_path_captured") or "")[:240],
+            )
+            return
         self._destination_expand_burst_queue.append(entry)
         self._destination_bump_interactive_expand_idle_full_tree_lockout(1400)
         n = len(self._destination_expand_burst_queue)
@@ -10833,6 +10918,14 @@ class MainWindow(QMainWindow):
         entries = self._destination_expand_burst_queue
         self._destination_expand_burst_queue = []
         if not entries:
+            return
+        if bool(self._expand_all_pending.get("destination")) and bool(
+            getattr(self, "_destination_expand_all_sequential_mode", True)
+        ):
+            self._destination_expand_all_seq_log(
+                "burst_suppressed_due_to_strict_sequential",
+                discarded_entries=len(entries),
+            )
             return
         self._destination_expand_burst_run_id += 1
         run_id = self._destination_expand_burst_run_id
@@ -15363,6 +15456,7 @@ class MainWindow(QMainWindow):
         self._memory_restore_background_trees = False
         self._memory_restore_complete = True
         self._suppress_autosave = False
+        log_info("restore_gate_cleared", finalization_reason=str(reason or "")[:200])
         # Stop restore-driven source expansion work once restore is finalized.
         # This prevents long-lived background source queue churn from competing
         # with user-triggered expand-all actions.
@@ -15661,6 +15755,10 @@ class MainWindow(QMainWindow):
         destination_queue_size = len(getattr(self, "_destination_restore_materialization_queue", []) or [])
         pending_destination_root_load = 1 if self.root_load_workers.get("destination") else 0
         pending_destination_folder_loads = bool(self.pending_folder_loads.get("destination"))
+        seq_dest_expand = bool(self._expand_all_pending.get("destination")) and bool(
+            getattr(self, "_destination_expand_all_sequential_mode", True)
+        )
+        folder_loads_gate_restore = pending_destination_folder_loads and not seq_dest_expand
         root_prime_pending = bool(getattr(self, "_destination_root_prime_pending", False))
         # Overlay pending can remain True after unresolved queues drain (e.g. phase4 set it earlier);
         # if there is no destination work left, clear it so restore can finalize and Reset Draft can run.
@@ -15668,7 +15766,7 @@ class MainWindow(QMainWindow):
             not unresolved_count
             and not destination_queue_size
             and not pending_destination_root_load
-            and not pending_destination_folder_loads
+            and not folder_loads_gate_restore
             and not root_prime_pending
             and getattr(self, "_restore_destination_overlay_pending", False)
         ):
@@ -15681,16 +15779,30 @@ class MainWindow(QMainWindow):
             destination_queue_size = len(getattr(self, "_destination_restore_materialization_queue", []) or [])
             pending_destination_root_load = 1 if self.root_load_workers.get("destination") else 0
             pending_destination_folder_loads = bool(self.pending_folder_loads.get("destination"))
+            folder_loads_gate_restore = pending_destination_folder_loads and not seq_dest_expand
             root_prime_pending = bool(getattr(self, "_destination_root_prime_pending", False))
         destination_busy = bool(
             unresolved_count
             or destination_queue_size
             or getattr(self, "_restore_destination_overlay_pending", False)
             or root_prime_pending
-            or pending_destination_folder_loads
+            or folder_loads_gate_restore
             or pending_destination_root_load
         )
         if destination_busy:
+            if getattr(self, "_memory_restore_in_progress", False) and not getattr(
+                self, "_restore_finalization_deferred_active", False
+            ):
+                log_info(
+                    "restore_gate_waiting",
+                    reason=str(reason or "")[:200],
+                    unresolved_count=int(unresolved_count),
+                    destination_queue_size=int(destination_queue_size),
+                    overlay_pending=bool(getattr(self, "_restore_destination_overlay_pending", False)),
+                    root_prime_pending=bool(getattr(self, "_destination_root_prime_pending", False)),
+                    pending_destination_folder_loads=len(self.pending_folder_loads.get("destination", set())),
+                    seq_dest_expand=bool(seq_dest_expand),
+                )
             if not getattr(self, "_restore_finalization_deferred_active", False):
                 self._restore_finalization_deferred_active = True
                 self._restore_finalization_deferred_reason = str(reason or "")
@@ -16520,13 +16632,13 @@ class MainWindow(QMainWindow):
         if panel_key == "destination" and self._destination_tree_uses_model_view():
             model = getattr(self, "destination_planning_model", None)
             if model is not None:
-                model.set_empty_library_message(message or "")
-                tree.setEnabled(False)
+                model.clear()
                 self._set_tree_status_message(
                     panel_key,
                     message,
                     loading=str(message or "").lower().startswith("loading"),
                 )
+                tree.setEnabled(False)
                 if self._full_trace_enabled():
                     log_trace(
                         "tree",
@@ -16842,16 +16954,23 @@ class MainWindow(QMainWindow):
                         root_payloads.append(data)
 
                     if not root_payloads:
-                        self._set_tree_status_message(panel_key, "This library is empty.", loading=False)
-                        model.set_empty_library_message("This library is empty.")
-                        tree.setEnabled(False)
+                        log_info("destination_library_empty_detected", panel_key=panel_key, reason="snapshot_chunk_restore")
+                        self._set_tree_status_message(
+                            panel_key,
+                            "This document library is empty. Start by proposing a folder.",
+                            loading=False,
+                        )
+                        log_info("destination_empty_state_rendered", panel_key=panel_key, kind="snapshot_chunk_restore")
+                        log_info("destination_no_synthetic_root", panel_key=panel_key, top_level_count=0)
+                        tree.setEnabled(True)
                     else:
                         with _PerfExplorerTimer(
-                            "tree_snapshot_reset_root_payloads",
+                            "tree_snapshot_reset_real_graph_roots",
                             panel_key="destination",
                             root_count=len(root_payloads),
                         ):
                             model.reset_root_payloads(root_payloads)
+                            self._destination_audit_top_level_rows_for_synthetic_root(model)
                         self._set_tree_status_message(
                             panel_key,
                             f"Loading tree snapshot… ({len(root_payloads)}/{len(snapshots)})",
@@ -17273,11 +17392,18 @@ class MainWindow(QMainWindow):
                         root_payloads.append(data)
 
                     if not root_payloads:
-                        self._set_tree_status_message(panel_key, "This library is empty.", loading=False)
-                        model.set_empty_library_message("This library is empty.")
-                        tree.setEnabled(False)
+                        log_info("destination_library_empty_detected", panel_key=panel_key, reason="snapshot_restore")
+                        self._set_tree_status_message(
+                            panel_key,
+                            "This document library is empty. Start by proposing a folder.",
+                            loading=False,
+                        )
+                        log_info("destination_empty_state_rendered", panel_key=panel_key, kind="snapshot_restore")
+                        log_info("destination_no_synthetic_root", panel_key=panel_key, top_level_count=0)
+                        tree.setEnabled(True)
                     else:
                         model.reset_root_payloads(root_payloads)
+                        self._destination_audit_top_level_rows_for_synthetic_root(model)
 
                     self._finalize_tree_snapshot_restore(panel_key, snapshots, status_message)
                     return True
@@ -18934,9 +19060,12 @@ class MainWindow(QMainWindow):
                 pl = ix.data(Qt.UserRole) or {}
                 if pl.get("placeholder"):
                     continue
-                if self._destination_semantic_path(pl) == "Root":
-                    root_ix = ix
-                    break
+                if not pl.get("is_folder"):
+                    continue
+                if not str(pl.get("id") or "").strip():
+                    continue
+                root_ix = ix
+                break
             if root_ix is None or not root_ix.isValid():
                 return False
             root_data = dict(root_ix.data(Qt.UserRole) or {})
@@ -18977,8 +19106,6 @@ class MainWindow(QMainWindow):
             or bool(root_data.get("load_failed"))
             or not bool(root_data.get("id"))
         ):
-            return False
-        if self._destination_semantic_path(root_data) != "Root":
             return False
         root_has_visible_children = any(
             not ((root_item.child(index).data(0, Qt.UserRole) or {}).get("placeholder"))
@@ -19285,6 +19412,21 @@ class MainWindow(QMainWindow):
         node_data.setdefault("tree_role", "destination")
         return node_data
 
+    def _destination_audit_top_level_rows_for_synthetic_root(self, model: DestinationPlanningTreeModel) -> None:
+        """Defensive: log if a visible destination top-level row is the removed synthetic-root pattern."""
+        try:
+            for r in range(model.rowCount(QModelIndex())):
+                ix = model.index(r, 0, QModelIndex())
+                pl = ix.data(Qt.UserRole) or {}
+                if pl.get("synthetic_destination_root") or str(pl.get("id") or "") == "synthetic::destination_root":
+                    log_error(
+                        "destination_synthetic_root_unexpected",
+                        row=r,
+                        item_path_excerpt=str(pl.get("item_path") or "")[:200],
+                    )
+        except Exception:
+            pass
+
     def _apply_root_payload_to_destination_model_view(self, panel_key, items):
         tree, status = self._get_tree_and_status(panel_key)
         model = getattr(self, "destination_planning_model", None)
@@ -19297,18 +19439,33 @@ class MainWindow(QMainWindow):
             tree.setEnabled(True)
             model.clear()
             if not items:
-                self._set_tree_status_message(panel_key, "This library is empty.", loading=False)
-                model.set_empty_library_message("This library is empty.")
-                tree.setEnabled(False)
+                log_info("destination_library_empty_detected", panel_key=panel_key, reason="graph_root_bind")
+                self._set_tree_status_message(
+                    panel_key,
+                    "This document library is empty. Start by proposing a folder.",
+                    loading=False,
+                )
+                log_info("destination_empty_state_rendered", panel_key=panel_key, kind="status_label_only")
+                log_info("destination_no_synthetic_root", panel_key=panel_key, top_level_count=0)
                 self._mark_destination_real_tree_snapshot_stale()
                 return
+            log_info("destination_real_root_bind_started", panel_key=panel_key, graph_item_count=len(items))
             sorted_items = sorted(items, key=lambda value: (not value.get("is_folder", False), value.get("name", "").lower()))
-            payloads = []
+            root_payloads: List[dict] = []
+            graph_names: List[str] = []
             for it in sorted_items:
                 pl = self._destination_payload_from_graph_item(it)
-                self._apply_tree_item_visual_state(None, pl)
-                payloads.append(pl)
-            model.reset_root_payloads(payloads)
+                root_payloads.append(pl)
+                graph_names.append(str(pl.get("name") or ""))
+            model.reset_root_payloads(root_payloads)
+            self._destination_audit_top_level_rows_for_synthetic_root(model)
+            log_info(
+                "destination_real_root_top_level_names",
+                panel_key=panel_key,
+                names=[n[:120] for n in graph_names],
+                count=len(graph_names),
+            )
+            log_info("destination_no_synthetic_root", panel_key=panel_key, top_level_count=len(root_payloads))
             self._mark_destination_real_tree_snapshot_stale()
             self._set_tree_status_message(panel_key, f"{len(items)} root item(s) loaded.", loading=False)
         finally:
@@ -19420,6 +19577,11 @@ class MainWindow(QMainWindow):
         is_destination_planned_allocation = bool(self.node_is_planned_allocation(node_data))
         if node_data.get("placeholder") or (not is_folder_like and not is_destination_planned_allocation):
             return
+        log_info(
+            "destination_expand_attempt_no_structural_mutation",
+            semantic_path_excerpt=str(self._destination_semantic_path(node_data) or self._tree_item_path(node_data) or "")[:240],
+            structure_ready=bool(self._destination_structure_ready("expand_signal", log_waiting=False)),
+        )
         if self._destination_pipeline_blocks_user_expand_gesture():
             sp = self._destination_semantic_path(node_data) or self._tree_item_path(node_data)
             if sp:
@@ -19477,97 +19639,9 @@ class MainWindow(QMainWindow):
         if node_data.get("children_loaded") or node_data.get("load_failed"):
             return
 
-        drive_id = self._resolve_tree_item_drive_id(panel_key, node_data)
-        item_id = node_data.get("id", "")
-        if not drive_id or not item_id:
-            return
-
-        pending_key = f"{drive_id}:{item_id}"
-        worker_key = f"{panel_key}:{item_id}"
-        if self._folder_load_worker_thread_running(worker_key):
-            self.pending_folder_loads[panel_key].add(pending_key)
-            return
-        if pending_key in self.pending_folder_loads[panel_key]:
-            return
-
-        pending_count = len(self.pending_folder_loads.get(panel_key, set()))
-        max_inflight_loads = 3
-        if pending_count >= max_inflight_loads:
-            return
-
-        self.pending_folder_loads[panel_key].add(pending_key)
-        model = self.destination_planning_model
-        has_future_children = self._destination_parent_has_future_state_children_model(index)
-        if not has_future_children:
-            model.set_loading_children(index)
-            sp_early = self._destination_semantic_path(node_data) or self._tree_item_path(node_data) or ""
-            log_info(
-                "destination_expand_loading_placeholder_set",
-                path_kind="model_view",
-                early=True,
-                semantic_path_excerpt=str(sp_early)[:240],
-                worker_key=worker_key,
-            )
-        item_path = self._tree_item_path(node_data)
-        if item_path and item_path in self._pending_snapshot_branch_refresh.get(panel_key, set()):
-            self._snapshot_branch_refresh_baseline_by_worker[worker_key] = (
-                self._capture_child_path_set_for_destination_model_index(index)
-            )
-        preserved_children = self._preserve_destination_future_state_children_model(index)
-        if preserved_children:
-            self._destination_preserved_children_by_worker[worker_key] = preserved_children
-        if has_future_children:
-            model.set_loading_children(index)
-            sp_late = self._destination_semantic_path(node_data) or self._tree_item_path(node_data) or ""
-            log_info(
-                "destination_expand_loading_placeholder_set",
-                path_kind="model_view",
-                early=False,
-                semantic_path_excerpt=str(sp_late)[:240],
-                worker_key=worker_key,
-            )
-
-        use_cache_only = bool(
-            (
-                getattr(self, "_memory_restore_in_progress", False)
-                or getattr(self, "_suppress_autosave", False)
-            )
-            and self.graph.has_cached_drive_item_children(drive_id, item_id)
-        )
-        worker_context = {
-            "site_id": node_data.get("site_id", ""),
-            "site_name": node_data.get("site_name", ""),
-            "library_id": node_data.get("library_id", drive_id),
-            "library_name": node_data.get("library_name", ""),
-            "tree_role": panel_key,
-            "parent_item_path": node_data.get("item_path", ""),
-            "cache_only": use_cache_only,
-        }
-        worker = FolderLoadWorker(self.graph, panel_key, drive_id, item_id, worker_context)
-        pmi = QPersistentModelIndex(index)
-        worker_entry = self._register_folder_worker(
-            worker_key,
-            worker,
-            None,
-            pending_key=pending_key,
-            destination_folder_parent_persistent=pmi,
-        )
-        worker.success.connect(
-            lambda payload, worker_id=worker_entry["id"]: self._safe_invoke(
-                "folder_worker.success", self.on_folder_load_success, payload, worker_id
-            )
-        )
-        worker.error.connect(
-            lambda payload, worker_id=worker_entry["id"]: self._safe_invoke(
-                "folder_worker.error", self.on_folder_load_error, payload, worker_id
-            )
-        )
-        worker.finished.connect(
-            lambda key=worker_key, worker_id=worker_entry["id"]: self._safe_invoke(
-                "folder_worker.finished", self.on_folder_worker_finished, key, worker_id
-            )
-        )
-        worker.start()
+        route = self._destination_model_request_folder_children_load(index, triggered_by_user_expand=True)
+        if self._full_trace_enabled():
+            self._ui_trace("tree", "expand_route", panel_key=panel_key, item=None, route=route)
 
     def _destination_allocation_folder_shows_materialized_children_index(self, index: QModelIndex) -> bool:
         """True when the row has any non-placeholder child (e.g. explicit file allocations).
@@ -19799,6 +19873,136 @@ class MainWindow(QMainWindow):
                 worker_key=worker_key,
                 cache_only=use_cache_only,
             )
+        worker.start()
+        return "started"
+
+    def _destination_model_request_folder_children_load(self, index, *, triggered_by_user_expand: bool) -> str:
+        """Start a Graph folder load for a destination model row if needed (mirrors source model path).
+
+        Returns ``noop``, ``throttled``, or ``started``.
+        """
+        panel_key = "destination"
+        node_data = index.data(Qt.UserRole) or {}
+        base_label = str(node_data.get("base_display_label", "") or "").strip().lower()
+        tree_label = str(node_data.get("tree_label", "") or "").strip().lower()
+        text_label = str(node_data.get("base_display_label", "") or "").strip().lower()
+        is_folder_like = bool(
+            node_data.get("is_folder")
+            or tree_label == "folder"
+            or base_label.startswith("folder:")
+            or text_label.startswith("folder:")
+        )
+        is_destination_planned_allocation = bool(self.node_is_planned_allocation(node_data))
+        if node_data.get("placeholder") or (not is_folder_like and not is_destination_planned_allocation):
+            return "noop"
+        if node_data.get("children_loaded") or node_data.get("load_failed"):
+            return "noop"
+
+        drive_id = self._resolve_tree_item_drive_id(panel_key, node_data)
+        item_id = node_data.get("id", "")
+        if not drive_id or not item_id:
+            return "noop"
+
+        pending_key = f"{drive_id}:{item_id}"
+        worker_key = f"{panel_key}:{item_id}"
+        if self._folder_load_worker_thread_running(worker_key):
+            self.pending_folder_loads[panel_key].add(pending_key)
+            return "noop"
+        if pending_key in self.pending_folder_loads[panel_key]:
+            return "noop"
+
+        pending_count = len(self.pending_folder_loads.get(panel_key, set()))
+        max_inflight_loads = self._destination_model_expand_all_max_inflight_loads()
+        if not triggered_by_user_expand:
+            max_inflight_loads = max(3, int(max_inflight_loads or 1))
+        if pending_count >= max_inflight_loads:
+            return "throttled"
+
+        model = getattr(self, "destination_planning_model", None)
+        if model is None:
+            return "noop"
+
+        self.pending_folder_loads[panel_key].add(pending_key)
+        has_future_children = self._destination_parent_has_future_state_children_model(index)
+        if not has_future_children:
+            model.set_loading_children(index)
+            sp_early = self._destination_semantic_path(node_data) or self._tree_item_path(node_data) or ""
+            log_info(
+                "destination_expand_loading_placeholder_set",
+                path_kind="model_view",
+                early=True,
+                semantic_path_excerpt=str(sp_early)[:240],
+                worker_key=worker_key,
+            )
+        item_path = self._tree_item_path(node_data)
+        if item_path and item_path in self._pending_snapshot_branch_refresh.get(panel_key, set()):
+            self._snapshot_branch_refresh_baseline_by_worker[worker_key] = (
+                self._capture_child_path_set_for_destination_model_index(index)
+            )
+        preserved_children = self._preserve_destination_future_state_children_model(index)
+        if preserved_children:
+            self._destination_preserved_children_by_worker[worker_key] = preserved_children
+        if has_future_children:
+            model.set_loading_children(index)
+            sp_late = self._destination_semantic_path(node_data) or self._tree_item_path(node_data) or ""
+            log_info(
+                "destination_expand_loading_placeholder_set",
+                path_kind="model_view",
+                early=False,
+                semantic_path_excerpt=str(sp_late)[:240],
+                worker_key=worker_key,
+            )
+
+        log_info(
+            "destination_expand_real_folder_load_started",
+            worker_key=worker_key,
+            semantic_path_excerpt=str(
+                self._destination_semantic_path(node_data) or self._tree_item_path(node_data) or ""
+            )[:240],
+            triggered_by_user_expand=bool(triggered_by_user_expand),
+        )
+
+        use_cache_only = bool(
+            (
+                getattr(self, "_memory_restore_in_progress", False)
+                or getattr(self, "_suppress_autosave", False)
+            )
+            and self.graph.has_cached_drive_item_children(drive_id, item_id)
+        )
+        worker_context = {
+            "site_id": node_data.get("site_id", ""),
+            "site_name": node_data.get("site_name", ""),
+            "library_id": node_data.get("library_id", drive_id),
+            "library_name": node_data.get("library_name", ""),
+            "tree_role": panel_key,
+            "parent_item_path": node_data.get("item_path", ""),
+            "cache_only": use_cache_only,
+        }
+        worker = FolderLoadWorker(self.graph, panel_key, drive_id, item_id, worker_context)
+        pmi = QPersistentModelIndex(index)
+        worker_entry = self._register_folder_worker(
+            worker_key,
+            worker,
+            None,
+            pending_key=pending_key,
+            destination_folder_parent_persistent=pmi,
+        )
+        worker.success.connect(
+            lambda payload, worker_id=worker_entry["id"]: self._safe_invoke(
+                "folder_worker.success", self.on_folder_load_success, payload, worker_id
+            )
+        )
+        worker.error.connect(
+            lambda payload, worker_id=worker_entry["id"]: self._safe_invoke(
+                "folder_worker.error", self.on_folder_load_error, payload, worker_id
+            )
+        )
+        worker.finished.connect(
+            lambda key=worker_key, worker_id=worker_entry["id"]: self._safe_invoke(
+                "folder_worker.finished", self.on_folder_worker_finished, key, worker_id
+            )
+        )
+        self._destination_scroll_defer_user_expand_keys.add(worker_key)
         worker.start()
         return "started"
 
@@ -20112,8 +20316,14 @@ class MainWindow(QMainWindow):
             if self._destination_tree_uses_model_view():
                 dm = getattr(self, "destination_planning_model", None)
                 if dm is not None:
-                    for r in range(dm.rowCount(QModelIndex())):
-                        ix = dm.index(r, 0, QModelIndex())
+                    # Real library-root topology: multiple top-level rows; overlays must visit every
+                    # materialized folder (depth-first), not only QModelIndex() children.
+                    for ix in dm.iter_depth_first():
+                        pl = ix.data(Qt.UserRole) or {}
+                        if pl.get("placeholder"):
+                            continue
+                        if not bool(pl.get("is_folder", True)):
+                            continue
                         applied_count += self._apply_proposed_children_to_item(ix)
                         applied_count += self._apply_allocation_children_to_item(ix)
             else:
@@ -20132,6 +20342,12 @@ class MainWindow(QMainWindow):
                 panel_key=panel_key,
                 applied_count=applied_count,
                 visible_proposed_count=self._count_visible_destination_proposed_nodes(),
+            )
+            log_info(
+                "destination_projection_overlay_applied_to_real_root",
+                panel_key=panel_key,
+                applied_count=applied_count,
+                top_level_count=_dest_top_level_count(),
             )
             return applied_count
         except Exception as exc:
@@ -20212,16 +20428,15 @@ class MainWindow(QMainWindow):
             root_present = root_row is not None and (
                 not isinstance(root_row, QModelIndex) or root_row.isValid()
             )
-            should_prime_destination_root = (
+            should_prime_destination_top_folder = (
                 getattr(self, "_sharepoint_lazy_mode", False)
                 and root_present
-                and self._destination_semantic_path(root_data) == "Root"
                 and bool(root_data.get("is_folder"))
                 and (not bool(root_data.get("children_loaded")) or not root_has_visible_children)
                 and not bool(root_data.get("load_failed"))
                 and bool(root_data.get("id"))
             )
-            if should_prime_destination_root:
+            if should_prime_destination_top_folder:
                 load_started = self._prime_destination_root_children_after_snapshot(force=True)
                 if not load_started:
                     self._schedule_safe_timer(220, "destination_root_prime_retry", self._prime_destination_root_children_after_snapshot)
@@ -22196,6 +22411,10 @@ class MainWindow(QMainWindow):
     def _run_destination_descendant_apply_tick(self) -> None:
         if getattr(self, "_destination_descendant_apply_paused_for_finalize_alloc", False):
             return
+        # Defer structural destination-model work while user scrolls (same pattern as merge attach).
+        # Queue + _destination_descendant_apply_state are unchanged; scroll idle reschedules the tick.
+        if self._destination_tree_uses_model_view() and self._destination_user_scroll_interaction_active():
+            return
         budget_s = float(getattr(self, "_destination_descendant_apply_budget_s", 0.005) or 0.005)
         deadline = time.perf_counter() + budget_s
 
@@ -23022,6 +23241,14 @@ class MainWindow(QMainWindow):
             and self._destination_full_tree_completed_drive_id == current_drive_id
         )
         if not full_snapshot_available:
+            log_info(
+                "destination_structure_waiting",
+                reason="refresh_destination_real_tree_snapshot_partial_fallback",
+                full_snapshot_available=False,
+                merge_full_tree_snapshot=bool(merge_full_tree_snapshot),
+                requested_drive_id=str(current_drive_id or "")[:80],
+                completed_drive_id=str(getattr(self, "_destination_full_tree_completed_drive_id", "") or "")[:80],
+            )
             self._destination_real_tree_snapshot = snapshot
             self._destination_real_tree_snapshot_stale = False
             return
@@ -27948,8 +28175,46 @@ class MainWindow(QMainWindow):
             dict(source_root_data or {}),
             move,
         )
+        drive_id = source_root_data.get("drive_id", "")
+        item_id = source_root_data.get("id", "")
+        item_path = source_root_data.get("item_path", "")
         source_item = self._find_source_item_for_planned_move(move)
         base_diag = self._destination_projection_diag_payload(source_root_data, move, source_item)
+        graph_attempted = False
+        graph_error = None
+
+        # Structural truth must come from authoritative source data first (Graph/cache), not
+        # from currently visible source rows.
+        if drive_id and item_id:
+            graph_attempted = True
+            try:
+                descendants = self.graph.list_drive_subtree_items_normalized(
+                    drive_id,
+                    item_id,
+                    site_id=source_root_data.get("site_id", ""),
+                    site_name=source_root_data.get("site_name", ""),
+                    library_id=source_root_data.get("library_id", drive_id),
+                    library_name=source_root_data.get("library_name", ""),
+                    tree_role="source",
+                    parent_item_path=item_path or "/",
+                )
+                self._log_destination_projection_collect_result(
+                    descendants,
+                    branch="graph_authoritative",
+                    graph_attempted=True,
+                    graph_error=None,
+                    **base_diag,
+                )
+                return descendants
+            except Exception as exc:
+                graph_error = type(exc).__name__
+                self._log_restore_exception("collect_source_descendants_for_projection", exc)
+                self._log_restore_phase(
+                    "destination_projection_graph_failed",
+                    graph_error=graph_error,
+                    graph_attempted=True,
+                    **base_diag,
+                )
 
         if source_item is not None and self._source_subtree_fully_loaded_in_tree(source_item):
             cache_key = self._source_projection_descendants_cache_key_for_root(source_root_data)
@@ -27995,12 +28260,10 @@ class MainWindow(QMainWindow):
         drive_id = source_root_data.get("drive_id", "")
         item_id = source_root_data.get("id", "")
         item_path = source_root_data.get("item_path", "")
-        graph_attempted = False
-        graph_error = None
         # Some saved move payloads omit item_path. Graph subtree enumeration
         # only needs drive_id + item_id; use a safe default when item_path
         # is missing so projected descendant expansion can resolve.
-        if drive_id and item_id and not defer_graph_until_subtree_ready:
+        if drive_id and item_id and not graph_attempted and not defer_graph_until_subtree_ready:
             graph_attempted = True
             try:
                 descendants = self.graph.list_drive_subtree_items_normalized(
@@ -28059,7 +28322,58 @@ class MainWindow(QMainWindow):
             if descendant_data.get("placeholder"):
                 continue
             descendants.append(dict(descendant_data))
-        if defer_graph_until_subtree_ready and not descendants:
+
+        graph_fallback_ran = False
+        if defer_graph_until_subtree_ready and not descendants and drive_id and item_id:
+            uk_fb = self._source_projection_descendants_cache_key_for_root(source_root_data)
+            unready_fb = getattr(self, "_source_projection_descendants_unready_empty_until", None)
+            allow_graph_fallback = True
+            if isinstance(unready_fb, dict):
+                dl_fb = unready_fb.get(uk_fb)
+                if dl_fb is not None and time.monotonic() < float(dl_fb):
+                    allow_graph_fallback = False
+            if allow_graph_fallback:
+                graph_fallback_ran = True
+                graph_attempted = True
+                ttl_fb = float(getattr(self, "_source_projection_unready_empty_ttl_s", 2.0) or 2.0)
+                try:
+                    descendants = self.graph.list_drive_subtree_items_normalized(
+                        drive_id,
+                        item_id,
+                        site_id=source_root_data.get("site_id", ""),
+                        site_name=source_root_data.get("site_name", ""),
+                        library_id=source_root_data.get("library_id", drive_id),
+                        library_name=source_root_data.get("library_name", ""),
+                        tree_role="source",
+                        parent_item_path=item_path or "/",
+                    )
+                except Exception as exc:
+                    graph_error = type(exc).__name__
+                    self._log_restore_exception("collect_source_descendants_for_projection", exc)
+                    descendants = []
+                if descendants:
+                    if isinstance(unready_fb, dict):
+                        unready_fb.pop(uk_fb, None)
+                    self._log_destination_projection_collect_result(
+                        descendants,
+                        branch="graph_fallback_after_partial_empty",
+                        graph_attempted=True,
+                        graph_error=None,
+                        **base_diag,
+                    )
+                    return descendants
+                if isinstance(unready_fb, dict):
+                    unready_fb[uk_fb] = time.monotonic() + max(0.25, ttl_fb)
+                self._log_destination_projection_collect_result(
+                    [],
+                    branch="graph_fallback_after_partial_empty",
+                    graph_attempted=True,
+                    graph_error=graph_error,
+                    **base_diag,
+                )
+                return []
+
+        if defer_graph_until_subtree_ready and not descendants and not graph_fallback_ran:
             uk = self._source_projection_descendants_cache_key_for_root(source_root_data)
             unready_map = getattr(self, "_source_projection_descendants_unready_empty_until", None)
             if isinstance(unready_map, dict):
@@ -28283,6 +28597,18 @@ class MainWindow(QMainWindow):
             source_root_data = dict(move.get("source", {}) or {})
             source_root_data.setdefault("item_path", move.get("source_path", ""))
             source_root_data.setdefault("display_path", move.get("source_path", ""))
+        if bool(source_root_data.get("is_folder", False)):
+            drive_id = str(source_root_data.get("drive_id", "") or "").strip()
+            item_id = str(source_root_data.get("id", "") or "").strip()
+            if not drive_id or not item_id:
+                self._destination_structure_blocked_reason = "source_descendants_missing_graph_ids"
+                log_info(
+                    "destination_structure_waiting",
+                    reason="project_source_descendants_missing_graph_ids",
+                    source_path_excerpt=str(source_path)[:240],
+                    allocation_path_excerpt=str(allocation_path)[:240],
+                )
+                return 0
 
         if not source_root_data:
             self._log_restore_phase(
@@ -28320,6 +28646,7 @@ class MainWindow(QMainWindow):
         source_root_segments = self._path_segments(source_root_path)
         added_count = 0
         descendants_full = self._collect_source_descendants_for_projection(source_root_data, move)
+        self._destination_structure_blocked_reason = ""
         eager, defer_mode, deferred_file_n, total_n = self._destination_partition_descendants_for_projection_files(
             descendants_full
         )
@@ -28717,6 +29044,11 @@ class MainWindow(QMainWindow):
         parent_order = sess["parent_order"]
         by_parent = sess["by_parent"]
         uses_mv = sess["uses_model_view"]
+        # During active destination-tree scroll, skip all QAbstractItemModel structural work for this
+        # tick (append_nested_child, remove_placeholder_children). Merge session state (fill_stack,
+        # parent_i, child_maps) is unchanged — original attach order is preserved when ticks resume.
+        if uses_mv and self._destination_user_scroll_interaction_active():
+            return
         dmodel = sess.get("dmodel")
         fill_stack = sess.setdefault("fill_stack", [])
         heavy_thr = int(getattr(self, "_destination_merge_heavy_root_child_threshold", 48) or 48)
@@ -30188,6 +30520,22 @@ class MainWindow(QMainWindow):
                     time.perf_counter() - _t0_m,
                 )
 
+        # Defer attach-phase structural work while the user scrolls the destination tree.
+        # Session state is unchanged; _destination_on_destination_tree_scroll_idle restarts the merge timer.
+        if (
+            sess.get("phase") == "attach"
+            and bool(sess.get("uses_model_view"))
+            and self._destination_user_scroll_interaction_active()
+        ):
+            t_idle = getattr(self, "_destination_tree_scroll_idle_timer", None)
+            if t_idle is not None:
+                idle_ms = max(
+                    120, int(getattr(self, "_destination_tree_scroll_idle_ms", 280) or 280)
+                )
+                t_idle.start(idle_ms)
+            _dest_scroll_prof_merge_tick_done()
+            return
+
         sess["tick_index"] = int(sess.get("tick_index") or 0) + 1
         tick_idx = sess["tick_index"]
         tick_local = QElapsedTimer()
@@ -30584,6 +30932,23 @@ class MainWindow(QMainWindow):
             del model_nodes[p]
             self._remap_destination_model_subtree_paths(model_nodes, p, root_child)
 
+    def _normalize_destination_future_root_topology(self, model_nodes) -> dict:
+        """Enforce exactly one top-level Root with children beneath it."""
+        root_key = "Root"
+        if root_key not in model_nodes:
+            return {"root_present": False, "reparented": 0}
+        reparented = 0
+        for p, node in list(model_nodes.items()):
+            if p == root_key:
+                continue
+            parent = str(node.get("parent_semantic_path") or "").strip()
+            if parent:
+                continue
+            # Single-root render contract: when Root exists, no other node may remain top-level.
+            node["parent_semantic_path"] = root_key
+            reparented += 1
+        return {"root_present": True, "reparented": int(reparented)}
+
     def _package_destination_future_model(
         self,
         model_nodes,
@@ -30645,6 +31010,12 @@ class MainWindow(QMainWindow):
         )
 
         self._coalesce_destination_future_orphan_root_siblings(model_nodes)
+        norm = self._normalize_destination_future_root_topology(model_nodes)
+        log_info(
+            "destination_root_normalized",
+            root_present=bool(norm.get("root_present")),
+            reparented_count=int(norm.get("reparented", 0)),
+        )
 
         for node in model_nodes.values():
             node["children"] = []
@@ -30666,6 +31037,23 @@ class MainWindow(QMainWindow):
             return (1, tuple(seg.lower() for seg in self._path_segments(ps)))
 
         top_level_paths.sort(key=_destination_future_top_level_sort_key)
+        if "Root" in model_nodes:
+            top_level_paths = ["Root"]
+        root_child_count = len(
+            [p for p, n in model_nodes.items() if p != "Root" and str(n.get("parent_semantic_path") or "") == "Root"]
+        )
+        log_info(
+            "top_level_node_count",
+            count=int(len(top_level_paths)),
+        )
+        log_info(
+            "top_level_node_names",
+            names=[str(p)[:120] for p in list(top_level_paths)],
+        )
+        log_info(
+            "root_child_count",
+            count=int(root_child_count),
+        )
         if "Root" in top_level_paths:
             root_path = "Root"
         else:
@@ -31096,6 +31484,13 @@ class MainWindow(QMainWindow):
         return payload
 
     def _build_destination_future_model(self, *, skip_allocation_descendants=False, restrict_real_snapshot_import=False):
+        if not self._destination_structure_ready("build_destination_future_model", log_waiting=True):
+            self._log_restore_phase(
+                "destination_bind_deferred_for_structure",
+                reason="build_destination_future_model",
+                skip_allocation_descendants=bool(skip_allocation_descendants),
+            )
+            return None
         self._log_restore_phase(
             "destination_future_model_build_started",
             planned_moves_count=len(self.planned_moves),
@@ -31117,9 +31512,23 @@ class MainWindow(QMainWindow):
                 branch_count=len((cache["payload"].get("nodes") or {})),
                 planned_moves_count=len(self.planned_moves),
             )
+            cached_payload = copy.deepcopy(cache["payload"])
+            cached_nodes = cached_payload.get("nodes", {}) if isinstance(cached_payload, dict) else {}
+            if isinstance(cached_nodes, dict) and cached_nodes:
+                self._normalize_destination_future_root_topology(cached_nodes)
+                for node in cached_nodes.values():
+                    node["children"] = []
+                for semantic_path, node in cached_nodes.items():
+                    parent_semantic_path = node.get("parent_semantic_path", "")
+                    if parent_semantic_path and parent_semantic_path in cached_nodes:
+                        parent_node = cached_nodes[parent_semantic_path]
+                        if semantic_path not in parent_node["children"]:
+                            parent_node["children"].append(semantic_path)
+                if "Root" in cached_nodes:
+                    cached_payload["top_level_paths"] = ["Root"]
             if restrict_real_snapshot_import:
                 self._restore_narrow_destination_future_snapshot_once = False
-            return copy.deepcopy(cache["payload"])
+            return cached_payload
         cur_sigs = move_list_signatures(self.planned_moves)
         if cache is not None and cache.get("payload") is not None:
             prev_sigs = cache.get("move_sigs") or []
@@ -31927,10 +32336,7 @@ class MainWindow(QMainWindow):
                 and not bool(data.get("load_failed"))
                 and data.get("id")
             ):
-                item.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
-                item.addChild(
-                    self.build_loading_placeholder_item("Expand to load contents", role="lazy_unloaded")
-                )
+                item.setChildIndicatorPolicy(QTreeWidgetItem.DontShowIndicator)
             else:
                 should_show_for_allocation = bool(
                     node_state in ("allocated", "proposed", "projected_descendant")
@@ -32016,13 +32422,7 @@ class MainWindow(QMainWindow):
                 and not bool(data.get("load_failed"))
                 and data.get("id")
             ):
-                lazy_pl = {
-                    "placeholder": True,
-                    "placeholder_role": "lazy_unloaded",
-                    "base_display_label": "Expand to load contents",
-                    "tree_role": "destination",
-                }
-                return (data, [(lazy_pl, [])])
+                return (data, [])
             should_show_for_allocation = bool(
                 node_state in ("allocated", "proposed", "projected_descendant")
                 or data.get("planned_allocation")
@@ -32044,6 +32444,43 @@ class MainWindow(QMainWindow):
             stack.append((QModelIndex(), p))
         return stack
 
+    def _destination_bind_add_top_level_item_widget(
+        self,
+        tree,
+        model_nodes: dict,
+        semantic_path: str,
+        allowed_top_level_paths: set[str],
+        *,
+        bind_tick_context: str,
+    ) -> None:
+        if semantic_path not in allowed_top_level_paths:
+            log_info(
+                "destination_bind_illegal_root_append",
+                semantic_path_excerpt=str(semantic_path)[:240],
+                bind_tick_context=str(bind_tick_context or "")[:80],
+            )
+            return
+        tree.addTopLevelItem(self._build_destination_tree_item_from_future_model(model_nodes, semantic_path))
+
+    def _destination_bind_resolved_top_level_paths(self, model: dict) -> list[str]:
+        """Canonicalize bind root rows so bind only uses allowed top-level semantic paths."""
+        model_nodes = (model or {}).get("nodes", {}) if isinstance(model, dict) else {}
+        raw_top = list((model or {}).get("top_level_paths", []) or [])
+        filtered = [p for p in raw_top if p in model_nodes]
+        if "Root" in model_nodes:
+            resolved = ["Root"]
+        else:
+            resolved = filtered
+        log_info(
+            "destination_bind_using_top_level_paths",
+            count=int(len(resolved)),
+        )
+        log_info(
+            "destination_bind_top_level_paths",
+            paths=[str(p)[:120] for p in resolved],
+        )
+        return resolved
+
     def _destination_bind_drain_append_stack_tick(
         self,
         dm: DestinationPlanningTreeModel,
@@ -32052,6 +32489,7 @@ class MainWindow(QMainWindow):
         *,
         budget_ms: int,
         max_nodes: int,
+        allowed_top_level_paths: Optional[set[str]] = None,
         bind_tick_context: str = "",
     ) -> bool:
         """Append up to budget_ms / max_nodes; return True when stack is empty."""
@@ -32063,6 +32501,19 @@ class MainWindow(QMainWindow):
         while stack and n < max_nodes and op.elapsed() < budget_ms:
             parent_ix, sem_path = stack.pop()
             if not sem_path or sem_path not in model_nodes:
+                continue
+            if (
+                parent_ix is not None
+                and hasattr(parent_ix, "isValid")
+                and not parent_ix.isValid()
+                and isinstance(allowed_top_level_paths, set)
+                and sem_path not in allowed_top_level_paths
+            ):
+                log_info(
+                    "destination_bind_illegal_root_append",
+                    semantic_path_excerpt=str(sem_path)[:240],
+                    bind_tick_context=str(bind_tick_context or "")[:80],
+                )
                 continue
             spec = self._build_destination_future_nested_append_spec(model_nodes, sem_path)
             new_ix = dm.append_nested_child(parent_ix, spec)
@@ -32103,6 +32554,7 @@ class MainWindow(QMainWindow):
                 stack,
                 budget_ms=budget_ms,
                 max_nodes=max_nodes,
+                allowed_top_level_paths=set(top_level_paths or []),
                 bind_tick_context="sync_model_bind",
             )
             QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
@@ -32690,7 +33142,7 @@ class MainWindow(QMainWindow):
             if dmodel is None:
                 return 0, 0
             model_nodes = model.get("nodes", {})
-            top_level_paths = model.get("top_level_paths", [])
+            top_level_paths = self._destination_bind_resolved_top_level_paths(model)
             node_count = len(model_nodes)
             t0 = time.perf_counter()
             self._destination_future_bind_sync_active = True
@@ -32915,7 +33367,7 @@ class MainWindow(QMainWindow):
                     self._schedule_destination_expand_user_deferred_drain()
 
         model_nodes = model.get("nodes", {})
-        top_level_paths = model.get("top_level_paths", [])
+        top_level_paths = self._destination_bind_resolved_top_level_paths(model)
         node_count = len(model_nodes)
         t0 = time.perf_counter()
         self._destination_future_bind_sync_active = True
@@ -32944,8 +33396,15 @@ class MainWindow(QMainWindow):
                 t_rs = time.perf_counter()
                 tree.clear()
                 self._future_bind_nodes_built = 0
+                allowed_top_level_paths = set(top_level_paths or [])
                 for semantic_path in top_level_paths:
-                    tree.addTopLevelItem(self._build_destination_tree_item_from_future_model(model_nodes, semantic_path))
+                    self._destination_bind_add_top_level_item_widget(
+                        tree,
+                        model_nodes,
+                        semantic_path,
+                        allowed_top_level_paths,
+                        bind_tick_context="sync_widget_bind",
+                    )
                 t_re = time.perf_counter()
                 QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
                 t_pe = time.perf_counter()
@@ -33206,10 +33665,10 @@ class MainWindow(QMainWindow):
                     model_nodes = model.get("nodes", {}) if isinstance(model, dict) else {}
                     stack = st.get("destination_build_stack")
                     if not isinstance(stack, deque):
-                        stack = self._destination_bind_init_append_stack(
-                            list(model.get("top_level_paths", []) or [])
-                        )
+                        resolved_top = self._destination_bind_resolved_top_level_paths(model)
+                        stack = self._destination_bind_init_append_stack(resolved_top)
                         st["destination_build_stack"] = stack
+                        st["destination_bind_allowed_top_level_paths"] = set(resolved_top)
                     budget_ms = int(getattr(self, "_destination_chunked_bind_build_budget_ms", 8) or 8)
                     max_nodes = int(getattr(self, "_destination_bind_append_max_nodes_per_tick", 64) or 64)
                     done = self._destination_bind_drain_append_stack_tick(
@@ -33218,6 +33677,7 @@ class MainWindow(QMainWindow):
                         stack,
                         budget_ms=budget_ms,
                         max_nodes=max_nodes,
+                        allowed_top_level_paths=set(st.get("destination_bind_allowed_top_level_paths") or set()),
                         bind_tick_context="chunked_async_build",
                     )
                     if not done:
@@ -33226,6 +33686,7 @@ class MainWindow(QMainWindow):
                         return
                     st.pop("build_subphase", None)
                     st.pop("destination_build_stack", None)
+                    st.pop("destination_bind_allowed_top_level_paths", None)
                     t_append0 = float(st.pop("build_append_t0", 0) or 0)
                     if t_append0:
                         log_info(
@@ -33244,7 +33705,7 @@ class MainWindow(QMainWindow):
                 st["destination_expanded_paths"] = set(ui_state.get("destination_expanded_paths", set()) or set())
                 st["destination_selected_path"] = str(ui_state.get("destination_selected_path", "") or "")
                 model_nodes = model.get("nodes", {})
-                top_level_paths = model.get("top_level_paths", [])
+                top_level_paths = self._destination_bind_resolved_top_level_paths(model)
                 norm_scope = st.get("bind_scope_paths_normalized")
                 self._log_restore_phase(
                     "destination_future_model_bind_started",
@@ -33329,9 +33790,14 @@ class MainWindow(QMainWindow):
                         return
                 else:
                     tree.clear()
+                    allowed_top_level_paths = set(top_level_paths or [])
                     for semantic_path in top_level_paths:
-                        tree.addTopLevelItem(
-                            self._build_destination_tree_item_from_future_model(model_nodes, semantic_path)
+                        self._destination_bind_add_top_level_item_widget(
+                            tree,
+                            model_nodes,
+                            semantic_path,
+                            allowed_top_level_paths,
+                            bind_tick_context="chunked_widget_bind",
                         )
                     visible_future_branch_count = sum(
                         1 for _p, n in model_nodes.items() if n.get("node_state") != "real"
@@ -33659,6 +34125,27 @@ class MainWindow(QMainWindow):
             return
 
     def _bind_destination_tree_from_future_state_model(self, model, *, on_complete=None):
+        if not self._destination_structure_ready("bind_destination_tree_from_future_state_model", log_waiting=True):
+            self._log_restore_phase(
+                "destination_bind_deferred_for_structure",
+                reason="bind_destination_tree_from_future_state_model",
+                waiting_for_structure=True,
+            )
+            QTimer.singleShot(
+                250,
+                lambda: self._safe_invoke(
+                    "destination_bind_retry_structure_ready",
+                    self._bind_destination_tree_from_future_state_model,
+                    model,
+                    on_complete=on_complete,
+                ),
+            )
+            return None
+        log_info(
+            "destination_bind_started_structurally_complete",
+            root_path=(model or {}).get("root_path", "Root") if isinstance(model, dict) else "Root",
+            model_node_count=len((model or {}).get("nodes", {}) if isinstance(model, dict) else {}),
+        )
         if getattr(self, "_destination_snapshot_chunked_restore_active", False):
             self._log_restore_phase(
                 "destination_future_bind_deferred",
@@ -34186,6 +34673,14 @@ class MainWindow(QMainWindow):
         self, reason, *, allow_defer=True, prefer_chunked_projection=False, narrow_restore_real_snapshot=False
     ):
         self._destination_future_model_last_blocked_source_restore = False
+        if not self._destination_structure_ready("materialize_destination_future_model", log_waiting=True):
+            self._log_restore_phase(
+                "destination_bind_deferred_for_structure",
+                reason=str(reason or ""),
+                waiting_for_structure=True,
+            )
+            self._schedule_destination_full_tree_materialization(500)
+            return 0
 
         if getattr(self, "_destination_incremental_merge_in_progress", False):
             self._log_restore_phase(
@@ -34334,9 +34829,18 @@ class MainWindow(QMainWindow):
                 loading=True,
             )
             model_fast = self._build_destination_future_model(
-                skip_allocation_descendants=True,
+                skip_allocation_descendants=False,
                 restrict_real_snapshot_import=bool(narrow_restore_real_snapshot),
             )
+            if model_fast is None:
+                self._log_restore_phase(
+                    "destination_bind_deferred_for_structure",
+                    reason=str(reason or ""),
+                    waiting_for_structure=True,
+                    phase="fast_first_paint",
+                )
+                self._schedule_destination_full_tree_materialization(500)
+                return 0
             self._log_restore_phase(
                 "destination_future_model_fast_first_paint",
                 reason=reason,
@@ -34427,6 +34931,15 @@ class MainWindow(QMainWindow):
         model = self._build_destination_future_model(
             restrict_real_snapshot_import=bool(narrow_restore_real_snapshot),
         )
+        if model is None:
+            self._log_restore_phase(
+                "destination_bind_deferred_for_structure",
+                reason=str(reason or ""),
+                waiting_for_structure=True,
+                phase="full_bind",
+            )
+            self._schedule_destination_full_tree_materialization(500)
+            return 0
         if "_real_child_counts" in model:
             del model["_real_child_counts"]
         self._log_restore_phase(
@@ -34478,6 +34991,11 @@ class MainWindow(QMainWindow):
                     visible_future_branch_count=applied_count,
                 )
                 self._dev_log_watch_folder_badge_owners("_complete_full_destination_bind")
+            log_info(
+                "destination_bind_started_structurally_complete",
+                reason=str(reason or "")[:160],
+                visible_future_branch_count=int(applied_count),
+            )
 
         bind_out = self._bind_destination_tree_from_future_state_model(
             model,
@@ -34673,9 +35191,114 @@ class MainWindow(QMainWindow):
 
     def _destination_on_destination_tree_scroll_idle(self) -> None:
         self._destination_tree_scroll_activity_until = 0.0
+        self._destination_drain_deferred_folder_structural_queue_safely()
+        # Resume incremental merge attach promptly after scroll settles (coalesced single-shot timer).
+        sess = getattr(self, "_destination_incremental_merge_session", None)
+        if sess is not None and sess.get("phase") == "attach" and bool(sess.get("uses_model_view")):
+            mt = getattr(self, "_destination_incremental_merge_timer", None)
+            if mt is not None:
+                mt.start(0)
+        if self._destination_descendant_apply_state is not None or self._destination_descendant_apply_queue:
+            self._schedule_destination_descendant_apply_tick()
         if getattr(self, "_destination_indicator_refresh_deferred_for_scroll", False):
             self._destination_indicator_refresh_deferred_for_scroll = False
             self._schedule_refresh_destination_tree_indicators()
+
+    def _destination_folder_row_viewport_visible(self, index) -> bool:
+        tw = getattr(self, "destination_tree_widget", None)
+        if tw is None or index is None or not index.isValid():
+            return False
+        try:
+            vr = tw.visualRect(index)
+            if vr.isEmpty():
+                return False
+            return tw.viewport().rect().intersects(vr)
+        except Exception:
+            return False
+
+    def _destination_folder_load_structural_must_run_immediately(self, semantic_path_captured: str) -> bool:
+        if self._expand_all_pending.get("destination"):
+            return True
+        if getattr(self, "_memory_restore_in_progress", False) and semantic_path_captured == "Root":
+            return True
+        if getattr(self, "_sharepoint_lazy_mode", False):
+            if getattr(self, "_destination_root_prime_pending", False) and semantic_path_captured != "Root":
+                return True
+            if semantic_path_captured == "Root":
+                return True
+        return False
+
+    def _destination_deferred_folder_structural_enqueue(self, entry: dict) -> None:
+        wk = str(entry.get("worker_key") or "")
+        if not wk:
+            return
+        by_key = self._destination_deferred_folder_structural_by_key
+        order = self._destination_deferred_folder_structural_order
+        by_key[wk] = entry
+        if wk not in order:
+            order.append(wk)
+
+    def _destination_deferred_folder_structural_cancel(self, worker_key: str) -> None:
+        self._destination_deferred_folder_structural_by_key.pop(worker_key, None)
+        self._destination_deferred_folder_structural_order = [
+            k for k in self._destination_deferred_folder_structural_order if k != worker_key
+        ]
+
+    def _destination_drain_deferred_folder_structural_queue_safely(self) -> None:
+        order = getattr(self, "_destination_deferred_folder_structural_order", None) or []
+        if not order:
+            return
+        while self._destination_deferred_folder_structural_order:
+            if self._destination_user_scroll_interaction_active():
+                t_idle = getattr(self, "_destination_tree_scroll_idle_timer", None)
+                if t_idle is not None:
+                    idle_ms = max(
+                        120, int(getattr(self, "_destination_tree_scroll_idle_ms", 280) or 280)
+                    )
+                    t_idle.start(idle_ms)
+                break
+            wk = self._destination_deferred_folder_structural_order[0]
+            ent = self._destination_deferred_folder_structural_by_key.pop(wk, None)
+            self._destination_deferred_folder_structural_order.pop(0)
+            if ent is None:
+                continue
+            model = getattr(self, "destination_planning_model", None)
+            if model is None:
+                continue
+            drive_id_c = str(ent.get("drive_id") or "")
+            item_id_c = str(ent.get("item_id") or "")
+            sp_cap = str(ent.get("semantic_path_captured") or "")
+            parent_index = QModelIndex()
+            if drive_id_c and item_id_c:
+                parent_index = model.find_index_by_drive_item(drive_id_c, item_id_c)
+            if (not parent_index.isValid()) and sp_cap:
+                idxs = model.find_indices_for_canonical_destination_path(sp_cap)
+                if idxs:
+                    parent_index = idxs[0]
+            if not parent_index.isValid() or (
+                hasattr(model, "is_index_live") and not model.is_index_live(parent_index)
+            ):
+                self._log_restore_phase(
+                    "destination_folder_worker_success_deferred_skipped",
+                    reason="scroll_idle_structural_parent_stale",
+                    semantic_path=str(sp_cap or "")[:240],
+                    drive_id=str(drive_id_c or "")[:80],
+                    item_id=str(item_id_c or "")[:80],
+                )
+                continue
+            self._destination_model_view_apply_folder_load_structural_and_pipeline(
+                parent_index=parent_index,
+                worker_key=wk,
+                worker_id=ent.get("worker_id"),
+                panel_key=str(ent.get("panel_key") or "destination"),
+                items=ent.get("items") or [],
+                skip_destination_child_replace=bool(ent.get("skip_destination_child_replace")),
+                previous_child_paths=set(ent.get("previous_child_paths") or set()),
+                preserved_nested=list(ent.get("preserved_nested") or []),
+                t_fw_bundle_0=float(ent.get("t_fw_bundle_0") or time.perf_counter()),
+                drive_id=drive_id_c,
+                item_id=item_id_c,
+            )
 
     def _refresh_destination_tree_indicators(self):
         _dsp_i = getattr(self, "_dest_scroll_profiler", None)
@@ -37011,6 +37634,32 @@ class MainWindow(QMainWindow):
         except RuntimeError:
             return {}
 
+    def _destination_projection_legal_insert_parent(
+        self,
+        parent_ref,
+        *,
+        normalized_target: str,
+        path_mode: str,
+    ) -> bool:
+        """Guard post-bind projection insertion so structural writes cannot create root-level siblings."""
+        if path_mode == "model":
+            if isinstance(parent_ref, QModelIndex) and parent_ref.isValid():
+                return True
+            self._log_restore_phase(
+                "destination_projection_illegal_root_insert_blocked",
+                normalized_parent_path=normalized_target,
+                path_mode=path_mode,
+            )
+            return False
+        if parent_ref is not None:
+            return True
+        self._log_restore_phase(
+            "destination_projection_illegal_root_insert_blocked",
+            normalized_parent_path=normalized_target,
+            path_mode=path_mode,
+        )
+        return False
+
     def _ensure_destination_projection_path_model(self, destination_path, normalized_target):
         model = getattr(self, "destination_planning_model", None)
         tree = getattr(self, "destination_tree_widget", None)
@@ -37021,9 +37670,10 @@ class MainWindow(QMainWindow):
             return existing is not None and (not isinstance(existing, QModelIndex) or existing.isValid())
 
         self._log_restore_phase(
-            "destination_parent_resolution_attempt",
+            "destination_projection_path_resolve_started",
             requested_parent_path=destination_path,
             normalized_parent_path=normalized_target,
+            path_mode="model",
         )
 
         prefixes = self._destination_projection_prefixes(normalized_target)
@@ -37086,30 +37736,19 @@ class MainWindow(QMainWindow):
                     created_new=False,
                 )
             else:
-                base_data = {}
-                if self._planning_tree_top_level_count(tree) > 0:
-                    top_ix = model.index(0, 0, QModelIndex())
-                    base_data = self._destination_model_index_user_role_dict(top_ix)
-                branch_path = prefixes[0]
-                folder_name = self._path_segments(branch_path)[-1]
-                pl = self._build_projected_destination_folder_payload(folder_name, branch_path, base_data)
-                root_parent = QModelIndex()
-                row_before = model.rowCount(root_parent)
-                model.append_child_payloads(root_parent, [pl])
-                current_ix = model.index(row_before, 0, root_parent)
-                current_parent_data = self._destination_model_index_user_role_dict(current_ix)
-                if not current_parent_data:
-                    current_parent_data = dict(pl)
-                start_index = 1
                 self._log_restore_phase(
-                    "destination_parent_resolution_created_projected",
+                    "destination_projection_path_missing_anchor",
                     requested_parent_path=destination_path,
                     normalized_parent_path=normalized_target,
-                    resolved_tree_path=self._tree_item_path(current_parent_data),
-                    resolved_node_origin=current_parent_data.get("node_origin", ""),
-                    reused_existing=False,
-                    created_new=True,
+                    path_mode="model",
                 )
+                self._log_restore_phase(
+                    "destination_projection_invariant_violation",
+                    reason="root_anchor_missing_for_model_projection_path",
+                    normalized_parent_path=normalized_target,
+                    path_mode="model",
+                )
+                return None
 
         for index in range(start_index, len(prefixes)):
             branch_path = prefixes[index]
@@ -37148,14 +37787,25 @@ class MainWindow(QMainWindow):
                     reread = self._destination_model_index_user_role_dict(current_ix)
                     if reread:
                         current_parent_data = reread
+                self._log_restore_phase(
+                    "destination_projection_created_intermediate_under_root",
+                    normalized_parent_path=normalized_target,
+                    created_semantic_path=branch_path,
+                    path_mode="model",
+                )
             else:
-                root_parent = QModelIndex()
-                row_before = model.rowCount(root_parent)
-                model.append_child_payloads(root_parent, [pl])
-                current_ix = model.index(row_before, 0, root_parent)
-                current_parent_data = self._destination_model_index_user_role_dict(current_ix)
-                if not current_parent_data:
-                    current_parent_data = dict(pl)
+                if not self._destination_projection_legal_insert_parent(
+                    current_ix,
+                    normalized_target=normalized_target,
+                    path_mode="model",
+                ):
+                    self._log_restore_phase(
+                        "destination_projection_invariant_violation",
+                        reason="model_projection_parent_invalid",
+                        normalized_parent_path=normalized_target,
+                        path_mode="model",
+                    )
+                    return None
             self._log_restore_phase(
                 "destination_parent_resolution_created_projected",
                 requested_parent_path=destination_path,
@@ -37166,6 +37816,13 @@ class MainWindow(QMainWindow):
                 created_new=True,
             )
 
+        self._log_restore_phase(
+            "destination_projection_path_resolved_under_root",
+            requested_parent_path=destination_path,
+            normalized_parent_path=normalized_target,
+            path_mode="model",
+            resolved=True,
+        )
         return current_ix if _ix_ok(current_ix) else None
 
     def _ensure_destination_projection_path(self, destination_path):
@@ -37180,9 +37837,10 @@ class MainWindow(QMainWindow):
             return self._ensure_destination_projection_path_model(destination_path, normalized_target)
 
         self._log_restore_phase(
-            "destination_parent_resolution_attempt",
+            "destination_projection_path_resolve_started",
             requested_parent_path=destination_path,
             normalized_parent_path=normalized_target,
+            path_mode="widget",
         )
 
         prefixes = self._destination_projection_prefixes(normalized_target)
@@ -37245,24 +37903,19 @@ class MainWindow(QMainWindow):
                     created_new=False,
                 )
             else:
-                base_data = {}
-                if tree.topLevelItemCount() > 0:
-                    base_data = tree.topLevelItem(0).data(0, Qt.UserRole) or {}
-                branch_path = prefixes[0]
-                folder_name = self._path_segments(branch_path)[-1]
-                current_item = self._build_projected_destination_folder_node(folder_name, branch_path, base_data)
-                tree.addTopLevelItem(current_item)
-                current_parent_data = current_item.data(0, Qt.UserRole) or {}
-                start_index = 1
                 self._log_restore_phase(
-                    "destination_parent_resolution_created_projected",
+                    "destination_projection_path_missing_anchor",
                     requested_parent_path=destination_path,
                     normalized_parent_path=normalized_target,
-                    resolved_tree_path=self._tree_item_path(current_parent_data),
-                    resolved_node_origin=current_parent_data.get("node_origin", ""),
-                    reused_existing=False,
-                    created_new=True,
+                    path_mode="widget",
                 )
+                self._log_restore_phase(
+                    "destination_projection_invariant_violation",
+                    reason="root_anchor_missing_for_widget_projection_path",
+                    normalized_parent_path=normalized_target,
+                    path_mode="widget",
+                )
+                return None
 
         for index in range(start_index, len(prefixes)):
             branch_path = prefixes[index]
@@ -37286,8 +37939,25 @@ class MainWindow(QMainWindow):
             if current_item is not None:
                 current_item.addChild(new_child)
                 self._refresh_destination_item_visibility(current_item, expand=True)
+                self._log_restore_phase(
+                    "destination_projection_created_intermediate_under_root",
+                    normalized_parent_path=normalized_target,
+                    created_semantic_path=branch_path,
+                    path_mode="widget",
+                )
             else:
-                tree.addTopLevelItem(new_child)
+                if not self._destination_projection_legal_insert_parent(
+                    current_item,
+                    normalized_target=normalized_target,
+                    path_mode="widget",
+                ):
+                    self._log_restore_phase(
+                        "destination_projection_invariant_violation",
+                        reason="widget_projection_parent_missing",
+                        normalized_parent_path=normalized_target,
+                        path_mode="widget",
+                    )
+                    return None
             current_item = new_child
             current_parent_data = current_item.data(0, Qt.UserRole) or {}
             self._log_restore_phase(
@@ -37300,6 +37970,13 @@ class MainWindow(QMainWindow):
                 created_new=True,
             )
 
+        self._log_restore_phase(
+            "destination_projection_path_resolved_under_root",
+            requested_parent_path=destination_path,
+            normalized_parent_path=normalized_target,
+            path_mode="widget",
+            resolved=bool(current_item is not None),
+        )
         return current_item
 
     def _apply_allocation_children_to_item(self, parent_item):
@@ -40107,6 +40784,20 @@ class MainWindow(QMainWindow):
         tree = getattr(self, "destination_tree_widget", None)
         if dmodel is None or not ix.isValid():
             return
+        nd0 = dict(ix.data(Qt.UserRole) or {})
+        sp0 = self._destination_semantic_path(nd0) or self._tree_item_path(nd0) or ""
+        log_info(
+            "destination_expand_attempt_no_structural_mutation",
+            semantic_path_excerpt=str(sp0)[:240],
+            path="load_destination_projected_descendants_index",
+        )
+        if bool(self._destination_structure_ready("load_destination_projected_descendants_index", log_waiting=False)):
+            log_info(
+                "destination_structural_mutation_after_bind",
+                path="load_destination_projected_descendants_index",
+                semantic_path_excerpt=str(sp0)[:240],
+            )
+        return
         if hasattr(dmodel, "is_index_live") and not dmodel.is_index_live(ix):
             log_info(
                 "destination_deferred_projected_descendants_skip_stale",
@@ -40300,6 +40991,24 @@ class MainWindow(QMainWindow):
     def _load_destination_projected_descendants(self, item):
         if item is None:
             return
+        nd0 = {}
+        if isinstance(item, QModelIndex):
+            nd0 = dict(item.data(Qt.UserRole) or {})
+        elif not isinstance(item, QModelIndex):
+            nd0 = dict(item.data(0, Qt.UserRole) or {})
+        sp0 = self._destination_semantic_path(nd0) or self._tree_item_path(nd0) or ""
+        log_info(
+            "destination_expand_attempt_no_structural_mutation",
+            semantic_path_excerpt=str(sp0)[:240],
+            path="load_destination_projected_descendants_widget",
+        )
+        if bool(self._destination_structure_ready("load_destination_projected_descendants_widget", log_waiting=False)):
+            log_info(
+                "destination_structural_mutation_after_bind",
+                path="load_destination_projected_descendants_widget",
+                semantic_path_excerpt=str(sp0)[:240],
+            )
+        return
         if isinstance(item, QModelIndex):
             return self._load_destination_projected_descendants_index(item)
         node_data = item.data(0, Qt.UserRole) or {}
@@ -40576,8 +41285,6 @@ class MainWindow(QMainWindow):
             drive_id = self._resolve_tree_item_drive_id(panel_key, node_data)
             item_id = node_data.get("id", "")
             pending_key = f"{drive_id}:{item_id}" if drive_id and item_id else ""
-            if pending_key and pending_key in self.pending_folder_loads.get(panel_key, set()):
-                return True
             self._on_destination_planning_model_expanded(item)
             if pending_key and pending_key in self.pending_folder_loads.get(panel_key, set()):
                 return True
@@ -40683,6 +41390,391 @@ class MainWindow(QMainWindow):
                     self.pending_folder_loads.get(panel, set()).discard(pk)
         except Exception as exc:
             self._log_restore_exception("on_folder_worker_finished", exc)
+
+    def _destination_model_view_apply_folder_load_structural_and_pipeline(
+        self,
+        *,
+        parent_index,
+        worker_key,
+        worker_id,
+        panel_key,
+        items,
+        skip_destination_child_replace,
+        previous_child_paths,
+        preserved_nested,
+        t_fw_bundle_0,
+        drive_id,
+        item_id,
+    ):
+        self._destination_deferred_folder_structural_cancel(worker_key)
+        self._destination_scroll_defer_user_expand_keys.discard(worker_key)
+        model = self.destination_planning_model
+        if not skip_destination_child_replace:
+            child_payloads = []
+            for child in sorted(
+                items, key=lambda value: (not value.get("is_folder", False), value.get("name", "").lower())
+            ):
+                pl = self._destination_payload_from_graph_item(child)
+                self._apply_tree_item_visual_state(None, pl)
+                child_payloads.append(pl)
+            model.replace_all_children(parent_index, child_payloads)
+
+            def _mut_ok(p):
+                p["children_loaded"] = True
+                p["load_failed"] = False
+
+            model.update_payload_for_index(parent_index, _mut_ok)
+        else:
+            model.remove_placeholder_children(parent_index)
+
+            def _mut_partial(p):
+                p["children_loaded"] = True
+                p["load_failed"] = False
+
+            model.update_payload_for_index(parent_index, _mut_partial)
+        log_info(
+            "destination_expand_loading_placeholder_cleared",
+            path_kind="model_view",
+            worker_key=worker_key,
+            skipped_replace=skip_destination_child_replace,
+            semantic_path_excerpt=str(
+                self._destination_semantic_path(dict(parent_index.data(Qt.UserRole) or {})) or ""
+            )[:240],
+        )
+        log_info(
+            "destination_expand_real_folder_load_complete",
+            worker_key=worker_key,
+            semantic_path_excerpt=str(
+                self._destination_semantic_path(dict(parent_index.data(Qt.UserRole) or {})) or ""
+            )[:240],
+            child_payload_count=len(items) if isinstance(items, list) else -1,
+        )
+        t_after_children_replace = time.perf_counter()
+        self._mark_destination_real_tree_snapshot_stale()
+        node_data_pre = dict(parent_index.data(Qt.UserRole) or {})
+        semantic_path_captured = self._destination_semantic_path(node_data_pre)
+        trigger_path_captured = node_data_pre.get("item_path") or node_data_pre.get("display_path") or ""
+        drive_id_captured = str(drive_id or "")
+        item_id_captured = str(item_id or "")
+        try:
+            tw = self.destination_tree_widget
+            if tw is not None:
+                tw.viewport().update()
+        except Exception:
+            pass
+
+        def _deferred_destination_folder_worker_success_pipeline() -> None:
+            self._destination_bump_interactive_expand_idle_full_tree_lockout(1500)
+
+            def _footer(trigger_for_nav: str) -> None:
+                if self._expand_all_pending.get("destination"):
+                    self._schedule_destination_expand_all_continue()
+                else:
+                    self._continue_expand_all("destination", None)
+                self._refresh_tree_column_width("destination")
+                self._process_pending_destination_navigation("folder_load", trigger_path=trigger_for_nav)
+                self._schedule_workspace_ui_persist(panel_key=panel_key)
+                if self._pending_snapshot_branch_refresh.get(panel_key) and not self._expand_all_pending.get(panel_key):
+                    self._schedule_snapshot_branch_refresh(panel_key, delay_ms=0)
+                self._schedule_progress_summary_refresh()
+
+            model_now = getattr(self, "destination_planning_model", None)
+            tree_now = getattr(self, "destination_tree_widget", None)
+            if model_now is None or tree_now is None:
+                self._log_restore_phase(
+                    "destination_folder_worker_success_deferred_skipped",
+                    reason="destination_model_or_tree_missing",
+                    semantic_path=str(semantic_path_captured or "")[:240],
+                    drive_id=str(drive_id_captured or "")[:80],
+                    item_id=str(item_id_captured or "")[:80],
+                )
+                _footer(trigger_path_captured)
+                return
+            parent_index_now = QModelIndex()
+            if drive_id_captured and item_id_captured:
+                parent_index_now = model_now.find_index_by_drive_item(
+                    drive_id_captured, item_id_captured
+                )
+            if (not parent_index_now.isValid()) and semantic_path_captured:
+                idxs = model_now.find_indices_for_canonical_destination_path(
+                    semantic_path_captured
+                )
+                if idxs:
+                    parent_index_now = idxs[0]
+            if not parent_index_now.isValid() or (
+                hasattr(model_now, "is_index_live")
+                and not model_now.is_index_live(parent_index_now)
+            ):
+                self._log_restore_phase(
+                    "destination_folder_worker_success_deferred_skipped",
+                    reason="parent_index_not_resolved_or_stale",
+                    semantic_path=str(semantic_path_captured or "")[:240],
+                    drive_id=str(drive_id_captured or "")[:80],
+                    item_id=str(item_id_captured or "")[:80],
+                )
+                _footer(trigger_path_captured)
+                return
+            nd_now = dict(parent_index_now.data(Qt.UserRole) or {})
+            trigger_path = nd_now.get("item_path") or nd_now.get("display_path") or ""
+            sp_resolved = self._destination_semantic_path(nd_now)
+            if semantic_path_captured and sp_resolved:
+                c0 = self._canonical_destination_projection_path(semantic_path_captured)
+                c1 = self._canonical_destination_projection_path(sp_resolved)
+                if c0 and c1 and c0 != c1:
+                    self._log_restore_phase(
+                        "destination_folder_worker_success_deferred_skipped",
+                        reason="semantic_path_mismatch_after_resolve",
+                        semantic_path_captured=str(c0)[:240],
+                        semantic_path_resolved=str(c1)[:240],
+                    )
+                    _footer(trigger_path_captured)
+                    return
+            semantic_path = sp_resolved
+            current_child_paths = self._capture_child_path_set_for_destination_model_index(
+                parent_index_now
+            )
+            if previous_child_paths:
+                added_count = len(current_child_paths - previous_child_paths)
+                removed_count = len(previous_child_paths - current_child_paths)
+                if added_count or removed_count:
+                    self._set_tree_status_message(
+                        panel_key,
+                        f"Refreshing saved branches... {added_count} added, {removed_count} removed in {nd_now.get('name', 'folder')}.",
+                        loading=bool(self._pending_snapshot_branch_refresh.get(panel_key)),
+                    )
+            if semantic_path == "Root":
+                self._destination_root_prime_pending = False
+            fw_mat_scope_n = 0
+            materialize_skipped_upstream_busy = False
+            try:
+                if self._expand_all_pending.get("destination"):
+                    self._expand_all_deferred_refresh["destination"] = True
+                    # Synchronous QTreeView.expand() on large branches blocks the UI thread for seconds
+                    # (layout/delegates) and inflates folder_worker_success elapsed_overlay_block_ms.
+                    # Defer expand to the next event-loop tick for large direct child counts only;
+                    # small folders stay synchronous to avoid extra latency and ordering noise.
+                    _defer_thr = max(
+                        8, int(getattr(self, "_destination_expand_all_defer_expand_row_threshold", 48) or 48)
+                    )
+                    _rc = 0
+                    try:
+                        _rc = int(model_now.rowCount(parent_index_now))
+                    except Exception:
+                        _rc = 0
+                    if _rc > _defer_thr:
+                        _pmi_e = QPersistentModelIndex(parent_index_now)
+                        _tw_e = tree_now
+
+                        def _expand_all_folder_worker_deferred_expand() -> None:
+                            if _tw_e is None or not _pmi_e.isValid():
+                                return
+                            _ix = QModelIndex(_pmi_e)
+                            if not _ix.isValid():
+                                return
+                            _dm_e = getattr(self, "destination_planning_model", None)
+                            if _dm_e is not None and hasattr(_dm_e, "is_index_live") and not _dm_e.is_index_live(
+                                _ix
+                            ):
+                                return
+                            try:
+                                _tw_e.expand(_ix)
+                            except Exception:
+                                pass
+
+                        QTimer.singleShot(
+                            0,
+                            lambda: self._safe_invoke(
+                                "destination_folder_worker_expand_all_deferred_expand",
+                                _expand_all_folder_worker_deferred_expand,
+                            ),
+                        )
+                    else:
+                        tree_now.expand(parent_index_now)
+                    handoff_moved_count = 0
+                    direct_applied_count = 0
+                    replay_applied_count = 0
+                    allocation_applied_count = 0
+                    allocation_replay_count = 0
+                    merge_moved_count = 0
+                    future_model_applied_count = 0
+                elif (
+                    getattr(self, "_sharepoint_lazy_mode", False)
+                    and getattr(self, "_destination_root_prime_pending", False)
+                    and semantic_path != "Root"
+                ):
+                    handoff_moved_count = self._restore_destination_future_state_children_model(
+                        parent_index_now, preserved_nested
+                    )
+                    direct_applied_count = 0
+                    replay_applied_count = 0
+                    allocation_applied_count = 0
+                    allocation_replay_count = 0
+                    merge_moved_count = 0
+                    future_model_applied_count = 0
+                elif semantic_path == "Root" and (
+                    getattr(self, "_sharepoint_lazy_mode", False)
+                    or getattr(self, "_memory_restore_in_progress", False)
+                ):
+                    handoff_moved_count = self._restore_destination_future_state_children_model(
+                        parent_index_now, preserved_nested
+                    )
+                    direct_applied_count = 0
+                    replay_applied_count = 0
+                    allocation_applied_count = 0
+                    allocation_replay_count = 0
+                    merge_moved_count = 0
+                    future_model_applied_count = 0
+                else:
+                    handoff_moved_count = self._restore_destination_future_state_children_model(
+                        parent_index_now, preserved_nested
+                    )
+                    direct_applied_count = self._apply_proposed_children_to_item(parent_index_now)
+                    allocation_applied_count = self._apply_allocation_children_to_item(parent_index_now)
+                    uqp = self._unresolved_proposed_queue_size()
+                    uqa = self._unresolved_allocation_queue_size()
+                    replay_applied_count = (
+                        self._replay_unresolved_proposed_overlay(
+                            "folder_worker_success",
+                            trigger_path=trigger_path,
+                        )
+                        if uqp
+                        else 0
+                    )
+                    allocation_replay_count = (
+                        self._replay_unresolved_allocation_overlay(
+                            "folder_worker_success",
+                            trigger_path=trigger_path,
+                        )
+                        if uqa
+                        else 0
+                    )
+                    merge_moved_count = self._reconcile_destination_semantic_duplicates_maybe_deferred(
+                        "folder_worker_success",
+                        affected_destination_paths=(semantic_path,),
+                    )
+                    if getattr(self, "_sharepoint_lazy_mode", False):
+                        future_model_applied_count = 0
+                    else:
+                        fw_scope = self._destination_folder_worker_materialize_scope_paths(semantic_path)
+                        fw_mat_scope_n = len(fw_scope)
+                        future_model_applied_count = self._destination_materialize_with_optional_overlay_scope(
+                            "folder_worker_success",
+                            allow_defer=True,
+                            prefer_chunked_projection=True,
+                            scope_paths=fw_scope,
+                        )
+                self._log_restore_phase(
+                    "destination_replay_attachment_applied",
+                    trigger_path=self.normalize_memory_path(trigger_path),
+                    handoff_moved_count=handoff_moved_count,
+                    direct_applied_count=direct_applied_count,
+                    replay_applied_count=replay_applied_count,
+                    allocation_applied_count=allocation_applied_count,
+                    allocation_replay_count=allocation_replay_count,
+                    merge_moved_count=merge_moved_count,
+                    future_model_applied_count=future_model_applied_count,
+                    queue_size=self._unresolved_proposed_queue_size(),
+                    folder_worker_materialize_scope_count=fw_mat_scope_n,
+                )
+                t_fw_diag = time.perf_counter()
+                dest_worker_slots = sum(
+                    1 for k in (self.folder_load_workers or {}) if str(k).startswith("destination:")
+                )
+                mat_mode = (
+                    "scoped_overlay"
+                    if fw_mat_scope_n
+                    else (
+                        "none_or_deferred"
+                        if not future_model_applied_count
+                        else "applied_unscoped"
+                    )
+                )
+                self._log_restore_phase(
+                    "folder_worker_success_destination_diag",
+                    worker_id=str(worker_id or "")[:80],
+                    drive_id_excerpt=str(drive_id or "")[:80],
+                    trigger_path=self.normalize_memory_path(trigger_path),
+                    semantic_path_excerpt=str(semantic_path or "")[:240],
+                    elapsed_children_replace_ms=int((t_after_children_replace - t_fw_bundle_0) * 1000),
+                    elapsed_overlay_block_ms=int((t_fw_diag - t_fw_bundle_0) * 1000),
+                    pending_destination_folder_loads=len(self.pending_folder_loads.get("destination", set())),
+                    active_destination_worker_slots=dest_worker_slots,
+                    unresolved_proposed_after=self._unresolved_proposed_queue_size(),
+                    unresolved_allocation_after=self._unresolved_allocation_queue_size(),
+                    bind_scope_active=bool(getattr(self, "_destination_bind_scope_paths", None)),
+                    destination_bind_sync_active=bool(getattr(self, "_destination_future_bind_sync_active", False)),
+                    chunked_bind_active=bool(getattr(self, "_destination_chunked_bind_state", None) is not None),
+                    full_tree_worker_running=bool(
+                        self._destination_full_tree_worker is not None
+                        and self._destination_full_tree_worker.isRunning()
+                    ),
+                    expand_all_pending_destination=bool(self._expand_all_pending.get("destination")),
+                    memory_restore_in_progress=bool(getattr(self, "_memory_restore_in_progress", False)),
+                    restore_destination_overlay_pending=bool(
+                        getattr(self, "_restore_destination_overlay_pending", False)
+                    ),
+                    materialize_mode=mat_mode,
+                    materialize_applied_count=future_model_applied_count,
+                    materialize_scope_path_count=fw_mat_scope_n,
+                )
+                if not self._expand_all_pending.get("destination"):
+                    if not getattr(self, "_destination_restore_completed_once", False):
+                        if semantic_path == "Root" and (
+                            getattr(self, "_sharepoint_lazy_mode", False)
+                            or getattr(self, "_memory_restore_in_progress", False)
+                        ):
+                            self._start_destination_restore_materialization()
+                        if not getattr(self, "_destination_root_prime_pending", False):
+                            self._schedule_destination_restore_materialization_queue(
+                                "folder_load",
+                                trigger_path=trigger_path,
+                            )
+                    self._schedule_refresh_destination_tree_indicators()
+                    tree_now.viewport().update()
+                    if (
+                        self._unresolved_proposed_queue_size() == 0
+                        and self._unresolved_allocation_queue_size() == 0
+                        and getattr(self, "_memory_restore_in_progress", False)
+                    ):
+                        self._finalize_memory_restore_if_ready(f"folder_load:{semantic_path}")
+                if (
+                    getattr(self, "_sharepoint_lazy_mode", False)
+                    and semantic_path == "Root"
+                    and not self._expand_all_pending.get("destination")
+                ):
+                    self._set_tree_status_message(
+                        "destination",
+                        f"{model_now.rowCount(parent_index_now)} top-level destination folder(s) loaded.",
+                        loading=False,
+                    )
+            except Exception as exc:
+                self._log_restore_exception("destination_overlay_folder_load_success", exc)
+            _footer(trigger_path)
+
+        if self._destination_expand_burst_should_coalesce(semantic_path_captured):
+            self._destination_expand_burst_schedule(
+                {
+                    "panel_key": panel_key,
+                    "worker_id": worker_id,
+                    "drive_id": drive_id_captured,
+                    "item_id": item_id_captured,
+                    "semantic_path_captured": semantic_path_captured,
+                    "trigger_path_captured": trigger_path_captured,
+                    "preserved_nested": preserved_nested,
+                    "previous_child_paths": previous_child_paths,
+                    "t_fw_bundle_0": t_fw_bundle_0,
+                    "t_after_children_replace": t_after_children_replace,
+                }
+            )
+        else:
+            QTimer.singleShot(
+                0,
+                lambda: self._safe_invoke(
+                    "destination_folder_worker_success_deferred_pipeline",
+                    _deferred_destination_folder_worker_success_pipeline,
+                ),
+            )
+
 
     def on_folder_load_success(self, payload, worker_id):
         _dsp_w = getattr(self, "_dest_scroll_profiler", None)
@@ -40824,365 +41916,61 @@ class MainWindow(QMainWindow):
                             ),
                         )
                         skip_destination_child_replace = True
-                model = self.destination_planning_model
                 t_fw_bundle_0 = time.perf_counter()
-                if not skip_destination_child_replace:
-                    child_payloads = []
-                    for child in sorted(
-                        items, key=lambda value: (not value.get("is_folder", False), value.get("name", "").lower())
-                    ):
-                        pl = self._destination_payload_from_graph_item(child)
-                        self._apply_tree_item_visual_state(None, pl)
-                        child_payloads.append(pl)
-                    model.replace_all_children(parent_index, child_payloads)
-
-                    def _mut_ok(p):
-                        p["children_loaded"] = True
-                        p["load_failed"] = False
-
-                    model.update_payload_for_index(parent_index, _mut_ok)
-                else:
-                    model.remove_placeholder_children(parent_index)
-
-                    def _mut_partial(p):
-                        p["children_loaded"] = True
-                        p["load_failed"] = False
-
-                    model.update_payload_for_index(parent_index, _mut_partial)
-                log_info(
-                    "destination_expand_loading_placeholder_cleared",
-                    path_kind="model_view",
-                    worker_key=worker_key,
-                    skipped_replace=skip_destination_child_replace,
-                    semantic_path_excerpt=str(
-                        self._destination_semantic_path(dict(parent_index.data(Qt.UserRole) or {})) or ""
-                    )[:240],
-                )
-                t_after_children_replace = time.perf_counter()
-                self._mark_destination_real_tree_snapshot_stale()
-                node_data_pre = dict(parent_index.data(Qt.UserRole) or {})
-                semantic_path_captured = self._destination_semantic_path(node_data_pre)
-                trigger_path_captured = node_data_pre.get("item_path") or node_data_pre.get("display_path") or ""
-                drive_id_captured = str(drive_id or "")
-                item_id_captured = str(item_id or "")
-                try:
-                    tw = self.destination_tree_widget
-                    if tw is not None:
-                        tw.viewport().update()
-                except Exception:
-                    pass
-
-                def _deferred_destination_folder_worker_success_pipeline() -> None:
-                    self._destination_bump_interactive_expand_idle_full_tree_lockout(1500)
-
-                    def _footer(trigger_for_nav: str) -> None:
-                        if self._expand_all_pending.get("destination"):
-                            self._schedule_destination_expand_all_continue()
-                        else:
-                            self._continue_expand_all("destination", None)
-                        self._refresh_tree_column_width("destination")
-                        self._process_pending_destination_navigation("folder_load", trigger_path=trigger_for_nav)
-                        self._schedule_workspace_ui_persist(panel_key=panel_key)
-                        if self._pending_snapshot_branch_refresh.get(panel_key) and not self._expand_all_pending.get(panel_key):
-                            self._schedule_snapshot_branch_refresh(panel_key, delay_ms=0)
-                        self._schedule_progress_summary_refresh()
-
-                    model_now = getattr(self, "destination_planning_model", None)
-                    tree_now = getattr(self, "destination_tree_widget", None)
-                    if model_now is None or tree_now is None:
-                        self._log_restore_phase(
-                            "destination_folder_worker_success_deferred_skipped",
-                            reason="destination_model_or_tree_missing",
-                            semantic_path=str(semantic_path_captured or "")[:240],
-                            drive_id=str(drive_id_captured or "")[:80],
-                            item_id=str(item_id_captured or "")[:80],
-                        )
-                        _footer(trigger_path_captured)
-                        return
-                    parent_index_now = QModelIndex()
-                    if drive_id_captured and item_id_captured:
-                        parent_index_now = model_now.find_index_by_drive_item(
-                            drive_id_captured, item_id_captured
-                        )
-                    if (not parent_index_now.isValid()) and semantic_path_captured:
-                        idxs = model_now.find_indices_for_canonical_destination_path(
-                            semantic_path_captured
-                        )
-                        if idxs:
-                            parent_index_now = idxs[0]
-                    if not parent_index_now.isValid() or (
-                        hasattr(model_now, "is_index_live")
-                        and not model_now.is_index_live(parent_index_now)
-                    ):
-                        self._log_restore_phase(
-                            "destination_folder_worker_success_deferred_skipped",
-                            reason="parent_index_not_resolved_or_stale",
-                            semantic_path=str(semantic_path_captured or "")[:240],
-                            drive_id=str(drive_id_captured or "")[:80],
-                            item_id=str(item_id_captured or "")[:80],
-                        )
-                        _footer(trigger_path_captured)
-                        return
-                    nd_now = dict(parent_index_now.data(Qt.UserRole) or {})
-                    trigger_path = nd_now.get("item_path") or nd_now.get("display_path") or ""
-                    sp_resolved = self._destination_semantic_path(nd_now)
-                    if semantic_path_captured and sp_resolved:
-                        c0 = self._canonical_destination_projection_path(semantic_path_captured)
-                        c1 = self._canonical_destination_projection_path(sp_resolved)
-                        if c0 and c1 and c0 != c1:
-                            self._log_restore_phase(
-                                "destination_folder_worker_success_deferred_skipped",
-                                reason="semantic_path_mismatch_after_resolve",
-                                semantic_path_captured=str(c0)[:240],
-                                semantic_path_resolved=str(c1)[:240],
-                            )
-                            _footer(trigger_path_captured)
-                            return
-                    semantic_path = sp_resolved
-                    current_child_paths = self._capture_child_path_set_for_destination_model_index(
-                        parent_index_now
-                    )
-                    if previous_child_paths:
-                        added_count = len(current_child_paths - previous_child_paths)
-                        removed_count = len(previous_child_paths - current_child_paths)
-                        if added_count or removed_count:
-                            self._set_tree_status_message(
-                                panel_key,
-                                f"Refreshing saved branches... {added_count} added, {removed_count} removed in {nd_now.get('name', 'folder')}.",
-                                loading=bool(self._pending_snapshot_branch_refresh.get(panel_key)),
-                            )
-                    if semantic_path == "Root":
-                        self._destination_root_prime_pending = False
-                    fw_mat_scope_n = 0
-                    materialize_skipped_upstream_busy = False
-                    try:
-                        if self._expand_all_pending.get("destination"):
-                            self._expand_all_deferred_refresh["destination"] = True
-                            # Synchronous QTreeView.expand() on large branches blocks the UI thread for seconds
-                            # (layout/delegates) and inflates folder_worker_success elapsed_overlay_block_ms.
-                            # Defer expand to the next event-loop tick for large direct child counts only;
-                            # small folders stay synchronous to avoid extra latency and ordering noise.
-                            _defer_thr = max(
-                                8, int(getattr(self, "_destination_expand_all_defer_expand_row_threshold", 48) or 48)
-                            )
-                            _rc = 0
-                            try:
-                                _rc = int(model_now.rowCount(parent_index_now))
-                            except Exception:
-                                _rc = 0
-                            if _rc > _defer_thr:
-                                _pmi_e = QPersistentModelIndex(parent_index_now)
-                                _tw_e = tree_now
-
-                                def _expand_all_folder_worker_deferred_expand() -> None:
-                                    if _tw_e is None or not _pmi_e.isValid():
-                                        return
-                                    _ix = QModelIndex(_pmi_e)
-                                    if not _ix.isValid():
-                                        return
-                                    _dm_e = getattr(self, "destination_planning_model", None)
-                                    if _dm_e is not None and hasattr(_dm_e, "is_index_live") and not _dm_e.is_index_live(
-                                        _ix
-                                    ):
-                                        return
-                                    try:
-                                        _tw_e.expand(_ix)
-                                    except Exception:
-                                        pass
-
-                                QTimer.singleShot(
-                                    0,
-                                    lambda: self._safe_invoke(
-                                        "destination_folder_worker_expand_all_deferred_expand",
-                                        _expand_all_folder_worker_deferred_expand,
-                                    ),
-                                )
-                            else:
-                                tree_now.expand(parent_index_now)
-                            handoff_moved_count = 0
-                            direct_applied_count = 0
-                            replay_applied_count = 0
-                            allocation_applied_count = 0
-                            allocation_replay_count = 0
-                            merge_moved_count = 0
-                            future_model_applied_count = 0
-                        elif (
-                            getattr(self, "_sharepoint_lazy_mode", False)
-                            and getattr(self, "_destination_root_prime_pending", False)
-                            and semantic_path != "Root"
-                        ):
-                            handoff_moved_count = self._restore_destination_future_state_children_model(
-                                parent_index_now, preserved_nested
-                            )
-                            direct_applied_count = 0
-                            replay_applied_count = 0
-                            allocation_applied_count = 0
-                            allocation_replay_count = 0
-                            merge_moved_count = 0
-                            future_model_applied_count = 0
-                        elif semantic_path == "Root" and (
-                            getattr(self, "_sharepoint_lazy_mode", False)
-                            or getattr(self, "_memory_restore_in_progress", False)
-                        ):
-                            handoff_moved_count = self._restore_destination_future_state_children_model(
-                                parent_index_now, preserved_nested
-                            )
-                            direct_applied_count = 0
-                            replay_applied_count = 0
-                            allocation_applied_count = 0
-                            allocation_replay_count = 0
-                            merge_moved_count = 0
-                            future_model_applied_count = 0
-                        else:
-                            handoff_moved_count = self._restore_destination_future_state_children_model(
-                                parent_index_now, preserved_nested
-                            )
-                            direct_applied_count = self._apply_proposed_children_to_item(parent_index_now)
-                            allocation_applied_count = self._apply_allocation_children_to_item(parent_index_now)
-                            uqp = self._unresolved_proposed_queue_size()
-                            uqa = self._unresolved_allocation_queue_size()
-                            replay_applied_count = (
-                                self._replay_unresolved_proposed_overlay(
-                                    "folder_worker_success",
-                                    trigger_path=trigger_path,
-                                )
-                                if uqp
-                                else 0
-                            )
-                            allocation_replay_count = (
-                                self._replay_unresolved_allocation_overlay(
-                                    "folder_worker_success",
-                                    trigger_path=trigger_path,
-                                )
-                                if uqa
-                                else 0
-                            )
-                            merge_moved_count = self._reconcile_destination_semantic_duplicates_maybe_deferred(
-                                "folder_worker_success",
-                                affected_destination_paths=(semantic_path,),
-                            )
-                            if getattr(self, "_sharepoint_lazy_mode", False):
-                                future_model_applied_count = 0
-                            else:
-                                fw_scope = self._destination_folder_worker_materialize_scope_paths(semantic_path)
-                                fw_mat_scope_n = len(fw_scope)
-                                future_model_applied_count = self._destination_materialize_with_optional_overlay_scope(
-                                    "folder_worker_success",
-                                    allow_defer=True,
-                                    prefer_chunked_projection=True,
-                                    scope_paths=fw_scope,
-                                )
-                        self._log_restore_phase(
-                            "destination_replay_attachment_applied",
-                            trigger_path=self.normalize_memory_path(trigger_path),
-                            handoff_moved_count=handoff_moved_count,
-                            direct_applied_count=direct_applied_count,
-                            replay_applied_count=replay_applied_count,
-                            allocation_applied_count=allocation_applied_count,
-                            allocation_replay_count=allocation_replay_count,
-                            merge_moved_count=merge_moved_count,
-                            future_model_applied_count=future_model_applied_count,
-                            queue_size=self._unresolved_proposed_queue_size(),
-                            folder_worker_materialize_scope_count=fw_mat_scope_n,
-                        )
-                        t_fw_diag = time.perf_counter()
-                        dest_worker_slots = sum(
-                            1 for k in (self.folder_load_workers or {}) if str(k).startswith("destination:")
-                        )
-                        mat_mode = (
-                            "scoped_overlay"
-                            if fw_mat_scope_n
-                            else (
-                                "none_or_deferred"
-                                if not future_model_applied_count
-                                else "applied_unscoped"
-                            )
-                        )
-                        self._log_restore_phase(
-                            "folder_worker_success_destination_diag",
-                            worker_id=str(worker_id or "")[:80],
-                            drive_id_excerpt=str(drive_id or "")[:80],
-                            trigger_path=self.normalize_memory_path(trigger_path),
-                            semantic_path_excerpt=str(semantic_path or "")[:240],
-                            elapsed_children_replace_ms=int((t_after_children_replace - t_fw_bundle_0) * 1000),
-                            elapsed_overlay_block_ms=int((t_fw_diag - t_fw_bundle_0) * 1000),
-                            pending_destination_folder_loads=len(self.pending_folder_loads.get("destination", set())),
-                            active_destination_worker_slots=dest_worker_slots,
-                            unresolved_proposed_after=self._unresolved_proposed_queue_size(),
-                            unresolved_allocation_after=self._unresolved_allocation_queue_size(),
-                            bind_scope_active=bool(getattr(self, "_destination_bind_scope_paths", None)),
-                            destination_bind_sync_active=bool(getattr(self, "_destination_future_bind_sync_active", False)),
-                            chunked_bind_active=bool(getattr(self, "_destination_chunked_bind_state", None) is not None),
-                            full_tree_worker_running=bool(
-                                self._destination_full_tree_worker is not None
-                                and self._destination_full_tree_worker.isRunning()
-                            ),
-                            expand_all_pending_destination=bool(self._expand_all_pending.get("destination")),
-                            memory_restore_in_progress=bool(getattr(self, "_memory_restore_in_progress", False)),
-                            restore_destination_overlay_pending=bool(
-                                getattr(self, "_restore_destination_overlay_pending", False)
-                            ),
-                            materialize_mode=mat_mode,
-                            materialize_applied_count=future_model_applied_count,
-                            materialize_scope_path_count=fw_mat_scope_n,
-                        )
-                        if not self._expand_all_pending.get("destination"):
-                            if not getattr(self, "_destination_restore_completed_once", False):
-                                if semantic_path == "Root" and (
-                                    getattr(self, "_sharepoint_lazy_mode", False)
-                                    or getattr(self, "_memory_restore_in_progress", False)
-                                ):
-                                    self._start_destination_restore_materialization()
-                                if not getattr(self, "_destination_root_prime_pending", False):
-                                    self._schedule_destination_restore_materialization_queue(
-                                        "folder_load",
-                                        trigger_path=trigger_path,
-                                    )
-                            self._schedule_refresh_destination_tree_indicators()
-                            tree_now.viewport().update()
-                            if (
-                                self._unresolved_proposed_queue_size() == 0
-                                and self._unresolved_allocation_queue_size() == 0
-                                and getattr(self, "_memory_restore_in_progress", False)
-                            ):
-                                self._finalize_memory_restore_if_ready(f"folder_load:{semantic_path}")
-                        if (
-                            getattr(self, "_sharepoint_lazy_mode", False)
-                            and semantic_path == "Root"
-                            and not self._expand_all_pending.get("destination")
-                        ):
-                            self._set_tree_status_message(
-                                "destination",
-                                f"{model_now.rowCount(parent_index_now)} top-level destination folder(s) loaded.",
-                                loading=False,
-                            )
-                    except Exception as exc:
-                        self._log_restore_exception("destination_overlay_folder_load_success", exc)
-                    _footer(trigger_path)
-
-                if self._destination_expand_burst_should_coalesce(semantic_path_captured):
-                    self._destination_expand_burst_schedule(
+                _nd_gate = dict(parent_index.data(Qt.UserRole) or {})
+                semantic_path_for_gate = self._destination_semantic_path(_nd_gate) or ""
+                scroll_active = self._destination_user_scroll_interaction_active()
+                user_expand = worker_key in self._destination_scroll_defer_user_expand_keys
+                viewport_visible = self._destination_folder_row_viewport_visible(parent_index)
+                force_immediate = self._destination_folder_load_structural_must_run_immediately(semantic_path_for_gate)
+                if (
+                    scroll_active
+                    and not force_immediate
+                    and not user_expand
+                    and not viewport_visible
+                ):
+                    self._destination_deferred_folder_structural_enqueue(
                         {
-                            "panel_key": panel_key,
                             "worker_id": worker_id,
-                            "drive_id": drive_id_captured,
-                            "item_id": item_id_captured,
-                            "semantic_path_captured": semantic_path_captured,
-                            "trigger_path_captured": trigger_path_captured,
-                            "preserved_nested": preserved_nested,
-                            "previous_child_paths": previous_child_paths,
+                            "worker_key": worker_key,
+                            "drive_id": str(drive_id or ""),
+                            "item_id": str(item_id or ""),
+                            "items": list(items),
+                            "skip_destination_child_replace": skip_destination_child_replace,
+                            "previous_child_paths": set(previous_child_paths),
+                            "preserved_nested": list(preserved_nested or []),
                             "t_fw_bundle_0": t_fw_bundle_0,
-                            "t_after_children_replace": t_after_children_replace,
+                            "panel_key": panel_key,
+                            "semantic_path_captured": semantic_path_for_gate,
+                            "trigger_path_captured": _nd_gate.get("item_path") or _nd_gate.get("display_path") or "",
                         }
                     )
-                else:
-                    QTimer.singleShot(
-                        0,
-                        lambda: self._safe_invoke(
-                            "destination_folder_worker_success_deferred_pipeline",
-                            _deferred_destination_folder_worker_success_pipeline,
-                        ),
+                    log_info(
+                        "destination_folder_load_structural_deferred_for_scroll",
+                        worker_key=worker_key,
+                        semantic_path_excerpt=str(semantic_path_for_gate or "")[:240],
                     )
+                    t_idle = getattr(self, "_destination_tree_scroll_idle_timer", None)
+                    if t_idle is not None:
+                        idle_ms = max(
+                            120, int(getattr(self, "_destination_tree_scroll_idle_ms", 280) or 280)
+                        )
+                        t_idle.start(idle_ms)
+                    return
+
+                self._destination_model_view_apply_folder_load_structural_and_pipeline(
+                    parent_index=parent_index,
+                    worker_key=worker_key,
+                    worker_id=worker_id,
+                    panel_key=panel_key,
+                    items=items,
+                    skip_destination_child_replace=skip_destination_child_replace,
+                    previous_child_paths=previous_child_paths,
+                    preserved_nested=preserved_nested,
+                    t_fw_bundle_0=t_fw_bundle_0,
+                    drive_id=str(drive_id or ""),
+                    item_id=str(item_id or ""),
+                )
                 return
 
             if not self._tree_item_is_alive(item):
@@ -41581,6 +42369,8 @@ class MainWindow(QMainWindow):
                 return
 
             if panel_key == "destination" and self._destination_tree_uses_model_view():
+                self._destination_deferred_folder_structural_cancel(worker_key)
+                self._destination_scroll_defer_user_expand_keys.discard(worker_key)
                 pmi = worker_state.get("destination_folder_parent_persistent")
                 parent_index = QModelIndex(pmi) if pmi is not None and pmi.isValid() else QModelIndex()
                 if not parent_index.isValid():
@@ -50309,6 +51099,12 @@ class MainWindow(QMainWindow):
             dq = getattr(self, "_expand_all_destination_model_queue", None)
             if dq is not None:
                 dq.clear()
+            self._destination_expand_all_seq_active_sp = ""
+            self._destination_expand_all_seq_expand_dispatched = False
+            self._destination_expand_all_seq_wait_started = None
+            self._destination_expand_all_seq_last_wait_log_key = None
+            self._destination_expand_all_dfs_roots_deque = deque()
+            self._destination_expand_all_dfs_stack = []
 
     def _expand_all_progress_text(self, panel_key, prefix):
         processed_map = getattr(self, "_expand_all_processed", {}) or {}
@@ -51363,6 +52159,10 @@ class MainWindow(QMainWindow):
 
         Avoids a blocking ``expandAll()`` at the end of destination model expand-all.
         """
+        if bool(self._expand_all_pending.get("destination")) and bool(
+            getattr(self, "_destination_expand_all_sequential_mode", True)
+        ):
+            return 0
         if max_enqueue <= 0:
             return 0
         tree = getattr(self, "destination_tree_widget", None)
@@ -51406,11 +52206,644 @@ class MainWindow(QMainWindow):
                     stack.append(model.index(r, 0, ix))
         return added
 
+    def _destination_model_expand_all_max_inflight_loads(self) -> int:
+        if (
+            bool(self._expand_all_pending.get("destination"))
+            and self._destination_tree_uses_model_view()
+            and bool(getattr(self, "_destination_expand_all_sequential_mode", True))
+        ):
+            return 1
+        return 3
+
+    @staticmethod
+    def _destination_expand_all_seq_sp_is_subtree_root(root_sp: str, candidate_sp: str) -> bool:
+        if not root_sp or not candidate_sp:
+            return False
+        r = str(root_sp).rstrip("\\").casefold()
+        c = str(candidate_sp).rstrip("\\").casefold()
+        if c == r:
+            return True
+        return c.startswith(r + "\\")
+
+    @staticmethod
+    def _destination_expand_all_seq_semantic_path_key(sp: str) -> str:
+        return str(sp or "").strip().rstrip("\\").casefold()
+
+    def _destination_expand_all_seq_merge_scheduled_path_reaches_folder(self, folder_sp: str, scheduled_path: str) -> bool:
+        """True if incremental-merge work keyed at ``scheduled_path`` can affect ``folder_sp`` (ancestor or descendant chain)."""
+        p = str(scheduled_path or "").strip()
+        f = str(folder_sp or "").strip()
+        if not p or not f:
+            return False
+        return self._destination_expand_all_seq_sp_is_subtree_root(f, p) or self._destination_expand_all_seq_sp_is_subtree_root(
+            p, f
+        )
+
+    def _destination_expand_all_seq_merge_work_path_inside_folder(self, folder_sp: str, work_path: str) -> bool:
+        """True if merge attach/sort row work at ``work_path`` is inside ``folder_sp``'s subtree (including the folder row)."""
+        w = str(work_path or "").strip()
+        f = str(folder_sp or "").strip()
+        if not w or not f:
+            return False
+        return self._destination_expand_all_seq_sp_is_subtree_root(f, w)
+
+    def _destination_expand_all_seq_merge_work_path_in_expansion_scope(self, folder_sp: str, work_path: str) -> bool:
+        """True if merge work at ``work_path`` is this folder row or one direct semantic child (not deeper).
+
+        Sequential expand-all completion must not treat the whole subtree as one barrier (e.g. Root vs deep paths).
+        """
+        f = self._destination_expand_all_seq_semantic_path_key(folder_sp)
+        w = self._destination_expand_all_seq_semantic_path_key(work_path)
+        if not f or not w:
+            return False
+        if w == f:
+            return True
+        if not w.startswith(f + "\\"):
+            return False
+        rest = w[len(f) + 1 :]
+        return "\\" not in rest
+
+    @staticmethod
+    def _destination_expand_all_seq_semantic_direct_parent_sp(sp: str) -> str:
+        s = str(sp or "").strip().rstrip("\\")
+        if "\\" not in s:
+            return ""
+        return s.rsplit("\\", 1)[0]
+
+    def _destination_expand_all_seq_merge_session_can_affect_subtree(self, folder_sp: str, sess: dict) -> bool:
+        if not folder_sp or not sess:
+            return False
+        by_parent = sess.get("by_parent") or {}
+        for pk, plist in by_parent.items():
+            if self._destination_expand_all_seq_merge_scheduled_path_reaches_folder(folder_sp, str(pk or "")):
+                return True
+            for c in plist or []:
+                if self._destination_expand_all_seq_merge_scheduled_path_reaches_folder(folder_sp, str(c or "")):
+                    return True
+        for er in sess.get("entry_roots") or []:
+            if self._destination_expand_all_seq_merge_scheduled_path_reaches_folder(folder_sp, str(er or "")):
+                return True
+        return False
+
+    def _destination_expand_all_seq_merge_remaining_for_subtree(self, folder_sp: str, sess: dict) -> tuple[bool, str]:
+        """Merge session rows that can touch ``folder_sp`` using **direct expansion scope** (folder or one child).
+
+        Matches sequential expand-all: no global Root barrier from deep descendant-only merge rows; DFS + model
+        subtree gates handle branch completeness. Unrelated branches filtered by ``merge_session_can_affect_subtree``.
+        """
+        if sess is None or not folder_sp:
+            return False, ""
+        if not self._destination_expand_all_seq_merge_session_can_affect_subtree(folder_sp, sess):
+            return False, ""
+        phase = str(sess.get("phase") or "")
+        if phase == "attach":
+            po = sess.get("parent_order") or []
+            pi = int(sess.get("parent_i") or 0)
+            by_parent = sess.get("by_parent") or {}
+            if pi < len(po):
+                ppath = str(po[pi] or "").strip()
+                rh = by_parent.get(ppath) or []
+                rj = int(sess.get("root_j") or 0)
+                for rp in rh[rj:]:
+                    w = str(rp or "").strip()
+                    if w and self._destination_expand_all_seq_merge_work_path_in_expansion_scope(folder_sp, w):
+                        return True, "merge_attach_root_pending"
+            for idx in range(pi + 1, len(po)):
+                ppath = str(po[idx] or "").strip()
+                if not ppath:
+                    continue
+                rh = by_parent.get(ppath) or []
+                for rp in rh:
+                    w = str(rp or "").strip()
+                    if w and self._destination_expand_all_seq_merge_work_path_in_expansion_scope(folder_sp, w):
+                        return True, "merge_attach_later_parent_pending"
+            fs = sess.get("fill_stack") or []
+            for fr in fs:
+                pix = fr.get("parent_ix")
+                if pix is not None and hasattr(pix, "isValid") and pix.isValid():
+                    ppl = pix.data(Qt.UserRole) or {}
+                    psp = self._destination_semantic_path(ppl) or self._tree_item_path(ppl) or ""
+                    if psp and self._destination_expand_all_seq_merge_work_path_in_expansion_scope(folder_sp, psp):
+                        return True, "merge_fill_stack_parent_ix"
+                ni = int(fr.get("next_i") or 0)
+                if fr.get("nested_specs") is not None:
+                    specs = list(fr.get("nested_specs") or [])
+                    for spec in specs[ni:]:
+                        try:
+                            pls = spec[0] if spec else None
+                            if isinstance(pls, dict):
+                                w = (
+                                    self._destination_semantic_path(pls)
+                                    or self._tree_item_path(pls)
+                                    or str(pls.get("destination_path") or pls.get("item_path") or "")
+                                )
+                                w = str(w or "").strip()
+                                if w and self._destination_expand_all_seq_merge_work_path_in_expansion_scope(folder_sp, w):
+                                    return True, "merge_fill_stack_nested_spec"
+                        except Exception:
+                            continue
+                else:
+                    for cpath in (fr.get("child_paths") or [])[ni:]:
+                        w = str(cpath or "").strip()
+                        if w and self._destination_expand_all_seq_merge_work_path_in_expansion_scope(folder_sp, w):
+                            return True, "merge_fill_stack_child_path"
+            crp = str(sess.get("current_merge_root_path") or "").strip()
+            if crp and self._destination_expand_all_seq_merge_work_path_in_expansion_scope(folder_sp, crp):
+                return True, "merge_current_merge_root_path"
+            return False, ""
+        if phase == "post_attach_sort":
+            q = sess.get("parents_sort_queue") or []
+            pi = int(sess.get("parent_sort_i") or 0)
+            for i in range(pi, len(q)):
+                sp = str(q[i] or "").strip()
+                if sp and self._destination_expand_all_seq_merge_work_path_in_expansion_scope(sp, folder_sp):
+                    return True, "merge_post_attach_sort_pending"
+            return False, ""
+        if phase == "visibility":
+            return False, ""
+        if phase == "finalize":
+            sub = str(sess.get("finalize_subphase") or "")
+            if sub != "alloc_step":
+                return False, ""
+            mode = sess.get("finalize_alloc_mode")
+            dmodel = sess.get("dmodel")
+            if mode == "eager" and dmodel is not None:
+                pairs = sess.get("finalize_alloc_pairs") or []
+                i = int(sess.get("finalize_alloc_idx", 0) or 0)
+                for k in range(i, len(pairs)):
+                    ix, _move = pairs[k]
+                    if not ix.isValid():
+                        continue
+                    nd = ix.data(Qt.UserRole) or {}
+                    sem = self._destination_semantic_path(nd) or self._tree_item_path(nd) or ""
+                    sem = str(sem or "").strip()
+                    if sem and self._destination_expand_all_seq_merge_work_path_in_expansion_scope(folder_sp, sem):
+                        return True, "merge_finalize_alloc_eager_pending"
+            elif mode == "lazy_ap":
+                keys = sess.get("finalize_alloc_lazy_ap_keys") or []
+                j = int(sess.get("finalize_alloc_lazy_ap_i", 0) or 0)
+                for ki in range(j, len(keys)):
+                    ap = str(keys[ki] or "").strip()
+                    if ap and self._destination_expand_all_seq_merge_work_path_in_expansion_scope(folder_sp, ap):
+                        return True, "merge_finalize_lazy_ap_pending"
+            elif mode == "lazy_df":
+                # Timer-sliced DFS finalize: completion is enforced via model subtree placeholders and
+                # descendant-apply queue; avoid a global gate here so unrelated branches are not blocked.
+                return False, ""
+            return False, ""
+        return False, ""
+
+    def _destination_expand_all_seq_user_deferred_expand_pending(self, folder_sp: str) -> bool:
+        q = getattr(self, "_destination_expand_user_deferred_queue", None)
+        if not q:
+            return False
+        fk = self._destination_expand_all_seq_semantic_path_key(folder_sp)
+        if not fk:
+            return False
+        for p in q:
+            pk = self._destination_expand_all_seq_semantic_path_key(str(p or ""))
+            if pk == fk or pk.startswith(fk + "\\"):
+                return True
+        return False
+
+    def _destination_expand_all_seq_current_folder_graph_load_pending(self, pl: dict) -> bool:
+        drive_id = self._resolve_tree_item_drive_id("destination", pl)
+        item_id = pl.get("id", "")
+        pending_key = f"{drive_id}:{item_id}" if drive_id and item_id else ""
+        if not pending_key:
+            return False
+        return pending_key in self.pending_folder_loads.get("destination", set())
+
+    def _destination_expand_all_seq_model_branch_materialization_pending(
+        self, model, folder_ix: QModelIndex, folder_sp: str
+    ) -> tuple[bool, str]:
+        """True if any row under ``folder_ix`` still blocks materialization for this DFS branch.
+
+        Scoped to the subtree rooted at ``folder_ix`` only — not sibling branches elsewhere.
+        """
+        _ = folder_sp
+        if not folder_ix.isValid():
+            return False, ""
+        stack_ix = [folder_ix]
+        while stack_ix:
+            ix = stack_ix.pop()
+            try:
+                rc = model.rowCount(ix)
+            except Exception:
+                rc = 0
+            for r in range(rc):
+                cix = model.index(r, 0, ix)
+                if not cix.isValid():
+                    continue
+                pl = cix.data(Qt.UserRole) or {}
+                if pl.get("placeholder"):
+                    role = str(pl.get("placeholder_role") or "")
+                    if role == "terminal_empty":
+                        continue
+                    if role in ("projection_pending", "loading_in_progress"):
+                        return True, f"model_branch_{role}"
+                    if role == "lazy_unloaded" and pl.get("is_folder"):
+                        return True, "model_branch_lazy_unloaded"
+                    if pl.get("ozlink_deferred_files_summary"):
+                        return True, "model_branch_deferred_files_summary_row"
+                    continue
+                if pl.get("is_folder"):
+                    stack_ix.append(cix)
+        return False, ""
+
+    def _destination_expand_all_seq_log(self, event: str, **fields) -> None:
+        if not (
+            bool(getattr(self, "_destination_expand_all_sequential_mode", True))
+            and bool(self._expand_all_pending.get("destination"))
+        ):
+            return
+        log_info("destination_expand_all_seq_" + str(event), **fields)
+
+    def _destination_expand_all_seq_is_terminal_empty_folder(self, model, index: QModelIndex) -> bool:
+        pl = index.data(Qt.UserRole) or {}
+        # Terminal-empty is only valid after this folder's own load has settled.
+        if self._destination_expand_all_seq_current_folder_graph_load_pending(pl):
+            return False
+        if not bool(pl.get("children_loaded") or pl.get("load_failed")):
+            return False
+        try:
+            rc = model.rowCount(index)
+        except Exception:
+            rc = 0
+        if rc != 1:
+            return False
+        c0 = model.index(0, 0, index)
+        if not c0.isValid():
+            return False
+        d = c0.data(Qt.UserRole) or {}
+        return bool(d.get("placeholder")) and str(d.get("placeholder_role") or "") == "terminal_empty"
+
+    def _destination_expand_all_seq_collect_folder_children(self, model, index: QModelIndex) -> list[tuple[str, QPersistentModelIndex, str]]:
+        out = []
+        try:
+            rc = model.rowCount(index)
+        except Exception:
+            rc = 0
+        for r in range(rc):
+            cix = model.index(r, 0, index)
+            if not cix.isValid():
+                continue
+            cpl = cix.data(Qt.UserRole) or {}
+            if cpl.get("placeholder") or not cpl.get("is_folder"):
+                continue
+            ck = self._destination_model_expand_all_key(cix)
+            csp = self._destination_semantic_path(cpl) or self._tree_item_path(cpl) or ""
+            ckey = str(ck or csp or f"row:{r}:{str(cpl.get('name') or '')}")
+            out.append((ckey, QPersistentModelIndex(cix), csp))
+        return out
+
+    def _destination_expand_all_seq_descendant_apply_pending_for_active_folder(self, folder_sp: str) -> bool:
+        """True when allocation-descendant apply targets this folder row or any path under it (DFS branch)."""
+        fk = self._destination_expand_all_seq_semantic_path_key(folder_sp)
+        if not fk:
+            return False
+
+        def _under(ps: str) -> bool:
+            pk = self._destination_expand_all_seq_semantic_path_key(ps)
+            if not pk:
+                return False
+            return pk == fk or pk.startswith(fk + "\\")
+
+        st = getattr(self, "_destination_descendant_apply_state", None)
+        if st is not None:
+            pix = st.get("parent_ix")
+            if pix is not None and pix.isValid():
+                ppl = pix.data(Qt.UserRole) or {}
+                ps = self._destination_semantic_path(ppl) or self._tree_item_path(ppl) or ""
+                if _under(ps):
+                    return True
+        q = getattr(self, "_destination_descendant_apply_queue", None)
+        if not q:
+            return False
+        for qix, _, _ in q:
+            if not qix.isValid():
+                continue
+            qpl = qix.data(Qt.UserRole) or {}
+            qs = self._destination_semantic_path(qpl) or self._tree_item_path(qpl) or ""
+            if _under(qs):
+                return True
+        return False
+
+    def _destination_expand_all_seq_folder_complete(
+        self, model, index: QModelIndex, pl: dict, folder_sp: str
+    ) -> tuple[bool, str]:
+        if self._destination_expand_all_seq_is_terminal_empty_folder(model, index):
+            return True, "terminal_empty"
+        if pl.get("placeholder") or not pl.get("is_folder"):
+            return True, "skip_non_folder"
+        if self._destination_expand_all_seq_current_folder_graph_load_pending(pl):
+            return False, "await_graph_children_load"
+        alloc = bool(self.node_is_planned_allocation(pl))
+        load_done = bool(pl.get("children_loaded") or pl.get("load_failed"))
+        alloc_applied = bool(pl.get("allocation_descendants_applied"))
+        if alloc:
+            if not alloc_applied:
+                return False, "await_allocation_descendants_applied"
+            if not load_done:
+                return False, "await_children_after_alloc"
+        else:
+            if not load_done:
+                return False, "await_children_load"
+        if folder_sp and self._destination_expand_all_seq_user_deferred_expand_pending(folder_sp):
+            return False, "await_user_deferred_expand"
+        if folder_sp and self._destination_expand_all_seq_descendant_apply_pending_for_active_folder(folder_sp):
+            return False, "await_descendant_apply_active_folder"
+        sess = getattr(self, "_destination_incremental_merge_session", None)
+        if sess is not None:
+            mpend, mwhy = self._destination_expand_all_seq_merge_remaining_for_subtree(folder_sp, sess)
+            if mpend:
+                return False, mwhy or "await_merge_subtree"
+        mp_vis, mvwhy = self._destination_expand_all_seq_model_branch_materialization_pending(
+            model, index, folder_sp
+        )
+        if mp_vis:
+            return False, mvwhy or "await_model_branch"
+        return True, "ok"
+
+    def _destination_expand_all_seq_dfs_note_folder_complete(
+        self, model, index: QModelIndex, reason: str, semantic_excerpt: str
+    ) -> None:
+        key = self._destination_model_expand_all_key(index)
+        if key:
+            panel_ps = self._expand_all_processed_seen["destination"]
+            if key not in panel_ps:
+                panel_ps.add(key)
+                self._expand_all_processed["destination"] += 1
+        for r in range(model.rowCount(index)):
+            cix = model.index(r, 0, index)
+            cpl = cix.data(Qt.UserRole) or {}
+            if cpl.get("placeholder") or not cpl.get("is_folder"):
+                continue
+            ck = self._destination_model_expand_all_key(cix)
+            if ck:
+                self._expand_all_seen["destination"].add(ck)
+        self._destination_expand_all_seq_log(
+            "folder_complete",
+            reason=str(reason)[:160],
+            semantic_path_excerpt=str(semantic_excerpt)[:240],
+            expansion_scope="dfs_branch",
+            forced_advance=False,
+        )
+
+    def _destination_model_expand_all_tick_sequential(self, tree, model) -> None:
+        roots_deque = getattr(self, "_destination_expand_all_dfs_roots_deque", None)
+        stack = self._destination_expand_all_dfs_stack
+        max_inflight = self._destination_model_expand_all_max_inflight_loads()
+        run_id = int(getattr(self, "_destination_expand_all_seq_run_id", 0) or 0)
+
+        while True:
+            if not stack:
+                if not roots_deque:
+                    return
+                seeded = False
+                while roots_deque:
+                    rp = roots_deque.popleft()
+                    if not rp.isValid():
+                        continue
+                    stack.append(
+                        {
+                            "pmi": QPersistentModelIndex(rp),
+                            "seen_child_keys": set(),
+                            "stable_count_last": None,
+                            "stable_passes": 0,
+                            "initial_logged": False,
+                        }
+                    )
+                    pl0 = QModelIndex(rp).data(Qt.UserRole) or {}
+                    sp0 = self._destination_semantic_path(pl0) or self._tree_item_path(pl0) or ""
+                    self._destination_expand_all_seq_log(
+                        "branch_started",
+                        semantic_path_excerpt=str(sp0)[:240],
+                        run_id=run_id,
+                        expansion_scope="dfs_branch",
+                    )
+                    seeded = True
+                    break
+                if not seeded:
+                    return
+
+            top = stack[-1]
+            pmi_top = top.get("pmi")
+            if pmi_top is None or not pmi_top.isValid():
+                stack.pop()
+                continue
+            index = QModelIndex(pmi_top)
+            pl = index.data(Qt.UserRole) or {}
+            if pl.get("placeholder") or not pl.get("is_folder"):
+                stack.pop()
+                continue
+            folder_sp = self._destination_semantic_path(pl) or self._tree_item_path(pl) or ""
+            visit_key = folder_sp or (self._destination_model_expand_all_key(pl) or "")
+            if visit_key and self._destination_expand_all_seq_active_sp != visit_key:
+                self._destination_expand_all_seq_active_sp = visit_key
+                self._destination_expand_all_seq_expand_dispatched = False
+                self._destination_expand_all_seq_wait_started = None
+                self._destination_expand_all_seq_last_wait_log_key = None
+                self._destination_expand_all_seq_log(
+                    "folder_started",
+                    visit_key_excerpt=str(visit_key)[:240],
+                    semantic_path_excerpt=str(folder_sp)[:240],
+                    expansion_scope="dfs_branch",
+                    run_id=run_id,
+                )
+            if self._destination_expand_all_seq_expand_dispatched:
+                done, why = self._destination_expand_all_seq_folder_complete(model, index, pl, folder_sp)
+                if not done:
+                    lk = (str(visit_key), str(why))
+                    if lk != self._destination_expand_all_seq_last_wait_log_key:
+                        self._destination_expand_all_seq_last_wait_log_key = lk
+                        self._destination_expand_all_seq_log(
+                            "folder_waiting",
+                            wait_reason=str(why)[:160],
+                            visit_key_excerpt=str(visit_key)[:240],
+                            semantic_path_excerpt=str(folder_sp)[:240],
+                            expansion_scope="dfs_branch",
+                            run_id=run_id,
+                        )
+                    break
+                children = self._destination_expand_all_seq_collect_folder_children(model, index)
+                child_count_now = len(children)
+                if not bool(top.get("initial_logged")):
+                    top["initial_logged"] = True
+                    top["stable_count_last"] = child_count_now
+                    self._destination_expand_all_seq_log(
+                        "folder_child_count_initial",
+                        visit_key_excerpt=str(visit_key)[:240],
+                        semantic_path_excerpt=str(folder_sp)[:240],
+                        child_folder_count=int(child_count_now),
+                        expansion_scope="dfs_branch",
+                        run_id=run_id,
+                    )
+                else:
+                    self._destination_expand_all_seq_log(
+                        "folder_child_count_recheck",
+                        visit_key_excerpt=str(visit_key)[:240],
+                        semantic_path_excerpt=str(folder_sp)[:240],
+                        child_folder_count=int(child_count_now),
+                        expansion_scope="dfs_branch",
+                        run_id=run_id,
+                    )
+
+                seen = top.setdefault("seen_child_keys", set())
+                child_triplet = None
+                for ckey, cpmi, csp in children:
+                    if ckey in seen:
+                        continue
+                    child_triplet = (ckey, cpmi, csp)
+                    break
+                if child_triplet is not None:
+                    ckey, child_pmi, csp = child_triplet
+                    seen.add(ckey)
+                    last_count = top.get("stable_count_last")
+                    if isinstance(last_count, int) and child_count_now > last_count:
+                        self._destination_expand_all_seq_log(
+                            "folder_reopened_due_to_new_children",
+                            visit_key_excerpt=str(visit_key)[:240],
+                            semantic_path_excerpt=str(folder_sp)[:240],
+                            previous_child_folder_count=int(last_count),
+                            child_folder_count=int(child_count_now),
+                            expansion_scope="dfs_branch",
+                            run_id=run_id,
+                        )
+                    top["stable_count_last"] = child_count_now
+                    top["stable_passes"] = 0
+                    stack.append(
+                        {
+                            "pmi": child_pmi,
+                            "seen_child_keys": set(),
+                            "stable_count_last": None,
+                            "stable_passes": 0,
+                            "initial_logged": False,
+                        }
+                    )
+                    self._destination_expand_all_seq_expand_dispatched = False
+                    self._destination_expand_all_seq_log(
+                        "child_descend",
+                        from_path_excerpt=str(folder_sp)[:240],
+                        to_path_excerpt=str(csp)[:240],
+                        expansion_scope="dfs_branch",
+                        run_id=run_id,
+                    )
+                    break
+                last_count = top.get("stable_count_last")
+                if not isinstance(last_count, int) or int(last_count) != int(child_count_now):
+                    top["stable_count_last"] = child_count_now
+                    top["stable_passes"] = 0
+                    self._destination_expand_all_seq_log(
+                        "folder_waiting",
+                        wait_reason="await_child_set_stable_recheck",
+                        visit_key_excerpt=str(visit_key)[:240],
+                        semantic_path_excerpt=str(folder_sp)[:240],
+                        child_folder_count=int(child_count_now),
+                        expansion_scope="dfs_branch",
+                        run_id=run_id,
+                    )
+                    break
+                top["stable_passes"] = int(top.get("stable_passes") or 0) + 1
+                if int(top.get("stable_passes") or 0) < 2:
+                    self._destination_expand_all_seq_log(
+                        "folder_waiting",
+                        wait_reason="await_child_set_stable_recheck",
+                        visit_key_excerpt=str(visit_key)[:240],
+                        semantic_path_excerpt=str(folder_sp)[:240],
+                        child_folder_count=int(child_count_now),
+                        expansion_scope="dfs_branch",
+                        run_id=run_id,
+                    )
+                    break
+                self._destination_expand_all_seq_log(
+                    "folder_completion_confirmed_stable",
+                    visit_key_excerpt=str(visit_key)[:240],
+                    semantic_path_excerpt=str(folder_sp)[:240],
+                    child_folder_count=int(child_count_now),
+                    expansion_scope="dfs_branch",
+                    run_id=run_id,
+                )
+                self._destination_expand_all_seq_dfs_note_folder_complete(model, index, why, folder_sp)
+                prev_depth = len(stack)
+                stack.pop()
+                if prev_depth == 1 and not stack:
+                    self._destination_expand_all_seq_log(
+                        "branch_complete",
+                        semantic_path_excerpt=str(folder_sp)[:240],
+                        expansion_scope="dfs_branch",
+                        run_id=run_id,
+                    )
+                elif stack:
+                    self._destination_expand_all_seq_log(
+                        "sibling_advance",
+                        completed_path_excerpt=str(folder_sp)[:240],
+                        expansion_scope="dfs_branch",
+                        run_id=run_id,
+                    )
+                self._destination_expand_all_seq_expand_dispatched = False
+                continue
+
+            pending_count = len(self.pending_folder_loads.get("destination", set()))
+            if pending_count >= max_inflight:
+                lk = (str(visit_key), "throttle_max_inflight")
+                if lk != self._destination_expand_all_seq_last_wait_log_key:
+                    self._destination_expand_all_seq_last_wait_log_key = lk
+                    self._destination_expand_all_seq_log(
+                        "folder_waiting",
+                        wait_reason="throttle_max_inflight",
+                        visit_key_excerpt=str(visit_key)[:240],
+                        pending_folder_loads=int(pending_count),
+                        expansion_scope="dfs_branch",
+                        run_id=run_id,
+                    )
+                break
+            tree.expand(index)
+            if self._destination_expand_all_seq_wait_started is None:
+                self._destination_expand_all_seq_wait_started = time.monotonic()
+            self._ensure_tree_item_load_started("destination", index)
+            self._destination_expand_all_seq_expand_dispatched = True
+            pl2 = index.data(Qt.UserRole) or {}
+            drive_id = self._resolve_tree_item_drive_id("destination", pl2)
+            item_id = pl2.get("id", "")
+            pending_key = f"{drive_id}:{item_id}" if drive_id and item_id else ""
+            if pending_key and pending_key in self.pending_folder_loads.get("destination", set()):
+                break
+            done, why = self._destination_expand_all_seq_folder_complete(model, index, pl2, folder_sp)
+            if done:
+                continue
+            lk = (str(visit_key), str(why))
+            if lk != self._destination_expand_all_seq_last_wait_log_key:
+                self._destination_expand_all_seq_last_wait_log_key = lk
+                self._destination_expand_all_seq_log(
+                    "folder_waiting",
+                    wait_reason=str(why)[:160],
+                    visit_key_excerpt=str(visit_key)[:240],
+                    semantic_path_excerpt=str(folder_sp)[:240],
+                    expansion_scope="dfs_branch",
+                    run_id=run_id,
+                )
+            break
+
     def _begin_destination_model_expand_all(self):
         panel_key = "destination"
         tree = getattr(self, "destination_tree_widget", None)
         model = getattr(self, "destination_planning_model", None)
         if tree is None or model is None:
+            return
+        if not self._destination_structure_ready("begin_destination_model_expand_all", log_waiting=True):
+            log_info(
+                "destination_bind_deferred_for_structure",
+                reason="begin_destination_model_expand_all",
+                waiting_for_structure=True,
+            )
+            QTimer.singleShot(
+                250,
+                lambda: self._safe_invoke(
+                    "destination_begin_expand_all_retry_structure_ready",
+                    self._begin_destination_model_expand_all,
+                ),
+            )
             return
         self._expand_all_pending[panel_key] = True
         self._reset_expand_all_progress(panel_key)
@@ -51422,6 +52855,11 @@ class MainWindow(QMainWindow):
             loading=True,
         )
         root = QModelIndex()
+        seq = bool(getattr(self, "_destination_expand_all_sequential_mode", True))
+        if seq:
+            self._destination_expand_all_seq_run_id = int(getattr(self, "_destination_expand_all_seq_run_id", 0) or 0) + 1
+            self._destination_expand_all_dfs_roots_deque = deque()
+            self._destination_expand_all_dfs_stack = []
         for r in range(model.rowCount(root)):
             ix = model.index(r, 0, root)
             pl = ix.data(Qt.UserRole) or {}
@@ -51430,7 +52868,26 @@ class MainWindow(QMainWindow):
             key = self._destination_model_expand_all_key(ix)
             if key:
                 self._expand_all_seen[panel_key].add(key)
-            self._expand_all_destination_model_queue.append(QPersistentModelIndex(ix))
+            if seq:
+                self._destination_expand_all_dfs_roots_deque.append(QPersistentModelIndex(ix))
+            else:
+                self._expand_all_destination_model_queue.append(QPersistentModelIndex(ix))
+        if seq:
+            self._destination_expand_all_seq_log(
+                "run_started",
+                run_id=self._destination_expand_all_seq_run_id,
+                expansion_scope="dfs_branch",
+                top_level_roots=len(self._destination_expand_all_dfs_roots_deque),
+            )
+            log_info(
+                "destination_expand_all_started_with_structure_ready",
+                run_id=self._destination_expand_all_seq_run_id,
+                structure_ready=True,
+            )
+            self._destination_expand_burst_cancel_for_strict_sequential(
+                reason="begin_destination_expand_all",
+                schedule_continue=False,
+            )
         self._destination_model_expand_all_tick()
 
     def _destination_model_expand_all_tick(self):
@@ -51439,6 +52896,29 @@ class MainWindow(QMainWindow):
         tree = getattr(self, "destination_tree_widget", None)
         model = getattr(self, "destination_planning_model", None)
         if tree is None or model is None:
+            self._finish_destination_model_expand_all()
+            return
+
+        if bool(getattr(self, "_destination_expand_all_sequential_mode", True)):
+            self._destination_model_expand_all_tick_sequential(tree, model)
+            roots_deque = getattr(self, "_destination_expand_all_dfs_roots_deque", None)
+            stack = getattr(self, "_destination_expand_all_dfs_stack", None)
+            dfs_busy = bool(stack) or bool(roots_deque)
+            pending_dest = bool(self.pending_folder_loads.get("destination"))
+            if dfs_busy or pending_dest:
+                self._update_expand_all_status(
+                    "destination",
+                    "Expanding all destination branches…",
+                    loading=True,
+                )
+                QTimer.singleShot(
+                    20,
+                    lambda: self._safe_invoke(
+                        "destination_model_expand_all_tick",
+                        self._destination_model_expand_all_tick,
+                    ),
+                )
+                return
             self._finish_destination_model_expand_all()
             return
 
@@ -51453,7 +52933,7 @@ class MainWindow(QMainWindow):
             and ((time.perf_counter() - tick_start) * 1000.0) < tick_budget_ms
         ):
             pending_count = len(self.pending_folder_loads.get("destination", set()))
-            max_inflight_loads = 3
+            max_inflight_loads = self._destination_model_expand_all_max_inflight_loads()
             if pending_count >= max_inflight_loads:
                 break
 
@@ -51568,6 +53048,12 @@ class MainWindow(QMainWindow):
             "expand_all_destination_model_complete",
             folder_count=self._count_expandable_tree_nodes(panel_key),
         )
+        if bool(getattr(self, "_destination_expand_all_sequential_mode", True)):
+            self._destination_expand_all_seq_log(
+                "run_complete",
+                run_id=int(getattr(self, "_destination_expand_all_seq_run_id", 0) or 0),
+                expansion_scope="dfs_branch",
+            )
         self._expand_all_pending[panel_key] = False
         self._reset_expand_all_progress(panel_key)
         self._expand_all_deferred_refresh[panel_key] = True
