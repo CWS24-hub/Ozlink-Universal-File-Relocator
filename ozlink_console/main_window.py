@@ -91,6 +91,11 @@ from ozlink_console.tree_models.sharepoint_source_model import SharePointSourceT
 from ozlink_console.tree_models.destination_planning_model import DestinationPlanningTreeModel, NestedSpec
 from ozlink_console.dev_mode import is_dev_mode
 from ozlink_console.logger import log_error, log_info, log_trace, log_warn
+
+# Sentinel: structural insert must not proceed (ambiguous canonical matches under parent).
+_DESTINATION_STRUCTURAL_INSERT_AMBIGUOUS = object()
+# Future-model graph only: parent of library top-level rows (not the SharePoint folder name "Root").
+_DESTINATION_FUTURE_MODEL_LIBRARY_PARENT_KEY = ""
 from ozlink_console.memory import MemoryManager, WORKSPACE_SNAPSHOT_SCHEMA_VERSION
 from ozlink_console.version_info import APP_VERSION
 from ozlink_console.models import AllocationRow, ProposedFolder, SessionState, SubmissionBatch
@@ -10874,15 +10879,10 @@ class MainWindow(QMainWindow):
         """True when the heavy folder_worker_success pipeline can be merged into a debounced burst."""
         if self._expand_all_pending.get("destination"):
             return False
-        # Root during post-login memory restore must run the immediate deferred pipeline (handoff + restore
-        # queue), not merge into a burst — same as lazy Root; avoids multi-second overlay/replay inline.
-        if getattr(self, "_memory_restore_in_progress", False) and semantic_path_captured == "Root":
+        if getattr(self, "_memory_restore_in_progress", False):
             return False
-        if getattr(self, "_sharepoint_lazy_mode", False):
-            if getattr(self, "_destination_root_prime_pending", False) and semantic_path_captured != "Root":
-                return False
-            if semantic_path_captured == "Root":
-                return False
+        if getattr(self, "_sharepoint_lazy_mode", False) and getattr(self, "_destination_root_prime_pending", False):
+            return False
         return True
 
     def _destination_expand_burst_schedule(self, entry: dict) -> None:
@@ -11107,7 +11107,7 @@ class MainWindow(QMainWindow):
                     f"Refreshing saved branches... {added_count} added, {removed_count} removed in {nd_now.get('name', 'folder')}.",
                     loading=bool(self._pending_snapshot_branch_refresh.get(panel_key)),
                 )
-        if semantic_path == "Root":
+        if self._destination_model_index_is_library_top_level(parent_index_now):
             self._destination_root_prime_pending = False
             ctx["root_drive_id"] = str(nd_now.get("drive_id") or drive_id_captured or "")
             ctx["root_item_id"] = str(nd_now.get("id") or item_id_captured or "")
@@ -11587,7 +11587,7 @@ class MainWindow(QMainWindow):
             )
             if not self._expand_all_pending.get("destination"):
                 if not getattr(self, "_destination_restore_completed_once", False):
-                    if any((sp or "") == "Root" for sp in all_semantic_paths) and (
+                    if any(self._destination_semantic_path_is_library_depth_one(sp) for sp in all_semantic_paths) and (
                         getattr(self, "_sharepoint_lazy_mode", False)
                         or getattr(self, "_memory_restore_in_progress", False)
                     ):
@@ -12577,19 +12577,31 @@ class MainWindow(QMainWindow):
 
         snapshot_entries = []
         for item in payload.get("items", []):
-            semantic_path = self._canonical_destination_projection_path(
-                item.get("display_path") or item.get("item_path") or item.get("destination_path") or ""
+            raw_item_path = str(item.get("item_path") or "").strip()
+            if raw_item_path:
+                slash_parts = [p for p in raw_item_path.replace("\\", "/").split("/") if p]
+                if not slash_parts:
+                    continue
+                joined = self.normalize_memory_path("\\".join(slash_parts))
+                semantic_path = self._canonical_destination_projection_path(joined) or joined
+            else:
+                disp = str(item.get("display_path") or item.get("destination_path") or "").strip()
+                semantic_path = self._canonical_destination_projection_path(disp) or self.normalize_memory_path(disp)
+                if not semantic_path:
+                    continue
+            segs = self._path_segments(semantic_path)
+            parent_semantic_path = (
+                self.normalize_memory_path("\\".join(segs[:-1])) if len(segs) > 1 else ""
             )
-            if not semantic_path:
-                continue
             item_data = dict(item)
             item_data["children_loaded"] = True
-            snapshot_entries.append({
-                "semantic_path": semantic_path,
-                "parent_semantic_path": self.normalize_memory_path("\\".join(self._path_segments(semantic_path)[:-1])),
-                "data": item_data,
-                "children": [],
-            })
+            snapshot_entries.append(
+                self._destination_pack_real_flat_snapshot_entry(
+                    semantic_path=semantic_path,
+                    parent_semantic_path=parent_semantic_path,
+                    data=item_data,
+                )
+            )
 
         self._destination_full_tree_snapshot = snapshot_entries
         self._destination_full_tree_completed_drive_id = drive_id
@@ -19519,6 +19531,84 @@ class MainWindow(QMainWindow):
         preserved.reverse()
         return preserved
 
+    def _destination_graph_zero_children_replace_mode(
+        self, parent_ix: QModelIndex, items: list, preserved_nested: list
+    ) -> str:
+        """How to represent an empty Graph child list for ``replace_all_children`` (destination only)."""
+        if not isinstance(items, list) or len(items) != 0:
+            return "terminal_empty"
+        if not self._destination_model_index_is_library_top_level(parent_ix):
+            return "terminal_empty"
+        parent_data = dict(parent_ix.data(Qt.UserRole) or {})
+        parent_path = self._tree_item_path(parent_data)
+        if preserved_nested:
+            log_info(
+                "destination_empty_library_detected",
+                mode="silent_pending_future_restore",
+                parent_path_excerpt=str(parent_path)[:240],
+            )
+            return "none"
+        if parent_path:
+            if self._get_unresolved_candidates_for_parent(parent_path):
+                log_info(
+                    "destination_empty_library_detected",
+                    mode="silent_pending_proposed",
+                    parent_path_excerpt=str(parent_path)[:240],
+                )
+                return "none"
+            if self._get_unresolved_allocation_candidates_for_parent(parent_path):
+                log_info(
+                    "destination_empty_library_detected",
+                    mode="silent_pending_allocation",
+                    parent_path_excerpt=str(parent_path)[:240],
+                )
+                return "none"
+        log_info(
+            "destination_empty_library_detected",
+            mode="empty_library_message",
+            parent_path_excerpt=str(parent_path)[:240],
+        )
+        log_info("destination_empty_state_rendered", placeholder_role="empty_library_message")
+        return "empty_library_message"
+
+    def _destination_merge_future_overlay_into_real_index(self, target_ix: QModelIndex, overlay_pl: dict) -> None:
+        """Copy planning/overlay fields from a preserved future node onto an existing real Graph row."""
+        model = getattr(self, "destination_planning_model", None)
+        if model is None or not target_ix.isValid() or not isinstance(overlay_pl, dict) or not overlay_pl:
+            return
+        base = dict(target_ix.data(Qt.UserRole) or {})
+        if self._destination_node_state(base) != "real":
+            return
+        keys = (
+            "planned_allocation",
+            "overlay_state",
+            "source_path",
+            "projection_unresolved_terminal",
+            "allocation_descendants_applied",
+            "planned_allocation_descendant",
+            "base_display_label",
+            "_model_foreground",
+            "_model_background",
+            "_model_tooltip",
+        )
+
+        def _mut(p):
+            for k in keys:
+                if k not in overlay_pl:
+                    continue
+                v = overlay_pl.get(k)
+                if v is None and k not in p:
+                    continue
+                if k == "base_display_label" and not (
+                    overlay_pl.get("planned_allocation") or overlay_pl.get("proposed")
+                ):
+                    continue
+                p[k] = v
+            if overlay_pl.get("proposed") or str(overlay_pl.get("node_origin", "")).lower() == "proposed":
+                p["proposed"] = True
+
+        model.update_payload_for_index(target_ix, _mut)
+
     def _restore_destination_future_state_children_model(self, parent_ix: QModelIndex, specs: List[NestedSpec]):
         if not specs:
             return 0
@@ -19533,13 +19623,81 @@ class MainWindow(QMainWindow):
             if moved and moved % yield_every == 0:
                 QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
             sem = self._destination_semantic_path(pl)
-            existing_ix = child_map.get(sem) if sem else None
+            child_path = self._tree_item_path(pl) or sem or ""
+            reuse_or_block = None
+            if child_path:
+                reuse_or_block = self._destination_precheck_before_projected_insert(
+                    parent_ix, child_path, reason="restore_future_state_model"
+                )
+            if reuse_or_block is _DESTINATION_STRUCTURAL_INSERT_AMBIGUOUS:
+                log_info(
+                    "destination_post_load_duplicate_blocked",
+                    reason="restore_future_state_model",
+                    detail="ambiguous_canonical_under_parent",
+                    target_canonical_excerpt=str(self._destination_effective_canonical_path(child_path))[:400],
+                )
+                continue
+            existing_ix = None
+            if isinstance(reuse_or_block, QModelIndex) and reuse_or_block.isValid():
+                existing_ix = reuse_or_block
+            elif (not child_path) and sem:
+                cand = child_map.get(sem)
+                if cand is not None and cand.isValid():
+                    existing_ix = cand
             if existing_ix is not None and existing_ix.isValid():
-                existing_data = existing_ix.data(Qt.UserRole) or {}
+                existing_data = dict(existing_ix.data(Qt.UserRole) or {})
+                if str(existing_data.get("real_name") or existing_data.get("name") or "").strip().casefold() == "root":
+                    log_info(
+                        "destination_real_root_folder_handled_normally",
+                        phase="restore_future_state_model",
+                        path_excerpt=str(self._tree_item_path(existing_data))[:400],
+                    )
+                log_info(
+                    "destination_post_load_reused_existing",
+                    reason="restore_future_state_model",
+                    target_canonical_excerpt=str(self._destination_effective_canonical_path(child_path))[:400],
+                )
                 if self._destination_node_state(existing_data) == "real":
+                    self._destination_merge_future_overlay_into_real_index(existing_ix, pl)
                     if kids:
                         moved += self._restore_destination_future_state_children_model(existing_ix, kids)
                     continue
+                if kids:
+                    moved += self._restore_destination_future_state_children_model(existing_ix, kids)
+                continue
+            dup_guard = None
+            if child_path:
+                dup_guard = self._destination_precheck_before_projected_insert(
+                    parent_ix, child_path, reason="restore_future_state_model_duplicate_guard"
+                )
+            if dup_guard is not None and dup_guard is not _DESTINATION_STRUCTURAL_INSERT_AMBIGUOUS:
+                log_error(
+                    "destination_real_spo_duplicate_violation",
+                    reason="restore_future_state_model",
+                    note="precheck_miss_then_hit_on_duplicate_guard",
+                    target_canonical_excerpt=str(self._destination_effective_canonical_path(child_path))[:400],
+                )
+                hit_ix = dup_guard if isinstance(dup_guard, QModelIndex) else None
+                if hit_ix is not None and hit_ix.isValid():
+                    ed2 = dict(hit_ix.data(Qt.UserRole) or {})
+                    if self._destination_node_state(ed2) == "real":
+                        self._destination_merge_future_overlay_into_real_index(hit_ix, pl)
+                    if kids:
+                        moved += self._restore_destination_future_state_children_model(hit_ix, kids)
+                continue
+            if dup_guard is _DESTINATION_STRUCTURAL_INSERT_AMBIGUOUS:
+                log_info(
+                    "destination_post_load_duplicate_blocked",
+                    reason="restore_future_state_model_duplicate_guard",
+                    detail="ambiguous_canonical_under_parent",
+                    target_canonical_excerpt=str(self._destination_effective_canonical_path(child_path))[:400],
+                )
+                continue
+            log_info(
+                "destination_post_load_insert_allowed",
+                reason="restore_future_state_model",
+                target_canonical_excerpt=str(self._destination_effective_canonical_path(child_path))[:400],
+            )
             new_ix = model.append_nested_child(parent_ix, (pl, kids))
             moved += 1
             if sem and new_ix.isValid():
@@ -20271,14 +20429,13 @@ class MainWindow(QMainWindow):
         else:
             root_item = tree.topLevelItem(0) if tree is not None else None
             root_data = root_item.data(0, Qt.UserRole) or {} if root_item is not None else {}
-        root_semantic_path = self._destination_semantic_path(root_data) if root_data else ""
         root_children_loaded = bool(root_data.get("children_loaded")) if root_data else False
         root_load_failed = bool(root_data.get("load_failed")) if root_data else False
 
         if (
             getattr(self, "_sharepoint_lazy_mode", False)
             and (root_item is not None or (self._destination_tree_uses_model_view() and root_data))
-            and root_semantic_path == "Root"
+            and bool(root_data.get("is_folder", True))
             and not root_children_loaded
             and not root_load_failed
         ):
@@ -20702,9 +20859,12 @@ class MainWindow(QMainWindow):
     def _destination_branch_visual_context(self, node_data):
         destination_path = self._canonical_destination_projection_path(self._tree_item_path(node_data))
         segments = self._path_segments(destination_path)
-        if len(segments) < 2 or str(segments[0]).lower() != "root":
+        if not segments:
             return "", 0
-        return segments[1], len(segments) - 1
+        # Library-relative paths: first segment is the branch (Finance, Sales, …). Legacy Root\X still supported.
+        if str(segments[0]).lower() == "root" and len(segments) >= 2:
+            return segments[1], len(segments) - 2
+        return segments[0], len(segments) - 1
 
     def _destination_branch_visual_color(self, node_data):
         branch_name, branch_depth = self._destination_branch_visual_context(node_data)
@@ -20745,34 +20905,37 @@ class MainWindow(QMainWindow):
         return [segment for segment in normalized.split("\\") if segment]
 
     def _destination_projection_segments(self, path):
+        """Segments for destination paths, relative to the selected library (after site/library trim only).
+
+        SharePoint/Graph is the structural source of truth: a real folder named ``Root`` is a normal
+        library child, and ``Root\\Finance`` stays ``Root\\Finance`` so projections bind under that
+        folder instead of mirroring ``Finance`` at the library root.
+        """
         segments = self._path_segments(path)
         if not segments:
             return []
 
         lowered = [segment.lower() for segment in segments]
-        if "root" in lowered:
-            return segments[lowered.index("root"):]
-
         context_segments = [segment.lower() for segment in self._current_destination_context_segments()]
         if context_segments:
             library_segment = context_segments[-1]
             if library_segment in lowered:
                 library_index = lowered.index(library_segment)
-                trimmed = segments[library_index + 1:]
-                return ["Root", *trimmed] if trimmed else ["Root"]
+                trimmed = segments[library_index + 1 :]
+                return list(trimmed)
 
             site_segment = context_segments[0]
             if site_segment in lowered:
                 site_index = lowered.index(site_segment)
-                trimmed = segments[site_index + 1:]
+                trimmed = segments[site_index + 1 :]
                 if trimmed:
                     trimmed_lowered = [segment.lower() for segment in trimmed]
                     if library_segment in trimmed_lowered:
                         library_index = trimmed_lowered.index(library_segment)
-                        trimmed = trimmed[library_index + 1:]
-                    return ["Root", *trimmed] if trimmed else ["Root"]
+                        trimmed = trimmed[library_index + 1 :]
+                return list(trimmed)
 
-        return ["Root", *segments]
+        return list(segments)
 
     def _canonical_destination_projection_path(self, path):
         raw = str(path or "").strip()
@@ -20784,9 +20947,22 @@ class MainWindow(QMainWindow):
         canonical_path = self.normalize_memory_path("\\".join(segments))
         return self._destination_semantic_alias_path(canonical_path)
 
+    def _destination_effective_canonical_path(self, path) -> str:
+        """Single destination path identity for reuse, index keys, and insert guards.
+
+        Applies library-relative canonicalization, then falls back to normalized raw path so
+        strict-only canonicalization cannot disagree with the visible row identity.
+        """
+        p = self.normalize_memory_path(str(path or "").strip())
+        if not p:
+            return ""
+        c = self._canonical_destination_projection_path(p)
+        out = (c or p).strip()
+        return out
+
     def _destination_parent_match_details(self, requested_parent_path, candidate_tree_path):
-        normalized_requested = self._canonical_destination_projection_path(requested_parent_path)
-        normalized_candidate = self._canonical_destination_projection_path(candidate_tree_path)
+        normalized_requested = self._destination_effective_canonical_path(requested_parent_path)
+        normalized_candidate = self._destination_effective_canonical_path(candidate_tree_path)
         requested_segments = [segment.lower() for segment in self._path_segments(normalized_requested)]
         candidate_segments = [segment.lower() for segment in self._path_segments(normalized_candidate)]
         exact_match = bool(requested_segments and candidate_segments and requested_segments == candidate_segments)
@@ -20831,25 +21007,6 @@ class MainWindow(QMainWindow):
             library_name = self._draft_shell_state.SelectedDestinationLibrary or ""
 
         return [segment for segment in (site_name, library_name) if segment]
-
-    def _destination_raw_path_uses_library_root_hub(self, tree_path: str) -> bool:
-        """True when ``tree_path`` goes ``...\\<Library>\\Root\\...`` (visible hub), not ``...\\<Library>\\<dept>``."""
-        segs = self._path_segments(tree_path or "")
-        if len(segs) < 2:
-            return False
-        ctx = self._current_destination_context_segments()
-        if len(ctx) < 2:
-            return False
-        lib_l = str(ctx[1] or "").strip().casefold()
-        if not lib_l:
-            return False
-        lowered = [str(s or "").strip().casefold() for s in segs]
-        try:
-            li = lowered.index(lib_l)
-        except ValueError:
-            return False
-        rest = segs[li + 1 :]
-        return bool(rest and str(rest[0]).strip().casefold() == "root")
 
     def _current_source_context_segments(self):
         site_name = ""
@@ -20913,26 +21070,25 @@ class MainWindow(QMainWindow):
     def _destination_payload_index_raw_mem(self, payload: dict) -> str:
         """Raw path string used to build :meth:`_destination_payload_index_key` (index bucket identity).
 
-        Field precedence matches the model index only (not :meth:`_tree_item_path`, which prefers
-        ``source_path`` over ``destination_path``). Incremental merge uses this to accept index
-        hits when the primary visible-path match fails.
+        Field precedence matches :meth:`_tree_item_path` so index buckets, child lookup, and
+        visible rows share one identity rule (no split between index and UI path).
         """
         if not isinstance(payload, dict) or payload.get("placeholder"):
             return ""
         return self.normalize_memory_path(
             payload.get("display_path")
             or payload.get("item_path")
-            or payload.get("destination_path")
             or payload.get("source_path")
+            or payload.get("destination_path")
             or ""
         )
 
     def _destination_payload_index_key(self, payload: dict) -> str:
-        """Canonical path key for DestinationPlanningTreeModel index (must match _destination_parent_match_details)."""
+        """Canonical path key for DestinationPlanningTreeModel (must match destination child reuse)."""
         mem = self._destination_payload_index_raw_mem(payload)
         if not mem:
             return ""
-        return self._canonical_destination_projection_path(mem) or ""
+        return self._destination_effective_canonical_path(mem)
 
     def _normalized_path_variants(self, path, tree_role=""):
         if tree_role == "source":
@@ -21779,8 +21935,7 @@ class MainWindow(QMainWindow):
         """
         if not isinstance(node_data, dict):
             return ""
-        raw = self._tree_item_path(node_data)
-        return self._canonical_destination_projection_path(raw) or self.normalize_memory_path(raw)
+        return self._destination_effective_canonical_path(self._tree_item_path(node_data))
 
     def _log_destination_action_target(self, action: str, *, selected_semantic_path: str, resolved_target_path: str, **extra):
         if not is_dev_mode():
@@ -21803,7 +21958,10 @@ class MainWindow(QMainWindow):
         )
 
     def _proposed_folder_exists_under(self, parent_item, destination_path):
-        normalized_target = self.normalize_memory_path(destination_path)
+        target_eff = self._destination_effective_canonical_path(destination_path)
+        if not target_eff:
+            return False
+        te = target_eff.casefold()
         if isinstance(parent_item, QModelIndex):
             model = getattr(self, "destination_planning_model", None)
             if model is None:
@@ -21811,15 +21969,15 @@ class MainWindow(QMainWindow):
             for r in range(model.rowCount(parent_item)):
                 ix = model.index(r, 0, parent_item)
                 child_data = ix.data(Qt.UserRole) or {}
-                child_path = child_data.get("item_path") or child_data.get("display_path") or ""
-                if self._paths_equivalent(child_path, normalized_target, "destination"):
+                child_eff = self._destination_effective_canonical_path(self._tree_item_path(child_data))
+                if child_eff and child_eff.casefold() == te:
                     return True
             return False
         for index in range(parent_item.childCount()):
             child = parent_item.child(index)
             child_data = child.data(0, Qt.UserRole) or {}
-            child_path = child_data.get("item_path") or child_data.get("display_path") or ""
-            if self._paths_equivalent(child_path, normalized_target, "destination"):
+            child_eff = self._destination_effective_canonical_path(self._tree_item_path(child_data))
+            if child_eff and child_eff.casefold() == te:
                 return True
         return False
 
@@ -21908,9 +22066,41 @@ class MainWindow(QMainWindow):
             normalized_parent_path = self._proposed_parent_path(proposed_folder)
             if not self._paths_equivalent(normalized_parent_path, parent_path, "destination"):
                 continue
-            if self._proposed_folder_exists_under(parent_ix, self._proposed_destination_path(proposed_folder)):
+            dest_path = self._proposed_destination_path(proposed_folder)
+            if self._proposed_folder_exists_under(parent_ix, dest_path):
                 self._mark_proposed_folder_resolved(proposed_folder)
                 continue
+            reuse_or_block = self._destination_precheck_before_projected_insert(
+                parent_ix, dest_path, reason="apply_proposed_children_model"
+            )
+            if reuse_or_block is _DESTINATION_STRUCTURAL_INSERT_AMBIGUOUS:
+                log_info(
+                    "destination_projection_insert_skipped_ambiguous",
+                    reason="apply_proposed_children_model",
+                    target_canonical_excerpt=str(self._destination_effective_canonical_path(dest_path))[:400],
+                )
+                log_info(
+                    "destination_duplicate_insert_blocked",
+                    reason="apply_proposed_children_model",
+                    detail="ambiguous_canonical_under_parent",
+                )
+                continue
+            if reuse_or_block is not None:
+                if is_dev_mode():
+                    log_info(
+                        "destination_replay_reused_existing",
+                        phase="proposed_overlay",
+                        path_excerpt=str(dest_path or "")[:400],
+                    )
+                self._mark_proposed_folder_resolved(proposed_folder)
+                continue
+            if is_dev_mode():
+                log_info(
+                    "destination_projection_insert_allowed",
+                    path_mode="model",
+                    phase="proposed_overlay",
+                    path_excerpt=str(dest_path or "")[:400],
+                )
             self._remove_placeholder_children(parent_ix)
             pl = self._build_proposed_payload(proposed_folder, parent_data)
             model.append_child_payloads(parent_ix, [pl])
@@ -21920,15 +22110,13 @@ class MainWindow(QMainWindow):
         return applied_count
 
     def _find_destination_child_by_allocation_equivalence(self, parent_item, move):
-        """Match planned allocation path using the same rules as the old exists_under check.
-
-        `_find_destination_child_by_path` can miss real SharePoint rows when only
-        `item_path`/`display_path` line up via `_paths_equivalent`, which previously caused
-        `_apply_allocation_children_to_item` to skip without upgrading the real child.
-        """
+        """Match allocation target using the same effective canonical identity as child lookup."""
         if parent_item is None or move is None:
             return None
-        normalized_target = self._allocation_projection_path(move)
+        target_eff = self._destination_effective_canonical_path(self._allocation_projection_path(move))
+        if not target_eff:
+            return None
+        te = target_eff.casefold()
         if isinstance(parent_item, QModelIndex):
             model = getattr(self, "destination_planning_model", None)
             if model is None:
@@ -21938,8 +22126,8 @@ class MainWindow(QMainWindow):
                 child_data = ix.data(Qt.UserRole) or {}
                 if child_data.get("placeholder"):
                     continue
-                child_path = child_data.get("item_path") or child_data.get("display_path") or ""
-                if self._paths_equivalent(child_path, normalized_target, "destination"):
+                child_eff = self._destination_effective_canonical_path(self._tree_item_path(child_data))
+                if child_eff and child_eff.casefold() == te:
                     return ix
             return None
         for index in range(parent_item.childCount()):
@@ -21947,8 +22135,8 @@ class MainWindow(QMainWindow):
             child_data = child.data(0, Qt.UserRole) or {}
             if child_data.get("placeholder"):
                 continue
-            child_path = child_data.get("item_path") or child_data.get("display_path") or ""
-            if self._paths_equivalent(child_path, normalized_target, "destination"):
+            child_eff = self._destination_effective_canonical_path(self._tree_item_path(child_data))
+            if child_eff and child_eff.casefold() == te:
                 return child
         return None
 
@@ -22349,31 +22537,70 @@ class MainWindow(QMainWindow):
             current_parent_ix, branch_path, child_map_cache
         )
         if existing_child is None:
-            new_pl = self._build_projected_allocation_descendant_payload(
-                descendant_data if is_leaf else {"name": segment, "real_name": segment, "is_folder": True},
+            reuse_or_block = self._destination_precheck_before_projected_insert(
+                current_parent_ix,
                 branch_path,
-                current_parent_data,
+                reason="destination_descendant_apply_allocation",
+                assume_primary_find_miss=True,
             )
-            if is_leaf:
-                pk = self._destination_child_map_cache_key_index(current_parent_ix)
-                batch = pending_leaf_batches.setdefault(
-                    pk, {"parent_ix": current_parent_ix, "payloads": []}
+            if reuse_or_block is _DESTINATION_STRUCTURAL_INSERT_AMBIGUOUS:
+                log_info(
+                    "destination_duplicate_insert_blocked",
+                    reason="destination_descendant_apply_allocation",
+                    detail="ambiguous_canonical_under_parent",
+                    branch_excerpt=str(branch_path or "")[:400],
                 )
-                batch["payloads"].append(new_pl)
-                visibility_targets[pk] = current_parent_ix
-                st["added_count"] += 1
-                existing_child = current_parent_ix
+                st["desc_index"] += 1
+                st["walk_phase"] = "next_descendant"
+                return "next_descendant"
+            if reuse_or_block is not None:
+                if is_dev_mode():
+                    log_info(
+                        "destination_allocation_reused_existing",
+                        phase="descendant_apply",
+                        branch_excerpt=str(branch_path or "")[:400],
+                    )
+                existing_child = reuse_or_block
             else:
-                self._allocation_apply_flush_pending_model(
-                    model, child_map_cache, pending_leaf_batches, current_parent_ix
+                new_pl = self._build_projected_allocation_descendant_payload(
+                    descendant_data if is_leaf else {"name": segment, "real_name": segment, "is_folder": True},
+                    branch_path,
+                    current_parent_data,
                 )
-                self._remove_placeholder_children(current_parent_ix)
-                model.append_child_payloads(current_parent_ix, [new_pl])
-                new_row = model.rowCount(current_parent_ix) - 1
-                existing_child = model.index(new_row, 0, current_parent_ix)
-                self._destination_merge_new_children_into_index_map_cache(child_map_cache, current_parent_ix, 1)
-                pk = self._destination_child_map_cache_key_index(current_parent_ix)
-                visibility_targets[pk] = current_parent_ix
+                if is_leaf:
+                    if is_dev_mode():
+                        log_info(
+                            "destination_projection_insert_allowed",
+                            path_mode="model",
+                            phase="descendant_apply_leaf",
+                            branch_excerpt=str(branch_path or "")[:400],
+                        )
+                    pk = self._destination_child_map_cache_key_index(current_parent_ix)
+                    batch = pending_leaf_batches.setdefault(
+                        pk, {"parent_ix": current_parent_ix, "payloads": []}
+                    )
+                    batch["payloads"].append(new_pl)
+                    visibility_targets[pk] = current_parent_ix
+                    st["added_count"] += 1
+                    existing_child = current_parent_ix
+                else:
+                    if is_dev_mode():
+                        log_info(
+                            "destination_projection_insert_allowed",
+                            path_mode="model",
+                            phase="descendant_apply_folder",
+                            branch_excerpt=str(branch_path or "")[:400],
+                        )
+                    self._allocation_apply_flush_pending_model(
+                        model, child_map_cache, pending_leaf_batches, current_parent_ix
+                    )
+                    self._remove_placeholder_children(current_parent_ix)
+                    model.append_child_payloads(current_parent_ix, [new_pl])
+                    new_row = model.rowCount(current_parent_ix) - 1
+                    existing_child = model.index(new_row, 0, current_parent_ix)
+                    self._destination_merge_new_children_into_index_map_cache(child_map_cache, current_parent_ix, 1)
+                    pk = self._destination_child_map_cache_key_index(current_parent_ix)
+                    visibility_targets[pk] = current_parent_ix
         st["current_parent_ix"] = existing_child
         st["current_parent_data"] = existing_child.data(Qt.UserRole) or {}
         st["seg_index"] = idx + 1
@@ -22705,7 +22932,6 @@ class MainWindow(QMainWindow):
 
     def _destination_bind_normalized_expanded_targets(self, destination_expanded_paths):
         target_paths = {p for p in (destination_expanded_paths or set()) if p}
-        target_paths.add("Root")
         normalized_targets = set(target_paths)
         for path in list(target_paths):
             k = self._destination_expansion_state_key(path)
@@ -23034,7 +23260,6 @@ class MainWindow(QMainWindow):
                 tree_path = self._tree_item_path(pl)
                 return (
                     self._destination_resolution_rank(pl),
-                    0 if self._destination_raw_path_uses_library_root_hub(tree_path) else 1,
                     -len(self._path_segments(tree_path)),
                 )
 
@@ -23050,17 +23275,36 @@ class MainWindow(QMainWindow):
             items,
             key=lambda item: (
                 self._destination_resolution_rank(item.data(0, Qt.UserRole) or {}),
-                0
-                if self._destination_raw_path_uses_library_root_hub(
-                    self._tree_item_path(item.data(0, Qt.UserRole) or {})
-                )
-                else 1,
                 -len(self._path_segments(self._tree_item_path(item.data(0, Qt.UserRole) or {}))),
             ),
         )
 
     def _destination_semantic_path(self, node_data):
-        return self._canonical_destination_projection_path(self._tree_item_path(node_data))
+        if not isinstance(node_data, dict):
+            return ""
+        return self._destination_effective_canonical_path(self._tree_item_path(node_data))
+
+    def _destination_canonical_segment_count(self, sem_path: str) -> int:
+        c = self._canonical_destination_projection_path(str(sem_path or "").strip())
+        return len(self._path_segments(c)) if c else 0
+
+    def _destination_semantic_path_is_library_depth_one(self, sem_path: str) -> bool:
+        """True when path is one library-relative segment (any top-level folder, including a folder named Root)."""
+        return self._destination_canonical_segment_count(sem_path) == 1
+
+    def _destination_future_model_normalize_parent_key(self, parent: str, child_semantic_path: str = "") -> str:
+        """Return parent key unchanged: ``Root`` is never remapped to the library (no hub inference)."""
+        _ = child_semantic_path
+        return str(parent or "").strip()
+
+    def _destination_model_index_is_library_top_level(self, ix: QModelIndex) -> bool:
+        return ix.isValid() and not ix.parent().isValid()
+
+    def _destination_widget_item_is_library_top_level(self, item) -> bool:
+        try:
+            return item is not None and item.parent() is None
+        except Exception:
+            return False
 
     def _destination_folder_display_name_for_sibling_dedup(self, node_data):
         """Extract a comparable folder name token from explorer-style ``base_display_label``."""
@@ -23117,21 +23361,262 @@ class MainWindow(QMainWindow):
         return self._destination_sibling_name_collision_token(dk)
 
     def _destination_expansion_state_key(self, path: str) -> str:
-        """Normalize paths for expand/collapse persistence across tree rebuilds.
+        """Canonical key for expand/collapse persistence (library-relative; no special ``Root`` segment)."""
+        return self._canonical_destination_projection_path(path or "") or ""
 
-        Live SharePoint rows often use ``Site\\Library\\Root\\...`` while future-model binds use
-        ``Root\\...`` only. Without this, ``_restore_expanded_destination_paths`` after
-        ``_bind_destination_tree_from_future_state_model`` only restores ``Root``, leaving deep
-        nodes visually collapsed while the expand-all button still says *Collapse All*.
+    def _destination_real_snapshot_paths_resolved(self, node_data, parent_resolved_semantic_path: str) -> tuple[str, str]:
+        """Build snapshot ``semantic_path`` / ``parent_semantic_path`` using the visible tree parent, not path string alone.
+
+        Rows whose payload path is a single segment (e.g. ``Finance``) but sit under ``Root`` in the model/widget
+        must snapshot as ``Root\\Finance`` so the future model graph does not invent a false library-root sibling.
         """
-        canon = self._canonical_destination_projection_path(path or "")
-        if not canon:
-            return ""
-        segs = self._path_segments(canon)
-        for i, seg in enumerate(segs):
-            if str(seg).strip().lower() == "root":
-                return "\\".join(segs[i:])
-        return canon
+        if not isinstance(node_data, dict):
+            return "", ""
+        sp0 = self.normalize_memory_path(self._destination_semantic_path(node_data) or "")
+        psp = self.normalize_memory_path(str(parent_resolved_semantic_path or "").strip())
+        segs0 = self._path_segments(sp0)
+        if not segs0:
+            return "", ""
+        if len(segs0) == 1 and psp:
+            sp = self.normalize_memory_path(f"{psp}\\{segs0[0]}")
+        else:
+            sp = sp0
+        psegs = self._path_segments(sp)
+        par_out = self.normalize_memory_path("\\".join(psegs[:-1])) if len(psegs) > 1 else ""
+        return sp, par_out
+
+    def _destination_model_index_resolved_snapshot_paths(self, ix) -> tuple[str, str]:
+        """Resolve snapshot paths for a planning-model row by walking ancestors top-down."""
+        if not ix.isValid():
+            return "", ""
+        chain = []
+        cur = ix
+        while cur.isValid():
+            chain.append(cur)
+            cur = cur.parent()
+        chain.reverse()
+        parent_sp = ""
+        out_sem = ""
+        out_par = ""
+        for cur_ix in chain:
+            nd = cur_ix.data(Qt.UserRole) or {}
+            out_sem, out_par = self._destination_real_snapshot_paths_resolved(nd, parent_sp)
+            parent_sp = out_sem
+        return out_sem, out_par
+
+    def _destination_pack_real_flat_snapshot_entry(self, *, semantic_path: str, parent_semantic_path: str, data: dict) -> dict:
+        """Single constructor for flat rows in ``_destination_real_tree_snapshot`` / ``_destination_full_tree_snapshot``.
+
+        Real-tree snapshot sources must all use this so paths stay parent-aware. Call sites:
+        ``on_destination_full_tree_success``, ``_collect_real_destination_snapshot_entries_index``,
+        ``_collect_real_destination_snapshot_entries``, ``_snapshot_real_destination_node``.
+        """
+        sp = self.normalize_memory_path(str(semantic_path or "").strip())
+        psp = self.normalize_memory_path(str(parent_semantic_path or "").strip())
+        if psp and "\\" not in sp:
+            raise AssertionError(
+                "destination_real_snapshot_illegal_leaf_only_under_parent: "
+                f"semantic_path={semantic_path!r} normalized={sp!r} parent_semantic_path={psp!r}"
+            )
+        return {
+            "semantic_path": sp,
+            "parent_semantic_path": psp,
+            "data": dict(data),
+            "children": [],
+        }
+
+    def _destination_audit_destination_graph_single_segment_nodes(self, model_nodes: dict, *, stage: str) -> None:
+        """Dev/investigation: all graph keys that are a single path segment (except ``Root``) with overlay state."""
+        if not model_nodes:
+            log_info("destination_graph_single_segment_audit", stage=str(stage or "")[:120], empty_model=True)
+            return
+        rows: list[dict] = []
+        for k, n in model_nodes.items():
+            if not isinstance(n, dict):
+                continue
+            sk = self.normalize_memory_path(str(k or "").strip())
+            segs = self._path_segments(sk)
+            if len(segs) != 1 or sk.casefold() == "root":
+                continue
+            leaf = segs[0]
+            rk = self.normalize_memory_path(f"Root\\{leaf}")
+            d = n.get("data") or {}
+            psp = str(n.get("parent_semantic_path") or "").strip()
+            st = str(n.get("node_state") or "")
+            rows.append(
+                {
+                    "key": sk[:200],
+                    "parent_semantic_path": psp[:200],
+                    "id": str(d.get("id") or "")[:80],
+                    "name": str(d.get("name") or "")[:120],
+                    "node_state": st[:40],
+                    "root_backslash_name_exists": rk in model_nodes,
+                    "planned_allocation": bool(d.get("planned_allocation")),
+                    "proposed_flag": bool(d.get("proposed")),
+                    "parentless_in_graph": not psp,
+                }
+            )
+        log_info(
+            "destination_graph_single_segment_audit",
+            stage=str(stage or "")[:120],
+            row_count=int(len(rows)),
+            rows=rows[:160],
+        )
+
+    def _destination_overlay_resolve_prefix_in_model(
+        self, model_nodes: dict, raw_prefix: str, parent_semantic_path: str
+    ) -> tuple[str, str]:
+        """If overlay would create a library-root single-segment key but ``Root\\<leaf>`` exists, bind under ``Root``."""
+        psp = self.normalize_memory_path(str(parent_semantic_path or "").strip())
+        rp = self.normalize_memory_path(str(raw_prefix or "").strip())
+        if not rp or psp:
+            return rp, psp
+        segs = self._path_segments(rp)
+        if len(segs) != 1:
+            return rp, psp
+        if segs[0].casefold() == "root":
+            return rp, psp
+        under_root = self.normalize_memory_path(f"Root\\{segs[0]}")
+        if under_root in model_nodes:
+            return under_root, self.normalize_memory_path("Root")
+        return rp, psp
+
+    def _destination_log_real_snapshot_ingest_audit(self, entries: list, *, merge_mode: str) -> None:
+        if not entries:
+            return
+        keys = []
+        one_seg = []
+        for ent in entries:
+            if not isinstance(ent, dict):
+                continue
+            k = self.normalize_memory_path(str(ent.get("semantic_path") or ""))
+            pk = str(ent.get("parent_semantic_path") or "").strip()
+            d = ent.get("data") or {}
+            if not k:
+                continue
+            keys.append(str(k)[:200])
+            if len(self._path_segments(k)) == 1 and k.casefold() != "root":
+                one_seg.append(
+                    {
+                        "key": str(k)[:160],
+                        "parent_semantic_path": str(pk)[:160],
+                        "id": str(d.get("id") or "")[:72],
+                        "name": str(d.get("name") or "")[:120],
+                    }
+                )
+        log_info(
+            "destination_real_snapshot_flat_ingest_audit",
+            merge_mode=str(merge_mode or "")[:80],
+            entry_count=int(len(entries)),
+            semantic_keys_sample=sorted(set(keys))[:200],
+            parentless_single_segment_rows=one_seg[:80],
+        )
+
+    def _destination_log_future_model_graph_audit(self, model_nodes: dict, *, when: str) -> None:
+        if not model_nodes:
+            log_info("destination_future_model_graph_audit", when=str(when or "")[:80], total_nodes=0)
+            return
+        top = [
+            p
+            for p, n in model_nodes.items()
+            if isinstance(n, dict) and not str(n.get("parent_semantic_path") or "").strip()
+        ]
+        one_seg = [
+            p
+            for p in top
+            if len(self._path_segments(str(p))) == 1 and str(p).strip().casefold() != "root"
+        ]
+        root_kids = [
+            p
+            for p, n in model_nodes.items()
+            if isinstance(n, dict) and str(n.get("parent_semantic_path") or "").strip().casefold() == "root"
+        ]
+        suspects: list[dict] = []
+        for p in sorted(one_seg, key=lambda z: str(z).lower()):
+            n = model_nodes.get(p)
+            if not isinstance(n, dict):
+                continue
+            d = n.get("data") or {}
+            segs = self._path_segments(str(p))
+            leaf = segs[0] if segs else ""
+            rk = self.normalize_memory_path(f"Root\\{leaf}") if leaf else ""
+            under = model_nodes.get(rk) if rk else None
+            id_top = str(d.get("id") or "").strip()
+            id_under = str(((under or {}).get("data") or {}).get("id") or "").strip() if isinstance(under, dict) else ""
+            suspects.append(
+                {
+                    "semantic_key": str(p)[:160],
+                    "parent_semantic_path": str(n.get("parent_semantic_path") or ""),
+                    "id": id_top[:72],
+                    "name": str(d.get("name") or "")[:120],
+                    "matching_root_child_key": rk[:160] if rk else "",
+                    "matching_root_child_exists": bool(isinstance(under, dict)),
+                    "under_parent_semantic": str((under or {}).get("parent_semantic_path") or "")[:120]
+                    if isinstance(under, dict)
+                    else "",
+                    "under_id": id_under[:72],
+                }
+            )
+        log_info(
+            "destination_future_model_graph_audit",
+            when=str(when or "")[:120],
+            total_nodes=int(len(model_nodes)),
+            top_level_key_count=int(len(top)),
+            top_level_keys_sorted=[str(x)[:200] for x in sorted(top, key=lambda z: str(z).lower())],
+            one_segment_top_level_not_root=[str(x)[:200] for x in sorted(one_seg, key=lambda z: str(z).lower())],
+            root_child_key_count=int(len(root_kids)),
+            root_children_sorted=[str(x)[:200] for x in sorted(root_kids, key=lambda z: str(z).lower())],
+            parentless_single_segment_detail=suspects[:64],
+        )
+
+    def _destination_log_root_child_dedupe_trace(self, model_nodes: dict, *, phase: str) -> None:
+        """Classify every parentless single-segment key (except ``Root``) vs ``Root\\<name>`` for debugging."""
+        if not model_nodes:
+            return
+        rows = []
+        for short, node in model_nodes.items():
+            if not isinstance(node, dict):
+                continue
+            if str(node.get("parent_semantic_path") or "").strip():
+                continue
+            segs = self._path_segments(str(short))
+            if len(segs) != 1:
+                continue
+            name = segs[0]
+            if name.casefold() == "root":
+                continue
+            under_key = self.normalize_memory_path(f"Root\\{name}")
+            under = model_nodes.get(under_key)
+            d_top = (node.get("data") or {}) if isinstance(node, dict) else {}
+            d_under = (under.get("data") or {}) if isinstance(under, dict) else {}
+            id_top = str(d_top.get("id") or "").strip()
+            id_under = str(d_under.get("id") or "").strip()
+            upar = str((under or {}).get("parent_semantic_path") or "").strip() if isinstance(under, dict) else ""
+            if not isinstance(under, dict):
+                reason = "no_matching_root_child_node"
+            elif upar.casefold() != "root":
+                reason = "under_node_parent_not_root"
+            elif id_top and id_under and id_top != id_under:
+                reason = "id_mismatch_dedupe_skipped"
+            else:
+                reason = "eligible_for_package_dedupe_merge"
+            rows.append(
+                {
+                    "key": str(short)[:160],
+                    "id": id_top[:72],
+                    "name": str(d_top.get("name") or "")[:120],
+                    "under_key": str(under_key)[:160],
+                    "under_id": id_under[:72],
+                    "dedupe_trace": reason,
+                }
+            )
+        if rows:
+            log_info(
+                "destination_root_child_dedupe_trace",
+                phase=str(phase or "")[:120],
+                candidate_count=int(len(rows)),
+                rows=rows[:80],
+            )
 
     def _destination_future_state_rank(self, node_state):
         if node_state == "projected":
@@ -23157,42 +23642,55 @@ class MainWindow(QMainWindow):
             return 1
         return 0
 
-    def _snapshot_real_destination_node(self, item):
+    def _snapshot_real_destination_node(self, item, parent_resolved_semantic_path: str = ""):
         if item is None:
             return None
         node_data = item.data(0, Qt.UserRole) or {}
         if node_data.get("placeholder") or self._destination_is_future_state_node(node_data):
             return None
-        semantic_path = self._destination_semantic_path(node_data)
+        semantic_path, parent_semantic_path = self._destination_real_snapshot_paths_resolved(
+            node_data, parent_resolved_semantic_path
+        )
         if not semantic_path:
             return None
-        snapshot = {
-            "semantic_path": semantic_path,
-            "parent_semantic_path": self.normalize_memory_path("\\".join(self._path_segments(semantic_path)[:-1])),
-            "data": dict(node_data),
-            "children": [],
-        }
+        snapshot = self._destination_pack_real_flat_snapshot_entry(
+            semantic_path=semantic_path,
+            parent_semantic_path=parent_semantic_path,
+            data=dict(node_data),
+        )
         for index in range(item.childCount()):
-            child_snapshot = self._snapshot_real_destination_node(item.child(index))
+            child_snapshot = self._snapshot_real_destination_node(item.child(index), semantic_path)
             if child_snapshot is not None:
                 snapshot["children"].append(child_snapshot)
         return snapshot
 
-    def _collect_real_destination_snapshot_entries(self, item, entries):
+    def _collect_real_destination_snapshot_entries(self, item, entries, parent_resolved_semantic_path: str = ""):
         if item is None:
             return
         node_data = item.data(0, Qt.UserRole) or {}
-        if not node_data.get("placeholder"):
-            semantic_path = self._destination_semantic_path(node_data)
-            if semantic_path and not self._destination_is_future_state_node(node_data):
-                entries.append({
-                    "semantic_path": semantic_path,
-                    "parent_semantic_path": self.normalize_memory_path("\\".join(self._path_segments(semantic_path)[:-1])),
-                    "data": dict(node_data),
-                    "children": [],
-                })
+        if node_data.get("placeholder"):
+            for index in range(item.childCount()):
+                self._collect_real_destination_snapshot_entries(item.child(index), entries, parent_resolved_semantic_path)
+            return
+        if self._destination_is_future_state_node(node_data):
+            for index in range(item.childCount()):
+                self._collect_real_destination_snapshot_entries(item.child(index), entries, parent_resolved_semantic_path)
+            return
+        semantic_path, parent_semantic_path = self._destination_real_snapshot_paths_resolved(
+            node_data, parent_resolved_semantic_path
+        )
+        child_parent_sp = parent_resolved_semantic_path
+        if semantic_path:
+            entries.append(
+                self._destination_pack_real_flat_snapshot_entry(
+                    semantic_path=semantic_path,
+                    parent_semantic_path=parent_semantic_path,
+                    data=dict(node_data),
+                )
+            )
+            child_parent_sp = semantic_path
         for index in range(item.childCount()):
-            self._collect_real_destination_snapshot_entries(item.child(index), entries)
+            self._collect_real_destination_snapshot_entries(item.child(index), entries, child_parent_sp)
 
     def _collect_real_destination_snapshot_entries_index(self, entries):
         """Flat snapshot of real (non-placeholder, non-future-overlay) rows from ``destination_planning_model``."""
@@ -23203,15 +23701,18 @@ class MainWindow(QMainWindow):
             node_data = ix.data(Qt.UserRole) or {}
             if node_data.get("placeholder"):
                 continue
-            semantic_path = self._destination_semantic_path(node_data)
-            if not semantic_path or self._destination_is_future_state_node(node_data):
+            if self._destination_is_future_state_node(node_data):
                 continue
-            entries.append({
-                "semantic_path": semantic_path,
-                "parent_semantic_path": self.normalize_memory_path("\\".join(self._path_segments(semantic_path)[:-1])),
-                "data": dict(node_data),
-                "children": [],
-            })
+            semantic_path, parent_semantic_path = self._destination_model_index_resolved_snapshot_paths(ix)
+            if not semantic_path:
+                continue
+            entries.append(
+                self._destination_pack_real_flat_snapshot_entry(
+                    semantic_path=semantic_path,
+                    parent_semantic_path=parent_semantic_path,
+                    data=dict(node_data),
+                )
+            )
 
     def _mark_destination_real_tree_snapshot_stale(self) -> None:
         """Real (non-overlay) destination rows changed; next overlay build must rescan the tree."""
@@ -23251,6 +23752,7 @@ class MainWindow(QMainWindow):
             )
             self._destination_real_tree_snapshot = snapshot
             self._destination_real_tree_snapshot_stale = False
+            self._destination_log_real_snapshot_ingest_audit(snapshot, merge_mode="partial_ui_only")
             return
 
         merged_by_path = {}
@@ -23267,30 +23769,71 @@ class MainWindow(QMainWindow):
         merged_snapshot.sort(key=lambda value: ([segment.lower() for segment in self._path_segments(value.get("semantic_path", ""))],))
         self._destination_real_tree_snapshot = merged_snapshot
         self._destination_real_tree_snapshot_stale = False
+        self._destination_log_real_snapshot_ingest_audit(merged_snapshot, merge_mode="merged_full_tree")
 
     def _ensure_visible_destination_root_children_in_model(self, model_nodes, *, planning_relevant_paths: set[str] | None = None):
+        """Mirror each visible library top-level folder's loaded children into the future model graph.
+
+        Uses each top-level row's real canonical path as parent (folder named Root is treated like any other).
+        """
+        log_info("destination_legacy_root_logic_removed", where="_ensure_visible_destination_root_children_in_model")
+        ensured_count = 0
         if self._destination_tree_uses_model_view():
             dmodel = getattr(self, "destination_planning_model", None)
             if dmodel is None:
                 return 0
-            root_ix = None
-            for r in range(dmodel.rowCount(QModelIndex())):
-                ix = dmodel.index(r, 0, QModelIndex())
-                pl = ix.data(Qt.UserRole) or {}
-                if pl.get("placeholder"):
+            for tr in range(dmodel.rowCount(QModelIndex())):
+                top_ix = dmodel.index(tr, 0, QModelIndex())
+                top_pl = top_ix.data(Qt.UserRole) or {}
+                if top_pl.get("placeholder"):
                     continue
-                if self._destination_semantic_path(pl) == "Root":
-                    root_ix = ix
-                    break
-            if root_ix is None or not root_ix.isValid():
-                return 0
-            ensured_count = 0
-            for r in range(dmodel.rowCount(root_ix)):
-                cix = dmodel.index(r, 0, root_ix)
-                child_data = cix.data(Qt.UserRole) or {}
+                parent_sp = self._destination_semantic_path(top_pl)
+                if not parent_sp:
+                    continue
+                for r in range(dmodel.rowCount(top_ix)):
+                    cix = dmodel.index(r, 0, top_ix)
+                    child_data = cix.data(Qt.UserRole) or {}
+                    if child_data.get("placeholder") or self._destination_is_future_state_node(child_data):
+                        continue
+                    semantic_path, _par = self._destination_real_snapshot_paths_resolved(child_data, parent_sp)
+                    if not semantic_path:
+                        continue
+                    if planning_relevant_paths is not None and not self._is_destination_semantic_path_planning_relevant(
+                        semantic_path, planning_relevant_paths
+                    ):
+                        continue
+                    name = child_data.get("name") or self._path_segments(semantic_path)[-1]
+                    self._upsert_destination_model_node(
+                        model_nodes,
+                        semantic_path,
+                        name=name,
+                        node_state="real",
+                        data=dict(child_data),
+                        parent_semantic_path=parent_sp,
+                    )
+                    self._attach_destination_model_child(model_nodes, parent_sp, semantic_path)
+                    ensured_count += 1
+            return ensured_count
+
+        tree = getattr(self, "destination_tree_widget", None)
+        if tree is None:
+            return 0
+        for ti in range(tree.topLevelItemCount()):
+            top_item = tree.topLevelItem(ti)
+            if top_item is None:
+                continue
+            top_data = top_item.data(0, Qt.UserRole) or {}
+            if top_data.get("placeholder"):
+                continue
+            parent_sp = self._destination_semantic_path(top_data)
+            if not parent_sp:
+                continue
+            for index in range(top_item.childCount()):
+                child_item = top_item.child(index)
+                child_data = child_item.data(0, Qt.UserRole) or {}
                 if child_data.get("placeholder") or self._destination_is_future_state_node(child_data):
                     continue
-                semantic_path = self._destination_semantic_path(child_data)
+                semantic_path, _par = self._destination_real_snapshot_paths_resolved(child_data, parent_sp)
                 if not semantic_path:
                     continue
                 if planning_relevant_paths is not None and not self._is_destination_semantic_path_planning_relevant(
@@ -23304,51 +23847,15 @@ class MainWindow(QMainWindow):
                     name=name,
                     node_state="real",
                     data=dict(child_data),
-                    parent_semantic_path="Root",
+                    parent_semantic_path=parent_sp,
                 )
-                self._attach_destination_model_child(model_nodes, "Root", semantic_path)
+                self._attach_destination_model_child(model_nodes, parent_sp, semantic_path)
                 ensured_count += 1
-            return ensured_count
-
-        tree = getattr(self, "destination_tree_widget", None)
-        if tree is None or tree.topLevelItemCount() == 0:
-            return 0
-        root_item = tree.topLevelItem(0)
-        if root_item is None:
-            return 0
-        root_data = root_item.data(0, Qt.UserRole) or {}
-        if self._destination_semantic_path(root_data) != "Root":
-            return 0
-
-        ensured_count = 0
-        for index in range(root_item.childCount()):
-            child_item = root_item.child(index)
-            child_data = child_item.data(0, Qt.UserRole) or {}
-            if child_data.get("placeholder") or self._destination_is_future_state_node(child_data):
-                continue
-            semantic_path = self._destination_semantic_path(child_data)
-            if not semantic_path:
-                continue
-            if planning_relevant_paths is not None and not self._is_destination_semantic_path_planning_relevant(
-                semantic_path, planning_relevant_paths
-            ):
-                continue
-            name = child_data.get("name") or self._path_segments(semantic_path)[-1]
-            self._upsert_destination_model_node(
-                model_nodes,
-                semantic_path,
-                name=name,
-                node_state="real",
-                data=dict(child_data),
-                parent_semantic_path="Root",
-            )
-            self._attach_destination_model_child(model_nodes, "Root", semantic_path)
-            ensured_count += 1
         return ensured_count
 
     def _collect_destination_planning_relevant_semantic_paths(self) -> set[str]:
         """Canonical destination paths (and ancestor prefixes) implied by proposed folders and planned moves."""
-        out: set[str] = {"Root", ""}
+        out: set[str] = {""}
         for pf in self.proposed_folders or []:
             dest = self._proposed_destination_path(pf)
             if not dest:
@@ -23390,64 +23897,80 @@ class MainWindow(QMainWindow):
         if sp in relevant_paths:
             return True
         for rel in relevant_paths:
-            if not rel or rel == "Root":
+            if not rel:
                 continue
             rel_cf = rel.casefold()
+            # Do not treat the single segment ``Root`` as a blanket prefix for every ``Root\\...``
+            # path (avoids matching ``Root\\OtherLib\\...`` when only ``Root\\Lib\\...`` is planned).
+            if rel_cf == "root":
+                continue
             if sp_cf == rel_cf:
                 return True
             if sp_cf.startswith(rel_cf + "\\"):
                 return True
         return False
 
-    def _destination_root_base_data(self):
+    def _destination_library_context_template_data(self):
+        """Drive/site/library fields for projected nodes under the library (no synthetic Root row)."""
         tree = getattr(self, "destination_tree_widget", None)
         if tree is not None:
             if self._destination_tree_uses_model_view():
                 dmodel = getattr(self, "destination_planning_model", None)
                 if dmodel is not None:
-                    # Root should exist as the first-level row in the planning model.
                     for r in range(dmodel.rowCount(QModelIndex())):
                         ix = dmodel.index(r, 0, QModelIndex())
                         node_data = ix.data(Qt.UserRole) or {}
                         if node_data.get("placeholder"):
                             continue
-                        semantic_path = self._destination_semantic_path(node_data)
-                        if semantic_path == "Root":
-                            base_data = dict(node_data)
-                            base_data.setdefault("tree_role", "destination")
-                            base_data.setdefault("name", "Root")
-                            base_data.setdefault("real_name", "Root")
-                            base_data.setdefault("display_path", "Root")
-                            base_data.setdefault("item_path", "Root")
-                            base_data.setdefault("destination_path", "Root")
-                            base_data.setdefault("is_folder", True)
-                            return base_data
+                        base_data = dict(node_data)
+                        base_data.setdefault("tree_role", "destination")
+                        base_data.setdefault("is_folder", True)
+                        log_info(
+                            "destination_real_root_folder_handled_normally",
+                            context="library_template_from_top_level_row",
+                            row_semantic_excerpt=str(self._destination_semantic_path(node_data) or "")[:120],
+                        )
+                        return base_data
             else:
                 for index in range(tree.topLevelItemCount()):
                     item = tree.topLevelItem(index)
                     node_data = item.data(0, Qt.UserRole) or {}
                     if node_data.get("placeholder"):
                         continue
-                    semantic_path = self._destination_semantic_path(node_data)
-                    if semantic_path == "Root":
-                        base_data = dict(node_data)
-                        base_data.setdefault("tree_role", "destination")
-                        base_data.setdefault("name", "Root")
-                        base_data.setdefault("real_name", "Root")
-                        base_data.setdefault("display_path", "Root")
-                        base_data.setdefault("item_path", "Root")
-                        base_data.setdefault("destination_path", "Root")
-                        base_data.setdefault("is_folder", True)
-                        return base_data
-        root_data = self._build_destination_projected_node_data("Root", "Root", {})
-        root_data.setdefault("tree_role", "destination")
-        root_data.setdefault("name", "Root")
-        root_data.setdefault("real_name", "Root")
-        root_data.setdefault("display_path", "Root")
-        root_data.setdefault("item_path", "Root")
-        root_data.setdefault("destination_path", "Root")
-        root_data.setdefault("is_folder", True)
-        return root_data
+                    base_data = dict(node_data)
+                    base_data.setdefault("tree_role", "destination")
+                    base_data.setdefault("is_folder", True)
+                    log_info(
+                        "destination_real_root_folder_handled_normally",
+                        context="library_template_from_top_level_row_widget",
+                        row_semantic_excerpt=str(self._destination_semantic_path(node_data) or "")[:120],
+                    )
+                    return base_data
+        rd = str(getattr(self, "pending_root_drive_ids", {}).get("destination", "") or "").strip()
+        site_id = site_name = library_id = library_name = ""
+        if hasattr(self, "planning_inputs"):
+            ds = self.planning_inputs.get("Destination Site")
+            dl = self.planning_inputs.get("Destination Library")
+            if isinstance(ds, dict):
+                site_id = str(ds.get("id") or "")
+                site_name = str(ds.get("name") or "")
+            if isinstance(dl, dict):
+                library_id = str(dl.get("id") or "")
+                library_name = str(dl.get("name") or "")
+        return {
+            "tree_role": "destination",
+            "is_folder": True,
+            "drive_id": rd,
+            "library_id": library_id or rd,
+            "site_id": site_id,
+            "site_name": site_name,
+            "library_name": library_name,
+            "name": "",
+            "real_name": "",
+            "display_path": "",
+            "item_path": "",
+            "destination_path": "",
+        }
 
     def _make_destination_model_node(self, semantic_path, name, node_state, data, parent_semantic_path=""):
         return {
@@ -28832,7 +29355,7 @@ class MainWindow(QMainWindow):
             "destination_future_model_materialize_started",
             reason=reason,
             materialize_phase="background_incremental_merge",
-            root_path=model.get("root_path", "Root"),
+            root_path=(model.get("root_path") or ""),
             visible_future_branch_count=len(model.get("nodes", {})),
         )
         self._set_tree_status_message(
@@ -28844,7 +29367,7 @@ class MainWindow(QMainWindow):
             "proj_t0": proj_t0,
             "reason": reason,
             "pending_after": pending_after,
-            "model_root_path": model.get("root_path", "Root"),
+            "model_root_path": (model.get("root_path") or ""),
             "planned_moves_count": len(state.get("moves") or []),
         }
         visible_future_branch_count = self._incremental_merge_destination_future_projection(
@@ -28861,7 +29384,7 @@ class MainWindow(QMainWindow):
         proj_t0 = float(merge_completion_ctx.get("proj_t0") or time.perf_counter())
         reason = merge_completion_ctx.get("reason", "background_projection")
         pending_after = str(merge_completion_ctx.get("pending_after") or "").strip()
-        model_root_path = str(merge_completion_ctx.get("model_root_path") or "Root")
+        model_root_path = str(merge_completion_ctx.get("model_root_path") or "")
         planned_moves_count = int(merge_completion_ctx.get("planned_moves_count") or 0)
         applied_count = visible_future_branch_count
         self._log_restore_phase(
@@ -29414,7 +29937,6 @@ class MainWindow(QMainWindow):
         for path in expanded_paths or set():
             if path:
                 acc.add(str(path).strip())
-        acc.add("Root")
         extra: set[str] = set()
         for p in list(acc):
             k = self._destination_expansion_state_key(p)
@@ -30010,7 +30532,6 @@ class MainWindow(QMainWindow):
             pending = sess.get("expand_collect_pending")
             if pending is None:
                 raw = {str(p).strip() for p in (destination_expanded_paths or set()) if p}
-                raw.add("Root")
                 pending = list(raw)
                 sess["expand_collect_accumulator"] = set()
             acc = sess.setdefault("expand_collect_accumulator", set())
@@ -30449,14 +30970,14 @@ class MainWindow(QMainWindow):
             top_n = self._planning_tree_top_level_count(tree)
             self._log_restore_phase(
                 "destination_future_incremental_merge_complete",
-                root_path=model.get("root_path", "Root"),
+                root_path=(model.get("root_path") or ""),
                 top_level_count=top_n,
                 visible_descendant_count=visible_descendant_count,
                 entry_roots=len(entry_roots),
             )
             self._log_restore_phase(
                 "destination_future_model_visible_summary",
-                root_path=model.get("root_path", "Root"),
+                root_path=(model.get("root_path") or ""),
                 total_real_nodes=model.get("total_real_nodes", 0),
                 total_proposed_nodes=model.get("total_proposed_nodes", 0),
                 total_allocation_nodes=model.get("total_allocation_nodes", 0),
@@ -30794,7 +31315,10 @@ class MainWindow(QMainWindow):
 
     def _import_destination_real_snapshot(self, snapshot_node, model_nodes, parent_semantic_path=""):
         semantic_path = snapshot_node["semantic_path"]
-        parent_semantic_path = snapshot_node.get("parent_semantic_path", parent_semantic_path)
+        parent_semantic_path = self._destination_future_model_normalize_parent_key(
+            snapshot_node.get("parent_semantic_path", parent_semantic_path),
+            snapshot_node.get("semantic_path", ""),
+        )
         data = dict(snapshot_node["data"])
         name = data.get("name") or self._path_segments(semantic_path)[-1]
         self._log_restore_phase(
@@ -30894,60 +31418,163 @@ class MainWindow(QMainWindow):
                 self._merge_destination_future_duplicate_folder_nodes(existing, node)
 
     def _coalesce_destination_future_orphan_root_siblings(self, model_nodes):
-        """Fold single-segment, parentless rows onto Root\\Name so they do not duplicate Root's children."""
-        root_key = "Root"
-        if root_key not in model_nodes:
-            return
-        candidates = []
-        for p, node in list(model_nodes.items()):
-            if p == root_key:
-                continue
-            if node.get("parent_semantic_path"):
-                continue
-            segs = self._path_segments(p)
-            if len(segs) != 1:
-                continue
-            leaf = segs[0]
-            if str(leaf).strip().lower() == "root":
-                continue
-            root_child = self.normalize_memory_path(f"{root_key}\\{leaf}")
-            if root_child == self.normalize_memory_path(p):
-                continue
-            candidates.append((self.normalize_memory_path(p), root_child))
-        for p, root_child in sorted(candidates, key=lambda x: (len(x[0]), x[0].lower())):
-            if p not in model_nodes:
-                continue
-            dup = model_nodes.get(p)
-            if dup is None:
-                continue
-            canon = model_nodes.get(root_child)
-            if canon is None:
-                node = model_nodes.pop(p)
-                self._rewrite_destination_model_node_paths_for_key_change(node, p, root_child)
-                node["parent_semantic_path"] = root_key
-                model_nodes[root_child] = node
-                self._remap_destination_model_subtree_paths(model_nodes, p, root_child)
-                continue
-            self._merge_destination_future_duplicate_folder_nodes(canon, dup)
-            del model_nodes[p]
-            self._remap_destination_model_subtree_paths(model_nodes, p, root_child)
+        """Former Root\\ coalescing removed: parentless rows stay library top-level (empty parent key)."""
+        log_info("destination_legacy_root_logic_removed", where="_coalesce_destination_future_orphan_root_siblings")
+        if "Root" in model_nodes:
+            log_info("destination_root_string_usage_detected", context="future_model_still_has_Root_key")
 
     def _normalize_destination_future_root_topology(self, model_nodes) -> dict:
-        """Enforce exactly one top-level Root with children beneath it."""
-        root_key = "Root"
-        if root_key not in model_nodes:
-            return {"root_present": False, "reparented": 0}
+        """Apply :meth:`_destination_future_model_normalize_parent_key` to all nodes; drop orphan non-drive ``Root`` hub only."""
+        log_info("destination_legacy_root_logic_removed", where="_normalize_destination_future_root_topology")
         reparented = 0
-        for p, node in list(model_nodes.items()):
-            if p == root_key:
+        for sem_path, node in list(model_nodes.items()):
+            old = str(node.get("parent_semantic_path") or "").strip()
+            new = self._destination_future_model_normalize_parent_key(old, sem_path)
+            if new != old:
+                node["parent_semantic_path"] = new
+                reparented += 1
+        if "Root" in model_nodes:
+            still_attached = any(
+                str(n.get("parent_semantic_path") or "").strip().casefold() == "root"
+                for k, n in model_nodes.items()
+                if str(k or "").strip().casefold() != "root"
+            )
+            root_entry = model_nodes.get("Root") or {}
+            root_data = root_entry.get("data") if isinstance(root_entry, dict) else {}
+            rid = str((root_data or {}).get("id") or "").strip()
+            if not still_attached and not rid:
+                model_nodes.pop("Root", None)
+                log_info("destination_legacy_root_logic_removed", where="removed_orphan_synthetic_Root_hub")
+            elif not still_attached and rid:
+                log_info(
+                    "destination_real_root_folder_handled_normally",
+                    context="future_model_Root_key_is_real_drive_item",
+                    drive_item_id_suffix=rid[-12:] if len(rid) > 12 else rid,
+                )
+        return {"root_present": False, "reparented": int(reparented)}
+
+    def _destination_library_parent_semantic_path_for_key(self, semantic_path: str) -> str:
+        """Parent semantic key for a library-relative path: ``Root\\HR`` → ``Root``; ``HR`` → ````."""
+        c = self.normalize_memory_path(str(semantic_path or "").strip())
+        segs = self._path_segments(c)
+        if len(segs) <= 1:
+            return ""
+        return self.normalize_memory_path("\\".join(segs[:-1]))
+
+    def _destination_path_is_under_prefix(self, path: str, prefix: str) -> bool:
+        p = self.normalize_memory_path(str(path or "").strip()).casefold()
+        pref = self.normalize_memory_path(str(prefix or "").strip()).casefold()
+        if not p or not pref:
+            return False
+        return p == pref or p.startswith(pref + "\\")
+
+    def _destination_deduplicate_root_child_top_level_leaks(self, model_nodes: dict) -> int:
+        """Drop parentless ``X`` when ``Root\\X`` exists under parent ``Root`` (future-model bind graph).
+
+        Prevents materialize/bind from treating ``HR`` as a library top-level row while ``Root\\HR`` is the real path.
+        """
+        if not model_nodes:
+            return 0
+        removed = 0
+        candidates: list[str] = []
+        for short, node in list(model_nodes.items()):
+            if not isinstance(node, dict):
                 continue
-            parent = str(node.get("parent_semantic_path") or "").strip()
-            if parent:
+            if str(node.get("parent_semantic_path") or "").strip():
                 continue
-            # Single-root render contract: when Root exists, no other node may remain top-level.
-            node["parent_semantic_path"] = root_key
-            reparented += 1
-        return {"root_present": True, "reparented": int(reparented)}
+            segs = self._path_segments(short)
+            if len(segs) != 1:
+                continue
+            name = segs[0]
+            if name.casefold() == "root":
+                continue
+            under_key = self.normalize_memory_path(f"Root\\{name}")
+            if under_key == short:
+                continue
+            under = model_nodes.get(under_key)
+            if not isinstance(under, dict):
+                continue
+            if str(under.get("parent_semantic_path") or "").strip().casefold() != "root":
+                continue
+            d_top = node.get("data") or {}
+            d_under = under.get("data") or {}
+            id_top = str(d_top.get("id") or "").strip()
+            id_under = str(d_under.get("id") or "").strip()
+            if id_top and id_under and id_top != id_under:
+                continue
+            candidates.append(short)
+
+        for short in candidates:
+            node = model_nodes.get(short)
+            under_key = self.normalize_memory_path(f"Root\\{self._path_segments(short)[0]}")
+            under = model_nodes.get(under_key)
+            if not isinstance(node, dict) or not isinstance(under, dict):
+                continue
+            if str(node.get("parent_semantic_path") or "").strip():
+                continue
+            log_info(
+                "destination_root_child_top_level_leak_detected",
+                phase="future_model_package",
+                short_key=str(short)[:240],
+                under_key=str(under_key)[:240],
+            )
+            log_info(
+                "destination_parent_resolution_root_child",
+                phase="future_model_package",
+                top_level_key=str(short)[:240],
+                canonical_under_root=str(under_key)[:240],
+            )
+            old_p = self.normalize_memory_path(short)
+            new_p = self.normalize_memory_path(under_key)
+            desc_keys = [
+                k
+                for k in list(model_nodes)
+                if k != short and self._destination_path_is_under_prefix(k, old_p)
+            ]
+            desc_keys.sort(key=lambda k: len(self._path_segments(k)), reverse=True)
+            for old_k in desc_keys:
+                rel = self.normalize_memory_path(old_k[len(old_p) + 1 :])
+                new_k = self.normalize_memory_path(f"{new_p}\\{rel}") if rel else new_p
+                mv = model_nodes.pop(old_k, None)
+                if not isinstance(mv, dict):
+                    continue
+                opar = str(mv.get("parent_semantic_path") or "").strip()
+                if opar.casefold() == old_p.casefold():
+                    mv["parent_semantic_path"] = new_p
+                elif self._destination_path_is_under_prefix(opar, old_p):
+                    suf = opar[len(old_p) + 1 :] if len(opar) > len(old_p) else ""
+                    mv["parent_semantic_path"] = (
+                        self.normalize_memory_path(f"{new_p}\\{suf}") if suf else new_p
+                    )
+                if new_k in model_nodes:
+                    self._merge_destination_future_duplicate_folder_nodes(model_nodes[new_k], mv)
+                else:
+                    model_nodes[new_k] = mv
+                log_info(
+                    "destination_root_child_reparented_under_root",
+                    phase="future_model_rekey",
+                    old_key=str(old_k)[:240],
+                    new_key=str(new_k)[:240],
+                )
+            under = model_nodes.get(under_key)
+            node = model_nodes.pop(short, None)
+            if isinstance(under, dict) and isinstance(node, dict):
+                self._merge_destination_future_duplicate_folder_nodes(under, node)
+            removed += 1
+            log_info(
+                "destination_illegal_top_level_sibling_removed",
+                phase="future_model_package",
+                removed_key=str(short)[:240],
+                kept_key=str(under_key)[:240],
+            )
+
+        if removed:
+            log_info(
+                "destination_top_level_rows_verified",
+                phase="future_model_package",
+                leaks_removed=int(removed),
+            )
+        return removed
 
     def _package_destination_future_model(
         self,
@@ -30958,6 +31585,9 @@ class MainWindow(QMainWindow):
         total_proposed_nodes,
         total_allocation_nodes,
     ):
+        self._destination_audit_destination_graph_single_segment_nodes(
+            model_nodes, stage="package_entry_before_projection_summary"
+        )
         state_counts = Counter(node["node_state"] for node in model_nodes.values())
         self._log_restore_phase(
             "destination_future_model_branch_summary",
@@ -31002,19 +31632,38 @@ class MainWindow(QMainWindow):
         total_overlay_nodes = sum(1 for node in model_nodes.values() if node["node_state"] != "real")
         self._log_restore_phase(
             "destination_projection_overlay_applied",
-            parent_path=model_nodes.get("Root", {}).get("semantic_path", "Root"),
+            parent_path=_DESTINATION_FUTURE_MODEL_LIBRARY_PARENT_KEY,
             real_child_count=total_real_nodes,
             projected_child_count=total_overlay_nodes,
             merged_child_count=len(model_nodes),
             replaced_incorrectly=False,
         )
+        self._destination_audit_destination_graph_single_segment_nodes(
+            model_nodes, stage="package_after_projection_overlay_summary"
+        )
 
+        self._destination_log_future_model_graph_audit(model_nodes, when="package_after_overlay_before_coalesce")
         self._coalesce_destination_future_orphan_root_siblings(model_nodes)
+        self._destination_audit_destination_graph_single_segment_nodes(
+            model_nodes, stage="package_after_coalesce_orphan_root_siblings"
+        )
         norm = self._normalize_destination_future_root_topology(model_nodes)
+        self._destination_audit_destination_graph_single_segment_nodes(
+            model_nodes, stage="package_after_normalize_future_root_topology"
+        )
+        self._destination_log_future_model_graph_audit(model_nodes, when="package_before_root_child_dedupe")
+        self._destination_log_root_child_dedupe_trace(model_nodes, phase="pre_dedupe")
+        leak_rm = self._destination_deduplicate_root_child_top_level_leaks(model_nodes)
+        self._destination_audit_destination_graph_single_segment_nodes(
+            model_nodes, stage="package_after_root_child_top_level_dedupe"
+        )
+        self._destination_log_future_model_graph_audit(model_nodes, when="package_after_root_child_dedupe")
+        self._destination_log_root_child_dedupe_trace(model_nodes, phase="post_dedupe")
         log_info(
-            "destination_root_normalized",
+            "destination_future_library_topology_normalized",
             root_present=bool(norm.get("root_present")),
             reparented_count=int(norm.get("reparented", 0)),
+            root_child_top_level_leaks_removed=int(leak_rm),
         )
 
         for node in model_nodes.values():
@@ -31032,15 +31681,45 @@ class MainWindow(QMainWindow):
             ps = str(p or "").strip()
             if not ps:
                 return (3, ())
-            if ps == "Root":
-                return (0, ())
             return (1, tuple(seg.lower() for seg in self._path_segments(ps)))
 
         top_level_paths.sort(key=_destination_future_top_level_sort_key)
-        if "Root" in model_nodes:
-            top_level_paths = ["Root"]
+        self._destination_audit_destination_graph_single_segment_nodes(
+            model_nodes, stage="package_after_top_level_paths_computed"
+        )
+        for _tl in top_level_paths:
+            tl = str(_tl or "").strip()
+            if not tl or tl.casefold() == "root":
+                continue
+            segs_tl = self._path_segments(tl)
+            if len(segs_tl) != 1:
+                continue
+            rk_tl = self.normalize_memory_path(f"Root\\{segs_tl[0]}")
+            if rk_tl in model_nodes:
+                tn = model_nodes.get(tl) or {}
+                un = model_nodes.get(rk_tl) or {}
+                td = (tn.get("data") or {}) if isinstance(tn, dict) else {}
+                ud = (un.get("data") or {}) if isinstance(un, dict) else {}
+                log_info(
+                    "destination_graph_top_level_contract_violation",
+                    top_level_key=tl[:200],
+                    root_child_key=rk_tl[:200],
+                    top_parent_semantic=str((tn.get("parent_semantic_path") if isinstance(tn, dict) else "") or "")[
+                        :160
+                    ],
+                    top_node_state=str((tn.get("node_state") if isinstance(tn, dict) else "") or "")[:40],
+                    top_id=str(td.get("id") or "")[:80],
+                    under_node_state=str((un.get("node_state") if isinstance(un, dict) else "") or "")[:40],
+                    under_id=str(ud.get("id") or "")[:80],
+                    top_planned_allocation=bool(td.get("planned_allocation")),
+                    under_planned_allocation=bool(ud.get("planned_allocation")),
+                )
         root_child_count = len(
-            [p for p, n in model_nodes.items() if p != "Root" and str(n.get("parent_semantic_path") or "") == "Root"]
+            [
+                p
+                for p, n in model_nodes.items()
+                if str(n.get("parent_semantic_path") or "").strip().casefold() == "root"
+            ]
         )
         log_info(
             "top_level_node_count",
@@ -31054,12 +31733,7 @@ class MainWindow(QMainWindow):
             "root_child_count",
             count=int(root_child_count),
         )
-        if "Root" in top_level_paths:
-            root_path = "Root"
-        else:
-            root_path = next((p for p in top_level_paths if str(p or "").strip()), top_level_paths[0] if top_level_paths else "Root")
-            if not str(root_path or "").strip():
-                root_path = "Root"
+        root_path = _DESTINATION_FUTURE_MODEL_LIBRARY_PARENT_KEY
         self._log_restore_phase(
             "destination_future_model_merge_complete",
             root_path=root_path,
@@ -31400,13 +32074,13 @@ class MainWindow(QMainWindow):
         parent_path = self._canonical_destination_projection_path(self._allocation_parent_path(move))
         allocation_path = self._canonical_destination_projection_path(self._allocation_projection_path(move))
         parent_semantic_path = ""
-        for prefix in self._destination_projection_prefixes(parent_path):
-            prefix_name = self._path_segments(prefix)[-1]
-            parent_data = (
-                model_nodes.get(parent_semantic_path or prefix, {}).get("data", {})
-                if parent_semantic_path
-                else model_nodes["Root"]["data"]
+        lib_template = self._destination_library_context_template_data()
+        for raw_prefix in self._destination_projection_prefixes(parent_path):
+            prefix_name = self._path_segments(raw_prefix)[-1]
+            prefix, par_sp = self._destination_overlay_resolve_prefix_in_model(
+                model_nodes, raw_prefix, parent_semantic_path
             )
+            parent_data = model_nodes.get(par_sp or prefix, {}).get("data", {}) if par_sp else lib_template
             projected_data = self._build_destination_projected_node_data(prefix, prefix_name, parent_data)
             self._upsert_destination_model_node(
                 model_nodes,
@@ -31414,14 +32088,14 @@ class MainWindow(QMainWindow):
                 name=prefix_name,
                 node_state="projected",
                 data=projected_data,
-                parent_semantic_path=parent_semantic_path,
+                parent_semantic_path=par_sp,
             )
-            if parent_semantic_path:
-                self._attach_destination_model_child(model_nodes, parent_semantic_path, prefix)
+            if par_sp:
+                self._attach_destination_model_child(model_nodes, par_sp, prefix)
             parent_semantic_path = prefix
 
-        parent_node = model_nodes.get(parent_path) or model_nodes.get("Root")
-        parent_data = parent_node["data"] if parent_node else {}
+        parent_node = model_nodes.get(parent_path)
+        parent_data = parent_node["data"] if parent_node else self._destination_library_context_template_data()
         allocation_data = self._build_destination_allocation_node_data(move, parent_data)
         source_name = allocation_data.get("name", "Allocated Item")
         self._upsert_destination_model_node(
@@ -31498,7 +32172,10 @@ class MainWindow(QMainWindow):
             skip_allocation_descendants=bool(skip_allocation_descendants),
             restrict_real_snapshot_import=bool(restrict_real_snapshot_import),
         )
-        self._refresh_destination_real_tree_snapshot(merge_full_tree_snapshot=not restrict_real_snapshot_import)
+        self._refresh_destination_real_tree_snapshot(
+            force=True,
+            merge_full_tree_snapshot=not restrict_real_snapshot_import,
+        )
         snap_sig, prop_sig, moves_sig, full_fp = self._destination_overlay_fingerprint_context(
             skip_allocation_descendants, restrict_real_snapshot_import
         )
@@ -31516,6 +32193,7 @@ class MainWindow(QMainWindow):
             cached_nodes = cached_payload.get("nodes", {}) if isinstance(cached_payload, dict) else {}
             if isinstance(cached_nodes, dict) and cached_nodes:
                 self._normalize_destination_future_root_topology(cached_nodes)
+                self._destination_deduplicate_root_child_top_level_leaks(cached_nodes)
                 for node in cached_nodes.values():
                     node["children"] = []
                 for semantic_path, node in cached_nodes.items():
@@ -31524,8 +32202,17 @@ class MainWindow(QMainWindow):
                         parent_node = cached_nodes[parent_semantic_path]
                         if semantic_path not in parent_node["children"]:
                             parent_node["children"].append(semantic_path)
-                if "Root" in cached_nodes:
-                    cached_payload["top_level_paths"] = ["Root"]
+                cached_payload["top_level_paths"] = sorted(
+                    [
+                        p
+                        for p, n in cached_nodes.items()
+                        if not (n or {}).get("parent_semantic_path")
+                    ],
+                    key=lambda x: tuple(s.lower() for s in self._path_segments(str(x))),
+                )
+                self._destination_audit_destination_graph_single_segment_nodes(
+                    cached_nodes, stage="build_cache_hit_after_cached_top_level_paths_rebuilt"
+                )
             if restrict_real_snapshot_import:
                 self._restore_narrow_destination_future_snapshot_once = False
             return cached_payload
@@ -31558,26 +32245,24 @@ class MainWindow(QMainWindow):
         total_real_nodes = 0
         total_proposed_nodes = 0
         total_allocation_nodes = 0
-
-        root_data = self._destination_root_base_data()
-        self._upsert_destination_model_node(
-            model_nodes,
-            "Root",
-            name="Root",
-            node_state="real" if not self._destination_is_future_state_node(root_data) else "projected",
-            data=root_data,
-            parent_semantic_path="",
-        )
+        log_info("destination_legacy_root_logic_removed", where="_build_destination_future_model_no_synthetic_Root")
 
         real_child_counts = {}
         for snapshot_node in self._destination_real_tree_snapshot:
             if restrict_real_snapshot_import and relevant_paths is not None:
                 if not self._is_destination_real_snapshot_node_planning_relevant(snapshot_node, relevant_paths):
                     continue
-            parent_path = snapshot_node.get("parent_semantic_path", "")
-            real_child_counts[parent_path] = real_child_counts.get(parent_path, 0) + 1
+            pk = self._destination_future_model_normalize_parent_key(
+                snapshot_node.get("parent_semantic_path", ""),
+                snapshot_node.get("semantic_path", ""),
+            )
+            real_child_counts[pk] = real_child_counts.get(pk, 0) + 1
             self._import_destination_real_snapshot(snapshot_node, model_nodes)
             total_real_nodes += 1
+
+        self._destination_audit_destination_graph_single_segment_nodes(
+            model_nodes, stage="after_real_snapshot_import_loop"
+        )
 
         ensured_root_child_count = self._ensure_visible_destination_root_children_in_model(
             model_nodes,
@@ -31589,6 +32274,10 @@ class MainWindow(QMainWindow):
                 preserved_count=ensured_root_child_count,
             )
 
+        self._destination_audit_destination_graph_single_segment_nodes(
+            model_nodes, stage="after_ensure_visible_destination_root_children"
+        )
+
         for proposed_folder in self.proposed_folders:
             destination_path = self._proposed_destination_path(proposed_folder)
             parent_path = (
@@ -31597,9 +32286,15 @@ class MainWindow(QMainWindow):
                 else ""
             )
             parent_semantic_path = ""
-            for prefix in self._destination_projection_prefixes(parent_path):
-                prefix_name = self._path_segments(prefix)[-1]
-                parent_data = model_nodes.get(parent_semantic_path or prefix, {}).get("data", {}) if parent_semantic_path else model_nodes["Root"]["data"]
+            lib_template = self._destination_library_context_template_data()
+            for raw_prefix in self._destination_projection_prefixes(parent_path):
+                prefix_name = self._path_segments(raw_prefix)[-1]
+                prefix, par_sp = self._destination_overlay_resolve_prefix_in_model(
+                    model_nodes, raw_prefix, parent_semantic_path
+                )
+                parent_data = (
+                    model_nodes.get(par_sp or prefix, {}).get("data", {}) if par_sp else lib_template
+                )
                 projected_data = self._build_destination_projected_node_data(prefix, prefix_name, parent_data)
                 self._upsert_destination_model_node(
                     model_nodes,
@@ -31607,14 +32302,14 @@ class MainWindow(QMainWindow):
                     name=prefix_name,
                     node_state="projected",
                     data=projected_data,
-                    parent_semantic_path=parent_semantic_path,
+                    parent_semantic_path=par_sp,
                 )
-                if parent_semantic_path:
-                    self._attach_destination_model_child(model_nodes, parent_semantic_path, prefix)
+                if par_sp:
+                    self._attach_destination_model_child(model_nodes, par_sp, prefix)
                 parent_semantic_path = prefix
 
-            parent_node = model_nodes.get(parent_path) or model_nodes.get("Root")
-            parent_data = parent_node["data"] if parent_node else {}
+            parent_node = model_nodes.get(parent_path)
+            parent_data = parent_node["data"] if parent_node else self._destination_library_context_template_data()
             proposed_data = self._build_destination_proposed_node_data(proposed_folder, parent_data)
             self._upsert_destination_model_node(
                 model_nodes,
@@ -31634,11 +32329,19 @@ class MainWindow(QMainWindow):
                 parent_semantic_path=parent_path,
             )
 
+        self._destination_audit_destination_graph_single_segment_nodes(
+            model_nodes, stage="after_proposed_folders_overlay"
+        )
+
         for move in self.planned_moves:
             self._append_one_planned_move_overlay_to_destination_future_model(
                 move, model_nodes, skip_allocation_descendants
             )
             total_allocation_nodes += 1
+
+        self._destination_audit_destination_graph_single_segment_nodes(
+            model_nodes, stage="after_planned_moves_overlay"
+        )
 
         payload = self._package_destination_future_model(
             model_nodes,
@@ -31838,7 +32541,6 @@ class MainWindow(QMainWindow):
             return
 
         target_paths = {path for path in expanded_paths if path}
-        target_paths.add("Root")
         normalized_targets = set(target_paths)
         for path in list(target_paths):
             k = self._destination_expansion_state_key(path)
@@ -32467,10 +33169,10 @@ class MainWindow(QMainWindow):
         model_nodes = (model or {}).get("nodes", {}) if isinstance(model, dict) else {}
         raw_top = list((model or {}).get("top_level_paths", []) or [])
         filtered = [p for p in raw_top if p in model_nodes]
-        if "Root" in model_nodes:
-            resolved = ["Root"]
-        else:
-            resolved = filtered
+        resolved = filtered
+        if not resolved and model_nodes:
+            resolved = [p for p, n in model_nodes.items() if not (n or {}).get("parent_semantic_path")]
+            resolved.sort(key=lambda x: tuple(s.lower() for s in self._path_segments(str(x))))
         log_info(
             "destination_bind_using_top_level_paths",
             count=int(len(resolved)),
@@ -32479,6 +33181,47 @@ class MainWindow(QMainWindow):
             "destination_bind_top_level_paths",
             paths=[str(p)[:120] for p in resolved],
         )
+        bind_rows = []
+        for p in resolved:
+            segs = self._path_segments(str(p))
+            if len(segs) != 1 or str(p).strip().casefold() == "root":
+                continue
+            n = model_nodes.get(p)
+            if not isinstance(n, dict):
+                continue
+            d = n.get("data") or {}
+            leaf = segs[0]
+            rk = self.normalize_memory_path(f"Root\\{leaf}")
+            under = model_nodes.get(rk)
+            id_top = str(d.get("id") or "").strip()
+            id_under = str(((under or {}).get("data") or {}).get("id") or "").strip() if isinstance(under, dict) else ""
+            upar = str((under or {}).get("parent_semantic_path") or "").strip() if isinstance(under, dict) else ""
+            if not isinstance(under, dict):
+                dedupe_hint = "no_root_child_key_in_graph"
+            elif upar.casefold() != "root":
+                dedupe_hint = "under_parent_not_root"
+            elif id_top and id_under and id_top != id_under:
+                dedupe_hint = "id_mismatch_vs_root_child"
+            else:
+                dedupe_hint = "graph_allows_top_level_duplicate_of_root_child"
+            bind_rows.append(
+                {
+                    "bind_top_level_key": str(p)[:160],
+                    "parent_semantic_path": str(n.get("parent_semantic_path") or ""),
+                    "id": id_top[:72],
+                    "name": str(d.get("name") or "")[:120],
+                    "matching_root_child_key": rk[:160],
+                    "matching_root_child_exists": bool(isinstance(under, dict)),
+                    "under_id": id_under[:72],
+                    "dedupe_or_bind_note": dedupe_hint,
+                }
+            )
+        if bind_rows:
+            log_info(
+                "destination_bind_top_level_root_child_audit",
+                bind_row_count=int(len(bind_rows)),
+                rows=bind_rows[:80],
+            )
         return resolved
 
     def _destination_bind_drain_append_stack_tick(
@@ -32577,7 +33320,6 @@ class MainWindow(QMainWindow):
         st["descendant_applied"] = 0
         st["allocation_pass"] = 0
         target_paths = {p for p in st["destination_expanded_paths"] if p}
-        target_paths.add("Root")
         normalized_targets = set(target_paths)
         for path in list(target_paths):
             k = self._destination_expansion_state_key(path)
@@ -33143,6 +33885,9 @@ class MainWindow(QMainWindow):
                 return 0, 0
             model_nodes = model.get("nodes", {})
             top_level_paths = self._destination_bind_resolved_top_level_paths(model)
+            self._destination_audit_destination_graph_single_segment_nodes(
+                model_nodes, stage="bind_sync_immediately_before_incremental_append_model"
+            )
             node_count = len(model_nodes)
             t0 = time.perf_counter()
             self._destination_future_bind_sync_active = True
@@ -33154,7 +33899,7 @@ class MainWindow(QMainWindow):
             )
             self._log_restore_phase(
                 "destination_future_model_bind_started",
-                root_path=model.get("root_path", "Root"),
+                root_path=(model.get("root_path") or ""),
                 top_level_count=len(top_level_paths),
                 bind_mode="sync_model",
                 model_node_count=node_count,
@@ -33218,7 +33963,7 @@ class MainWindow(QMainWindow):
                     wall_ms = round((time.perf_counter() - t0) * 1000.0, 1)
                     self._log_restore_phase(
                         "destination_future_model_bind_complete",
-                        root_path=model.get("root_path", "Root"),
+                        root_path=(model.get("root_path") or ""),
                         top_level_count=dmodel.rowCount(QModelIndex()),
                         visible_descendant_count=visible_descendant_count,
                         bind_mode="sync_model",
@@ -33227,7 +33972,7 @@ class MainWindow(QMainWindow):
                     )
                     self._log_restore_phase(
                         "destination_future_model_visible_summary",
-                        root_path=model.get("root_path", "Root"),
+                        root_path=(model.get("root_path") or ""),
                         total_real_nodes=model.get("total_real_nodes", 0),
                         total_proposed_nodes=model.get("total_proposed_nodes", 0),
                         total_allocation_nodes=model.get("total_allocation_nodes", 0),
@@ -33373,7 +34118,7 @@ class MainWindow(QMainWindow):
         self._destination_future_bind_sync_active = True
         self._log_restore_phase(
             "destination_future_model_bind_started",
-            root_path=model.get("root_path", "Root"),
+            root_path=(model.get("root_path") or ""),
             top_level_count=len(top_level_paths),
             bind_mode="sync",
             model_node_count=node_count,
@@ -33433,7 +34178,7 @@ class MainWindow(QMainWindow):
                 wall_ms = round((time.perf_counter() - t0) * 1000.0, 1)
                 self._log_restore_phase(
                     "destination_future_model_bind_complete",
-                    root_path=model.get("root_path", "Root"),
+                    root_path=(model.get("root_path") or ""),
                     top_level_count=tree.topLevelItemCount(),
                     visible_descendant_count=visible_descendant_count,
                     bind_mode="sync",
@@ -33442,7 +34187,7 @@ class MainWindow(QMainWindow):
                 )
                 self._log_restore_phase(
                     "destination_future_model_visible_summary",
-                    root_path=model.get("root_path", "Root"),
+                    root_path=(model.get("root_path") or ""),
                     total_real_nodes=model.get("total_real_nodes", 0),
                     total_proposed_nodes=model.get("total_proposed_nodes", 0),
                     total_allocation_nodes=model.get("total_allocation_nodes", 0),
@@ -33598,7 +34343,7 @@ class MainWindow(QMainWindow):
             "destination_chunked_bind_scheduled",
             bind_generation=gen,
             model_node_count=node_count,
-            root_path=model.get("root_path", "Root") if isinstance(model, dict) else "Root",
+            root_path=(model.get("root_path") or "") if isinstance(model, dict) else "",
             schedule_reason=schedule_reason,
             total_allocation_nodes=int(model.get("total_allocation_nodes", 0) or 0) if isinstance(model, dict) else 0,
             bind_is_scoped=bool(norm_scope),
@@ -33709,7 +34454,7 @@ class MainWindow(QMainWindow):
                 norm_scope = st.get("bind_scope_paths_normalized")
                 self._log_restore_phase(
                     "destination_future_model_bind_started",
-                    root_path=model.get("root_path", "Root"),
+                    root_path=(model.get("root_path") or ""),
                     top_level_count=len(top_level_paths),
                     bind_mode="chunked_async",
                     chunked_async=True,
@@ -34057,7 +34802,7 @@ class MainWindow(QMainWindow):
                 scoped_flat = bool(st.get("bind_scoped_collect"))
                 self._log_restore_phase(
                     "destination_future_model_bind_complete",
-                    root_path=model.get("root_path", "Root"),
+                    root_path=(model.get("root_path") or ""),
                     top_level_count=top_n,
                     visible_descendant_count=da,
                     bind_mode="chunked_async",
@@ -34073,7 +34818,7 @@ class MainWindow(QMainWindow):
                 )
                 self._log_restore_phase(
                     "destination_future_model_visible_summary",
-                    root_path=model.get("root_path", "Root"),
+                    root_path=(model.get("root_path") or ""),
                     total_real_nodes=model.get("total_real_nodes", 0),
                     total_proposed_nodes=model.get("total_proposed_nodes", 0),
                     total_allocation_nodes=model.get("total_allocation_nodes", 0),
@@ -34143,14 +34888,14 @@ class MainWindow(QMainWindow):
             return None
         log_info(
             "destination_bind_started_structurally_complete",
-            root_path=(model or {}).get("root_path", "Root") if isinstance(model, dict) else "Root",
+            root_path=((model or {}).get("root_path") or "") if isinstance(model, dict) else "",
             model_node_count=len((model or {}).get("nodes", {}) if isinstance(model, dict) else {}),
         )
         if getattr(self, "_destination_snapshot_chunked_restore_active", False):
             self._log_restore_phase(
                 "destination_future_bind_deferred",
                 waiting_for_destination_snapshot_restore=True,
-                root_path=model.get("root_path", "Root") if isinstance(model, dict) else "Root",
+                root_path=(model.get("root_path") or "") if isinstance(model, dict) else "",
             )
 
             def _retry_bind():
@@ -34276,7 +35021,7 @@ class MainWindow(QMainWindow):
         }
         self._log_restore_phase(
             "destination_future_incremental_merge_started",
-            root_path=model.get("root_path", "Root"),
+            root_path=(model.get("root_path") or ""),
             new_branch_count=len(new_paths),
         )
 
@@ -34287,7 +35032,7 @@ class MainWindow(QMainWindow):
         if not new_paths:
             self._log_restore_phase(
                 "destination_future_incremental_merge_skipped",
-                root_path=model.get("root_path", "Root"),
+                root_path=(model.get("root_path") or ""),
                 reason="no_projected_descendants",
             )
             return visible_future_branch_count
@@ -34534,14 +35279,14 @@ class MainWindow(QMainWindow):
             top_n = self._planning_tree_top_level_count(tree)
             self._log_restore_phase(
                 "destination_future_incremental_merge_complete",
-                root_path=model.get("root_path", "Root"),
+                root_path=(model.get("root_path") or ""),
                 top_level_count=top_n,
                 visible_descendant_count=visible_descendant_count,
                 entry_roots=len(entry_roots),
             )
             self._log_restore_phase(
                 "destination_future_model_visible_summary",
-                root_path=model.get("root_path", "Root"),
+                root_path=(model.get("root_path") or ""),
                 total_real_nodes=model.get("total_real_nodes", 0),
                 total_proposed_nodes=model.get("total_proposed_nodes", 0),
                 total_allocation_nodes=model.get("total_allocation_nodes", 0),
@@ -34844,7 +35589,7 @@ class MainWindow(QMainWindow):
             self._log_restore_phase(
                 "destination_future_model_fast_first_paint",
                 reason=reason,
-                root_path=model_fast.get("root_path", "Root"),
+                root_path=(model_fast.get("root_path") or ""),
                 branch_count=len(model_fast.get("nodes", {})),
                 prefer_chunked_projection=bool(prefer_chunked_projection),
             )
@@ -34852,7 +35597,7 @@ class MainWindow(QMainWindow):
                 "destination_future_model_materialize_started",
                 reason=reason,
                 materialize_phase="fast_first_paint",
-                root_path=model_fast.get("root_path", "Root"),
+                root_path=(model_fast.get("root_path") or ""),
                 visible_future_branch_count=len(model_fast.get("nodes", {})),
             )
             self._set_tree_status_message(
@@ -34867,7 +35612,7 @@ class MainWindow(QMainWindow):
                     "destination_future_model_materialize_applied",
                     reason=reason,
                     materialize_phase="fast_first_paint",
-                    root_path=model_fast.get("root_path", "Root"),
+                    root_path=(model_fast.get("root_path") or ""),
                     applied_count=applied_count,
                     visible_future_branch_count=applied_count,
                 )
@@ -34875,7 +35620,7 @@ class MainWindow(QMainWindow):
                     "destination_future_model_materialize_complete",
                     reason=reason,
                     materialize_phase="fast_first_paint",
-                    root_path=model_fast.get("root_path", "Root"),
+                    root_path=(model_fast.get("root_path") or ""),
                     applied_count=applied_count,
                     visible_future_branch_count=applied_count,
                 )
@@ -34883,7 +35628,7 @@ class MainWindow(QMainWindow):
                     "destination_visible_future_branch_count",
                     reason=reason,
                     materialize_phase="fast_first_paint",
-                    root_path=model_fast.get("root_path", "Root"),
+                    root_path=(model_fast.get("root_path") or ""),
                     visible_future_branch_count=applied_count,
                 )
                 self._destination_future_model_pending_after_source_restore = False
@@ -34945,7 +35690,7 @@ class MainWindow(QMainWindow):
         self._log_restore_phase(
             "destination_future_model_materialize_started",
             reason=reason,
-            root_path=model.get("root_path", "Root"),
+            root_path=(model.get("root_path") or ""),
             visible_future_branch_count=len(model.get("nodes", {})),
         )
         self._set_tree_status_message(
@@ -34959,21 +35704,21 @@ class MainWindow(QMainWindow):
             self._log_restore_phase(
                 "destination_future_model_materialize_applied",
                 reason=reason,
-                root_path=model.get("root_path", "Root"),
+                root_path=(model.get("root_path") or ""),
                 applied_count=applied_count,
                 visible_future_branch_count=applied_count,
             )
             self._log_restore_phase(
                 "destination_future_model_materialize_complete",
                 reason=reason,
-                root_path=model.get("root_path", "Root"),
+                root_path=(model.get("root_path") or ""),
                 applied_count=applied_count,
                 visible_future_branch_count=applied_count,
             )
             self._log_restore_phase(
                 "destination_visible_future_branch_count",
                 reason=reason,
-                root_path=model.get("root_path", "Root"),
+                root_path=(model.get("root_path") or ""),
                 visible_future_branch_count=applied_count,
             )
             self._destination_future_model_pending_after_source_restore = False
@@ -35219,12 +35964,12 @@ class MainWindow(QMainWindow):
     def _destination_folder_load_structural_must_run_immediately(self, semantic_path_captured: str) -> bool:
         if self._expand_all_pending.get("destination"):
             return True
-        if getattr(self, "_memory_restore_in_progress", False) and semantic_path_captured == "Root":
+        if getattr(self, "_memory_restore_in_progress", False):
             return True
         if getattr(self, "_sharepoint_lazy_mode", False):
-            if getattr(self, "_destination_root_prime_pending", False) and semantic_path_captured != "Root":
+            if getattr(self, "_destination_root_prime_pending", False):
                 return True
-            if semantic_path_captured == "Root":
+            if self._destination_semantic_path_is_library_depth_one(semantic_path_captured):
                 return True
         return False
 
@@ -35539,19 +36284,79 @@ class MainWindow(QMainWindow):
         return moved_count
 
     def _merge_nested_spec_into_parent_index(self, target_parent_ix: QModelIndex, nested: NestedSpec) -> int:
-        """Merge one nested subtree into an existing same-semantic child under ``target_parent_ix``, else append."""
+        """Merge one nested subtree into an existing same-canonical-path child under ``target_parent_ix``, else append."""
         dmodel = getattr(self, "destination_planning_model", None)
         if dmodel is None or not target_parent_ix.isValid():
             return 0
         pl, kid_specs = nested[0], nested[1]
         child_sem = self._destination_semantic_path(pl)
-        existing = self._find_destination_child_by_semantic_path_index(target_parent_ix, child_sem) if child_sem else None
+        child_path = self._tree_item_path(pl) or child_sem or ""
+        reuse_or_block = None
+        if child_path:
+            reuse_or_block = self._destination_precheck_before_projected_insert(
+                target_parent_ix, child_path, reason="merge_nested_spec_into_parent_index"
+            )
+        if reuse_or_block is _DESTINATION_STRUCTURAL_INSERT_AMBIGUOUS:
+            log_info(
+                "destination_post_load_duplicate_blocked",
+                reason="merge_nested_spec_into_parent_index",
+                detail="ambiguous_canonical_under_parent",
+                target_canonical_excerpt=str(self._destination_effective_canonical_path(child_path))[:400],
+            )
+            return 0
+        existing = reuse_or_block if isinstance(reuse_or_block, QModelIndex) and reuse_or_block.isValid() else None
+        if existing is None and (not child_path) and child_sem:
+            existing = self._find_destination_child_by_semantic_path_index(target_parent_ix, child_sem)
         if existing is not None and existing.isValid():
+            log_info(
+                "destination_post_load_reused_existing",
+                reason="merge_nested_spec_into_parent_index",
+                target_canonical_excerpt=str(self._destination_effective_canonical_path(child_path))[:400],
+            )
             self._remove_placeholder_children(existing)
+            ed = dict(existing.data(Qt.UserRole) or {})
+            if self._destination_node_state(ed) == "real":
+                self._destination_merge_future_overlay_into_real_index(existing, pl)
             moved = 0
             for sub in kid_specs:
                 moved += self._merge_nested_spec_into_parent_index(existing, sub)
             return moved
+        dup_guard = None
+        if child_path:
+            dup_guard = self._destination_precheck_before_projected_insert(
+                target_parent_ix, child_path, reason="merge_nested_spec_duplicate_guard"
+            )
+        if dup_guard is not None and dup_guard is not _DESTINATION_STRUCTURAL_INSERT_AMBIGUOUS:
+            log_error(
+                "destination_real_spo_duplicate_violation",
+                reason="merge_nested_spec_into_parent_index",
+                note="precheck_miss_then_hit_on_duplicate_guard",
+                target_canonical_excerpt=str(self._destination_effective_canonical_path(child_path))[:400],
+            )
+            hit_ix = dup_guard if isinstance(dup_guard, QModelIndex) else None
+            if hit_ix is not None and hit_ix.isValid():
+                self._remove_placeholder_children(hit_ix)
+                ed2 = dict(hit_ix.data(Qt.UserRole) or {})
+                if self._destination_node_state(ed2) == "real":
+                    self._destination_merge_future_overlay_into_real_index(hit_ix, pl)
+                moved = 0
+                for sub in kid_specs:
+                    moved += self._merge_nested_spec_into_parent_index(hit_ix, sub)
+                return moved
+            return 0
+        if dup_guard is _DESTINATION_STRUCTURAL_INSERT_AMBIGUOUS:
+            log_info(
+                "destination_post_load_duplicate_blocked",
+                reason="merge_nested_spec_duplicate_guard",
+                detail="ambiguous_canonical_under_parent",
+                target_canonical_excerpt=str(self._destination_effective_canonical_path(child_path))[:400],
+            )
+            return 0
+        log_info(
+            "destination_post_load_insert_allowed",
+            reason="merge_nested_spec_into_parent_index",
+            target_canonical_excerpt=str(self._destination_effective_canonical_path(child_path))[:400],
+        )
         new_ix = dmodel.append_nested_child(target_parent_ix, nested)
         if new_ix.isValid():
             self._refresh_destination_item_visibility_index(target_parent_ix, expand=True)
@@ -36357,6 +37162,118 @@ class MainWindow(QMainWindow):
         _emit_timing()
         return out
 
+    def _reconcile_destination_root_child_top_level_leaks_planning_model(self, reason: str) -> int:
+        """Remove library top-level row ``X`` when ``Root\\X`` already exists under real folder ``Root``."""
+        dmodel = getattr(self, "destination_planning_model", None)
+        if dmodel is None:
+            return 0
+        lib = QModelIndex()
+        root_ix = QModelIndex()
+        for r in range(dmodel.rowCount(lib)):
+            ix = dmodel.index(r, 0, lib)
+            if not ix.isValid() or not dmodel.is_index_live(ix):
+                continue
+            pl = ix.data(Qt.UserRole) or {}
+            if not isinstance(pl, dict) or pl.get("placeholder"):
+                continue
+            sp = self._destination_semantic_path(pl)
+            if sp and str(sp).strip().casefold() == "root":
+                root_ix = ix
+                break
+        if not root_ix.isValid():
+            log_info(
+                "destination_top_level_rows_verified",
+                reason=str(reason or "")[:120],
+                root_folder_present=False,
+                leaks_removed=0,
+                path_mode="model",
+            )
+            return 0
+
+        removed = 0
+        for r in range(dmodel.rowCount(lib) - 1, -1, -1):
+            top_ix = dmodel.index(r, 0, lib)
+            if not top_ix.isValid() or not dmodel.is_index_live(top_ix):
+                continue
+            if top_ix == root_ix:
+                continue
+            tpl = top_ix.data(Qt.UserRole) or {}
+            if not isinstance(tpl, dict) or tpl.get("placeholder"):
+                continue
+            tsp = self._destination_semantic_path(tpl)
+            segs = self._path_segments(tsp)
+            if len(segs) != 1:
+                continue
+            name = segs[0]
+            if name.casefold() == "root":
+                continue
+            under_sp = self.normalize_memory_path(f"Root\\{name}")
+            under_ix = self._find_destination_child_by_path(root_ix, under_sp)
+            if not under_ix.isValid() or not dmodel.is_index_live(under_ix):
+                continue
+            id_top = str(tpl.get("id") or "").strip()
+            udata = under_ix.data(Qt.UserRole) or {}
+            id_under = str((udata or {}).get("id") or "").strip()
+            if id_top and id_under and id_top != id_under:
+                continue
+            log_info(
+                "destination_root_child_top_level_leak_detected",
+                phase="planning_model_reconcile",
+                short_path=str(tsp)[:240],
+                under_path=str(under_sp)[:240],
+                reason=str(reason or "")[:120],
+            )
+            log_info(
+                "destination_parent_resolution_root_child",
+                phase="planning_model_reconcile",
+                top_level_path=str(tsp)[:240],
+                canonical_under_root=str(under_sp)[:240],
+            )
+            if dmodel.rowCount(top_ix) > 0:
+                self._merge_destination_projection_children_index(top_ix, under_ix, under_sp)
+            if self._destination_node_state(udata) == "real":
+                self._destination_merge_future_overlay_into_real_index(under_ix, tpl)
+            else:
+
+                def _mut_overlay(p):
+                    for k, v in tpl.items():
+                        if k in ("id", "placeholder"):
+                            continue
+                        if k in (
+                            "planned_allocation",
+                            "overlay_state",
+                            "source_path",
+                            "projection_unresolved_terminal",
+                            "base_display_label",
+                            "_model_foreground",
+                            "_model_background",
+                        ):
+                            if v is not None and v != "":
+                                p[k] = v
+                    if tpl.get("proposed"):
+                        p["proposed"] = True
+
+                dmodel.update_payload_for_index(under_ix, _mut_overlay)
+            spec = dmodel.remove_node_at(top_ix)
+            if spec is not None:
+                removed += 1
+            log_info(
+                "destination_illegal_top_level_sibling_removed",
+                phase="planning_model_reconcile",
+                removed_path=str(tsp)[:240],
+                kept_path=str(under_sp)[:240],
+                reason=str(reason or "")[:120],
+            )
+
+        log_info(
+            "destination_top_level_rows_verified",
+            reason=str(reason or "")[:120],
+            root_folder_present=True,
+            leaks_removed=int(removed),
+            path_mode="model",
+        )
+        return removed
+
     def _reconcile_destination_semantic_duplicates_index(self, reason):
         """Merge duplicate destination rows that share the same semantic path (QTreeView / planning model)."""
         dmodel = getattr(self, "destination_planning_model", None)
@@ -36502,6 +37419,11 @@ class MainWindow(QMainWindow):
         total_moved += sm
         merged_groups += sg
 
+        rk = self._reconcile_destination_root_child_top_level_leaks_planning_model(reason)
+        total_moved += rk
+        if rk:
+            merged_groups += rk
+
         if merged_groups:
             self._log_restore_phase(
                 "destination_projection_reconciled",
@@ -36510,6 +37432,108 @@ class MainWindow(QMainWindow):
                 child_count_moved=total_moved,
             )
         return total_moved
+
+    def _reconcile_destination_root_child_top_level_leaks_widget(self, reason: str) -> int:
+        """Widget tree: remove top-level ``X`` when ``Root\\X`` exists under folder ``Root``."""
+        if self._destination_tree_uses_model_view():
+            return 0
+        tree = getattr(self, "destination_tree_widget", None)
+        if tree is None:
+            return 0
+        root_item = None
+        for i in range(tree.topLevelItemCount()):
+            it = tree.topLevelItem(i)
+            if it is None or not self._tree_item_is_alive(it):
+                continue
+            nd = it.data(0, Qt.UserRole) or {}
+            if not isinstance(nd, dict) or nd.get("placeholder"):
+                continue
+            sp = self._destination_semantic_path(nd)
+            if sp and str(sp).strip().casefold() == "root":
+                root_item = it
+                break
+        if root_item is None:
+            log_info(
+                "destination_top_level_rows_verified",
+                reason=str(reason or "")[:120],
+                root_folder_present=False,
+                leaks_removed=0,
+                path_mode="widget",
+            )
+            return 0
+
+        removed = 0
+        for i in range(tree.topLevelItemCount() - 1, -1, -1):
+            top = tree.topLevelItem(i)
+            if top is None or not self._tree_item_is_alive(top) or top is root_item:
+                continue
+            tpl = top.data(0, Qt.UserRole) or {}
+            if not isinstance(tpl, dict) or tpl.get("placeholder"):
+                continue
+            tsp = self._destination_semantic_path(tpl)
+            segs = self._path_segments(tsp)
+            if len(segs) != 1:
+                continue
+            name = segs[0]
+            if name.casefold() == "root":
+                continue
+            under_sp = self.normalize_memory_path(f"Root\\{name}")
+            under_item = self._find_destination_child_by_path(root_item, under_sp)
+            if under_item is None or not self._tree_item_is_alive(under_item):
+                continue
+            udata = under_item.data(0, Qt.UserRole) or {}
+            id_top = str(tpl.get("id") or "").strip()
+            id_under = str((udata or {}).get("id") or "").strip()
+            if id_top and id_under and id_top != id_under:
+                continue
+            log_info(
+                "destination_root_child_top_level_leak_detected",
+                phase="widget_reconcile",
+                short_path=str(tsp)[:240],
+                under_path=str(under_sp)[:240],
+                reason=str(reason or "")[:120],
+            )
+            log_info(
+                "destination_parent_resolution_root_child",
+                phase="widget_reconcile",
+                top_level_path=str(tsp)[:240],
+                canonical_under_root=str(under_sp)[:240],
+            )
+            if top.childCount() > 0:
+                self._merge_destination_projection_children(top, under_item, under_sp)
+            if self._destination_node_state(udata) == "real":
+                merged = dict(udata)
+                for k in (
+                    "planned_allocation",
+                    "overlay_state",
+                    "proposed",
+                    "base_display_label",
+                    "projection_unresolved_terminal",
+                ):
+                    if k in tpl and tpl.get(k) not in (None, ""):
+                        merged[k] = tpl[k]
+                if tpl.get("proposed"):
+                    merged["proposed"] = True
+                under_item.setData(0, Qt.UserRole, merged)
+                self._apply_tree_item_visual_state(under_item, merged)
+            self._detach_destination_item(top)
+            removed += 1
+            log_info(
+                "destination_illegal_top_level_sibling_removed",
+                phase="widget_reconcile",
+                removed_path=str(tsp)[:240],
+                kept_path=str(under_sp)[:240],
+                reason=str(reason or "")[:120],
+            )
+
+        log_info(
+            "destination_top_level_rows_verified",
+            reason=str(reason or "")[:120],
+            root_folder_present=True,
+            leaks_removed=int(removed),
+            path_mode="widget",
+        )
+        return removed
 
     def _destination_folder_children_grouped_by_sibling_name_key(self, parent_ix: QModelIndex):
         dmodel = getattr(self, "destination_planning_model", None)
@@ -36759,9 +37783,31 @@ class MainWindow(QMainWindow):
         for child in preserved_children:
             child_data = child.data(0, Qt.UserRole) or {}
             semantic_path = self._destination_semantic_path(child_data)
-            existing = self._find_destination_child_by_semantic_path(parent_item, semantic_path)
+            child_path = self._tree_item_path(child_data) or semantic_path or ""
+            existing = None
+            if child_path:
+                reuse_or_block = self._destination_precheck_before_projected_insert(
+                    parent_item, child_path, reason="restore_future_state_widget"
+                )
+                if reuse_or_block is _DESTINATION_STRUCTURAL_INSERT_AMBIGUOUS:
+                    log_info(
+                        "destination_post_load_duplicate_blocked",
+                        reason="restore_future_state_widget",
+                        detail="ambiguous_canonical_under_parent",
+                        target_canonical_excerpt=str(self._destination_effective_canonical_path(child_path))[:400],
+                    )
+                    continue
+                if reuse_or_block is not None and reuse_or_block is not child:
+                    existing = reuse_or_block
+            if existing is None and (not child_path) and semantic_path:
+                existing = self._find_destination_child_by_semantic_path(parent_item, semantic_path)
             if existing is not None and existing is not child:
                 existing_data = existing.data(0, Qt.UserRole) or {}
+                log_info(
+                    "destination_post_load_reused_existing",
+                    reason="restore_future_state_widget",
+                    target_canonical_excerpt=str(self._destination_effective_canonical_path(child_path))[:400],
+                )
                 if self._destination_node_state(existing_data) == "real":
                     self._log_restore_phase(
                         "destination_real_child_loaded_for_semantic_path",
@@ -36791,6 +37837,32 @@ class MainWindow(QMainWindow):
                     )
                 continue
 
+            if child_path:
+                dup_guard = self._destination_precheck_before_projected_insert(
+                    parent_item, child_path, reason="restore_future_state_widget_duplicate_guard"
+                )
+                if dup_guard is _DESTINATION_STRUCTURAL_INSERT_AMBIGUOUS:
+                    log_info(
+                        "destination_post_load_duplicate_blocked",
+                        reason="restore_future_state_widget_duplicate_guard",
+                        detail="ambiguous_canonical_under_parent",
+                        target_canonical_excerpt=str(self._destination_effective_canonical_path(child_path))[:400],
+                    )
+                    continue
+                if dup_guard is not None and dup_guard is not child:
+                    log_error(
+                        "destination_real_spo_duplicate_violation",
+                        reason="restore_future_state_widget",
+                        note="precheck_miss_then_hit_on_duplicate_guard",
+                        target_canonical_excerpt=str(self._destination_effective_canonical_path(child_path))[:400],
+                    )
+                    moved_count += self._merge_destination_projection_children(child, dup_guard, semantic_path)
+                    continue
+            log_info(
+                "destination_post_load_insert_allowed",
+                reason="restore_future_state_widget",
+                target_canonical_excerpt=str(self._destination_effective_canonical_path(child_path))[:400],
+            )
             parent_item.addChild(child)
             self._refresh_destination_item_visibility(parent_item, expand=True)
         return moved_count
@@ -36926,6 +37998,11 @@ class MainWindow(QMainWindow):
         sw, sg_widget = self._reconcile_destination_sibling_folder_name_collisions_widget(reason)
         total_moved += sw
         merged_groups += sg_widget
+
+        rk = self._reconcile_destination_root_child_top_level_leaks_widget(reason)
+        total_moved += rk
+        if rk:
+            merged_groups += rk
 
         if merged_groups:
             self._log_restore_phase(
@@ -37265,9 +38342,7 @@ class MainWindow(QMainWindow):
 
     def _find_destination_child_by_path_index_cached(self, parent_ix: QModelIndex, destination_path: str, cache: dict):
         dm = getattr(self, "destination_planning_model", None)
-        normalized_target = self._canonical_destination_projection_path(destination_path) or self.normalize_memory_path(
-            destination_path
-        )
+        normalized_target = self._destination_effective_canonical_path(destination_path)
         if dm is not None:
             self._destination_child_map_cache_sync_generation(cache, dm)
         parent_dead = False
@@ -37383,9 +38458,7 @@ class MainWindow(QMainWindow):
         return found
 
     def _find_destination_child_by_path_widget_cached(self, parent_item, destination_path: str, cache: dict):
-        normalized_target = self._canonical_destination_projection_path(destination_path) or self.normalize_memory_path(
-            destination_path
-        )
+        normalized_target = self._destination_effective_canonical_path(destination_path)
         ck = self._destination_child_map_cache_key_widget(parent_item)
         sub = cache.get(ck)
         if sub is None:
@@ -37459,16 +38532,252 @@ class MainWindow(QMainWindow):
                 ck = self._destination_sibling_folder_collision_key(child_data)
                 if dk == want_raw or ck == want_col:
                     folder_siblings.append(child)
-        return self._select_canonical_destination_item(folder_siblings)
+        if len(folder_siblings) > 1:
+            log_info(
+                "destination_projection_insert_skipped_ambiguous",
+                reason="last_segment_folder_name",
+                match_count=len(folder_siblings),
+                normalized_target_excerpt=str(normalized_target or "")[:400],
+            )
+            return None
+        if len(folder_siblings) == 1:
+            return folder_siblings[0]
+        return None
+
+    def _destination_find_top_level_widget_folder_by_last_segment(self, tree_widget, normalized_target: str):
+        segs = self._path_segments(normalized_target or "")
+        if not segs:
+            return None
+        want_raw = str(segs[-1] or "").casefold()
+        if not want_raw:
+            return None
+        want_col = self._destination_sibling_name_collision_token(want_raw)
+        folder_siblings = []
+        try:
+            n = tree_widget.topLevelItemCount()
+        except RuntimeError:
+            return None
+        for index in range(n):
+            try:
+                child = tree_widget.topLevelItem(index)
+            except RuntimeError:
+                continue
+            if child is None or not self._tree_item_is_alive(child):
+                continue
+            try:
+                child_data = child.data(0, Qt.UserRole) or {}
+            except RuntimeError:
+                continue
+            if child_data.get("placeholder"):
+                continue
+            if not child_data.get("is_folder", False):
+                continue
+            dk = self._destination_sibling_folder_dedup_key(child_data)
+            ck = self._destination_sibling_folder_collision_key(child_data)
+            if dk == want_raw or ck == want_col:
+                folder_siblings.append(child)
+        if len(folder_siblings) > 1:
+            log_info(
+                "destination_projection_insert_skipped_ambiguous",
+                reason="top_level_last_segment_folder_name",
+                match_count=len(folder_siblings),
+                normalized_target_excerpt=str(normalized_target or "")[:400],
+            )
+            return None
+        if len(folder_siblings) == 1:
+            return folder_siblings[0]
+        return None
+
+    def _destination_list_direct_children_matching_canonical(self, parent_item, target_eff: str) -> list:
+        if not target_eff:
+            return []
+        te = target_eff.casefold()
+        matches = []
+        if isinstance(parent_item, QModelIndex):
+            model = getattr(self, "destination_planning_model", None)
+            if model is None:
+                return []
+            if parent_item.isValid() and hasattr(model, "is_index_live") and not model.is_index_live(parent_item):
+                return []
+            parent = parent_item if parent_item.isValid() else QModelIndex()
+            for r in range(model.rowCount(parent)):
+                ix = model.index(r, 0, parent)
+                child_data = self._destination_model_index_user_role_dict(ix)
+                if child_data.get("placeholder"):
+                    continue
+                ce = self._destination_effective_canonical_path(self._tree_item_path(child_data))
+                if ce and ce.casefold() == te:
+                    matches.append(ix)
+            return matches
+        if parent_item is None:
+            tw = getattr(self, "destination_tree_widget", None)
+            if tw is None:
+                return []
+            try:
+                n = tw.topLevelItemCount()
+            except RuntimeError:
+                return []
+            for index in range(n):
+                try:
+                    child = tw.topLevelItem(index)
+                except RuntimeError:
+                    continue
+                if child is None or not self._tree_item_is_alive(child):
+                    continue
+                try:
+                    child_data = child.data(0, Qt.UserRole) or {}
+                except RuntimeError:
+                    continue
+                if child_data.get("placeholder"):
+                    continue
+                ce = self._destination_effective_canonical_path(self._tree_item_path(child_data))
+                if ce and ce.casefold() == te:
+                    matches.append(child)
+            return matches
+        try:
+            nchild = parent_item.childCount()
+        except RuntimeError:
+            return []
+        for index in range(nchild):
+            try:
+                child = parent_item.child(index)
+            except RuntimeError:
+                continue
+            if child is None or not self._tree_item_is_alive(child):
+                continue
+            try:
+                child_data = child.data(0, Qt.UserRole) or {}
+            except RuntimeError:
+                continue
+            if child_data.get("placeholder"):
+                continue
+            ce = self._destination_effective_canonical_path(self._tree_item_path(child_data))
+            if ce and ce.casefold() == te:
+                matches.append(child)
+        return matches
+
+    def _destination_precheck_before_projected_insert(
+        self, parent_ref, child_target_path: str, *, reason: str, assume_primary_find_miss: bool = False
+    ):
+        """Before inserting a projected/allocation/replay row, reuse an existing child at the same canonical path.
+
+        Returns:
+            - existing QModelIndex / QTreeWidgetItem to reuse
+            - None to allow a new insert
+            - :data:`_DESTINATION_STRUCTURAL_INSERT_AMBIGUOUS` when multiple children share the path (fail closed)
+
+        If ``assume_primary_find_miss`` is True, skip :meth:`_find_destination_child_by_path` (caller already ran it).
+        """
+        target_eff = self._destination_effective_canonical_path(child_target_path)
+        if is_dev_mode():
+            log_info(
+                "destination_canonical_path_computed",
+                context=reason,
+                canonical_excerpt=str(target_eff)[:400],
+            )
+            log_info(
+                "destination_node_reuse_check_started",
+                reason=reason,
+                target_canonical_excerpt=str(target_eff)[:400],
+            )
+        if not assume_primary_find_miss:
+            existing = self._find_destination_child_by_path(parent_ref, child_target_path)
+            if existing is not None:
+                if is_dev_mode():
+                    log_info(
+                        "destination_node_reuse_found_existing",
+                        reason=reason,
+                        phase="primary_find",
+                    )
+                return existing
+        enum_matches = self._destination_list_direct_children_matching_canonical(parent_ref, target_eff)
+        if len(enum_matches) > 1:
+            log_info(
+                "destination_projection_insert_skipped_ambiguous",
+                reason=reason,
+                match_count=len(enum_matches),
+                target_canonical_excerpt=str(target_eff)[:400],
+            )
+            log_info(
+                "destination_duplicate_insert_blocked",
+                reason=reason,
+                detail="multiple_canonical_matches_under_parent",
+            )
+            return _DESTINATION_STRUCTURAL_INSERT_AMBIGUOUS
+        if len(enum_matches) == 1:
+            log_error(
+                "destination_duplicate_canonical_path_violation",
+                reason=reason,
+                note="find_child_missed_enumeration_hit",
+                target_canonical_excerpt=str(target_eff)[:400],
+            )
+            if is_dev_mode():
+                log_info(
+                    "destination_node_reuse_found_existing",
+                    reason=reason,
+                    phase="enumeration_recovery",
+                )
+            return enum_matches[0]
+        if is_dev_mode():
+            log_info(
+                "destination_node_reuse_miss",
+                reason=reason,
+                target_canonical_excerpt=str(target_eff)[:400],
+            )
+        return None
+
+    def _find_destination_top_level_widget_child_by_path(self, destination_path):
+        tw = getattr(self, "destination_tree_widget", None)
+        if tw is None:
+            return None
+        target_eff = self._destination_effective_canonical_path(destination_path)
+        if not target_eff:
+            return None
+        te = target_eff.casefold()
+        matches = []
+        try:
+            n = tw.topLevelItemCount()
+        except RuntimeError:
+            return None
+        for index in range(n):
+            try:
+                child = tw.topLevelItem(index)
+            except RuntimeError:
+                continue
+            if child is None or not self._tree_item_is_alive(child):
+                continue
+            try:
+                child_data = child.data(0, Qt.UserRole) or {}
+            except RuntimeError:
+                continue
+            if child_data.get("placeholder"):
+                continue
+            ce = self._destination_effective_canonical_path(self._tree_item_path(child_data))
+            if ce and ce.casefold() == te:
+                matches.append(child)
+        if len(matches) > 1:
+            log_error(
+                "destination_duplicate_canonical_path_violation",
+                reason="top_level_widget_child_lookup",
+                note="multiple_rows_same_canonical",
+                match_count=len(matches),
+            )
+        hit = self._select_canonical_destination_item(matches)
+        if hit is not None:
+            return hit
+        return self._destination_find_top_level_widget_folder_by_last_segment(tw, target_eff)
 
     def _find_destination_child_by_path(self, parent_item, destination_path):
         if parent_item is None:
-            return None
+            if self._destination_tree_uses_model_view():
+                parent_item = QModelIndex()
+            else:
+                return self._find_destination_top_level_widget_child_by_path(destination_path)
         if isinstance(parent_item, QModelIndex):
-            normalized_target = self._canonical_destination_projection_path(destination_path) or self.normalize_memory_path(
-                destination_path
-            )
-            emit_restore_match_logs = bool(getattr(self, "_verbose_destination_match_logging", False))
+            normalized_target = self._destination_effective_canonical_path(destination_path)
+            if not normalized_target:
+                return None
+            te = normalized_target.casefold()
             matches = []
             model = getattr(self, "destination_planning_model", None)
             if model is None:
@@ -37480,82 +38789,46 @@ class MainWindow(QMainWindow):
                     destination_path_hint=normalized_target,
                 )
                 return None
-            for r in range(model.rowCount(parent_item)):
-                ix = model.index(r, 0, parent_item)
+            parent = parent_item if parent_item.isValid() else QModelIndex()
+            for r in range(model.rowCount(parent)):
+                ix = model.index(r, 0, parent)
                 child_data = self._destination_model_index_user_role_dict(ix)
                 if child_data.get("placeholder"):
                     continue
-                child_path = self._tree_item_path(child_data)
-                if not child_path:
-                    continue
-                match_details = self._destination_parent_match_details(destination_path, child_path)
-                if match_details["exact_match"]:
+                ce = self._destination_effective_canonical_path(self._tree_item_path(child_data))
+                if ce and ce.casefold() == te:
                     matches.append(ix)
-                    continue
-                if match_details["prefix_only_match"]:
-                    continue
-                if emit_restore_match_logs:
-                    pass
+            if len(matches) > 1:
+                log_error(
+                    "destination_duplicate_canonical_path_violation",
+                    reason="model_child_lookup",
+                    note="multiple_rows_same_canonical",
+                    match_count=len(matches),
+                )
             hit = self._select_canonical_destination_item(matches)
             if hit is not None:
                 return hit
             return self._destination_find_child_by_last_segment_folder_name(parent_item, normalized_target)
-        normalized_target = self._canonical_destination_projection_path(destination_path) or self.normalize_memory_path(destination_path)
-        emit_restore_match_logs = bool(getattr(self, "_verbose_destination_match_logging", False))
-        if emit_restore_match_logs:
-            self._log_restore_phase(
-                "destination_parent_exact_match_required",
-                requested_parent_path=destination_path,
-                normalized_parent_path=normalized_target,
-            )
+        normalized_target = self._destination_effective_canonical_path(destination_path)
+        if not normalized_target:
+            return None
+        te = normalized_target.casefold()
         matches = []
         for index in range(parent_item.childCount()):
             child = parent_item.child(index)
             child_data = child.data(0, Qt.UserRole) or {}
             if child_data.get("placeholder"):
                 continue
-            child_path = self._tree_item_path(child_data)
-            if not child_path:
-                continue
-            match_details = self._destination_parent_match_details(destination_path, child_path)
-            if match_details["exact_match"]:
-                if emit_restore_match_logs:
-                    self._log_restore_phase(
-                        "destination_parent_exact_match_succeeded",
-                        requested_parent_path=destination_path,
-                        normalized_parent_path=match_details["normalized_requested"],
-                        candidate_tree_path=child_path,
-                        candidate_normalized_path=match_details["normalized_candidate"],
-                        exact_match=True,
-                        prefix_only_match=False,
-                        accepted_or_rejected="accepted",
-                    )
+            ce = self._destination_effective_canonical_path(self._tree_item_path(child_data))
+            if ce and ce.casefold() == te:
                 matches.append(child)
-                continue
-            if match_details["prefix_only_match"]:
-                if emit_restore_match_logs:
-                    self._log_restore_phase(
-                        "destination_parent_prefix_rejected",
-                        requested_parent_path=destination_path,
-                        normalized_parent_path=match_details["normalized_requested"],
-                        candidate_tree_path=child_path,
-                        candidate_normalized_path=match_details["normalized_candidate"],
-                        exact_match=False,
-                        prefix_only_match=True,
-                        accepted_or_rejected="rejected",
-                    )
-                continue
-            if emit_restore_match_logs:
-                self._log_restore_phase(
-                    "destination_parent_exact_match_failed",
-                    requested_parent_path=destination_path,
-                    normalized_parent_path=match_details["normalized_requested"],
-                    candidate_tree_path=child_path,
-                    candidate_normalized_path=match_details["normalized_candidate"],
-                    exact_match=False,
-                    prefix_only_match=False,
-                    accepted_or_rejected="rejected",
-                )
+        if len(matches) > 1:
+            log_error(
+                "destination_duplicate_canonical_path_violation",
+                reason="widget_child_lookup",
+                note="multiple_rows_same_canonical",
+                match_count=len(matches),
+            )
         hit = self._select_canonical_destination_item(matches)
         if hit is not None:
             return hit
@@ -37570,6 +38843,9 @@ class MainWindow(QMainWindow):
         )
         normalized_path = normalized_path or self.normalize_memory_path(destination_path)
         base_label = self._tree_name_column_label(folder_name)
+        root_drive = str(getattr(self, "pending_root_drive_ids", {}).get("destination", "") or "").strip()
+        drive_id = str(parent_data.get("drive_id") or root_drive or "").strip()
+        library_id = str(parent_data.get("library_id") or parent_data.get("drive_id") or root_drive or "").strip()
         return {
             "id": f"projected::{normalized_path}",
             "name": folder_name,
@@ -37578,10 +38854,10 @@ class MainWindow(QMainWindow):
             "item_path": normalized_path,
             "destination_path": normalized_path,
             "tree_role": "destination",
-            "drive_id": parent_data.get("drive_id", ""),
+            "drive_id": drive_id,
             "site_id": parent_data.get("site_id", ""),
             "site_name": parent_data.get("site_name", ""),
-            "library_id": parent_data.get("library_id", ""),
+            "library_id": library_id,
             "library_name": parent_data.get("library_name", ""),
             "is_folder": True,
             "children_loaded": True,
@@ -37641,24 +38917,14 @@ class MainWindow(QMainWindow):
         normalized_target: str,
         path_mode: str,
     ) -> bool:
-        """Guard post-bind projection insertion so structural writes cannot create root-level siblings."""
+        """Allow projection under the library root (real-root tree) and under normal folder parents."""
         if path_mode == "model":
-            if isinstance(parent_ref, QModelIndex) and parent_ref.isValid():
-                return True
-            self._log_restore_phase(
-                "destination_projection_illegal_root_insert_blocked",
-                normalized_parent_path=normalized_target,
-                path_mode=path_mode,
-            )
-            return False
+            # Invalid QModelIndex = library (invisible) root — legal for top-level projected rows.
+            return isinstance(parent_ref, QModelIndex)
         if parent_ref is not None:
             return True
-        self._log_restore_phase(
-            "destination_projection_illegal_root_insert_blocked",
-            normalized_parent_path=normalized_target,
-            path_mode=path_mode,
-        )
-        return False
+        # QTreeWidget: None parent means add as top-level under the destination tree.
+        return True
 
     def _ensure_destination_projection_path_model(self, destination_path, normalized_target):
         model = getattr(self, "destination_planning_model", None)
@@ -37686,6 +38952,12 @@ class MainWindow(QMainWindow):
                 anchor_index = index
                 anchor_data = self._destination_model_index_user_role_dict(existing)
                 anchor_state = self._destination_node_state(anchor_data)
+                log_info(
+                    "destination_projection_anchor_found",
+                    path_mode="model",
+                    anchor_kind="tree_prefix",
+                    prefix=str(prefixes[index] or "")[:500],
+                )
                 if index == len(prefixes) - 1:
                     self._log_restore_phase(
                         "destination_parent_resolution_reused_real" if anchor_state == "real" else "destination_parent_resolution_reused_projected",
@@ -37721,41 +38993,42 @@ class MainWindow(QMainWindow):
 
         start_index = anchor_index + 1
         if not _ix_ok(current_ix) and prefixes:
-            visible_root = self._find_visible_destination_item_by_path("Root")
-            if _ix_ok(visible_root):
-                current_ix = visible_root
-                current_parent_data = self._destination_model_index_user_role_dict(current_ix)
-                start_index = 1
-                self._log_restore_phase(
-                    "destination_parent_resolution_reused_real",
-                    requested_parent_path=destination_path,
-                    normalized_parent_path=normalized_target,
-                    resolved_tree_path=self._tree_item_path(current_parent_data),
-                    resolved_node_origin=current_parent_data.get("node_origin", ""),
-                    reused_existing=True,
-                    created_new=False,
-                )
-            else:
-                self._log_restore_phase(
-                    "destination_projection_path_missing_anchor",
-                    requested_parent_path=destination_path,
-                    normalized_parent_path=normalized_target,
-                    path_mode="model",
-                )
-                self._log_restore_phase(
-                    "destination_projection_invariant_violation",
-                    reason="root_anchor_missing_for_model_projection_path",
-                    normalized_parent_path=normalized_target,
-                    path_mode="model",
-                )
-                return None
+            # Real-root UI: no synthetic ``Root`` row — start from the library (invisible model root).
+            current_ix = QModelIndex()
+            current_parent_data = {}
+            start_index = 0
+            log_info(
+                "destination_projection_anchor_found",
+                path_mode="model",
+                anchor_kind="library_root",
+                normalized_parent_path=str(normalized_target or "")[:500],
+            )
+            self._log_restore_phase(
+                "destination_parent_resolution_reused_real",
+                requested_parent_path=destination_path,
+                normalized_parent_path=normalized_target,
+                resolved_tree_path="",
+                resolved_node_origin="library_root",
+                reused_existing=True,
+                created_new=False,
+            )
 
         for index in range(start_index, len(prefixes)):
             branch_path = prefixes[index]
             parent_for_find = current_ix if _ix_ok(current_ix) else QModelIndex()
-            existing_child = self._find_destination_child_by_path(parent_for_find, branch_path)
-            if existing_child is not None:
-                current_ix = existing_child
+            resolved_child = self._destination_precheck_before_projected_insert(
+                parent_for_find, branch_path, reason="ensure_destination_projection_path_model"
+            )
+            if resolved_child is _DESTINATION_STRUCTURAL_INSERT_AMBIGUOUS:
+                log_info(
+                    "destination_duplicate_insert_blocked",
+                    reason="ensure_destination_projection_path_model",
+                    detail="ambiguous_canonical_under_parent",
+                    branch_excerpt=str(branch_path or "")[:400],
+                )
+                return None
+            if resolved_child is not None:
+                current_ix = resolved_child
                 current_parent_data = self._destination_model_index_user_role_dict(current_ix)
                 self._log_restore_phase(
                     "destination_parent_resolution_duplicate_detected",
@@ -37766,46 +39039,61 @@ class MainWindow(QMainWindow):
                     reused_existing=True,
                     created_new=False,
                 )
+                if is_dev_mode():
+                    log_info(
+                        "destination_replay_reused_existing",
+                        path_mode="model",
+                        phase="projection_prefix",
+                        branch_excerpt=str(branch_path or "")[:400],
+                    )
                 continue
 
             folder_name = self._path_segments(branch_path)[-1]
             pl = self._build_projected_destination_folder_payload(folder_name, branch_path, current_parent_data)
-            if _ix_ok(current_ix):
-                row_before = model.rowCount(current_ix)
-                parent_refresh = current_ix
-                model.append_child_payloads(parent_refresh, [pl])
-                current_ix = model.index(row_before, 0, parent_refresh)
-                current_parent_data = self._destination_model_index_user_role_dict(current_ix)
-                if not current_parent_data:
-                    current_parent_data = dict(pl)
-                # Refresh parent after reading the new row: refresh can pump events and invalidate
-                # QModelIndex snapshots (native access violation if we .data() the child after).
-                self._refresh_destination_item_visibility_index(parent_refresh, expand=True)
-                fresh_ix = model.index(row_before, 0, parent_refresh)
-                if fresh_ix.isValid():
-                    current_ix = fresh_ix
-                    reread = self._destination_model_index_user_role_dict(current_ix)
-                    if reread:
-                        current_parent_data = reread
+            parent_refresh = current_ix if _ix_ok(current_ix) else QModelIndex()
+            if not self._destination_projection_legal_insert_parent(
+                parent_refresh,
+                normalized_target=normalized_target,
+                path_mode="model",
+            ):
+                log_info(
+                    "destination_projection_anchor_missing",
+                    path_mode="model",
+                    reason="illegal_insert_parent",
+                    normalized_parent_path=str(normalized_target or "")[:500],
+                )
                 self._log_restore_phase(
-                    "destination_projection_created_intermediate_under_root",
+                    "destination_projection_invariant_violation",
+                    reason="model_projection_parent_invalid",
                     normalized_parent_path=normalized_target,
-                    created_semantic_path=branch_path,
                     path_mode="model",
                 )
-            else:
-                if not self._destination_projection_legal_insert_parent(
-                    current_ix,
-                    normalized_target=normalized_target,
+                return None
+            if is_dev_mode():
+                log_info(
+                    "destination_projection_insert_allowed",
                     path_mode="model",
-                ):
-                    self._log_restore_phase(
-                        "destination_projection_invariant_violation",
-                        reason="model_projection_parent_invalid",
-                        normalized_parent_path=normalized_target,
-                        path_mode="model",
-                    )
-                    return None
+                    branch_excerpt=str(branch_path or "")[:400],
+                )
+            row_before = model.rowCount(parent_refresh)
+            model.append_child_payloads(parent_refresh, [pl])
+            current_ix = model.index(row_before, 0, parent_refresh)
+            current_parent_data = self._destination_model_index_user_role_dict(current_ix)
+            if not current_parent_data:
+                current_parent_data = dict(pl)
+            self._refresh_destination_item_visibility_index(parent_refresh, expand=True)
+            fresh_ix = model.index(row_before, 0, parent_refresh)
+            if fresh_ix.isValid():
+                current_ix = fresh_ix
+                reread = self._destination_model_index_user_role_dict(current_ix)
+                if reread:
+                    current_parent_data = reread
+            self._log_restore_phase(
+                "destination_projection_created_intermediate_under_root",
+                normalized_parent_path=normalized_target,
+                created_semantic_path=branch_path,
+                path_mode="model",
+            )
             self._log_restore_phase(
                 "destination_parent_resolution_created_projected",
                 requested_parent_path=destination_path,
@@ -37823,15 +39111,28 @@ class MainWindow(QMainWindow):
             path_mode="model",
             resolved=True,
         )
+        log_info(
+            "destination_projection_applied",
+            path_mode="model",
+            normalized_parent_path=str(normalized_target or "")[:500],
+        )
         return current_ix if _ix_ok(current_ix) else None
 
     def _ensure_destination_projection_path(self, destination_path):
+        log_info("destination_projection_path_original", path=str(destination_path or "")[:500])
         normalized_target = self._canonical_destination_projection_path(destination_path)
+        log_info("destination_projection_path_normalized", path=str(normalized_target or "")[:500])
         if not normalized_target:
+            log_info(
+                "destination_projection_anchor_missing",
+                reason="empty_normalized_path",
+                path=str(destination_path or "")[:500],
+            )
             return None
 
         tree = getattr(self, "destination_tree_widget", None)
         if tree is None:
+            log_info("destination_projection_anchor_missing", reason="no_destination_tree", path=str(destination_path or "")[:500])
             return None
         if self._destination_tree_uses_model_view():
             return self._ensure_destination_projection_path_model(destination_path, normalized_target)
@@ -37853,6 +39154,12 @@ class MainWindow(QMainWindow):
                 anchor_index = index
                 anchor_data = existing.data(0, Qt.UserRole) or {}
                 anchor_state = self._destination_node_state(anchor_data)
+                log_info(
+                    "destination_projection_anchor_found",
+                    path_mode="widget",
+                    anchor_kind="tree_prefix",
+                    prefix=str(prefixes[index] or "")[:500],
+                )
                 if index == len(prefixes) - 1:
                     self._log_restore_phase(
                         "destination_parent_resolution_reused_real" if anchor_state == "real" else "destination_parent_resolution_reused_projected",
@@ -37888,40 +39195,41 @@ class MainWindow(QMainWindow):
 
         start_index = anchor_index + 1
         if current_item is None and prefixes:
-            visible_root = self._find_visible_destination_item_by_path("Root")
-            if visible_root is not None:
-                current_item = visible_root
-                current_parent_data = current_item.data(0, Qt.UserRole) or {}
-                start_index = 1
-                self._log_restore_phase(
-                    "destination_parent_resolution_reused_real",
-                    requested_parent_path=destination_path,
-                    normalized_parent_path=normalized_target,
-                    resolved_tree_path=self._tree_item_path(current_parent_data),
-                    resolved_node_origin=current_parent_data.get("node_origin", ""),
-                    reused_existing=True,
-                    created_new=False,
-                )
-            else:
-                self._log_restore_phase(
-                    "destination_projection_path_missing_anchor",
-                    requested_parent_path=destination_path,
-                    normalized_parent_path=normalized_target,
-                    path_mode="widget",
-                )
-                self._log_restore_phase(
-                    "destination_projection_invariant_violation",
-                    reason="root_anchor_missing_for_widget_projection_path",
-                    normalized_parent_path=normalized_target,
-                    path_mode="widget",
-                )
-                return None
+            current_item = None
+            current_parent_data = {}
+            start_index = 0
+            log_info(
+                "destination_projection_anchor_found",
+                path_mode="widget",
+                anchor_kind="library_root",
+                normalized_parent_path=str(normalized_target or "")[:500],
+            )
+            self._log_restore_phase(
+                "destination_parent_resolution_reused_real",
+                requested_parent_path=destination_path,
+                normalized_parent_path=normalized_target,
+                resolved_tree_path="",
+                resolved_node_origin="library_root",
+                reused_existing=True,
+                created_new=False,
+            )
 
         for index in range(start_index, len(prefixes)):
             branch_path = prefixes[index]
-            existing_child = self._find_destination_child_by_path(current_item, branch_path) if current_item is not None else None
-            if existing_child is not None:
-                current_item = existing_child
+            parent_for_find = current_item
+            resolved_child = self._destination_precheck_before_projected_insert(
+                parent_for_find, branch_path, reason="ensure_destination_projection_path_widget"
+            )
+            if resolved_child is _DESTINATION_STRUCTURAL_INSERT_AMBIGUOUS:
+                log_info(
+                    "destination_duplicate_insert_blocked",
+                    reason="ensure_destination_projection_path_widget",
+                    detail="ambiguous_canonical_under_parent",
+                    branch_excerpt=str(branch_path or "")[:400],
+                )
+                return None
+            if resolved_child is not None:
+                current_item = resolved_child
                 current_parent_data = current_item.data(0, Qt.UserRole) or {}
                 self._log_restore_phase(
                     "destination_parent_resolution_duplicate_detected",
@@ -37932,9 +39240,22 @@ class MainWindow(QMainWindow):
                     reused_existing=True,
                     created_new=False,
                 )
+                if is_dev_mode():
+                    log_info(
+                        "destination_replay_reused_existing",
+                        path_mode="widget",
+                        phase="projection_prefix",
+                        branch_excerpt=str(branch_path or "")[:400],
+                    )
                 continue
 
             folder_name = self._path_segments(branch_path)[-1]
+            if is_dev_mode():
+                log_info(
+                    "destination_projection_insert_allowed",
+                    path_mode="widget",
+                    branch_excerpt=str(branch_path or "")[:400],
+                )
             new_child = self._build_projected_destination_folder_node(folder_name, branch_path, current_parent_data)
             if current_item is not None:
                 current_item.addChild(new_child)
@@ -37947,10 +39268,16 @@ class MainWindow(QMainWindow):
                 )
             else:
                 if not self._destination_projection_legal_insert_parent(
-                    current_item,
+                    None,
                     normalized_target=normalized_target,
                     path_mode="widget",
                 ):
+                    log_info(
+                        "destination_projection_anchor_missing",
+                        path_mode="widget",
+                        reason="illegal_top_level_insert",
+                        normalized_parent_path=str(normalized_target or "")[:500],
+                    )
                     self._log_restore_phase(
                         "destination_projection_invariant_violation",
                         reason="widget_projection_parent_missing",
@@ -37958,6 +39285,16 @@ class MainWindow(QMainWindow):
                         path_mode="widget",
                     )
                     return None
+                tw = getattr(self, "destination_tree_widget", None)
+                if tw is not None:
+                    tw.addTopLevelItem(new_child)
+                self._refresh_destination_item_visibility(new_child, expand=True)
+                self._log_restore_phase(
+                    "destination_projection_created_intermediate_under_root",
+                    normalized_parent_path=normalized_target,
+                    created_semantic_path=branch_path,
+                    path_mode="widget",
+                )
             current_item = new_child
             current_parent_data = current_item.data(0, Qt.UserRole) or {}
             self._log_restore_phase(
@@ -37976,6 +39313,11 @@ class MainWindow(QMainWindow):
             normalized_parent_path=normalized_target,
             path_mode="widget",
             resolved=bool(current_item is not None),
+        )
+        log_info(
+            "destination_projection_applied",
+            path_mode="widget",
+            normalized_parent_path=str(normalized_target or "")[:500],
         )
         return current_item
 
@@ -37999,10 +39341,32 @@ class MainWindow(QMainWindow):
             existing_child = self._find_destination_child_by_path(parent_item, allocation_path)
             if existing_child is None:
                 existing_child = self._find_destination_child_by_allocation_equivalence(parent_item, move)
+            if existing_child is None:
+                reuse_or_block = self._destination_precheck_before_projected_insert(
+                    parent_item,
+                    allocation_path,
+                    reason="apply_allocation_children_widget",
+                    assume_primary_find_miss=True,
+                )
+                if reuse_or_block is _DESTINATION_STRUCTURAL_INSERT_AMBIGUOUS:
+                    log_info(
+                        "destination_duplicate_insert_blocked",
+                        reason="apply_allocation_children_widget",
+                        detail="ambiguous_canonical_under_parent",
+                    )
+                    continue
+                if reuse_or_block is not None:
+                    existing_child = reuse_or_block
             if existing_child is not None:
                 self._ensure_planned_allocation_overlay_on_real_item(parent_item, existing_child, move)
                 self._mark_allocation_resolved(move)
                 applied_count += 1
+                if is_dev_mode():
+                    log_info(
+                        "destination_allocation_reused_existing",
+                        path_mode="widget",
+                        destination_path_excerpt=str(allocation_path or "")[:400],
+                    )
                 self._log_restore_phase(
                     "destination_projection_node_reused",
                     destination_path=allocation_path,
@@ -38019,7 +39383,21 @@ class MainWindow(QMainWindow):
                     node_state="allocated",
                     reused_existing=True,
                 )
+                if is_dev_mode():
+                    log_info(
+                        "destination_replay_reused_existing",
+                        path_mode="widget",
+                        phase="allocation_overlay",
+                        destination_path_excerpt=str(allocation_path or "")[:400],
+                    )
                 continue
+            if is_dev_mode():
+                log_info(
+                    "destination_projection_insert_allowed",
+                    path_mode="widget",
+                    phase="allocation_new_node",
+                    destination_path_excerpt=str(allocation_path or "")[:400],
+                )
             self._remove_placeholder_children(parent_item)
             allocation_item = self._build_allocation_tree_node(move, parent_data)
             parent_item.addChild(allocation_item)
@@ -38063,12 +39441,47 @@ class MainWindow(QMainWindow):
             existing_child = self._find_destination_child_by_path(parent_ix, allocation_path)
             if existing_child is None:
                 existing_child = self._find_destination_child_by_allocation_equivalence(parent_ix, move)
+            if existing_child is None:
+                reuse_or_block = self._destination_precheck_before_projected_insert(
+                    parent_ix,
+                    allocation_path,
+                    reason="apply_allocation_children_model",
+                    assume_primary_find_miss=True,
+                )
+                if reuse_or_block is _DESTINATION_STRUCTURAL_INSERT_AMBIGUOUS:
+                    log_info(
+                        "destination_duplicate_insert_blocked",
+                        reason="apply_allocation_children_model",
+                        detail="ambiguous_canonical_under_parent",
+                    )
+                    continue
+                if reuse_or_block is not None:
+                    existing_child = reuse_or_block
             if existing_child is not None:
                 if isinstance(existing_child, QModelIndex):
                     self._ensure_planned_allocation_overlay_on_real_model_index(parent_ix, existing_child, move)
                 self._mark_allocation_resolved(move)
                 applied_count += 1
+                if is_dev_mode():
+                    log_info(
+                        "destination_allocation_reused_existing",
+                        path_mode="model",
+                        destination_path_excerpt=str(allocation_path or "")[:400],
+                    )
+                    log_info(
+                        "destination_replay_reused_existing",
+                        path_mode="model",
+                        phase="allocation_overlay",
+                        destination_path_excerpt=str(allocation_path or "")[:400],
+                    )
                 continue
+            if is_dev_mode():
+                log_info(
+                    "destination_projection_insert_allowed",
+                    path_mode="model",
+                    phase="allocation_new_node",
+                    destination_path_excerpt=str(allocation_path or "")[:400],
+                )
             self._remove_placeholder_children(parent_ix)
             pl = self._build_allocation_payload(move, parent_data)
             model.append_child_payloads(parent_ix, [pl])
@@ -38159,9 +39572,7 @@ class MainWindow(QMainWindow):
             if dev:
                 _perf_explorer_log("find_visible_destination_item_by_path", elapsed_ms=perf.elapsed(), match="no_tree")
             return None
-        normalized_target = self._canonical_destination_projection_path(destination_path) or self.normalize_memory_path(
-            destination_path
-        )
+        normalized_target = self._destination_effective_canonical_path(destination_path)
         dest_cache = getattr(self, "_destination_path_lookup_cache", None)
         if dest_cache is None:
             dest_cache = {}
@@ -38322,10 +39733,8 @@ class MainWindow(QMainWindow):
         """Resolve a destination parent row for incremental merge attach.
 
         Reuses :meth:`_find_visible_destination_item_by_path` first. If that returns None but the
-        planning model still has nodes under the canonical path key, accept a row whose
-        :meth:`_destination_payload_index_key` matches — :meth:`_tree_item_path` can disagree
-        (``source_path`` before ``destination_path``) while the path index uses the reverse
-        precedence, so strict ``exact_match`` on visible paths alone skipped valid parents.
+        planning model still has nodes indexed under the same effective canonical path as
+        ``parent_path``, accept that row (index key matches :meth:`_tree_item_path` identity).
         """
         pp = str(parent_path or "").strip()
         if not pp:
@@ -38333,7 +39742,7 @@ class MainWindow(QMainWindow):
         primary = self._find_visible_destination_item_by_path(pp)
         if primary is not None and (not isinstance(primary, QModelIndex) or primary.isValid()):
             return primary
-        req_c = self._canonical_destination_projection_path(pp) or self.normalize_memory_path(pp)
+        req_c = self._destination_effective_canonical_path(pp)
         if not req_c:
             return None
         if self._destination_tree_uses_model_view():
@@ -38356,9 +39765,8 @@ class MainWindow(QMainWindow):
                             parent_path_excerpt=pp[:240],
                         )
                     return ix
-                mem = self._destination_payload_index_raw_mem(nd)
-                bucket_c = self._canonical_destination_projection_path(mem) or ""
-                if bucket_c == req_c:
+                bucket_key = self._destination_payload_index_key(nd)
+                if bucket_key and bucket_key.casefold() == req_c.casefold():
                     if is_dev_mode():
                         log_info(
                             "destination_incremental_merge_parent_resolve",
@@ -38691,16 +40099,48 @@ class MainWindow(QMainWindow):
             )
             if not match_succeeded:
                 continue
-            if self._proposed_folder_exists_under(parent_item, self._proposed_destination_path(proposed_folder)):
+            dest_path = self._proposed_destination_path(proposed_folder)
+            if self._proposed_folder_exists_under(parent_item, dest_path):
                 self._mark_proposed_folder_resolved(proposed_folder)
                 self._log_restore_phase(
                     "proposed_overlay_node_skipped",
                     reason="already_exists_under_parent",
                     parent_path=parent_path,
-                    destination_path=self._proposed_destination_path(proposed_folder),
+                    destination_path=dest_path,
                     queue_size=self._unresolved_proposed_queue_size(),
                 )
                 continue
+            reuse_or_block = self._destination_precheck_before_projected_insert(
+                parent_item, dest_path, reason="apply_proposed_children_widget"
+            )
+            if reuse_or_block is _DESTINATION_STRUCTURAL_INSERT_AMBIGUOUS:
+                log_info(
+                    "destination_projection_insert_skipped_ambiguous",
+                    reason="apply_proposed_children_widget",
+                    target_canonical_excerpt=str(self._destination_effective_canonical_path(dest_path))[:400],
+                )
+                log_info(
+                    "destination_duplicate_insert_blocked",
+                    reason="apply_proposed_children_widget",
+                    detail="ambiguous_canonical_under_parent",
+                )
+                continue
+            if reuse_or_block is not None:
+                if is_dev_mode():
+                    log_info(
+                        "destination_replay_reused_existing",
+                        phase="proposed_overlay_widget",
+                        path_excerpt=str(dest_path or "")[:400],
+                    )
+                self._mark_proposed_folder_resolved(proposed_folder)
+                continue
+            if is_dev_mode():
+                log_info(
+                    "destination_projection_insert_allowed",
+                    path_mode="widget",
+                    phase="proposed_overlay",
+                    path_excerpt=str(dest_path or "")[:400],
+                )
             self._remove_placeholder_children(parent_item)
             parent_item.addChild(self._build_proposed_tree_node(proposed_folder, parent_data))
             self._refresh_destination_item_visibility(parent_item, expand=True)
@@ -41002,13 +42442,13 @@ class MainWindow(QMainWindow):
             semantic_path_excerpt=str(sp0)[:240],
             path="load_destination_projected_descendants_widget",
         )
-        if bool(self._destination_structure_ready("load_destination_projected_descendants_widget", log_waiting=False)):
-            log_info(
-                "destination_structural_mutation_after_bind",
-                path="load_destination_projected_descendants_widget",
-                semantic_path_excerpt=str(sp0)[:240],
-            )
-        return
+        if not bool(self._destination_structure_ready("load_destination_projected_descendants_widget", log_waiting=False)):
+            return
+        log_info(
+            "destination_structural_mutation_after_bind",
+            path="load_destination_projected_descendants_widget",
+            semantic_path_excerpt=str(sp0)[:240],
+        )
         if isinstance(item, QModelIndex):
             return self._load_destination_projected_descendants_index(item)
         node_data = item.data(0, Qt.UserRole) or {}
@@ -41417,7 +42857,20 @@ class MainWindow(QMainWindow):
                 pl = self._destination_payload_from_graph_item(child)
                 self._apply_tree_item_visual_state(None, pl)
                 child_payloads.append(pl)
-            model.replace_all_children(parent_index, child_payloads)
+            zmode = self._destination_graph_zero_children_replace_mode(
+                parent_index, items, preserved_nested or []
+            )
+            if child_payloads:
+                model.replace_all_children(parent_index, child_payloads)
+            else:
+                model.replace_all_children(parent_index, child_payloads, zero_children_mode=zmode)
+            log_info(
+                "destination_real_spo_children_loaded",
+                worker_key=str(worker_key or "")[:200],
+                child_count=len(child_payloads),
+                library_top_level=bool(self._destination_model_index_is_library_top_level(parent_index)),
+                zero_children_mode=zmode if not child_payloads else "has_real_children",
+            )
 
             def _mut_ok(p):
                 p["children_loaded"] = True
@@ -41530,6 +42983,11 @@ class MainWindow(QMainWindow):
                     _footer(trigger_path_captured)
                     return
             semantic_path = sp_resolved
+            log_info(
+                "destination_post_load_merge_started",
+                semantic_path_excerpt=str(semantic_path or "")[:240],
+                preserved_nested_count=len(preserved_nested or []),
+            )
             current_child_paths = self._capture_child_path_set_for_destination_model_index(
                 parent_index_now
             )
@@ -41542,7 +43000,7 @@ class MainWindow(QMainWindow):
                         f"Refreshing saved branches... {added_count} added, {removed_count} removed in {nd_now.get('name', 'folder')}.",
                         loading=bool(self._pending_snapshot_branch_refresh.get(panel_key)),
                     )
-            if semantic_path == "Root":
+            if self._destination_model_index_is_library_top_level(parent_index_now):
                 self._destination_root_prime_pending = False
             fw_mat_scope_n = 0
             materialize_skipped_upstream_busy = False
@@ -41597,23 +43055,8 @@ class MainWindow(QMainWindow):
                     allocation_replay_count = 0
                     merge_moved_count = 0
                     future_model_applied_count = 0
-                elif (
-                    getattr(self, "_sharepoint_lazy_mode", False)
-                    and getattr(self, "_destination_root_prime_pending", False)
-                    and semantic_path != "Root"
-                ):
-                    handoff_moved_count = self._restore_destination_future_state_children_model(
-                        parent_index_now, preserved_nested
-                    )
-                    direct_applied_count = 0
-                    replay_applied_count = 0
-                    allocation_applied_count = 0
-                    allocation_replay_count = 0
-                    merge_moved_count = 0
-                    future_model_applied_count = 0
-                elif semantic_path == "Root" and (
-                    getattr(self, "_sharepoint_lazy_mode", False)
-                    or getattr(self, "_memory_restore_in_progress", False)
+                elif getattr(self, "_sharepoint_lazy_mode", False) and getattr(
+                    self, "_destination_root_prime_pending", False
                 ):
                     handoff_moved_count = self._restore_destination_future_state_children_model(
                         parent_index_now, preserved_nested
@@ -41719,7 +43162,7 @@ class MainWindow(QMainWindow):
                 )
                 if not self._expand_all_pending.get("destination"):
                     if not getattr(self, "_destination_restore_completed_once", False):
-                        if semantic_path == "Root" and (
+                        if self._destination_semantic_path_is_library_depth_one(semantic_path) and (
                             getattr(self, "_sharepoint_lazy_mode", False)
                             or getattr(self, "_memory_restore_in_progress", False)
                         ):
@@ -41739,12 +43182,12 @@ class MainWindow(QMainWindow):
                         self._finalize_memory_restore_if_ready(f"folder_load:{semantic_path}")
                 if (
                     getattr(self, "_sharepoint_lazy_mode", False)
-                    and semantic_path == "Root"
+                    and self._destination_model_index_is_library_top_level(parent_index_now)
                     and not self._expand_all_pending.get("destination")
                 ):
                     self._set_tree_status_message(
                         "destination",
-                        f"{model_now.rowCount(parent_index_now)} top-level destination folder(s) loaded.",
+                        f"{model_now.rowCount(parent_index_now)} item(s) loaded under library folder.",
                         loading=False,
                     )
             except Exception as exc:
@@ -42061,7 +43504,7 @@ class MainWindow(QMainWindow):
             if panel_key == "destination":
                 self._mark_destination_real_tree_snapshot_stale()
                 semantic_path = self._destination_semantic_path(node_data)
-                if semantic_path == "Root":
+                if self._destination_widget_item_is_library_top_level(item):
                     self._destination_root_prime_pending = False
                 fw_mat_scope_n = 0
                 try:
@@ -42077,10 +43520,8 @@ class MainWindow(QMainWindow):
                         allocation_replay_count = 0
                         merge_moved_count = 0
                         future_model_applied_count = 0
-                    elif (
-                        getattr(self, "_sharepoint_lazy_mode", False)
-                        and getattr(self, "_destination_root_prime_pending", False)
-                        and semantic_path != "Root"
+                    elif getattr(self, "_sharepoint_lazy_mode", False) and getattr(
+                        self, "_destination_root_prime_pending", False
                     ):
                         handoff_moved_count = self._restore_destination_future_state_children(item, preserved_destination_children)
                         direct_applied_count = 0
@@ -42090,23 +43531,7 @@ class MainWindow(QMainWindow):
                         merge_moved_count = 0
                         future_model_applied_count = 0
                         self._log_restore_phase(
-                            "destination_overlay_deferred_for_root_prime",
-                            trigger_path=self.normalize_memory_path(trigger_path),
-                            destination_path=semantic_path,
-                        )
-                    elif semantic_path == "Root" and (
-                        getattr(self, "_sharepoint_lazy_mode", False)
-                        or getattr(self, "_memory_restore_in_progress", False)
-                    ):
-                        handoff_moved_count = self._restore_destination_future_state_children(item, preserved_destination_children)
-                        direct_applied_count = 0
-                        replay_applied_count = 0
-                        allocation_applied_count = 0
-                        allocation_replay_count = 0
-                        merge_moved_count = 0
-                        future_model_applied_count = 0
-                        self._log_restore_phase(
-                            "destination_overlay_deferred_for_root_restore_queue",
+                            "destination_overlay_deferred_for_library_prime",
                             trigger_path=self.normalize_memory_path(trigger_path),
                             destination_path=semantic_path,
                         )
@@ -42162,7 +43587,7 @@ class MainWindow(QMainWindow):
                     )
                     if not self._expand_all_pending.get("destination"):
                         if not getattr(self, "_destination_restore_completed_once", False):
-                            if semantic_path == "Root" and (
+                            if self._destination_semantic_path_is_library_depth_one(semantic_path) and (
                                 getattr(self, "_sharepoint_lazy_mode", False)
                                 or getattr(self, "_memory_restore_in_progress", False)
                             ):
@@ -42195,12 +43620,12 @@ class MainWindow(QMainWindow):
                             )
                     if (
                         getattr(self, "_sharepoint_lazy_mode", False)
-                        and semantic_path == "Root"
+                        and self._destination_widget_item_is_library_top_level(item)
                         and not self._expand_all_pending.get("destination")
                     ):
                         self._set_tree_status_message(
                             "destination",
-                            f"{item.childCount()} top-level destination folder(s) loaded.",
+                            f"{item.childCount()} item(s) loaded under library folder.",
                             loading=False,
                         )
                 except Exception as exc:
@@ -42405,15 +43830,15 @@ class MainWindow(QMainWindow):
 
                 model.update_payload_for_index(parent_index, _mut_err_dest)
                 node_data = parent_index.data(Qt.UserRole) or {}
-                if panel_key == "destination" and self._destination_semantic_path(node_data) == "Root":
+                if panel_key == "destination" and self._destination_model_index_is_library_top_level(parent_index):
                     self._destination_root_prime_pending = False
                     self._set_tree_status_message(
                         "destination",
-                        "Could not refresh top-level destination folders. Showing current draft structure.",
+                        "Could not refresh library-level folder. Showing current draft structure.",
                         loading=False,
                     )
                     try:
-                        self._materialize_destination_future_model("destination_root_error_fallback")
+                        self._materialize_destination_future_model("destination_library_top_error_fallback")
                         self._start_destination_restore_materialization()
                         if getattr(self, "destination_tree_widget", None) is not None:
                             self.destination_tree_widget.viewport().update()
@@ -42463,15 +43888,15 @@ class MainWindow(QMainWindow):
             node_data["load_failed"] = True
             item.setData(0, Qt.UserRole, node_data)
 
-            if panel_key == "destination" and self._destination_semantic_path(node_data) == "Root":
+            if panel_key == "destination" and self._destination_widget_item_is_library_top_level(item):
                 self._destination_root_prime_pending = False
                 self._set_tree_status_message(
                     "destination",
-                    "Could not refresh top-level destination folders. Showing current draft structure.",
+                    "Could not refresh library-level folder. Showing current draft structure.",
                     loading=False,
                 )
                 try:
-                    self._materialize_destination_future_model("destination_root_error_fallback")
+                    self._materialize_destination_future_model("destination_library_top_error_fallback")
                     self._start_destination_restore_materialization()
                     if getattr(self, "destination_tree_widget", None) is not None:
                         self.destination_tree_widget.viewport().update()
@@ -43572,9 +44997,19 @@ class MainWindow(QMainWindow):
             return
         node_data = self.get_tree_item_node_data(item) or {}
         current_path = self.normalize_memory_path(node_data.get("display_path") or node_data.get("item_path") or "")
-        if current_path == original_path or current_path.startswith(original_path + "\\"):
-            suffix = current_path[len(original_path):]
-            next_path = self.normalize_memory_path(updated_path + suffix)
+        cur_eff = self._destination_effective_canonical_path(current_path).rstrip("\\")
+        orig_eff = self._destination_effective_canonical_path(original_path).rstrip("\\")
+        upd_eff = self._destination_effective_canonical_path(updated_path).rstrip("\\")
+        cur_cf = cur_eff.casefold()
+        orig_cf = orig_eff.casefold()
+        if cur_cf == orig_cf:
+            next_path = upd_eff
+        elif cur_cf.startswith(orig_cf + "\\"):
+            suffix = cur_eff[len(orig_eff) + 1 :]
+            next_path = self.normalize_memory_path(f"{upd_eff}\\{suffix}") if suffix else upd_eff
+        else:
+            next_path = ""
+        if next_path:
             next_name = self._path_segments(next_path)[-1] if self._path_segments(next_path) else str(node_data.get("name", "")).strip()
             node_data["name"] = next_name
             node_data["real_name"] = next_name
@@ -43594,9 +45029,19 @@ class MainWindow(QMainWindow):
             return
         node_data = dict(index.data(Qt.UserRole) or {})
         current_path = self.normalize_memory_path(node_data.get("display_path") or node_data.get("item_path") or "")
-        if current_path == original_path or current_path.startswith(original_path + "\\"):
-            suffix = current_path[len(original_path) :]
-            next_path = self.normalize_memory_path(updated_path + suffix)
+        cur_eff = self._destination_effective_canonical_path(current_path).rstrip("\\")
+        orig_eff = self._destination_effective_canonical_path(original_path).rstrip("\\")
+        upd_eff = self._destination_effective_canonical_path(updated_path).rstrip("\\")
+        cur_cf = cur_eff.casefold()
+        orig_cf = orig_eff.casefold()
+        if cur_cf == orig_cf:
+            next_path = upd_eff
+        elif cur_cf.startswith(orig_cf + "\\"):
+            suffix = cur_eff[len(orig_eff) + 1 :]
+            next_path = self.normalize_memory_path(f"{upd_eff}\\{suffix}") if suffix else upd_eff
+        else:
+            next_path = ""
+        if next_path:
             next_name = (
                 self._path_segments(next_path)[-1]
                 if self._path_segments(next_path)
@@ -43938,43 +45383,59 @@ class MainWindow(QMainWindow):
         normalized_updated = self.normalize_memory_path(updated_path)
         if not normalized_original or not normalized_updated:
             return
+        orig_eff = self._destination_effective_canonical_path(normalized_original).rstrip("\\")
+        upd_eff = self._destination_effective_canonical_path(normalized_updated).rstrip("\\")
+        if not orig_eff or not upd_eff:
+            return
+        orig_cf = orig_eff.casefold()
 
         updated_proposed_folders = []
         for proposed_folder in self.proposed_folders:
             folder_path = self._proposed_destination_path(proposed_folder)
-            if folder_path == normalized_original or folder_path.startswith(normalized_original + "\\"):
-                suffix = folder_path[len(normalized_original):]
-                next_path = self.normalize_memory_path(normalized_updated + suffix)
-                next_name = self._path_segments(next_path)[-1] if self._path_segments(next_path) else proposed_folder.FolderName
-                updated_proposed_folders.append(
-                    ProposedFolder(
-                        DestinationId=proposed_folder.DestinationId,
-                        FolderName=next_name,
-                        DestinationPath=next_path,
-                        DestinationDriveId=proposed_folder.DestinationDriveId,
-                        DestinationParentItemId=proposed_folder.DestinationParentItemId,
-                        ParentPath=self._destination_parent_path(next_path),
-                        IsSelectable=proposed_folder.IsSelectable,
-                        IsProposed=proposed_folder.IsProposed,
-                        Status=proposed_folder.Status,
-                        RequestedBy=proposed_folder.RequestedBy,
-                        RequestedDate=proposed_folder.RequestedDate,
-                    )
-                )
+            fe = self._destination_effective_canonical_path(folder_path).rstrip("\\")
+            fe_cf = fe.casefold()
+            if fe_cf == orig_cf:
+                next_path = upd_eff
+            elif fe_cf.startswith(orig_cf + "\\"):
+                suffix = fe[len(orig_eff) + 1 :]
+                next_path = self.normalize_memory_path(f"{upd_eff}\\{suffix}") if suffix else upd_eff
             else:
                 updated_proposed_folders.append(proposed_folder)
+                continue
+            next_name = self._path_segments(next_path)[-1] if self._path_segments(next_path) else proposed_folder.FolderName
+            updated_proposed_folders.append(
+                ProposedFolder(
+                    DestinationId=proposed_folder.DestinationId,
+                    FolderName=next_name,
+                    DestinationPath=next_path,
+                    DestinationDriveId=proposed_folder.DestinationDriveId,
+                    DestinationParentItemId=proposed_folder.DestinationParentItemId,
+                    ParentPath=self._destination_parent_path(next_path),
+                    IsSelectable=proposed_folder.IsSelectable,
+                    IsProposed=proposed_folder.IsProposed,
+                    Status=proposed_folder.Status,
+                    RequestedBy=proposed_folder.RequestedBy,
+                    RequestedDate=proposed_folder.RequestedDate,
+                )
+            )
         self.proposed_folders = updated_proposed_folders
 
         for move in self.planned_moves:
             destination_path = self.normalize_memory_path(move.get("destination_path", ""))
-            if destination_path == normalized_original or destination_path.startswith(normalized_original + "\\"):
-                suffix = destination_path[len(normalized_original):]
-                next_destination_path = self.normalize_memory_path(normalized_updated + suffix)
-                move["destination_path"] = next_destination_path
-                move.setdefault("destination", {})
-                move["destination"]["display_path"] = next_destination_path
-                move["destination"]["item_path"] = next_destination_path
-                move["destination"]["destination_path"] = next_destination_path
+            de = self._destination_effective_canonical_path(destination_path).rstrip("\\")
+            de_cf = de.casefold()
+            if de_cf == orig_cf:
+                next_destination_path = upd_eff
+            elif de_cf.startswith(orig_cf + "\\"):
+                suffix = de[len(orig_eff) + 1 :]
+                next_destination_path = self.normalize_memory_path(f"{upd_eff}\\{suffix}") if suffix else upd_eff
+            else:
+                continue
+            move["destination_path"] = next_destination_path
+            move.setdefault("destination", {})
+            move["destination"]["display_path"] = next_destination_path
+            move["destination"]["item_path"] = next_destination_path
+            move["destination"]["destination_path"] = next_destination_path
 
     def _proposed_branch_contains_submitted_items(self, branch_path):
         normalized_branch = self.normalize_memory_path(branch_path)
@@ -53365,9 +54826,15 @@ class MainWindow(QMainWindow):
         return None
 
     def _find_proposed_folder_record_by_path(self, path):
-        target_path = self.normalize_memory_path(path)
+        target_eff = self._destination_effective_canonical_path(path)
+        if not target_eff:
+            return None
+        te = target_eff.casefold()
         for proposed_folder in self.proposed_folders:
-            if self._proposed_destination_path(proposed_folder) == target_path:
+            pd = self._proposed_destination_path(proposed_folder)
+            if not pd:
+                continue
+            if self._destination_effective_canonical_path(pd).casefold() == te:
                 return proposed_folder
         return None
 

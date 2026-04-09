@@ -1207,7 +1207,7 @@ def test_manual_drop_nested_allocation_descendant_folder_on_item():
     )
     assert commit_ix == child_ix
     assert meta["drop_rejected_reason"] == ""
-    assert r"Root\Finance\Employee Hours\2025-26" in (meta["resolved_target_path"] or "").replace("/", "\\")
+    assert r"Finance\Employee Hours\2025-26" in (meta["resolved_target_path"] or "").replace("/", "\\")
 
 
 def test_manual_planning_drag_nested_descendant_folder_hover_overlay_matches_commit_qtreeview():

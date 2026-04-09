@@ -120,7 +120,11 @@ def test_finalize_destination_move_planning_consistency_refreshes_source_project
             incremental_lightweight=True,
             move_origin="other",
         )
-    inv.assert_called_once_with(bump_generation=False)
+    inv.assert_called_once_with(
+        bump_generation=False,
+        clear_source_path_cache=False,
+        source_eviction_paths={"S\\One"},
+    )
     ref.assert_called_once()
     args, kwargs = ref.call_args
     assert "S\\One" in args[0]

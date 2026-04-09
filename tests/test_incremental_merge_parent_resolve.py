@@ -16,7 +16,7 @@ def _qapp():
 
 
 def test_resolve_incremental_merge_parent_aligns_index_key_with_tree_item_path():
-    """Regression: index buckets use destination_path before source_path; _tree_item_path does not."""
+    """Index buckets and _tree_item_path share one field precedence; merge resolves by index key."""
     _qapp()
     mw = MainWindow.__new__(MainWindow)
     mw._destination_tree_model_view = True
@@ -39,6 +39,8 @@ def test_resolve_incremental_merge_parent_aligns_index_key_with_tree_item_path()
         "base_display_label": "Folder: Email attachments",
         "name": "Email attachments",
         "is_folder": True,
+        "display_path": r"Root\Management\Email attachments",
+        "item_path": r"Root\Management\Email attachments",
         "source_path": r"FTBMRoot\Documents\Email attachments",
         "destination_path": r"Root\Management\Email attachments",
         "tree_role": "destination",
@@ -48,10 +50,9 @@ def test_resolve_incremental_merge_parent_aligns_index_key_with_tree_item_path()
     assert parent_ix.isValid()
 
     semantic_parent = r"Root\Management\Email attachments"
-    assert mw._destination_payload_index_key(parent_ix.data(Qt.UserRole) or {}) == mw._canonical_destination_projection_path(
-        semantic_parent
-    )
-    assert not mw._destination_parent_match_details(semantic_parent, mw._tree_item_path(alloc_folder)).get("exact_match")
+    role = parent_ix.data(Qt.UserRole) or {}
+    assert mw._destination_payload_index_key(role) == mw._destination_effective_canonical_path(semantic_parent)
+    assert mw._destination_parent_match_details(semantic_parent, mw._tree_item_path(alloc_folder)).get("exact_match")
 
     mw._find_visible_destination_item_by_path = MagicMock(return_value=None)
     resolved = mw._resolve_incremental_merge_parent_item(semantic_parent)

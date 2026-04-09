@@ -76,6 +76,24 @@ class _MaterializeSkipHost:
     def _cancel_destination_future_async_projection(self, reason=""):
         self.cancel_projection_calls.append(str(reason or ""))
 
+    def _destination_steady_state_full_materialize_redundant(self):
+        return False
+
+    def _destination_structure_ready(self, *args, **kwargs):
+        return True
+
+    def _schedule_destination_full_tree_materialization(self, delay_ms: int = 500) -> None:
+        return None
+
+    def _destination_materialize_reason_should_queue_until_async_finishes(self, reason):
+        return False
+
+    def _merge_pending_materialize_after_async(self, existing: str, incoming: str) -> str:
+        return incoming or existing
+
+    def _try_skip_redundant_destination_future_model_materialize(self, reason):
+        return None
+
     def _materialize_destination_future_model_body(
         self, reason, *, allow_defer=True, prefer_chunked_projection=False, narrow_restore_real_snapshot=False
     ):
@@ -243,6 +261,15 @@ def test_schedule_post_login_phase4_invokes_safe_invoke_when_pending():
 
         def _post_login_restore_phase4(self) -> None:
             pass
+
+        def _import_ok_trace(self, *args, **kwargs) -> None:
+            return None
+
+        def _import_ok_timing(self, *args, **kwargs) -> None:
+            return None
+
+        def _run_after_import_success_dialog_idle(self, name, fn, delay_ms=50) -> None:
+            self._safe_invoke(str(name), fn)
 
         def _safe_invoke(self, name, fn) -> None:
             self.calls.append(str(name))

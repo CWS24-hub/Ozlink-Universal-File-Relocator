@@ -697,6 +697,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
             },
         )
         tree.addTopLevelItem(root)
+        tree.setCurrentItem(root)
         window.destination_tree_widget = tree
         window._memory_restore_in_progress = False
         window._canonical_destination_projection_path = lambda path: path
@@ -906,9 +907,12 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._destination_branch_visual_color = MainWindow._destination_branch_visual_color.__get__(window, MainWindow)
 
         top_level_color, top_level_depth = window._destination_branch_visual_color({"destination_path": "Root\\Finance"})
-        child_color, child_depth = window._destination_branch_visual_color({"destination_path": "Root\\Finance\\Payroll"})
+        child_color, child_depth = window._destination_branch_visual_color(
+            {"destination_path": "Root\\Finance\\Payroll\\Quarterly"}
+        )
 
-        self.assertEqual(top_level_depth, 1)
+        # Under ``Root\Finance`` hub, branch is ``Finance``; depth counts segments below that branch.
+        self.assertEqual(top_level_depth, 0)
         self.assertEqual(child_depth, 2)
         self.assertEqual(top_level_color.name().lower(), "#7fd36b")
         self.assertNotEqual(child_color.name().lower(), top_level_color.name().lower())
@@ -1047,6 +1051,8 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._expand_all_pending = {"source": False, "destination": True}
         window.pending_folder_loads = {"source": set(), "destination": set()}
         window._root_tree_bind_in_progress = False
+        window._destination_full_tree_materialization_pending = False
+        window._destination_structure_ready = lambda *args, **kwargs: True
         window._count_expandable_tree_nodes = lambda panel_key: 200
         scheduled = []
         window._schedule_deferred_destination_materialization = lambda reason, delay_ms=180: scheduled.append((reason, delay_ms))
@@ -1325,6 +1331,9 @@ class DestinationReplayRegressionTests(unittest.TestCase):
 
         log_calls = []
         window.destination_tree_widget = _TreeStub()
+        window.pending_root_drive_ids = {"source": "", "destination": ""}
+        window._current_selected_destination_drive_id = lambda: ""
+        window._destination_structure_ready = lambda *args, **kwargs: True
         window.proposed_folders = []
         window.planned_moves = []
         window._log_restore_phase = lambda phase, **data: log_calls.append((phase, data))
@@ -1465,7 +1474,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._resolve_planned_move_for_destination_node = lambda node: (0, move, None)
         window._is_move_submitted = lambda current_move: False
         window._find_visible_destination_item_by_path = lambda path: None
-        window._persist_planning_change = lambda reason: setattr(window, "_persist_reason", reason)
+        window._persist_planning_change = lambda reason, **kwargs: setattr(window, "_persist_reason", reason)
         window.refresh_planned_moves_table = lambda: None
         window._schedule_deferred_destination_materialization = lambda *args, **kwargs: None
 
@@ -1559,7 +1568,8 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window.destination_tree_widget = _TreeStub()
         window.source_tree_widget = _TreeStub()
         window._deferred_planning_refresh_pending = True
-        window._deferred_planning_refresh_reasons = ["planning_change_lightweight", "planned_item_moved"]
+        # Both lightweight reasons skip full bind; include a non-incremental reason to force materialize.
+        window._deferred_planning_refresh_reasons = ["planning_change_lightweight", "unit_test_requires_full_destination_bind"]
         window._deferred_source_projection_paths = set()
         materialized = []
         window._materialize_destination_future_model = lambda reason: materialized.append(reason)
@@ -1573,7 +1583,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._run_deferred_planning_refresh()
 
         self.assertEqual(len(materialized), 1)
-        self.assertIn("planned_item_moved", materialized[0])
+        self.assertIn("unit_test_requires_full_destination_bind", materialized[0])
 
     def test_finalize_cache_refresh_workspace_restore_reapplies_destination_overlay(self):
         window = MainWindow.__new__(MainWindow)
@@ -1647,7 +1657,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         updated = root_item.data(0, Qt.UserRole)
         self.assertFalse(window._destination_root_prime_pending)
         self.assertEqual(window._last_tree_status[0], "destination")
-        self.assertEqual(window._fallback_materialize_reason, "destination_root_error_fallback")
+        self.assertEqual(window._fallback_materialize_reason, "destination_library_top_error_fallback")
         self.assertTrue(window._fallback_restore_started)
         self.assertTrue(updated["load_failed"])
 

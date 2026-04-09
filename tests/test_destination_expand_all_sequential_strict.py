@@ -58,46 +58,53 @@ def _model_folder_with_child_payloads(folder_pl: dict, child_payloads: list):
 
 
 class DestinationExpandAllSequentialStrictTests(unittest.TestCase):
-    def test_root_normalization_reparents_root_children_from_top_level(self):
+    def test_normalize_future_model_keeps_root_as_parent_for_single_segment_child(self):
         mw = _bare_main_window_for_seq_tests()
+        mw._canonical_destination_projection_path = lambda p: str(p or "").strip()
         nodes = {
-            "Root": {"parent_semantic_path": "", "node_state": "real", "name": "Root", "data": {"is_folder": True}},
-            "Root\\Finance": {"parent_semantic_path": "", "node_state": "real", "name": "Finance", "data": {"is_folder": True}},
-            "Root\\HR": {"parent_semantic_path": "", "node_state": "real", "name": "HR", "data": {"is_folder": True}},
+            "Finance": {"parent_semantic_path": "Root", "node_state": "real", "name": "Finance", "data": {"is_folder": True}},
         }
         out = MainWindow._normalize_destination_future_root_topology(mw, nodes)
-        self.assertTrue(out["root_present"])
-        self.assertEqual(out["reparented"], 2)
-        self.assertEqual(nodes["Root\\Finance"]["parent_semantic_path"], "Root")
-        self.assertEqual(nodes["Root\\HR"]["parent_semantic_path"], "Root")
+        self.assertFalse(out["root_present"])
+        self.assertEqual(out["reparented"], 0)
+        self.assertEqual(nodes["Finance"]["parent_semantic_path"], "Root")
 
-    def test_package_model_has_single_root_top_level(self):
+    def test_normalize_keeps_parent_root_for_multi_segment_child_paths(self):
         mw = _bare_main_window_for_seq_tests()
-        mw._log_restore_phase = lambda *a, **k: None
+        mw._canonical_destination_projection_path = lambda p: str(p or "").strip()
         nodes = {
-            "Root": {"semantic_path": "Root", "parent_semantic_path": "", "node_state": "real", "name": "Root", "data": {"is_folder": True}},
-            "Root\\Finance": {"semantic_path": "Root\\Finance", "parent_semantic_path": "", "node_state": "real", "name": "Finance", "data": {"is_folder": True}},
-            "Root\\HR": {"semantic_path": "Root\\HR", "parent_semantic_path": "", "node_state": "real", "name": "HR", "data": {"is_folder": True}},
+            "Root\\Payroll": {"parent_semantic_path": "Root", "node_state": "real", "name": "Payroll", "data": {"is_folder": True}},
         }
-        out = MainWindow._package_destination_future_model(
-            mw,
-            nodes,
-            {},
-            total_real_nodes=3,
-            total_proposed_nodes=0,
-            total_allocation_nodes=0,
-        )
-        self.assertEqual(out["top_level_paths"], ["Root"])
-        self.assertIn("Root\\Finance", out["nodes"]["Root"]["children"])
-        self.assertIn("Root\\HR", out["nodes"]["Root"]["children"])
+        out = MainWindow._normalize_destination_future_root_topology(mw, nodes)
+        self.assertEqual(out["reparented"], 0)
+        self.assertEqual(nodes["Root\\Payroll"]["parent_semantic_path"], "Root")
 
-    def test_no_mixed_root_and_child_top_level_structure(self):
+    def test_package_model_library_top_level_paths_sorted(self):
         mw = _bare_main_window_for_seq_tests()
         mw._log_restore_phase = lambda *a, **k: None
         nodes = {
-            "Root": {"semantic_path": "Root", "parent_semantic_path": "", "node_state": "real", "name": "Root", "data": {"is_folder": True}},
             "Finance": {"semantic_path": "Finance", "parent_semantic_path": "", "node_state": "real", "name": "Finance", "data": {"is_folder": True}},
-            "Root\\Sales": {"semantic_path": "Root\\Sales", "parent_semantic_path": "", "node_state": "real", "name": "Sales", "data": {"is_folder": True}},
+            "HR": {"semantic_path": "HR", "parent_semantic_path": "", "node_state": "real", "name": "HR", "data": {"is_folder": True}},
+        }
+        out = MainWindow._package_destination_future_model(
+            mw,
+            nodes,
+            {},
+            total_real_nodes=2,
+            total_proposed_nodes=0,
+            total_allocation_nodes=0,
+        )
+        self.assertEqual(out["top_level_paths"], ["Finance", "HR"])
+        self.assertEqual(out["root_path"], "")
+
+    def test_package_model_nested_under_real_root_folder_name(self):
+        mw = _bare_main_window_for_seq_tests()
+        mw._canonical_destination_projection_path = lambda p: str(p or "").strip()
+        mw._log_restore_phase = lambda *a, **k: None
+        nodes = {
+            "Root": {"semantic_path": "Root", "parent_semantic_path": "", "node_state": "real", "name": "Root", "data": {"is_folder": True, "id": "real-root-id"}},
+            "Root\\Sales": {"semantic_path": "Root\\Sales", "parent_semantic_path": "Root", "node_state": "real", "name": "Sales", "data": {"is_folder": True}},
+            "Finance": {"semantic_path": "Finance", "parent_semantic_path": "", "node_state": "real", "name": "Finance", "data": {"is_folder": True}},
         }
         out = MainWindow._package_destination_future_model(
             mw,
@@ -107,27 +114,11 @@ class DestinationExpandAllSequentialStrictTests(unittest.TestCase):
             total_proposed_nodes=0,
             total_allocation_nodes=0,
         )
-        # Coalesce + normalization eliminate mixed Root/child top-level shape.
-        self.assertEqual(out["top_level_paths"], ["Root"])
-        root_children = out["nodes"]["Root"]["children"]
-        self.assertIn("Root\\Finance", root_children)
-        self.assertIn("Root\\Sales", root_children)
-        self.assertNotIn("Root\\Sales", out["top_level_paths"])
-        self.assertNotIn("Root\\Finance", out["top_level_paths"])
+        tops = set(out["top_level_paths"])
+        self.assertEqual(tops, {"Finance", "Root"})
+        self.assertIn("Root\\Sales", out["nodes"]["Root"]["children"])
 
-    def test_when_root_present_all_parentless_nodes_become_root_children(self):
-        mw = _bare_main_window_for_seq_tests()
-        nodes = {
-            "Root": {"parent_semantic_path": "", "node_state": "real", "name": "Root", "data": {"is_folder": True}},
-            "RandomA": {"parent_semantic_path": "", "node_state": "real", "name": "RandomA", "data": {"is_folder": True}},
-            "Root\\Dept": {"parent_semantic_path": "", "node_state": "real", "name": "Dept", "data": {"is_folder": True}},
-        }
-        out = MainWindow._normalize_destination_future_root_topology(mw, nodes)
-        self.assertEqual(out["reparented"], 2)
-        self.assertEqual(nodes["RandomA"]["parent_semantic_path"], "Root")
-        self.assertEqual(nodes["Root\\Dept"]["parent_semantic_path"], "Root")
-
-    def test_bind_uses_only_top_level_paths_root_only_when_present(self):
+    def test_bind_resolved_top_level_paths_filters_to_declared_top_level(self):
         mw = _bare_main_window_for_seq_tests()
         model = {
             "nodes": {
@@ -137,7 +128,7 @@ class DestinationExpandAllSequentialStrictTests(unittest.TestCase):
             "top_level_paths": ["Root", "Root\\Finance"],
         }
         out = MainWindow._destination_bind_resolved_top_level_paths(mw, model)
-        self.assertEqual(out, ["Root"])
+        self.assertEqual(out, ["Root", "Root\\Finance"])
 
     def test_bind_widget_rejects_root_append_outside_top_level_paths(self):
         mw = _bare_main_window_for_seq_tests()
@@ -168,36 +159,48 @@ class DestinationExpandAllSequentialStrictTests(unittest.TestCase):
         )
         tree.addTopLevelItem.assert_called_once_with(built_item)
 
-    def test_projection_path_widget_blocks_top_level_insert_when_root_missing(self):
-        mw = _bare_main_window_for_seq_tests()
-        mw._destination_tree_uses_model_view = lambda: False
-        mw.destination_tree_widget = MagicMock()
-        mw._find_visible_destination_item_by_path = lambda _p: None
-        mw._find_destination_child_by_path = lambda _parent, _path: None
-        mw._build_projected_destination_folder_node = MagicMock()
-        out = MainWindow._ensure_destination_projection_path(mw, r"Root\Finance\Payroll")
-        self.assertIsNone(out)
-        mw.destination_tree_widget.addTopLevelItem.assert_not_called()
-
-    def test_projection_path_widget_creates_intermediate_under_root_only(self):
+    def test_projection_path_widget_inserts_root_then_descendants_when_no_visible_anchor(self):
+        """Library-relative path ``Root\\Finance\\Payroll`` builds under real ``Root`` folder segments."""
         mw = _bare_main_window_for_seq_tests()
         mw._destination_tree_uses_model_view = lambda: False
         tree = MagicMock()
         mw.destination_tree_widget = tree
         mw._refresh_destination_item_visibility = lambda *a, **k: None
-        root_item = MagicMock()
-        root_item.data.return_value = {"item_path": "Root", "name": "Root", "is_folder": True}
-        mw._find_visible_destination_item_by_path = lambda p: root_item if p == "Root" else None
+        mw._find_visible_destination_item_by_path = lambda _p: None
+        mw._find_destination_child_by_path = lambda _parent, _path: None
+        child_root = MagicMock()
+        child_root.data.return_value = {"item_path": r"Root", "name": "Root", "is_folder": True}
+        child_finance = MagicMock()
+        child_finance.data.return_value = {"item_path": r"Root\Finance", "name": "Finance", "is_folder": True}
+        child_pay = MagicMock()
+        child_pay.data.return_value = {"item_path": r"Root\Finance\Payroll", "name": "Payroll", "is_folder": True}
+        mw._build_projected_destination_folder_node = MagicMock(side_effect=[child_root, child_finance, child_pay])
+        out = MainWindow._ensure_destination_projection_path(mw, r"Root\Finance\Payroll")
+        self.assertIsNotNone(out)
+        tree.addTopLevelItem.assert_called_once_with(child_root)
+        child_root.addChild.assert_called_once_with(child_finance)
+        child_finance.addChild.assert_called_once_with(child_pay)
+
+    def test_projection_path_widget_reuses_existing_library_child_prefix(self):
+        mw = _bare_main_window_for_seq_tests()
+        mw._destination_tree_uses_model_view = lambda: False
+        tree = MagicMock()
+        mw.destination_tree_widget = tree
+        mw._refresh_destination_item_visibility = lambda *a, **k: None
+        finance_item = MagicMock()
+        finance_item.data.return_value = {"item_path": r"Finance", "name": "Finance", "is_folder": True}
+        mw._find_visible_destination_item_by_path = lambda p: finance_item if p == r"Finance" else None
         mw._find_destination_child_by_path = lambda _parent, _path: None
         child_item = MagicMock()
-        child_item.data.return_value = {"item_path": r"Root\Finance", "name": "Finance", "is_folder": True}
+        child_item.data.return_value = {"item_path": r"Finance\AR", "name": "AR", "is_folder": True}
         mw._build_projected_destination_folder_node = MagicMock(return_value=child_item)
-        out = MainWindow._ensure_destination_projection_path(mw, r"Root\Finance")
+        out = MainWindow._ensure_destination_projection_path(mw, r"Finance\AR")
         self.assertIsNotNone(out)
-        root_item.addChild.assert_called_once_with(child_item)
+        finance_item.addChild.assert_called_once_with(child_item)
         tree.addTopLevelItem.assert_not_called()
 
-    def test_projection_path_model_never_inserts_with_invalid_root_parent(self):
+    def test_projection_path_model_uses_invalid_parent_for_library_root_insert(self):
+        """Real-root: QModelIndex() (invalid) is the legal parent for first projected library segment."""
         mw = _bare_main_window_for_seq_tests()
         mw._destination_tree_uses_model_view = lambda: True
         mw.destination_tree_widget = MagicMock()
@@ -217,17 +220,13 @@ class DestinationExpandAllSequentialStrictTests(unittest.TestCase):
                     parent_item.appendRow(it)
 
         dm = _FakeModel()
-        root = QStandardItem("Root")
-        root.setData({"item_path": "Root", "name": "Root", "is_folder": True}, Qt.UserRole)
-        dm.invisibleRootItem().appendRow(root)
         mw.destination_planning_model = dm
-        root_ix = dm.index(0, 0, QModelIndex())
-        mw._find_visible_destination_item_by_path = lambda p: root_ix if p == "Root" else None
+        mw._find_visible_destination_item_by_path = lambda _p: None
         mw._find_destination_child_by_path = lambda _parent, _path: None
-        out = MainWindow._ensure_destination_projection_path_model(mw, r"Root\HR", r"Root\HR")
+        out = MainWindow._ensure_destination_projection_path_model(mw, r"Root\HR", r"HR")
         self.assertIsNotNone(out)
         self.assertTrue(dm.append_parent_valid_flags)
-        self.assertTrue(all(dm.append_parent_valid_flags))
+        self.assertFalse(dm.append_parent_valid_flags[0])
 
     def test_destination_structure_ready_false_when_blocked_reason_set(self):
         mw = _bare_main_window_for_seq_tests()

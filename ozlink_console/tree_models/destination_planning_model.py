@@ -375,7 +375,21 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         self._rebuild_path_index()
         self._notify_structure_changed()
 
-    def replace_all_children(self, parent: QModelIndex, child_payloads: List[Dict[str, Any]]) -> None:
+    def replace_all_children(
+        self,
+        parent: QModelIndex,
+        child_payloads: List[Dict[str, Any]],
+        *,
+        zero_children_mode: str = "terminal_empty",
+    ) -> None:
+        """Replace direct children of ``parent``.
+
+        When ``child_payloads`` is empty, ``zero_children_mode`` selects the placeholder policy:
+
+        - ``terminal_empty`` — classic folder empty row ("This folder is empty.").
+        - ``empty_library_message`` — non-structural library empty state row.
+        - ``none`` — no child rows (used before overlays restore planned nodes under an empty library).
+        """
         parent_node = self._node(parent)
         if parent_node is None:
             return
@@ -388,6 +402,26 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             self.endRemoveRows()
         n = len(child_payloads)
         if not n:
+            mode = str(zero_children_mode or "terminal_empty")
+            if mode == "none":
+                parent_node._children = []
+                self._reindex(parent_node)
+                self._notify_structure_changed()
+                return
+            if mode == "empty_library_message":
+                self.beginInsertRows(parent, 0, 0)
+                empty_pl = {
+                    "placeholder": True,
+                    "placeholder_role": "empty_library_message",
+                    "base_display_label": "This document library is empty. Propose a folder to start.",
+                    "tree_role": "destination",
+                }
+                parent_node._children = [_Node(parent_node, 0, empty_pl, [])]
+                self._reindex(parent_node)
+                self.endInsertRows()
+                self._register_subtree_paths(parent_node._children[0])
+                self._notify_structure_changed()
+                return
             self.beginInsertRows(parent, 0, 0)
             empty_pl = {
                 "placeholder": True,

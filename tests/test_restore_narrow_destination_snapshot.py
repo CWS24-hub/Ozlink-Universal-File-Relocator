@@ -35,7 +35,7 @@ def test_collect_planning_relevant_semantic_paths_unbound():
         }
     ]
     paths = MainWindow._collect_destination_planning_relevant_semantic_paths(mw)
-    assert "Root" in paths
+    assert "" in paths
     assert any("ProposedFolder" in p for p in paths)
     assert any("AllocParent" in p for p in paths)
     assert any("Moved.txt" in p for p in paths)
