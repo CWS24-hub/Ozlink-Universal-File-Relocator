@@ -297,3 +297,122 @@ def test_widget_reconcile_removes_top_level_HR_when_Root_HR_exists(qapp):
     assert tw.topLevelItemCount() == 1
     top0 = tw.topLevelItem(0)
     assert (top0.data(0, Qt.UserRole) or {}).get("item_path") == "Root"
+
+
+def test_planning_model_reconcile_skips_when_top_and_under_root_ids_differ(qapp):
+    """RECONCILE CONSTRAINT: two different Graph ids → do not remove either row."""
+    mw = MainWindow.__new__(MainWindow)
+    mw.destination_tree_widget = object()
+    mw.planned_moves = []
+    mw.proposed_folders = []
+    mw._memory_restore_in_progress = False
+    mw._suppress_selector_change_handlers = False
+    mw._log_restore_phase = lambda *_a, **_k: None  # noqa: E731
+    mw._refresh_destination_item_visibility_index = lambda *_a, **_k: None  # noqa: E731
+    mw._merge_destination_projection_children_index = lambda *_a, **_k: None  # noqa: E731
+    mw._destination_merge_future_overlay_into_real_index = lambda *_a, **_k: None  # noqa: E731
+    mw._destination_log_root_child_top_level_screen_diagnostic = lambda *_a, **_k: None  # noqa: E731
+
+    model = DestinationPlanningTreeModel(
+        parent=None,
+        destination_index_key_fn=mw._destination_payload_index_key,
+    )
+    mw.destination_planning_model = model
+    mw._destination_tree_uses_model_view = lambda: True  # noqa: E731
+
+    root_pl = {
+        "is_folder": True,
+        "item_path": "Root",
+        "tree_role": "destination",
+        "node_origin": "sharepoint",
+        "id": "root-1",
+        "name": "Root",
+    }
+    hr_under = {
+        "is_folder": True,
+        "item_path": r"Root\HR",
+        "tree_role": "destination",
+        "node_origin": "sharepoint",
+        "id": "hr-under-id",
+        "name": "HR",
+    }
+    hr_top = {
+        "is_folder": True,
+        "item_path": "HR",
+        "tree_role": "destination",
+        "node_origin": "sharepoint",
+        "id": "hr-top-only-id",
+        "name": "HR",
+    }
+    model.reset_nested([(root_pl, [(hr_under, [])]), (hr_top, [])])
+    lib = QModelIndex()
+    assert model.rowCount(lib) == 2
+    removed = mw._reconcile_destination_root_child_top_level_leaks_planning_model("test_id_mismatch_skip")
+    assert removed == 0
+    assert model.rowCount(lib) == 2
+
+
+def test_widget_reconcile_skips_when_top_and_under_root_ids_differ(qapp):
+    mw = MainWindow.__new__(MainWindow)
+    tw = QTreeWidget()
+    mw.destination_tree_widget = tw
+    mw.planned_moves = []
+    mw.proposed_folders = []
+    mw._memory_restore_in_progress = False
+    mw._suppress_selector_change_handlers = False
+    mw._log_restore_phase = lambda *_a, **_k: None  # noqa: E731
+    mw._refresh_destination_item_visibility = lambda *_a, **_k: None  # noqa: E731
+    mw._apply_tree_item_visual_state = lambda *_a, **_k: None  # noqa: E731
+    mw._merge_destination_projection_children = lambda *_a, **_k: None  # noqa: E731
+    mw._detach_destination_item = lambda *_a, **_k: None  # noqa: E731
+    mw.destination_planning_model = None
+    mw._destination_tree_uses_model_view = lambda: False  # noqa: E731
+
+    root = QTreeWidgetItem()
+    root.setData(
+        0,
+        Qt.UserRole,
+        {
+            "is_folder": True,
+            "item_path": "Root",
+            "tree_role": "destination",
+            "node_origin": "sharepoint",
+            "id": "r1",
+            "name": "Root",
+        },
+    )
+    hr_under = QTreeWidgetItem()
+    hr_under.setData(
+        0,
+        Qt.UserRole,
+        {
+            "is_folder": True,
+            "item_path": r"Root\HR",
+            "tree_role": "destination",
+            "node_origin": "sharepoint",
+            "id": "under-hr",
+            "name": "HR",
+        },
+    )
+    root.addChild(hr_under)
+
+    hr_leak = QTreeWidgetItem()
+    hr_leak.setData(
+        0,
+        Qt.UserRole,
+        {
+            "is_folder": True,
+            "item_path": "HR",
+            "tree_role": "destination",
+            "node_origin": "sharepoint",
+            "id": "top-hr",
+            "name": "HR",
+        },
+    )
+
+    tw.addTopLevelItem(root)
+    tw.addTopLevelItem(hr_leak)
+
+    n = mw._reconcile_destination_root_child_top_level_leaks_widget("test_widget_id_mismatch")
+    assert n == 0
+    assert tw.topLevelItemCount() == 2

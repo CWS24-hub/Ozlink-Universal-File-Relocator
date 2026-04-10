@@ -18,3 +18,6 @@ Thumbs.db
 
 # Local PyInstaller client drops (repo root)
 OzlinkConsole_release_*.zip
+
+# Power Platform / Dataverse solution exports (local ALM drops; not part of the Python console build)
+/baseline/

@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from PySide6.QtCore import QAbstractItemModel, QModelIndex, Qt, Signal
 from PySide6.QtGui import QBrush
 
+from ozlink_console.destination_tree_contract import EMPTY_LIBRARY_MESSAGE
 from ozlink_console.logger import log_info
 from ozlink_console.tree_models.explorer_columns import (
     EXPLORER_COLUMN_COUNT,
@@ -413,7 +414,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
                 empty_pl = {
                     "placeholder": True,
                     "placeholder_role": "empty_library_message",
-                    "base_display_label": "This document library is empty. Propose a folder to start.",
+                    "base_display_label": EMPTY_LIBRARY_MESSAGE,
                     "tree_role": "destination",
                 }
                 parent_node._children = [_Node(parent_node, 0, empty_pl, [])]
