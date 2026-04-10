@@ -2704,8 +2704,16 @@ class MainWindow(QMainWindow):
         self._destination_restore_materialization_seen = set()
         # Set True in _memory_restore_apply_finalize_success; blocks global restore queue restarts mid-session.
         self._destination_restore_completed_once = False
+        # After a new destination root bind, allow one materialize even if overlay fingerprint matches prior.
+        self._destination_suppress_steady_materialize_skip_once = False
+        # Force one full deferred planning refresh materialize after destination Graph root bind.
+        self._destination_require_deferred_full_materialize_once = False
         self._destination_restore_materialization_user_paused = False
         self._destination_preserved_children_by_worker = {}
+        # True only while applying Graph folder children (same role as source folder expand).
+        self._destination_graph_folder_replace_active = False
+        # True only while reconcile paths reparent removed subtrees onto an existing anchor.
+        self._destination_reconcile_nested_attach_active = False
         self._destination_real_tree_snapshot = []
         self._destination_real_tree_snapshot_stale = True
         self._destination_full_tree_snapshot = []
@@ -6574,12 +6582,24 @@ class MainWindow(QMainWindow):
 
         # Skip synchronous destination future-model bind when the UI was already updated
         # incrementally (add/remove allocation overlays). Full binds can freeze for large libraries.
-        skip_full_destination_future_model = bool(reasons) and all(
-            r in _INCREMENTAL_DEFERRED_PLANNING_REFRESH_REASONS for r in reasons
+        # Multiple reasons in one flush imply a combined delta — run at least one full materialize.
+        skip_full_destination_future_model = (
+            len(reasons) == 1
+            and bool(reasons)
+            and reasons[0] in _INCREMENTAL_DEFERRED_PLANNING_REFRESH_REASONS
         )
         # Graph path/id enrichment updates row metadata only; destination tree structure is unchanged.
         if reasons == ["graph_ids_resolved_from_sharepoint_paths"]:
             skip_full_destination_future_model = True
+        force_dest_full = bool(getattr(self, "_destination_require_deferred_full_materialize_once", False))
+        if force_dest_full:
+            skip_full_destination_future_model = False
+        self._destination_lifecycle_trace_TEMP(
+            fn="_run_deferred_planning_refresh",
+            reason=combined_reason,
+            step_kind="projection_materialize",
+            extra=f"skip_full_destination_future_model={skip_full_destination_future_model};n_src_paths={len(source_projection_paths)}",
+        )
         if is_dev_mode():
             if skip_full_destination_future_model:
                 log_info(
@@ -6606,8 +6626,13 @@ class MainWindow(QMainWindow):
         ):
             try:
                 if getattr(self, "destination_tree_widget", None) is not None:
-                    if not skip_full_destination_future_model and not self._destination_steady_state_full_materialize_redundant():
+                    if (
+                        (not skip_full_destination_future_model or force_dest_full)
+                        and not self._destination_steady_state_full_materialize_redundant()
+                    ):
                         self._materialize_destination_future_model(f"deferred_{combined_reason}")
+                        if force_dest_full:
+                            self._destination_require_deferred_full_materialize_once = False
             except Exception as exc:
                 self._log_restore_exception("deferred_planning_refresh.destination", exc)
 
@@ -11976,6 +12001,12 @@ class MainWindow(QMainWindow):
             self._schedule_lazy_destination_projection_refresh(reason, 1800)
             return
         self._lazy_destination_projection_pending_reason = ""
+        self._destination_lifecycle_trace_TEMP(
+            fn="_run_lazy_destination_projection_refresh",
+            reason=str(reason),
+            step_kind="projection_materialize",
+            extra="invoking_materialize_destination_future_model",
+        )
         self._materialize_destination_future_model(f"lazy_{reason}")
 
     def _is_graph_ids_deferred_destination_materialize_reason(self, reason) -> bool:
@@ -16091,9 +16122,23 @@ class MainWindow(QMainWindow):
             # Avoid competing branch refresh traversal during source expand-all.
             self._schedule_snapshot_branch_refresh(panel_key, delay_ms=220)
             return
+        if panel_key == "destination":
+            self._destination_lifecycle_trace_TEMP(
+                fn="_process_snapshot_branch_refresh",
+                reason="tick_start",
+                step_kind="state_restore",
+                extra="expand_existing_plus_lazy_folder_load_only",
+            )
         pending_paths = set(self._pending_snapshot_branch_refresh.get(panel_key, set()) or set())
         if not pending_paths:
             self._set_tree_status_message(panel_key, "Saved branches are up to date.", loading=False)
+            if panel_key == "destination":
+                self._destination_lifecycle_trace_TEMP(
+                    fn="_process_snapshot_branch_refresh",
+                    reason="saved_branches_up_to_date",
+                    step_kind="state_restore",
+                    extra="pending_empty",
+                )
             return
 
         tree = getattr(self, f"{panel_key}_tree_widget", None)
@@ -16259,6 +16304,13 @@ class MainWindow(QMainWindow):
         }
         self._pending_session_workspace_restore_panels = pending_panels
         self._pending_workspace_post_expand_selection = {"source": "", "destination": ""}
+        if "destination" in pending_panels:
+            self._destination_lifecycle_trace_TEMP(
+                fn="_begin_session_workspace_ui_restore",
+                reason="session_workspace_restore_scheduled",
+                step_kind="state_restore",
+                extra=f"dest_snapshots={len(self._pending_session_tree_snapshots.get('destination', []) or [])};pending_branch_paths={len(self._pending_snapshot_branch_refresh.get('destination', set()) or set())}",
+            )
 
     def _restore_workspace_tree_panel_state(self, panel_key, ui_state):
         if not ui_state:
@@ -16718,6 +16770,12 @@ class MainWindow(QMainWindow):
         if panel_key == "destination":
             self._destination_snapshot_chunked_restore_active = False
             self._mark_destination_real_tree_snapshot_stale()
+            self._destination_lifecycle_trace_TEMP(
+                fn="_finalize_tree_snapshot_restore",
+                reason=str(status_message or "")[:120],
+                step_kind="state_restore",
+                extra=f"snapshot_top_nodes={len(snapshots or [])}",
+            )
         tree, _status = self._get_tree_and_status(panel_key)
         if panel_key == "destination" and self._tree_snapshot_node_count_gt(snapshots, 1):
             self._destination_root_prime_pending = False
@@ -16824,40 +16882,18 @@ class MainWindow(QMainWindow):
                     except Exception:
                         pass
 
-        if panel_key == "destination" and not callable(getattr(tree, "topLevelItemCount", None)):
+        if panel_key == "destination" and self._destination_tree_uses_model_view():
             model = getattr(self, "destination_planning_model", None)
-            if model is not None:
+            if model is not None and tree is not None:
                 try:
                     tree.setUpdatesEnabled(False)
                     tree.setEnabled(True)
-                    model.clear()
-                    root_payloads = []
-                    for snap in snapshots:
-                        data = dict(((snap or {}).get("data") or {}))
-                        if not data:
-                            continue
-                        data["children_loaded"] = False
-                        data["load_failed"] = False
-                        data.setdefault("tree_role", "destination")
-                        root_payloads.append(data)
-
-                    if not root_payloads:
-                        self._set_tree_status_message(panel_key, "This library is empty.", loading=False)
-                        model.set_empty_library_message("This library is empty.")
-                        tree.setEnabled(False)
-                    else:
-                        with _PerfExplorerTimer(
-                            "tree_snapshot_reset_root_payloads",
-                            panel_key="destination",
-                            root_count=len(root_payloads),
-                        ):
-                            model.reset_root_payloads(root_payloads)
-                        self._set_tree_status_message(
-                            panel_key,
-                            f"Loading tree snapshot… ({len(root_payloads)}/{len(snapshots)})",
-                            loading=True,
-                        )
-
+                    self._destination_lifecycle_trace_TEMP(
+                        fn="_restore_tree_items_snapshot_chunked",
+                        reason=str(status_message or "")[:120],
+                        step_kind="state_restore",
+                        extra=f"context={str(context)[:40]};planning_skip_structural_snapshot",
+                    )
                     self._finalize_tree_snapshot_restore(panel_key, snapshots, status_message)
                     if on_complete:
                         on_complete()
@@ -17261,24 +17297,12 @@ class MainWindow(QMainWindow):
                 try:
                     tree.setUpdatesEnabled(False)
                     tree.setEnabled(True)
-                    model.clear()
-                    root_payloads = []
-                    for snap in snapshots:
-                        data = dict(((snap or {}).get("data") or {}))
-                        if not data:
-                            continue
-                        data["children_loaded"] = False
-                        data["load_failed"] = False
-                        data.setdefault("tree_role", "destination")
-                        root_payloads.append(data)
-
-                    if not root_payloads:
-                        self._set_tree_status_message(panel_key, "This library is empty.", loading=False)
-                        model.set_empty_library_message("This library is empty.")
-                        tree.setEnabled(False)
-                    else:
-                        model.reset_root_payloads(root_payloads)
-
+                    self._destination_lifecycle_trace_TEMP(
+                        fn="_restore_tree_items_snapshot",
+                        reason=str(status_message or "")[:120],
+                        step_kind="state_restore",
+                        extra="planning_skip_structural_snapshot",
+                    )
                     self._finalize_tree_snapshot_restore(panel_key, snapshots, status_message)
                     return True
                 finally:
@@ -19296,11 +19320,23 @@ class MainWindow(QMainWindow):
         try:
             tree.setEnabled(True)
             model.clear()
+            self._destination_lifecycle_trace_TEMP(
+                fn="_apply_root_payload_to_destination_model_view",
+                reason="after_model_clear_before_graph_payloads",
+                step_kind="model_reset",
+                extra=f"graph_item_count={len(items or [])}",
+            )
             if not items:
                 self._set_tree_status_message(panel_key, "This library is empty.", loading=False)
                 model.set_empty_library_message("This library is empty.")
                 tree.setEnabled(False)
                 self._mark_destination_real_tree_snapshot_stale()
+                self._destination_lifecycle_trace_TEMP(
+                    fn="_apply_root_payload_to_destination_model_view",
+                    reason="empty_library_placeholder",
+                    step_kind="structural_bind",
+                    extra="empty",
+                )
                 return
             sorted_items = sorted(items, key=lambda value: (not value.get("is_folder", False), value.get("name", "").lower()))
             payloads = []
@@ -19309,12 +19345,140 @@ class MainWindow(QMainWindow):
                 self._apply_tree_item_visual_state(None, pl)
                 payloads.append(pl)
             model.reset_root_payloads(payloads)
+            self._destination_lifecycle_trace_TEMP(
+                fn="_apply_root_payload_to_destination_model_view",
+                reason="after_reset_root_payloads_from_graph",
+                step_kind="structural_bind",
+                extra=f"n_payloads={len(payloads)}",
+            )
+            self._destination_suppress_steady_materialize_skip_once = True
+            self._destination_require_deferred_full_materialize_once = True
             self._mark_destination_real_tree_snapshot_stale()
-            self._set_tree_status_message(panel_key, f"{len(items)} root item(s) loaded.", loading=False)
+            self._set_tree_status_message(panel_key, f"{len(sorted_items)} root item(s) loaded.", loading=False)
         finally:
             tree.setUpdatesEnabled(True)
             tree.blockSignals(False)
             self._root_tree_bind_in_progress = False
+
+    def _destination_log_blocked_structural_mutation_TEMP(self, *, phase: str, detail: str = "") -> None:
+        """TEMP: log when destination planning model would add rows outside Graph bind / folder replace / reconcile attach."""
+        if not self._destination_tree_uses_model_view():
+            return
+        if (
+            getattr(self, "_root_tree_bind_in_progress", False)
+            or getattr(self, "_destination_graph_folder_replace_active", False)
+            or getattr(self, "_destination_reconcile_nested_attach_active", False)
+        ):
+            return
+        log_info(
+            "destination_structural_mutation_blocked_TEMP",
+            phase=str(phase)[:120],
+            detail=str(detail)[:400],
+        )
+
+    def _destination_selector_library_label_TEMP(self) -> str:
+        try:
+            lib = self.planning_inputs.get("Destination Library")
+            if lib is not None and hasattr(lib, "currentText"):
+                return str(lib.currentText() or "").strip()
+        except Exception:
+            pass
+        return ""
+
+    def _destination_planning_surface_diag_TEMP(self) -> dict[str, Any]:
+        """TEMP: visible destination planning-model shape + library hints for lifecycle reports."""
+        inv = QModelIndex()
+        model = getattr(self, "destination_planning_model", None)
+        state = getattr(self, "pending_root_drive_ids", None) or {}
+        dest_drive = str(state.get("destination") or "").strip()
+        drive_excerpt = dest_drive[-16:] if len(dest_drive) > 16 else dest_drive
+        if model is None or not self._destination_tree_uses_model_view():
+            return {
+                "planning_surface": "widget_or_no_model",
+                "pending_destination_drive_id_suffix": drive_excerpt,
+                "selector_destination_library": self._destination_selector_library_label_TEMP(),
+            }
+        try:
+            n = int(model.rowCount(inv))
+        except Exception:
+            n = -1
+        names: list[str] = []
+        lib_names: set[str] = set()
+        overlayish = 0
+        root_at_top = False
+        dept_hints = (
+            "finance",
+            "hr",
+            "management",
+            "operations",
+            "projects",
+            "sales",
+            "it",
+            "marketing",
+        )
+        depts_at_top: list[str] = []
+        for r in range(max(0, n)):
+            try:
+                ix = model.index(int(r), 0, inv)
+                pl = ix.data(Qt.UserRole) or {}
+            except Exception:
+                pl = {}
+            if not isinstance(pl, dict):
+                pl = {}
+            if pl.get("placeholder"):
+                names.append(f"[ph:{str(pl.get('placeholder_role') or '')[:20]}]")
+                continue
+            nm = str(pl.get("name") or pl.get("real_name") or "").strip()
+            names.append(nm[:80] if nm else "?")
+            if nm.casefold() == "root":
+                root_at_top = True
+            if nm.casefold() in dept_hints:
+                depts_at_top.append(nm)
+            ln = str(pl.get("library_name") or "").strip()
+            if ln:
+                lib_names.add(ln)
+            if pl.get("proposed") or pl.get("planned_allocation"):
+                overlayish += 1
+            no = str(pl.get("node_origin") or "").strip().casefold()
+            if no in ("proposed", "allocated", "projection"):
+                overlayish += 1
+            bl = str(pl.get("base_display_label") or "")
+            if "[Allocated]" in bl or "(Proposed)" in bl:
+                overlayish += 1
+        return {
+            "planning_surface": "qtreewview_model",
+            "top_level_row_count": n,
+            "top_level_names": names[:48],
+            "root_row_at_top_level": root_at_top,
+            "dept_like_names_at_top_level": depts_at_top[:24],
+            "overlay_signal_row_count_top": overlayish,
+            "payload_library_names_top": sorted(lib_names)[:12],
+            "pending_destination_drive_id_suffix": drive_excerpt,
+            "selector_destination_library": self._destination_selector_library_label_TEMP(),
+        }
+
+    def _destination_lifecycle_trace_TEMP(
+        self,
+        *,
+        fn: str,
+        reason: str,
+        step_kind: str,
+        extra: str = "",
+    ) -> None:
+        if not getattr(self, "_destination_tree_model_view", False):
+            return
+        try:
+            diag = self._destination_planning_surface_diag_TEMP()
+        except Exception as exc:
+            diag = {"planning_surface": "diag_error", "diag_error": str(exc)[:200]}
+        log_info(
+            "destination_lifecycle_TEMP",
+            fn=str(fn)[:120],
+            reason=str(reason)[:240],
+            step_kind=str(step_kind)[:64],
+            extra=str(extra)[:240],
+            **diag,
+        )
 
     def _capture_child_path_set_for_destination_model_index(self, parent: QModelIndex):
         paths = set()
@@ -19368,6 +19532,12 @@ class MainWindow(QMainWindow):
         model = getattr(self, "destination_planning_model", None)
         if model is None:
             return 0
+        self._destination_lifecycle_trace_TEMP(
+            fn="_restore_destination_future_state_children_model",
+            reason="handoff_preserved_specs_to_existing_rows",
+            step_kind="overlay_repaint",
+            extra=f"n_specs={len(specs)};parent_live={parent_ix.isValid()}",
+        )
         model.remove_placeholder_children(parent_ix)
         moved = 0
         child_map = self._destination_children_semantic_map_index(parent_ix)
@@ -19378,15 +19548,25 @@ class MainWindow(QMainWindow):
             sem = self._destination_semantic_path(pl)
             existing_ix = child_map.get(sem) if sem else None
             if existing_ix is not None and existing_ix.isValid():
-                existing_data = existing_ix.data(Qt.UserRole) or {}
-                if self._destination_node_state(existing_data) == "real":
-                    if kids:
-                        moved += self._restore_destination_future_state_children_model(existing_ix, kids)
-                    continue
+                if kids:
+                    moved += self._restore_destination_future_state_children_model(existing_ix, kids)
+                continue
+            if self._destination_tree_uses_model_view():
+                self._destination_log_blocked_structural_mutation_TEMP(
+                    phase="restore_future_state_children_model",
+                    detail=sem or self._tree_item_path(pl) or pl.get("name", ""),
+                )
+                continue
             new_ix = model.append_nested_child(parent_ix, (pl, kids))
             moved += 1
             if sem and new_ix.isValid():
                 child_map[sem] = new_ix
+        self._destination_lifecycle_trace_TEMP(
+            fn="_restore_destination_future_state_children_model",
+            reason="exit",
+            step_kind="overlay_repaint",
+            extra=f"moved_handoffs={moved}",
+        )
         return moved
 
     def _on_destination_planning_model_collapsed(self, index):
@@ -20030,6 +20210,12 @@ class MainWindow(QMainWindow):
         tree, _status = self._get_tree_and_status(panel_key)
         if panel_key != "destination":
             return 0
+        self._destination_lifecycle_trace_TEMP(
+            fn="_apply_proposed_overlay_after_root_bind",
+            reason="enter",
+            step_kind="overlay_repaint",
+            extra="root_bind_proposed_allocation_overlay",
+        )
 
         def _dest_top_level_count():
             if tree is None:
@@ -20038,26 +20224,6 @@ class MainWindow(QMainWindow):
                 dm = getattr(self, "destination_planning_model", None)
                 return dm.rowCount(QModelIndex()) if dm is not None else 0
             return tree.topLevelItemCount()
-
-        if getattr(self, "_sharepoint_lazy_mode", False):
-            self._log_restore_phase(
-                "root_bind destination_overlay_deferred",
-                panel_key=panel_key,
-                reason="lazy_destination_root_bind_uses_restore_queue",
-                top_level_count=_dest_top_level_count(),
-            )
-            self._sync_restore_destination_overlay_pending_from_unresolved_queues()
-            return 0
-
-        if getattr(self, "_sharepoint_lazy_mode", False) and tree is not None and _dest_top_level_count() <= 1:
-            self._log_restore_phase(
-                "root_bind destination_overlay_deferred",
-                panel_key=panel_key,
-                reason="top_level_destination_tree_not_ready",
-                top_level_count=_dest_top_level_count(),
-            )
-            self._sync_restore_destination_overlay_pending_from_unresolved_queues()
-            return 0
 
         if self._destination_tree_uses_model_view():
             dm = getattr(self, "destination_planning_model", None)
@@ -20085,6 +20251,12 @@ class MainWindow(QMainWindow):
                 top_level_count=_dest_top_level_count(),
             )
             self._sync_restore_destination_overlay_pending_from_unresolved_queues()
+            self._destination_lifecycle_trace_TEMP(
+                fn="_apply_proposed_overlay_after_root_bind",
+                reason="deferred_waiting_for_root_children",
+                step_kind="overlay_repaint",
+                extra=f"root_semantic_path={root_semantic_path}",
+            )
             return 0
 
         if self._memory_ui_rebind_in_progress or self._memory_restore_in_progress:
@@ -20094,10 +20266,22 @@ class MainWindow(QMainWindow):
                 reason="restore_or_ui_rebind_in_progress",
             )
             self._sync_restore_destination_overlay_pending_from_unresolved_queues()
+            self._destination_lifecycle_trace_TEMP(
+                fn="_apply_proposed_overlay_after_root_bind",
+                reason="deferred_restore_or_ui_rebind",
+                step_kind="overlay_repaint",
+                extra="",
+            )
             return 0
 
         if not self.proposed_folders and not self.planned_moves:
             self._log_restore_phase("root_bind destination_overlay_skipped", panel_key=panel_key, reason="no_destination_overlays")
+            self._destination_lifecycle_trace_TEMP(
+                fn="_apply_proposed_overlay_after_root_bind",
+                reason="skipped_no_proposed_or_moves",
+                step_kind="overlay_repaint",
+                extra="",
+            )
             return 0
 
         try:
@@ -20133,6 +20317,12 @@ class MainWindow(QMainWindow):
                 applied_count=applied_count,
                 visible_proposed_count=self._count_visible_destination_proposed_nodes(),
             )
+            self._destination_lifecycle_trace_TEMP(
+                fn="_apply_proposed_overlay_after_root_bind",
+                reason="overlay_applied",
+                step_kind="overlay_repaint",
+                extra=f"applied_count={applied_count};visible_proposed={self._count_visible_destination_proposed_nodes()}",
+            )
             return applied_count
         except Exception as exc:
             self._log_restore_exception("root_bind destination_overlay", exc)
@@ -20164,6 +20354,12 @@ class MainWindow(QMainWindow):
             if not restored_runtime_snapshot:
                 self._start_source_restore_materialization()
         else:
+            self._destination_lifecycle_trace_TEMP(
+                fn="_refresh_tree_ui_after_root_bind",
+                reason=f"destination_post_root_bind;restored_runtime_snapshot={bool(restored_runtime_snapshot)}",
+                step_kind="state_restore",
+                extra="before_prime_expand_all_overlay",
+            )
             self._refresh_destination_real_tree_snapshot(force=True)
             dest_tree = getattr(self, "destination_tree_widget", None)
             destination_top_level_count = self._planning_tree_top_level_count(dest_tree)
@@ -20192,7 +20388,12 @@ class MainWindow(QMainWindow):
                                 for index in range(root_item.childCount())
                             )
                         )
-            if getattr(self, "_sharepoint_lazy_mode", False) and destination_top_level_count <= 1:
+            dest_needs_top_level_prime = (
+                destination_top_level_count <= 1
+                and not root_has_visible_children
+                and not bool(root_data.get("children_loaded"))
+            )
+            if getattr(self, "_sharepoint_lazy_mode", False) and dest_needs_top_level_prime:
                 self._sync_restore_destination_overlay_pending_from_unresolved_queues()
                 load_started = self._prime_destination_root_children_after_snapshot(force=True)
                 if not load_started:
@@ -20306,11 +20507,19 @@ class MainWindow(QMainWindow):
     def populate_root_tree(self, panel_key, items):
         restore_destination_state = not bool(self._expand_all_pending.get("destination"))
         if restore_destination_state:
-            destination_expanded_paths = self._collect_expanded_tree_paths("destination")
-            destination_selected_path = self._collect_selected_tree_path("destination")
+            ui_state = {
+                "source_expanded_paths": self._collect_expanded_tree_paths("source"),
+                "source_selected_path": self._collect_selected_tree_path("source"),
+                "destination_expanded_paths": self._collect_expanded_tree_paths("destination"),
+                "destination_selected_path": self._collect_selected_tree_path("destination"),
+            }
         else:
-            destination_expanded_paths = set()
-            destination_selected_path = ""
+            ui_state = {
+                "source_expanded_paths": set(),
+                "source_selected_path": "",
+                "destination_expanded_paths": set(),
+                "destination_selected_path": "",
+            }
         self._apply_root_payload_to_tree(panel_key, items)
         self._refresh_tree_ui_after_root_bind(panel_key)
         self._restore_workspace_tree_state(ui_state)
@@ -30883,6 +31092,8 @@ class MainWindow(QMainWindow):
         Requires both fingerprints non-empty so we never skip the first post-restore materialize
         or a bind before ``_destination_last_materialized_overlay_fp`` was recorded.
         """
+        if getattr(self, "_destination_suppress_steady_materialize_skip_once", False):
+            return False
         if not getattr(self, "_destination_restore_completed_once", False):
             return False
         try:
@@ -34090,6 +34301,12 @@ class MainWindow(QMainWindow):
                 reason=r,
                 skip_reason="steady_state_overlay_fingerprint_unchanged",
             )
+            self._destination_lifecycle_trace_TEMP(
+                fn="_materialize_destination_future_model",
+                reason=r,
+                step_kind="projection_materialize",
+                extra="SKIPPED_steady_state_redundant",
+            )
             return 0
         if r == "destination_full_tree_idle_success" and self._destination_should_block_idle_full_tree_materialize():
             self._destination_full_tree_materialization_pending = True
@@ -34140,6 +34357,12 @@ class MainWindow(QMainWindow):
         _t0 = time.perf_counter()
         prev_active = str(getattr(self, "_destination_materialize_active_reason", "") or "")
         self._destination_materialize_active_reason = r
+        self._destination_lifecycle_trace_TEMP(
+            fn="_materialize_destination_future_model",
+            reason=r,
+            step_kind="projection_materialize",
+            extra=f"prev_active={prev_active[:80]}",
+        )
         if is_dev_mode() and r == "destination_full_tree_idle_success":
             d = self._expand_idle_path_diag()
             log_info(
@@ -34186,6 +34409,8 @@ class MainWindow(QMainWindow):
         self, reason, *, allow_defer=True, prefer_chunked_projection=False, narrow_restore_real_snapshot=False
     ):
         self._destination_future_model_last_blocked_source_restore = False
+        if getattr(self, "_destination_suppress_steady_materialize_skip_once", False):
+            self._destination_suppress_steady_materialize_skip_once = False
 
         if getattr(self, "_destination_incremental_merge_in_progress", False):
             self._log_restore_phase(
@@ -34915,8 +35140,17 @@ class MainWindow(QMainWindow):
             )
         return moved_count
 
-    def _merge_nested_spec_into_parent_index(self, target_parent_ix: QModelIndex, nested: NestedSpec) -> int:
-        """Merge one nested subtree into an existing same-semantic child under ``target_parent_ix``, else append."""
+    def _merge_nested_spec_into_parent_index(
+        self,
+        target_parent_ix: QModelIndex,
+        nested: NestedSpec,
+        *,
+        allow_structural_attach: bool = False,
+    ) -> int:
+        """Merge one nested subtree into an existing same-semantic child under ``target_parent_ix``, else append.
+
+        Under the planning model, new rows are not appended unless ``allow_structural_attach`` (reconcile reparent).
+        """
         dmodel = getattr(self, "destination_planning_model", None)
         if dmodel is None or not target_parent_ix.isValid():
             return 0
@@ -34927,8 +35161,16 @@ class MainWindow(QMainWindow):
             self._remove_placeholder_children(existing)
             moved = 0
             for sub in kid_specs:
-                moved += self._merge_nested_spec_into_parent_index(existing, sub)
+                moved += self._merge_nested_spec_into_parent_index(
+                    existing, sub, allow_structural_attach=allow_structural_attach
+                )
             return moved
+        if self._destination_tree_uses_model_view() and not allow_structural_attach:
+            self._destination_log_blocked_structural_mutation_TEMP(
+                phase="merge_nested_spec_into_parent_index",
+                detail=child_sem or self._tree_item_path(pl) or pl.get("name", ""),
+            )
+            return 0
         new_ix = dmodel.append_nested_child(target_parent_ix, nested)
         if new_ix.isValid():
             self._refresh_destination_item_visibility_index(target_parent_ix, expand=True)
@@ -35025,7 +35267,13 @@ class MainWindow(QMainWindow):
             nested = dmodel.remove_node_at(child_ix)
             if nested is None:
                 break
-            moved_total += self._merge_nested_spec_into_parent_index(target_ix, nested)
+            self._destination_reconcile_nested_attach_active = True
+            try:
+                moved_total += self._merge_nested_spec_into_parent_index(
+                    target_ix, nested, allow_structural_attach=True
+                )
+            finally:
+                self._destination_reconcile_nested_attach_active = False
             n_ops += 1
             merge_snap_gen = int(dmodel.structure_generation())
             mst["merge_snap_gen"] = merge_snap_gen
@@ -35097,7 +35345,13 @@ class MainWindow(QMainWindow):
             nested = dmodel.remove_node_at(child_ix)
             if nested is None:
                 break
-            moved_count += self._merge_nested_spec_into_parent_index(target_ix, nested)
+            self._destination_reconcile_nested_attach_active = True
+            try:
+                moved_count += self._merge_nested_spec_into_parent_index(
+                    target_ix, nested, allow_structural_attach=True
+                )
+            finally:
+                self._destination_reconcile_nested_attach_active = False
         return moved_count
 
     def _destination_finalize_reconcile_log_tick_bundle(
@@ -40834,7 +41088,11 @@ class MainWindow(QMainWindow):
                         pl = self._destination_payload_from_graph_item(child)
                         self._apply_tree_item_visual_state(None, pl)
                         child_payloads.append(pl)
-                    model.replace_all_children(parent_index, child_payloads)
+                    self._destination_graph_folder_replace_active = True
+                    try:
+                        model.replace_all_children(parent_index, child_payloads)
+                    finally:
+                        self._destination_graph_folder_replace_active = False
 
                     def _mut_ok(p):
                         p["children_loaded"] = True
@@ -40849,6 +41107,12 @@ class MainWindow(QMainWindow):
                         p["load_failed"] = False
 
                     model.update_payload_for_index(parent_index, _mut_partial)
+                self._destination_lifecycle_trace_TEMP(
+                    fn="on_folder_load_success",
+                    reason=f"destination_folder_worker;worker_key={str(worker_key)[:80]}",
+                    step_kind="graph_child_replace",
+                    extra=f"skip_replace={skip_destination_child_replace};n_graph_items={len(items or [])}",
+                )
                 log_info(
                     "destination_expand_loading_placeholder_cleared",
                     path_kind="model_view",
@@ -41596,18 +41860,22 @@ class MainWindow(QMainWindow):
                 preserved_nested = self._destination_preserved_children_by_worker.pop(worker_key, [])
                 model = self.destination_planning_model
                 if preserved_nested:
-                    model.remove_placeholder_children(parent_index)
-                    for spec in preserved_nested:
-                        model.append_nested_child(parent_index, spec)
-                    self._refresh_destination_item_visibility_index(parent_index, expand=True)
-                else:
-                    err_pl = {
-                        "placeholder": True,
-                        "placeholder_role": "error",
-                        "base_display_label": "Could not load folder contents.",
-                        "tree_role": "destination",
-                    }
+                    log_info(
+                        "destination_folder_error_discarded_preserved_nested_TEMP",
+                        worker_key=str(worker_key)[:120],
+                        preserved_count=len(preserved_nested),
+                    )
+                err_pl = {
+                    "placeholder": True,
+                    "placeholder_role": "error",
+                    "base_display_label": "Could not load folder contents.",
+                    "tree_role": "destination",
+                }
+                self._destination_graph_folder_replace_active = True
+                try:
                     model.replace_all_children(parent_index, [err_pl])
+                finally:
+                    self._destination_graph_folder_replace_active = False
 
                 def _mut_err_dest(p):
                     p["children_loaded"] = False
