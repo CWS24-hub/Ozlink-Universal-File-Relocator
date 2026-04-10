@@ -695,9 +695,20 @@ def test_reapply_paste_touch_paths_calls_ensure_projection_and_apply_children():
     assert ("apply", "stub-item") in calls
 
 
+def _stub_destination_redundant_skip_steady_state(mw, *, merge_seq=0, materialize_seq=0):
+    """Align Fix 2 gates so benign fp-match skip is allowed (queues empty, coverage seqs match)."""
+    mw.unresolved_proposed_by_parent_path = {}
+    mw.unresolved_allocations_by_parent_path = {}
+    mw._destination_incremental_merge_in_progress = False
+    mw._restore_destination_overlay_pending = False
+    mw._destination_merge_coverage_seq = merge_seq
+    mw._destination_materialize_coverage_seq = materialize_seq
+
+
 def test_try_skip_redundant_destination_materialize_when_fp_matches_and_async_benign():
     _qapp()
     mw = MainWindow.__new__(MainWindow)
+    _stub_destination_redundant_skip_steady_state(mw)
     mw.destination_tree_widget = MagicMock()
     mw._planning_tree_top_level_count = lambda _t: 1
     mw._destination_last_materialized_overlay_fp = "samefp"
@@ -738,6 +749,7 @@ def test_try_skip_redundant_non_benign_never_skips_when_fp_matches_without_async
 def test_try_skip_redundant_skips_when_benign_fp_matches_without_async():
     _qapp()
     mw = MainWindow.__new__(MainWindow)
+    _stub_destination_redundant_skip_steady_state(mw)
     mw.destination_tree_widget = MagicMock()
     mw._planning_tree_top_level_count = lambda _t: 1
     mw._destination_last_materialized_overlay_fp = "x"
@@ -764,6 +776,7 @@ def test_try_skip_redundant_destination_materialize_none_when_fp_mismatch():
 def test_try_skip_redundant_allows_deferred_prefix_during_async():
     _qapp()
     mw = MainWindow.__new__(MainWindow)
+    _stub_destination_redundant_skip_steady_state(mw)
     mw.destination_tree_widget = MagicMock()
     mw._planning_tree_top_level_count = lambda _t: 1
     mw._destination_last_materialized_overlay_fp = "x"
@@ -773,6 +786,58 @@ def test_try_skip_redundant_allows_deferred_prefix_during_async():
     mw._log_restore_phase = lambda *a, **kwargs: None
     mw._set_tree_status_message = lambda *a, **k: None
     assert mw._try_skip_redundant_destination_future_model_materialize("deferred_planning_change_lightweight") == 1
+
+
+def test_try_skip_redundant_declined_when_post_merge_materialize_not_yet_acknowledged():
+    """After incremental merge bumps merge_coverage_seq, benign fp-match must not skip until bind ack."""
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    _stub_destination_redundant_skip_steady_state(mw, merge_seq=2, materialize_seq=1)
+    mw.destination_tree_widget = MagicMock()
+    mw._planning_tree_top_level_count = lambda _t: 1
+    mw._destination_last_materialized_overlay_fp = "fp"
+    mw._current_destination_full_overlay_fingerprint = lambda: "fp"
+    mw._destination_future_projection_async_state = None
+    assert mw._try_skip_redundant_destination_future_model_materialize("source_folder_load_success") is None
+
+
+def test_try_skip_redundant_declined_when_restore_destination_overlay_pending():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    _stub_destination_redundant_skip_steady_state(mw)
+    mw._restore_destination_overlay_pending = True
+    mw.destination_tree_widget = MagicMock()
+    mw._planning_tree_top_level_count = lambda _t: 1
+    mw._destination_last_materialized_overlay_fp = "fp"
+    mw._current_destination_full_overlay_fingerprint = lambda: "fp"
+    mw._destination_future_projection_async_state = None
+    assert mw._try_skip_redundant_destination_future_model_materialize("source_folder_load_success") is None
+
+
+def test_try_skip_redundant_declined_when_unresolved_proposed_queue_nonempty():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    _stub_destination_redundant_skip_steady_state(mw)
+    mw.unresolved_proposed_by_parent_path = {"Root\\Pending": {"k": {}}}
+    mw.destination_tree_widget = MagicMock()
+    mw._planning_tree_top_level_count = lambda _t: 1
+    mw._destination_last_materialized_overlay_fp = "fp"
+    mw._current_destination_full_overlay_fingerprint = lambda: "fp"
+    mw._destination_future_projection_async_state = None
+    assert mw._try_skip_redundant_destination_future_model_materialize("source_folder_load_success") is None
+
+
+def test_try_skip_redundant_declined_when_incremental_merge_in_progress():
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    _stub_destination_redundant_skip_steady_state(mw)
+    mw._destination_incremental_merge_in_progress = True
+    mw.destination_tree_widget = MagicMock()
+    mw._planning_tree_top_level_count = lambda _t: 1
+    mw._destination_last_materialized_overlay_fp = "fp"
+    mw._current_destination_full_overlay_fingerprint = lambda: "fp"
+    mw._destination_future_projection_async_state = None
+    assert mw._try_skip_redundant_destination_future_model_materialize("source_folder_load_success") is None
 
 
 def test_deferred_planning_refresh_skips_destination_for_paste_quick_reason():
@@ -1730,4 +1795,30 @@ def test_manual_planning_drag_does_not_use_qdrag_exec():
             buttons=Qt.MouseButton.NoButton,
         )
     assert exec_called == []
+
+
+def test_collect_source_descendants_uses_graph_when_source_subtree_not_fully_loaded():
+    """Avoid destination_projection_collect_empty when UI source folder is not fully expanded."""
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    mw.graph = MagicMock()
+    # Unit test: keep synchronous Graph call (production uses a worker thread + pending sentinel).
+    mw._force_sync_graph_subtree_projection = True
+    fake_row = {"is_folder": False, "item_path": "Root\\A\\f.txt", "name": "f.txt"}
+    mw.graph.list_drive_subtree_items_normalized.return_value = [fake_row]
+    stub_item = object()
+    mw._find_source_item_for_planned_move = MagicMock(return_value=stub_item)
+    mw._source_subtree_fully_loaded_in_tree = MagicMock(return_value=False)
+    mw._enrich_source_root_for_projection_graph_lookup = lambda d, m: dict(d or {})
+    mw._destination_projection_diag_payload = lambda s, m, si: {}
+    mw._log_destination_projection_collect_result = MagicMock()
+    mw._log_restore_phase = MagicMock()
+    mw._log_restore_exception = MagicMock()
+    root = {"drive_id": "drv1", "id": "id1", "item_path": "/root", "is_folder": True}
+    move = {"source": root, "source_path": "Root\\A"}
+    out = mw._collect_source_descendants_for_projection(root, move)
+    mw.graph.list_drive_subtree_items_normalized.assert_called_once()
+    assert out == [fake_row]
+    kw = mw._log_destination_projection_collect_result.call_args[1]
+    assert kw.get("branch") == "graph_source_subtree_not_ready"
 

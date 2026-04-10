@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 from PySide6.QtCore import QModelIndex, Qt
 
+from ozlink_console.main_window import MainWindow
 from ozlink_console.tree_models.destination_planning_model import DestinationPlanningTreeModel
 
 
@@ -156,3 +161,62 @@ def test_destination_path_index_multi_candidate():
     )
     ixs2 = model.find_indices_for_canonical_destination_path(r"Root\a.txt")
     assert len(ixs2) == 1
+
+
+def _mw_norm():
+    window = MainWindow.__new__(MainWindow)
+    window.normalize_memory_path = MainWindow.normalize_memory_path.__get__(window, MainWindow)
+    return window
+
+
+def test_destination_graph_root_normalizer_nested_when_root_and_folder_siblings():
+    mw = _mw_norm()
+    flat = [
+        {"name": "Finance", "is_folder": True, "item_path": "Finance", "id": "f"},
+        {"name": "HR", "is_folder": True, "item_path": "HR", "id": "h"},
+        {"name": "Root", "is_folder": True, "item_path": "Root", "id": "r"},
+        {"name": "Sales", "is_folder": True, "item_path": "Sales", "id": "s"},
+    ]
+    nested = mw._destination_graph_root_child_payloads_if_flat_graph(flat)
+    assert nested is not None
+    assert nested["root"]["name"] == "Root"
+    assert nested["root"]["item_path"] == "Root"
+    assert nested["root"].get("children_loaded") is True
+    names = [c["name"] for c in nested["children"]]
+    assert names == ["Finance", "HR", "Sales"]
+    assert nested["children"][0]["item_path"] == r"Root\Finance"
+
+
+def test_destination_graph_root_normalizer_none_without_extra_folders():
+    mw = _mw_norm()
+    flat = [
+        {"name": "Root", "is_folder": True, "item_path": "Root"},
+        {"name": "readme.txt", "is_folder": False, "item_path": "readme.txt"},
+    ]
+    assert mw._destination_graph_root_child_payloads_if_flat_graph(flat) is None
+
+
+def test_destination_model_single_top_level_after_graph_root_normalization():
+    mw = _mw_norm()
+    flat = [
+        {"name": "Finance", "is_folder": True, "item_path": "Finance"},
+        {"name": "HR", "is_folder": True, "item_path": "HR"},
+        {"name": "Management", "is_folder": True, "item_path": "Management"},
+        {"name": "Operations", "is_folder": True, "item_path": "Operations"},
+        {"name": "Projects", "is_folder": True, "item_path": "Projects"},
+        {"name": "Root", "is_folder": True, "item_path": "Root"},
+        {"name": "Sales", "is_folder": True, "item_path": "Sales"},
+    ]
+    nested = mw._destination_graph_root_child_payloads_if_flat_graph(flat)
+    assert nested is not None
+    model = DestinationPlanningTreeModel()
+    model.reset_root_payloads([nested["root"]])
+    root_ix = model.index(0, 0, QModelIndex())
+    model.replace_all_children(root_ix, nested["children"])
+    assert model.rowCount(QModelIndex()) == 1
+    root_pl = model.index(0, 0, QModelIndex()).data(Qt.UserRole) or {}
+    assert root_pl.get("name") == "Root"
+    assert model.rowCount(root_ix) == 6
+    child0 = model.index(0, 0, root_ix).data(Qt.UserRole) or {}
+    assert child0.get("name") == "Finance"
+    assert child0.get("item_path") == r"Root\Finance"

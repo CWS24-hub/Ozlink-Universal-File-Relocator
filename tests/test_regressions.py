@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from collections import deque
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -14,6 +14,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox, QTreeView, QTreeWidget,
 
 import ozlink_console.logger as logger_module
 from ozlink_console.logger import JsonLineFormatter, reset_logging_for_tests
+import ozlink_console.main_window as main_window_module
 from ozlink_console.main_window import MainWindow
 from ozlink_console.memory import MemoryManager
 from ozlink_console.tree_models.sharepoint_source_model import SharePointSourceTreeModel
@@ -156,7 +157,7 @@ def _main_window_stub_for_source_model_expand_all(tree, model):
     window.source_tree_widget = tree
     window.source_sharepoint_model = model
     window.pending_root_drive_ids = {"source": "", "destination": ""}
-    window._expand_all_source_model_queue = deque()
+    window._expand_all_source_model_queue = []
     window._expand_all_pending = {"source": False, "destination": False}
     window._expand_all_queue = {"source": deque(), "destination": deque()}
     window._expand_all_seen = {"source": set(), "destination": set()}
@@ -1057,6 +1058,102 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         self.assertEqual(applied, 0)
         self.assertEqual(scheduled, [("destination_expand_all_complete", 180)])
 
+    def test_destination_incremental_merge_tick_spacing_override_for_expand_all_complete(self):
+        window = MainWindow.__new__(MainWindow)
+        self.assertEqual(
+            window._destination_incremental_merge_tick_spacing_override_ms(
+                {"reason": "destination_expand_all_complete"}
+            ),
+            18,
+        )
+        self.assertEqual(window._destination_incremental_merge_tick_spacing_override_ms({"reason": "other"}), 0)
+        self.assertEqual(window._destination_incremental_merge_tick_spacing_override_ms(None), 0)
+
+    def test_finish_destination_future_async_projection_tail_replays_after_expand_all_complete(self):
+        window = MainWindow.__new__(MainWindow)
+        calls = []
+        window._replay_unresolved_proposed_overlay = lambda ctx: calls.append(("proposed", ctx))
+        window._replay_unresolved_allocation_overlay = lambda ctx: calls.append(("alloc", ctx))
+        window._reconcile_destination_semantic_duplicates_maybe_deferred = lambda ctx: calls.append(("rec", ctx))
+        window._set_tree_status_message = lambda *a, **k: None
+        window._destination_future_model_pending_after_source_restore = True
+        window._current_destination_full_overlay_fingerprint = lambda: "fp"
+        window._destination_materialize_pending_after_async_projection = ""
+        window._merge_pending_materialize_after_async = lambda a, b: ""
+        window._log_restore_phase = lambda *a, **k: None
+
+        window._finish_destination_future_async_projection_tail(
+            3,
+            {
+                "proj_t0": 0.0,
+                "reason": "destination_expand_all_complete",
+                "pending_after": "",
+                "model_root_path": "Root",
+                "planned_moves_count": 0,
+            },
+        )
+
+        self.assertIn(("proposed", "destination_expand_all_merge_tail"), calls)
+        self.assertIn(("alloc", "destination_expand_all_merge_tail"), calls)
+        self.assertIn(("rec", "destination_expand_all_merge_tail"), calls)
+
+    def test_finish_destination_future_async_projection_tail_skips_expand_all_replay_for_other_reasons(self):
+        window = MainWindow.__new__(MainWindow)
+        calls = []
+        window._replay_unresolved_proposed_overlay = lambda ctx: calls.append(("proposed", ctx))
+        window._replay_unresolved_allocation_overlay = lambda ctx: calls.append(("alloc", ctx))
+        window._reconcile_destination_semantic_duplicates_maybe_deferred = lambda ctx: calls.append(("rec", ctx))
+        window._set_tree_status_message = lambda *a, **k: None
+        window._destination_future_model_pending_after_source_restore = False
+        window._current_destination_full_overlay_fingerprint = lambda: "fp"
+        window._destination_materialize_pending_after_async_projection = ""
+        window._merge_pending_materialize_after_async = lambda a, b: ""
+        window._log_restore_phase = lambda *a, **k: None
+
+        window._finish_destination_future_async_projection_tail(
+            1,
+            {
+                "proj_t0": 0.0,
+                "reason": "idle_destination_materialize",
+                "pending_after": "",
+                "model_root_path": "Root",
+                "planned_moves_count": 0,
+            },
+        )
+
+        self.assertEqual(calls, [])
+
+    def test_finish_destination_model_expand_all_sets_suppress_and_defers_column_snapshot_persist(self):
+        window = MainWindow.__new__(MainWindow)
+        window.destination_tree_widget = _TreeStub()
+        window._expand_all_pending = {"source": False, "destination": True}
+        window._reset_expand_all_progress = lambda pk: None
+        window._expand_all_deferred_refresh = {"destination": True}
+        window._pending_workspace_post_expand_selection = {"destination": ""}
+        window._count_expandable_tree_nodes = lambda pk: 5
+        window._schedule_deferred_destination_materialization = lambda *a, **k: None
+        window._schedule_destination_restore_materialization_queue = lambda *a, **k: None
+        window._sync_expand_all_button_from_tree = lambda *a, **k: None
+        window._update_expand_all_status = lambda *a, **k: None
+        window._workspace_ui_snapshot_dirty_panels = set()
+        window._schedule_progress_summary_refresh = lambda: None
+        persisted = []
+        window._persist_workspace_ui_state_safely = lambda: persisted.append(True)
+        snapshotted = []
+        window._refresh_runtime_tree_snapshot = lambda pk: snapshotted.append(pk)
+        cols = []
+        window._refresh_tree_column_width = lambda pk: cols.append(pk)
+        window._safe_invoke = lambda name, fn: fn()
+
+        with patch.object(QTimer, "singleShot", side_effect=lambda ms, cb: cb()):
+            window._finish_destination_model_expand_all()
+
+        self.assertFalse(window._expand_all_pending["destination"])
+        self.assertTrue(window._destination_suppress_steady_materialize_skip_once)
+        self.assertEqual(cols, ["destination"])
+        self.assertEqual(snapshotted, ["destination"])
+        self.assertEqual(persisted, [True])
+
     def test_restore_workspace_tree_panel_state_reapplies_expanded_all(self):
         window = MainWindow.__new__(MainWindow)
         window.destination_tree_widget = QTreeWidget()
@@ -1247,6 +1344,18 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         self.assertTrue(window._expand_all_pending["source"])
         self.assertEqual(scheduled[-1], ("source", "Expanding branches...", True))
 
+    def test_process_expand_all_queue_ignores_source_model_view_expand_all(self):
+        """Legacy QTreeWidget expand-all timer must not clear model-view DFS state."""
+        window = MainWindow.__new__(MainWindow)
+        window._expand_all_pending = {"source": True, "destination": False}
+        window._source_tree_uses_model_view = lambda: True
+        window._expand_all_queue = {"source": deque(), "destination": deque()}
+        sentinel = object()
+        window._expand_all_source_model_queue = [sentinel]
+        window._process_expand_all_queue("source")
+        self.assertTrue(window._expand_all_pending["source"])
+        self.assertIs(window._expand_all_source_model_queue[0], sentinel)
+
     def test_fast_expand_path_skips_folders_with_lazy_placeholder_children(self):
         window = MainWindow.__new__(MainWindow)
         tree = _ExpandTreeStub()
@@ -1282,6 +1391,83 @@ class DestinationReplayRegressionTests(unittest.TestCase):
             window._expand_all_progress_text("source", "Expanding branches..."),
             "Expanding branches... (3/5 folders)",
         )
+
+    def test_destination_full_tree_success_resumes_expand_all_without_begin_restart(self):
+        window = MainWindow.__new__(MainWindow)
+        window._active_destination_full_tree_worker_id = 42
+        window._destination_full_tree_requested_drive_id = "dvc"
+        window._destination_expand_all_after_full_tree = True
+        window._expand_all_pending = {"source": False, "destination": True}
+        window._expand_all_status_last_update_ms = {"source": 0, "destination": 0}
+        began = []
+        window._begin_destination_model_expand_all = lambda: began.append(True)
+        rebuilt = {"calls": 0}
+
+        def _rb(**kwargs):
+            rebuilt["calls"] += 1
+            return 3
+
+        window._destination_expand_all_rebuild_queue_after_model_refresh = _rb
+        continued = []
+        window._schedule_destination_expand_all_continue = lambda: continued.append(True)
+        window._destination_expand_all_reseed_collapsed_folders = lambda n: 0
+        window._mark_destination_real_tree_snapshot_stale = lambda: None
+        window._flush_parked_destination_materialize_after_full_tree_completion = lambda: None
+        window._materialize_destination_future_model = lambda *a, **k: None
+        window._expand_all_button_for_panel = lambda pk: None
+        window._can_fast_bulk_expand = lambda pk: False
+        window._destination_tree_uses_model_view = lambda: True
+        window._update_expand_all_status = lambda *a, **k: None
+        window._fast_expand_all_loaded_tree = lambda pk: (_ for _ in ()).throw(
+            AssertionError("fast_expand should not run in this stub scenario")
+        )
+
+        window.on_destination_full_tree_success({"drive_id": "dvc", "items": []}, 42)
+
+        self.assertFalse(began)
+        self.assertEqual(rebuilt["calls"], 1)
+        self.assertEqual(continued, [True])
+
+    def test_destination_model_unloaded_folder_true_when_children_loaded_false_despite_rows(self):
+        """Mixed allocated/proposed rows can appear under a folder before Graph marks children_loaded."""
+        window = MainWindow.__new__(MainWindow)
+        ix = MagicMock()
+        ix.data = MagicMock(
+            side_effect=lambda role: (
+                {
+                    "is_folder": True,
+                    "children_loaded": False,
+                    "id": "i1",
+                    "drive_id": "dv",
+                }
+                if role == Qt.UserRole
+                else None
+            )
+        )
+        model = MagicMock()
+        model.iter_depth_first = lambda: [ix]
+        window.destination_planning_model = model
+        window.node_is_planned_allocation = lambda pl: False
+        window._index_has_unresolved_lazy_placeholder_child = lambda i: False
+        window._resolve_tree_item_drive_id = lambda pk, pl: str(pl.get("drive_id") or "")
+        self.assertTrue(window._destination_model_tree_has_unloaded_folder_nodes())
+
+    def test_expand_all_status_update_throttles_while_expand_all_pending(self):
+        window = MainWindow.__new__(MainWindow)
+        window._expand_all_pending = {"source": True, "destination": False}
+        window._expand_all_status_last_update_ms = {"source": 0}
+        window._expand_all_processed = {"source": 1, "destination": 0}
+        window._expand_all_seen = {"source": {"a"}, "destination": set()}
+        calls = []
+        window._set_tree_status_message = lambda pk, msg, loading=False: calls.append((pk, msg))
+        window.source_tree_status = _LabelStub()
+        # perf_counter() is seconds; status uses int(perf_counter()*1000). Use large base so
+        # first update clears the 0 last_ms, second is within 420ms and should throttle.
+        with patch.object(main_window_module.time, "perf_counter", side_effect=[1000.0, 1000.05]):
+            window._update_expand_all_status("source", "Expanding…", loading=True)
+            self.assertEqual(len(calls), 1)
+            window._update_expand_all_status("source", "Expanding…", loading=True)
+            self.assertEqual(len(calls), 1)
 
     def test_projected_descendant_folder_node_is_preloaded(self):
         window = MainWindow.__new__(MainWindow)
