@@ -2575,6 +2575,18 @@ QDialog QDialogButtonBox QPushButton {
 }
 """
 
+# Full destination semantic bind/reconcile reasons deferred while folder workers
+# or pending loads are active (coalesced; one flush after stabilize).
+_DESTINATION_BIND_RECONCILE_GATE_REASONS = frozenset(
+    {
+        "destination_bind_sync_model",
+        "destination_bind_post_hydrate_sync_model",
+        "destination_bind_post_hydrate_chunked_lazy",
+        "destination_bind_chunked_async",
+        "destination_restore_queue_bootstrap",
+    }
+)
+
 
 class MainWindow(QMainWindow):
     @staticmethod
@@ -2802,6 +2814,14 @@ class MainWindow(QMainWindow):
         self._destination_future_projection_timer = QTimer(self)
         self._destination_future_projection_timer.setSingleShot(True)
         self._destination_future_projection_timer.timeout.connect(self._run_destination_future_projection_chunk)
+        self._destination_bind_reconcile_after_workers_timer = QTimer(self)
+        self._destination_bind_reconcile_after_workers_timer.setSingleShot(True)
+        self._destination_bind_reconcile_after_workers_timer.timeout.connect(
+            self._flush_destination_bind_reconcile_deferred_after_workers
+        )
+        self._destination_bind_reconcile_deferred_reasons: set = set()
+        self._destination_bind_reconcile_defer_sibling_fast_paint_pending: bool = False
+        self._destination_bind_reconcile_defer_reschedules: int = 0
         self._destination_indicator_refresh_timer = QTimer(self)
         self._destination_indicator_refresh_timer.setSingleShot(True)
         self._destination_indicator_refresh_timer.timeout.connect(self._refresh_destination_tree_indicators)
@@ -17470,6 +17490,8 @@ class MainWindow(QMainWindow):
     def on_root_worker_finished(self, panel_key, worker_id):
         try:
             self._cleanup_root_worker(panel_key, worker_id)
+            if str(panel_key or "") == "destination":
+                self._schedule_destination_bind_reconcile_after_workers()
             self._refresh_planning_loading_banner()
             if hasattr(self, "planned_moves_table"):
                 self.refresh_planned_moves_table()
@@ -19551,16 +19573,12 @@ class MainWindow(QMainWindow):
                 if kids:
                     moved += self._restore_destination_future_state_children_model(existing_ix, kids)
                 continue
-            if self._destination_tree_uses_model_view():
-                self._destination_log_blocked_structural_mutation_TEMP(
-                    phase="restore_future_state_children_model",
-                    detail=sem or self._tree_item_path(pl) or pl.get("name", ""),
-                )
-                continue
             new_ix = model.append_nested_child(parent_ix, (pl, kids))
-            moved += 1
-            if sem and new_ix.isValid():
-                child_map[sem] = new_ix
+            if new_ix.isValid():
+                moved += 1
+                if sem:
+                    child_map[sem] = new_ix
+                self._refresh_destination_item_visibility_index(parent_ix, expand=True)
         self._destination_lifecycle_trace_TEMP(
             fn="_restore_destination_future_state_children_model",
             reason="exit",
@@ -36238,6 +36256,11 @@ class MainWindow(QMainWindow):
     def _reconcile_destination_sibling_folders_during_allocation_apply(self, phase: str) -> None:
         """Merge same-named folder siblings before UI repaints (allocation apply yields, fast first paint, etc.)."""
         try:
+            if str(phase or "") == "fast_paint_pre_projection" and self._destination_bind_reconcile_suppressed_for_active_workers():
+                self._destination_bind_reconcile_defer_sibling_fast_paint_pending = True
+                self._log_restore_phase("destination_sibling_fast_paint_deferred_while_workers_active")
+                self._schedule_destination_bind_reconcile_after_workers()
+                return
             if self._destination_tree_uses_model_view():
                 model = getattr(self, "destination_planning_model", None)
                 gen_before = None
@@ -36451,14 +36474,64 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(200, lambda: self._safe_invoke("deferred_semantic_reconcile_after_merge", _run))
 
+    def _destination_bind_reconcile_suppressed_for_active_workers(self) -> bool:
+        if MainWindow._root_load_worker_running(self, "destination"):
+            return True
+        pending = getattr(self, "pending_folder_loads", None) or {}
+        if pending.get("destination"):
+            return True
+        for wkey, entry in (getattr(self, "folder_load_workers", None) or {}).items():
+            if not str(wkey).startswith("destination:"):
+                continue
+            if MainWindow._qt_worker_is_running((entry or {}).get("worker")):
+                return True
+        return False
+
+    def _schedule_destination_bind_reconcile_after_workers(self, delay_ms: int = 140) -> None:
+        try:
+            t = getattr(self, "_destination_bind_reconcile_after_workers_timer", None)
+            if t is None:
+                return
+            t.start(int(delay_ms))
+        except Exception:
+            pass
+
+    def _flush_destination_bind_reconcile_deferred_after_workers(self) -> None:
+        reasons = set(getattr(self, "_destination_bind_reconcile_deferred_reasons", None) or set())
+        defer_semantic = bool(reasons)
+        sibling_pending = bool(getattr(self, "_destination_bind_reconcile_defer_sibling_fast_paint_pending", False))
+        if self._destination_bind_reconcile_suppressed_for_active_workers():
+            n = int(getattr(self, "_destination_bind_reconcile_defer_reschedules", 0) or 0) + 1
+            self._destination_bind_reconcile_defer_reschedules = n
+            cap = 45
+            if n < cap:
+                self._schedule_destination_bind_reconcile_after_workers()
+                return
+            self._log_restore_phase(
+                "destination_bind_reconcile_forced_after_defer_cap",
+                reschedule_count=n,
+                defer_semantic=defer_semantic,
+                sibling_fast_paint_pending=sibling_pending,
+            )
+        self._destination_bind_reconcile_defer_reschedules = 0
+        self._destination_bind_reconcile_deferred_reasons = set()
+        self._destination_bind_reconcile_defer_sibling_fast_paint_pending = False
+        try:
+            if defer_semantic:
+                self._reconcile_destination_semantic_duplicates("destination_bind_reconcile_after_worker_stabilize")
+            if sibling_pending:
+                self._reconcile_destination_sibling_folders_during_allocation_apply("fast_paint_pre_projection")
+        except Exception as exc:
+            self._log_restore_exception("destination_bind_reconcile_after_worker_stabilize", exc)
+
     def _reconcile_destination_semantic_duplicates(self, reason):
         _dsp_rec = getattr(self, "_dest_scroll_profiler", None)
         _t0_rec = time.perf_counter() if _dsp_rec else None
         prev_depth = int(getattr(self, "_destination_semantic_reconcile_guard_depth", 0) or 0)
         self._destination_semantic_reconcile_guard_depth = prev_depth + 1
         try:
+            r = str(reason or "")
             if self._destination_tree_uses_model_view():
-                r = str(reason or "")
                 if (
                     r != "deferred_after_incremental_merge_finalize"
                     and self._destination_incremental_merge_blocks_full_semantic_reconcile()
@@ -36475,6 +36548,22 @@ class MainWindow(QMainWindow):
                         ),
                     )
                     return 0
+            if (
+                r in _DESTINATION_BIND_RECONCILE_GATE_REASONS
+                and self._destination_bind_reconcile_suppressed_for_active_workers()
+            ):
+                self._destination_bind_reconcile_deferred_reasons.add(r)
+                self._log_restore_phase(
+                    "destination_bind_reconcile_deferred_while_workers_active",
+                    reason=r,
+                    pending_destination_folder_loads=len(
+                        (getattr(self, "pending_folder_loads", None) or {}).get("destination", set()) or set()
+                    ),
+                    destination_root_worker_running=MainWindow._root_load_worker_running(self, "destination"),
+                )
+                self._schedule_destination_bind_reconcile_after_workers()
+                return 0
+            if self._destination_tree_uses_model_view():
                 return self._reconcile_destination_semantic_duplicates_index(reason)
             return self._reconcile_destination_semantic_duplicates_widget_path(reason)
         finally:
@@ -37736,6 +37825,16 @@ class MainWindow(QMainWindow):
             if dev:
                 _perf_explorer_log("find_visible_destination_item_by_path", elapsed_ms=perf.elapsed(), match="no_tree")
             return None
+        if getattr(self, "_root_tree_bind_in_progress", False):
+            if dev:
+                _perf_explorer_log(
+                    "find_visible_destination_item_by_path",
+                    elapsed_ms=perf.elapsed(),
+                    match="root_bind_in_progress",
+                    scanned_nodes=0,
+                    candidate_matches=0,
+                )
+            return None
         normalized_target = self._canonical_destination_projection_path(destination_path) or self.normalize_memory_path(
             destination_path
         )
@@ -37986,6 +38085,15 @@ class MainWindow(QMainWindow):
                 or self._unresolved_allocation_queue_size()
             ):
                 return
+        pending_q = getattr(self, "_destination_restore_materialization_queue", None) or []
+        if pending_q and not getattr(self, "_destination_restore_materialization_user_paused", False):
+            self._log_restore_phase(
+                "destination_restore_materialization_start_coalesced",
+                queue_size=len(pending_q),
+                planned_moves_count=len(getattr(self, "planned_moves", []) or []),
+                proposed_folders_count=len(getattr(self, "proposed_folders", []) or []),
+            )
+            return
         self._destination_restore_materialization_user_paused = False
         self._destination_restore_materialization_queue = []
         self._destination_restore_materialization_seen = set()
@@ -40935,6 +41043,8 @@ class MainWindow(QMainWindow):
                         except Exception:
                             pass
                     self.pending_folder_loads.get(panel, set()).discard(pk)
+            if str(worker_key).startswith("destination:"):
+                self._schedule_destination_bind_reconcile_after_workers()
         except Exception as exc:
             self._log_restore_exception("on_folder_worker_finished", exc)
 
