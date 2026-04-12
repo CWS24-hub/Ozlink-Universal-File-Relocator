@@ -45,7 +45,7 @@ def test_infer_anchor_one_real_root_child_folder():
         "Root": {"parent_semantic_path": "", "node_state": "real", "data": {"name": "Root", "is_folder": True}},
         "Root\\RootTest2": _real_folder_node("RootTest2"),
     }
-    assert mw._destination_infer_single_library_folder_anchor_path(nodes) == "Root\\RootTest2"
+    assert mw._destination_infer_single_library_folder_anchor_path(nodes) == "RootTest2"
 
 
 def test_infer_anchor_two_real_root_folders_returns_empty():
@@ -72,7 +72,7 @@ def test_infer_anchor_ignores_projected_sibling_and_non_folders():
             "data": {"name": "readme.txt", "is_folder": False},
         },
     }
-    assert mw._destination_infer_single_library_folder_anchor_path(nodes) == "Root\\RootTest2"
+    assert mw._destination_infer_single_library_folder_anchor_path(nodes) == "RootTest2"
 
 
 def test_reanchor_prefixes_under_anchor():
@@ -80,9 +80,9 @@ def test_reanchor_prefixes_under_anchor():
     mw = MainWindow.__new__(MainWindow)
     anchor = "Root\\RootTest2"
     assert mw._destination_reanchor_sharepoint_projection_path("", anchor) == ""
-    assert mw._destination_reanchor_sharepoint_projection_path("Root\\Finance", anchor) == "Root\\RootTest2\\Finance"
-    assert mw._destination_reanchor_sharepoint_projection_path("Root\\RootTest2\\Finance", anchor) == "Root\\RootTest2\\Finance"
-    assert mw._destination_reanchor_sharepoint_projection_path("Root", anchor) == "Root"
+    assert mw._destination_reanchor_sharepoint_projection_path("Root\\Finance", anchor) == "RootTest2\\Finance"
+    assert mw._destination_reanchor_sharepoint_projection_path("Root\\RootTest2\\Finance", anchor) == "RootTest2\\Finance"
+    assert mw._destination_reanchor_sharepoint_projection_path("Root", anchor) == "RootTest2"
 
 
 def test_reanchor_no_op_for_non_root_paths():
@@ -102,7 +102,7 @@ def test_visible_top_level_paths_promotes_root_children_for_sharepoint():
         "Root\\Zeta": {"parent_semantic_path": "Root"},
     }
     out = mw._destination_future_model_visible_top_level_paths(nodes, ["Root"])
-    assert out == ["Root\\Alpha", "Root\\Zeta"]
+    assert out == ["Alpha", "Zeta"]
 
 
 def test_visible_top_level_paths_local_mode_keeps_root_row():
@@ -142,5 +142,5 @@ def test_visible_top_level_paths_sharepoint_merges_root_children_without_visible
     norms = {mw.normalize_memory_path(x) for x in out}
     assert mw.normalize_memory_path("Root") not in norms
     assert "Other" in out
-    assert mw.normalize_memory_path("Root\\RootTest2") in norms
-    assert mw.normalize_memory_path("Root\\Zeta") in norms
+    assert mw.normalize_memory_path("RootTest2") in norms
+    assert mw.normalize_memory_path("Zeta") in norms

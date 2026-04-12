@@ -335,6 +335,14 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         if not canonical_key or self._destination_index_key_fn is None:
             return []
         nodes = self._path_to_nodes.get(canonical_key) or []
+        if not nodes:
+            cf = canonical_key.casefold()
+            n_buckets = len(self._path_to_nodes)
+            if n_buckets and n_buckets <= 4096:
+                for k, lst in self._path_to_nodes.items():
+                    if k.casefold() == cf:
+                        nodes = lst
+                        break
         out: List[QModelIndex] = []
         for n in nodes:
             ix = self._index_for_node(n)

@@ -727,7 +727,8 @@ class DestinationReplayRegressionTests(unittest.TestCase):
 
         self.assertFalse(window._panel_is_expanded_all("source"))
 
-    def test_find_visible_destination_item_by_path_skips_verbose_logs_by_default(self):
+    @patch("ozlink_console.main_window.is_dev_mode", return_value=False)
+    def test_find_visible_destination_item_by_path_skips_verbose_logs_by_default(self, _mock_dev):
         window = MainWindow.__new__(MainWindow)
         model = QStandardItemModel()
         root_item = QStandardItem("Folder: Root")
@@ -747,6 +748,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         model.find_indices_for_canonical_destination_path = _find_indices
         window.destination_tree_widget = QTreeView()
         window.destination_planning_model = model
+        window._destination_browse_mode = "local"
         window._memory_restore_in_progress = False
         window._canonical_destination_projection_path = lambda path: path
         window.normalize_memory_path = lambda path: path
@@ -1421,38 +1423,38 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window.proposed_folders = [
             ProposedFolder(
                 FolderName="Follow Up",
-                DestinationPath="Root\\Sales\\Follow Up",
-                ParentPath="Root\\Sales",
+                DestinationPath="Sales\\Follow Up",
+                ParentPath="Sales",
             ),
             ProposedFolder(
                 FolderName="Nested",
-                DestinationPath="Root\\Sales\\Follow Up\\Nested",
-                ParentPath="Root\\Sales\\Follow Up",
+                DestinationPath="Sales\\Follow Up\\Nested",
+                ParentPath="Sales\\Follow Up",
             ),
         ]
         window.planned_moves = [
             {
-                "destination_path": "Root\\Sales\\Follow Up\\Salary Increases.xlsx",
+                "destination_path": "Sales\\Follow Up\\Salary Increases.xlsx",
                 "destination": {
-                    "display_path": "Root\\Sales\\Follow Up\\Salary Increases.xlsx",
-                    "item_path": "Root\\Sales\\Follow Up\\Salary Increases.xlsx",
-                    "destination_path": "Root\\Sales\\Follow Up\\Salary Increases.xlsx",
+                    "display_path": "Sales\\Follow Up\\Salary Increases.xlsx",
+                    "item_path": "Sales\\Follow Up\\Salary Increases.xlsx",
+                    "destination_path": "Sales\\Follow Up\\Salary Increases.xlsx",
                 },
             }
         ]
 
         window._rewrite_proposed_branch_runtime_paths(
-            "Root\\Sales\\Follow Up",
-            "Root\\Management\\Follow Up",
+            "Sales\\Follow Up",
+            "Management\\Follow Up",
         )
 
-        self.assertEqual(window.proposed_folders[0].DestinationPath, "Root\\Management\\Follow Up")
-        self.assertEqual(window.proposed_folders[0].ParentPath, "Root\\Management")
-        self.assertEqual(window.proposed_folders[1].DestinationPath, "Root\\Management\\Follow Up\\Nested")
-        self.assertEqual(window.proposed_folders[1].ParentPath, "Root\\Management\\Follow Up")
+        self.assertEqual(window.proposed_folders[0].DestinationPath, "Management\\Follow Up")
+        self.assertEqual(window.proposed_folders[0].ParentPath, "Management")
+        self.assertEqual(window.proposed_folders[1].DestinationPath, "Management\\Follow Up\\Nested")
+        self.assertEqual(window.proposed_folders[1].ParentPath, "Management\\Follow Up")
         self.assertEqual(
             window.planned_moves[0]["destination_path"],
-            "Root\\Management\\Follow Up\\Salary Increases.xlsx",
+            "Management\\Follow Up\\Salary Increases.xlsx",
         )
 
     def test_destination_branch_move_to_top_level_folder_is_not_treated_as_same_path(self):
@@ -1461,8 +1463,8 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window.proposed_folders = [
             ProposedFolder(
                 FolderName="Test",
-                DestinationPath="Root\\Test",
-                ParentPath="Root",
+                DestinationPath="Test",
+                ParentPath="",
             )
         ]
         window.planned_moves = []
@@ -1476,9 +1478,9 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         src_payload = {
             "name": "Test",
             "real_name": "Test",
-            "display_path": "Root\\Test",
-            "item_path": "Root\\Test",
-            "destination_path": "Root\\Test",
+            "display_path": "Test",
+            "item_path": "Test",
+            "destination_path": "Test",
             "tree_role": "destination",
             "is_folder": True,
             "proposed": True,
@@ -1487,9 +1489,9 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         tgt_payload = {
             "name": "Management",
             "real_name": "Management",
-            "display_path": "Root\\Management",
-            "item_path": "Root\\Management",
-            "destination_path": "Root\\Management",
+            "display_path": "Management",
+            "item_path": "Management",
+            "destination_path": "Management",
             "tree_role": "destination",
             "is_folder": True,
             "node_origin": "Real",
@@ -1504,7 +1506,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         target_item = std.index(1, 0)
 
         dmodel = MagicMock()
-        nested = ({"name": "Test", "display_path": "Root\\Management\\Test"}, [])
+        nested = ({"name": "Test", "display_path": "Management\\Test"}, [])
         dmodel.remove_node_at.return_value = nested
         new_ix = MagicMock(spec=QModelIndex)
         new_ix.isValid.return_value = True
@@ -1532,8 +1534,8 @@ class DestinationReplayRegressionTests(unittest.TestCase):
 
         window.handle_destination_draft_move(source_item, target_item)
 
-        self.assertEqual(window.proposed_folders[0].DestinationPath, "Root\\Management\\Test")
-        self.assertEqual(window.proposed_folders[0].ParentPath, "Root\\Management")
+        self.assertEqual(window.proposed_folders[0].DestinationPath, "Management\\Test")
+        self.assertEqual(window.proposed_folders[0].ParentPath, "Management")
         dmodel.remove_node_at.assert_called_once_with(source_item)
         dmodel.append_nested_child.assert_called_once_with(target_item, nested)
         self.assertTrue(window._persisted)
@@ -1567,13 +1569,13 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._schedule_deferred_destination_materialization = lambda *args, **kwargs: None
 
         moved = window._move_planned_destination_node(
-            {"name": "Salary Increases.xlsx", "display_path": "Root\\Sales\\Follow Up\\Salary Increases.xlsx"},
-            {"name": "Management", "display_path": "Root\\Management", "item_path": "Root\\Management", "is_folder": True},
+            {"name": "Salary Increases.xlsx", "display_path": "Sales\\Follow Up\\Salary Increases.xlsx"},
+            {"name": "Management", "display_path": "Management", "item_path": "Management", "is_folder": True},
         )
 
         self.assertTrue(moved)
-        self.assertEqual(move["destination_path"], "Root\\Management")
-        self.assertEqual(move["destination"]["display_path"], "Root\\Management")
+        self.assertEqual(move["destination_path"], "Management")
+        self.assertEqual(move["destination"]["display_path"], "Management")
         self.assertEqual(window._persist_reason, "planned_item_moved")
 
     def test_persist_planning_change_lightweight_queues_deferred_refresh(self):
@@ -1806,28 +1808,28 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window.proposed_folders = [
             ProposedFolder(
                 FolderName="Projects Completed",
-                DestinationPath="Root\\Projects\\Projects Completed",
-                ParentPath="Root\\Projects",
+                DestinationPath="Projects\\Projects Completed",
+                ParentPath="Projects",
                 Status="Draft",
             )
         ]
 
         node = window._upsert_destination_model_node(
             {},
-            "Root\\Projects\\Projects Completed",
+            "Projects\\Projects Completed",
             name="Projects Completed",
             node_state="real",
             data={
                 "name": "Projects Completed",
                 "real_name": "Projects Completed",
-                "display_path": "Root\\Projects\\Projects Completed",
-                "item_path": "Root\\Projects\\Projects Completed",
-                "destination_path": "Root\\Projects\\Projects Completed",
+                "display_path": "Projects\\Projects Completed",
+                "item_path": "Projects\\Projects Completed",
+                "destination_path": "Projects\\Projects Completed",
                 "tree_role": "destination",
                 "is_folder": True,
                 "children_loaded": True,
             },
-            parent_semantic_path="Root\\Projects",
+            parent_semantic_path="Projects",
         )
 
         self.assertEqual(node["node_state"], "proposed")

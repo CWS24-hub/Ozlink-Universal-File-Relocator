@@ -108,6 +108,9 @@ class _SharePointAuthoritativeMaterializeHost:
     def _cancel_destination_future_async_projection(self, *_a, **_k) -> None:
         return None
 
+    def _schedule_proactive_graph_parent_chains_for_unresolved_overlays(self, *, reason: str) -> int:
+        return 0
+
     def _destination_materialize_reason_should_queue_until_async_finishes(self, _reason: str) -> bool:
         return False
 

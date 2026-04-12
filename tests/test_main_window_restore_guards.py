@@ -167,6 +167,9 @@ class _MaterializeSkipHost:
     def _cancel_destination_future_async_projection(self, reason=""):
         self.cancel_projection_calls.append(str(reason or ""))
 
+    def _schedule_proactive_graph_parent_chains_for_unresolved_overlays(self, *, reason: str) -> int:
+        return 0
+
     def _apply_destination_planning_overlays_body(
         self,
         reason,

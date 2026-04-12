@@ -54,11 +54,11 @@ def test_rewrite_nonprimary_planned_moves_destination_prefix_updates_descendants
         "Root\\HR\\Dept", "Root\\Archive\\Dept", primary_move=primary
     )
     assert child in out
-    assert child["destination_path"] == "Root\\Archive\\Dept\\sub"
+    assert child["destination_path"] == "Archive\\Dept\\sub"
     assert child["target_name"] == "a.txt"
-    assert child["destination"]["item_path"] == "Root\\Archive\\Dept\\sub\\a.txt"
+    assert child["destination"]["item_path"] == "Archive\\Dept\\sub\\a.txt"
     step = _planned_move_to_step(0, child)
-    assert step.destination_path == "Root\\Archive\\Dept\\sub"
+    assert step.destination_path == "Archive\\Dept\\sub"
     assert step.destination_name == "a.txt"
 
 

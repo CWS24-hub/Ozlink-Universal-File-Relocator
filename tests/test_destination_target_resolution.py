@@ -699,7 +699,7 @@ def test_try_skip_redundant_destination_materialize_when_fp_matches_and_async_be
     mw.destination_tree_widget = MagicMock()
     mw._planning_tree_top_level_count = lambda _t: 1
     mw._destination_last_materialized_overlay_fp = "samefp"
-    mw._current_destination_full_overlay_fingerprint = lambda: "samefp"
+    mw._current_destination_full_overlay_fingerprint = lambda *a, **k: "samefp"
     mw._destination_future_projection_async_state = {"move_index": 0}
     mw._count_visible_destination_future_state_nodes = lambda: 3
     mw._log_restore_phase = lambda *a, **kwargs: None
@@ -714,7 +714,7 @@ def test_try_skip_redundant_destination_materialize_none_when_async_and_non_beni
     mw.destination_tree_widget = MagicMock()
     mw._planning_tree_top_level_count = lambda _t: 1
     mw._destination_last_materialized_overlay_fp = "samefp"
-    mw._current_destination_full_overlay_fingerprint = lambda: "samefp"
+    mw._current_destination_full_overlay_fingerprint = lambda *a, **k: "samefp"
     mw._destination_future_projection_async_state = {"move_index": 0}
     out = mw._try_skip_redundant_destination_future_model_materialize("planned_item_moved")
     assert out is None
@@ -727,7 +727,7 @@ def test_try_skip_redundant_non_benign_never_skips_when_fp_matches_without_async
     mw.destination_tree_widget = MagicMock()
     mw._planning_tree_top_level_count = lambda _t: 1
     mw._destination_last_materialized_overlay_fp = "samefp"
-    mw._current_destination_full_overlay_fingerprint = lambda: "samefp"
+    mw._current_destination_full_overlay_fingerprint = lambda *a, **k: "samefp"
     mw._destination_future_projection_async_state = None
     out = mw._try_skip_redundant_destination_future_model_materialize("planned_item_moved")
     assert out is None
@@ -739,7 +739,7 @@ def test_try_skip_redundant_skips_when_benign_fp_matches_without_async():
     mw.destination_tree_widget = MagicMock()
     mw._planning_tree_top_level_count = lambda _t: 1
     mw._destination_last_materialized_overlay_fp = "x"
-    mw._current_destination_full_overlay_fingerprint = lambda: "x"
+    mw._current_destination_full_overlay_fingerprint = lambda *a, **k: "x"
     mw._destination_future_projection_async_state = None
     mw._count_visible_destination_future_state_nodes = lambda: 4
     mw._log_restore_phase = lambda *a, **kwargs: None
@@ -753,7 +753,7 @@ def test_try_skip_redundant_destination_materialize_none_when_fp_mismatch():
     mw.destination_tree_widget = MagicMock()
     mw._planning_tree_top_level_count = lambda _t: 1
     mw._destination_last_materialized_overlay_fp = "a"
-    mw._current_destination_full_overlay_fingerprint = lambda: "b"
+    mw._current_destination_full_overlay_fingerprint = lambda *a, **k: "b"
     mw._destination_future_projection_async_state = None
     out = mw._try_skip_redundant_destination_future_model_materialize("source_folder_load_success")
     assert out is None
@@ -765,7 +765,7 @@ def test_try_skip_redundant_allows_deferred_prefix_during_async():
     mw.destination_tree_widget = MagicMock()
     mw._planning_tree_top_level_count = lambda _t: 1
     mw._destination_last_materialized_overlay_fp = "x"
-    mw._current_destination_full_overlay_fingerprint = lambda: "x"
+    mw._current_destination_full_overlay_fingerprint = lambda *a, **k: "x"
     mw._destination_future_projection_async_state = {"move_index": 0}
     mw._count_visible_destination_future_state_nodes = lambda: 1
     mw._log_restore_phase = lambda *a, **kwargs: None
@@ -1204,7 +1204,7 @@ def test_manual_drop_nested_allocation_descendant_folder_on_item():
     )
     assert commit_ix == child_ix
     assert meta["drop_rejected_reason"] == ""
-    assert r"Root\Finance\Employee Hours\2025-26" in (meta["resolved_target_path"] or "").replace("/", "\\")
+    assert r"Finance\Employee Hours\2025-26" in (meta["resolved_target_path"] or "").replace("/", "\\")
 
 
 def test_manual_planning_drag_nested_descendant_folder_hover_overlay_matches_commit_qtreeview():

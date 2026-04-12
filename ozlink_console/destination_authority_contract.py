@@ -19,9 +19,10 @@ with a planning model attached):
   visible real rows in this mode (structural rows come only from Graph loads; overlays attach via
   ``MainWindow._apply_destination_planning_overlays``).
 
-* The internal semantic path segment ``Root`` must **never** appear as a visible tree row; only live
-  Graph library children (e.g. ``RootTest2``) are top-level in the pane. SharePoint overlay topology
-  uses ``OVERLAY_LIB_ROOT_SEMANTIC`` in the in-memory future model (not rendered), not a ``Root`` node.
+* Canonical destination planning paths are **graph-relative** (e.g. ``RootTest2\\Finance``) with no
+  leading internal ``Root\\`` segment; legacy persisted values may still carry that prefix and are
+  stripped when normalized. Only live Graph rows appear in the pane. Overlay topology may use
+  ``OVERLAY_LIB_ROOT_SEMANTIC`` in the in-memory future model (not rendered); it is not the string ``Root``.
 
 Local disk destination browsing does not use this contract (future model may still carry real nodes
 from filesystem snapshot semantics).
