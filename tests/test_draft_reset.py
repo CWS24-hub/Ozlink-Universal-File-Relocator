@@ -211,7 +211,7 @@ def test_apply_draft_reset_after_backup_clears_runtime_and_persists_empty():
     mw.source_tree_widget = MagicMock()
     mw.destination_tree_widget = MagicMock()
     mw._refresh_source_projection = MagicMock()
-    mw._materialize_destination_future_model = MagicMock(return_value=2)
+    mw._apply_destination_planning_overlays = MagicMock(return_value=2)
     mw._schedule_deferred_destination_materialization = MagicMock()
 
     mw._apply_draft_reset_after_backup()
@@ -224,8 +224,8 @@ def test_apply_draft_reset_after_backup_clears_runtime_and_persists_empty():
     mm.save_proposed.assert_called_once_with([], allow_empty=True)
     mm.save_session.assert_called_once()
     mm.refresh_manifest.assert_called_once()
-    mw._materialize_destination_future_model.assert_called_once()
-    call_kw = mw._materialize_destination_future_model.call_args.kwargs
+    mw._apply_destination_planning_overlays.assert_called_once()
+    call_kw = mw._apply_destination_planning_overlays.call_args.kwargs
     assert call_kw.get("allow_defer") is False
     mw._refresh_source_projection.assert_called_once()
     mw.reset_root_panels.assert_called_once()
@@ -319,7 +319,7 @@ def test_apply_draft_reset_stops_deferred_planning_timer_and_clears_queues():
     mw.source_tree_widget = MagicMock()
     mw.destination_tree_widget = MagicMock()
     mw._refresh_source_projection = MagicMock()
-    mw._materialize_destination_future_model = MagicMock(return_value=0)
+    mw._apply_destination_planning_overlays = MagicMock(return_value=0)
     mw._schedule_deferred_destination_materialization = MagicMock()
 
     mw._apply_draft_reset_after_backup()

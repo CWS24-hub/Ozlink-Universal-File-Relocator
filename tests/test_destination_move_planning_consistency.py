@@ -120,7 +120,11 @@ def test_finalize_destination_move_planning_consistency_refreshes_source_project
             incremental_lightweight=True,
             move_origin="other",
         )
-    inv.assert_called_once_with(bump_generation=False)
+    inv.assert_called_once_with(
+        bump_generation=False,
+        clear_source_path_cache=False,
+        source_eviction_paths={"S\\One"},
+    )
     ref.assert_called_once()
     args, kwargs = ref.call_args
     assert "S\\One" in args[0]
@@ -395,7 +399,6 @@ def test_map_visible_source_items_uses_single_bulk_walk_for_multiple_index_misse
 
     mw.source_tree_widget = MagicMock()
     mw.source_sharepoint_model = model
-    mw._source_tree_uses_model_view = lambda: True
     mw.get_tree_item_node_data = lambda ix: payloads[getattr(ix, "_row_i", 0)]
     mw._canonical_source_projection_path = lambda p: str(p or "").replace("/", "\\") if p else ""
     mw._tree_item_path = lambda d: d.get("item_path", "") or ""

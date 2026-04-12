@@ -37,8 +37,6 @@ def test_restore_future_state_children_model_appends_missing_child_under_model_v
     mw = MainWindow.__new__(MainWindow)
     mw.destination_planning_model = model
     mw.destination_tree_widget = None
-    mw._destination_tree_uses_model_view = lambda: True  # type: ignore[method-assign]
-
     child_pl = {
         "base_display_label": "Folder: HandoffChild",
         "name": "HandoffChild",
@@ -97,3 +95,87 @@ def test_find_visible_destination_item_by_path_returns_none_during_root_bind():
     tree = MagicMock()
     mw.destination_tree_widget = tree
     assert mw._find_visible_destination_item_by_path("Root") is None
+
+
+def test_destination_expanded_paths_for_planning_bind_unions_restore_intent():
+    """Bind-time gating must see saved expanded paths before those rows exist in the view."""
+    _app()
+    mw = MainWindow.__new__(MainWindow)
+    mw._destination_restore_session_expanded_paths_intent = {r"Root\A", r"Root\B"}
+
+    def _collect(pk: str):
+        return {r"Root\A"} if pk == "destination" else set()
+
+    mw._collect_expanded_tree_paths = _collect  # type: ignore[method-assign]
+    ep = mw._destination_expanded_paths_for_planning_bind()
+    assert ep == {r"Root\A", r"Root\B"}
+
+
+def test_destination_selected_path_for_planning_bind_prefers_intent_during_restore():
+    _app()
+    mw = MainWindow.__new__(MainWindow)
+    mw._memory_restore_in_progress = True
+    mw._destination_restore_session_selected_path_intent = r"Root\Deep\Item"
+
+    def _sel(pk: str) -> str:
+        return "" if pk == "destination" else ""
+
+    mw._collect_selected_tree_path = _sel  # type: ignore[method-assign]
+    assert mw._destination_selected_path_for_planning_bind() == r"Root\Deep\Item"
+
+
+def test_destination_selected_path_for_planning_bind_uses_live_when_not_restoring():
+    _app()
+    mw = MainWindow.__new__(MainWindow)
+    mw._memory_restore_in_progress = False
+    mw._destination_restore_session_selected_path_intent = r"Root\Stale"
+
+    def _sel(pk: str) -> str:
+        return r"Root\Live" if pk == "destination" else ""
+
+    mw._collect_selected_tree_path = _sel  # type: ignore[method-assign]
+    assert mw._destination_selected_path_for_planning_bind() == r"Root\Live"
+
+
+def test_destination_path_effective_expanded_true_when_expand_all_pending():
+    _app()
+    mw = MainWindow.__new__(MainWindow)
+    mw._expand_all_pending = {"source": False, "destination": True}
+    from unittest.mock import MagicMock
+
+    tree = MagicMock()
+    tree.isExpanded.return_value = False
+    ix = MagicMock()
+    ix.isValid.return_value = True
+    assert mw._destination_path_effective_expanded_for_hydrate(tree, ix, r"Root\Any") is True
+
+
+def test_destination_restore_path_under_session_expanded_intent_uses_explicit_paths():
+    _app()
+    mw = MainWindow.__new__(MainWindow)
+    mw._memory_restore_in_progress = True
+    mw._destination_restore_session_expanded_paths_intent = {r"Root\Library\Plans"}
+    child = r"Root\Library\Plans\Q1"
+    assert mw._destination_restore_path_under_session_expanded_intent(child) is True
+
+
+def test_destination_restore_path_under_session_expanded_intent_false_without_restore():
+    _app()
+    mw = MainWindow.__new__(MainWindow)
+    mw._memory_restore_in_progress = False
+    mw._destination_restore_session_expanded_paths_intent = {r"Root\Library\Plans"}
+    assert mw._destination_restore_path_under_session_expanded_intent(r"Root\Library\Plans\Q1") is False
+
+
+def test_destination_live_refresh_still_blocked_during_incremental_merge():
+    _app()
+    mw = MainWindow.__new__(MainWindow)
+    mw.unresolved_proposed_by_parent_path = {}
+    mw.unresolved_allocations_by_parent_path = {}
+    mw._memory_restore_in_progress = False
+    mw._restore_destination_overlay_pending = False
+    mw._destination_restore_materialization_queue = []
+    mw._destination_idle_materialize_pending_reason = ""
+    mw._destination_idle_materialize_timer = None
+    mw._destination_incremental_merge_in_progress = True
+    assert mw._destination_live_refresh_still_blocked() is True

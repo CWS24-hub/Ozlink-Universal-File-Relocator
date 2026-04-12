@@ -6,7 +6,8 @@ import json
 
 from PySide6.QtCore import QByteArray, QTimer, Qt
 from PySide6.QtGui import QBrush, QColor, QFont
-from PySide6.QtWidgets import QApplication, QTreeWidgetItem
+from PySide6.QtGui import QStandardItem, QStandardItemModel
+from PySide6.QtWidgets import QApplication, QTreeView, QTreeWidgetItem
 
 from ozlink_console.main_window import MainWindow
 
@@ -51,14 +52,14 @@ def test_capture_tree_items_snapshot_output_is_json_serializable():
     _qapp()
     mw = MainWindow.__new__(MainWindow)
     mw._JSON_PERSIST_MAX_DEPTH = 48
-    tree = type("T", (), {})()
-    tree.topLevelItemCount = lambda: 1
-    item = QTreeWidgetItem(["row"])
-    item.setData(0, Qt.UserRole, {"name": "n", "_model_background": QColor("#112233")})
-    tree.topLevelItem = lambda _i=0: item
-    mw._source_tree_uses_model_view = lambda: False
-    mw._destination_tree_uses_model_view = lambda: False
-    mw._get_tree_and_status = lambda pk: (tree, None)
+    tree = QTreeView()
+    model = QStandardItemModel()
+    row = QStandardItem("row")
+    row.setData({"name": "n", "_model_background": QColor("#112233")}, Qt.UserRole)
+    model.appendRow(row)
+    tree.setModel(model)
+    mw.source_sharepoint_model = model
+    mw._get_tree_and_status = lambda pk: (tree, None) if pk == "source" else (None, None)
     mw._normalize_destination_snapshot_tree_for_persist = lambda _s: None
     out = MainWindow._capture_tree_items_snapshot(mw, "source")
     assert out

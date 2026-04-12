@@ -80,6 +80,8 @@ class GraphClient:
         self.device_flow: Optional[Dict[str, Any]] = None
         self.profile: Optional[Dict[str, Any]] = None
         self._drive_children_cache: Dict[tuple[str, str], List[Dict[str, Any]]] = {}
+        # UI thread + QThread workers (e.g. DestinationFullTreeWorker) touch this dict concurrently.
+        self._drive_cache_lock = threading.RLock()
         # Serialize token/header reads and token mutations across UI thread + QThread workers.
         self._client_rlock = threading.RLock()
         self._graph_cache_root: Path = graph_cache_root()
@@ -258,7 +260,8 @@ class GraphClient:
             self.token = None
             self.device_flow = None
             self.profile = None
-            self._drive_children_cache.clear()
+            with self._drive_cache_lock:
+                self._drive_children_cache.clear()
             self.app = None
             self._token_cache = None
             self.session_context = {
@@ -582,9 +585,10 @@ class GraphClient:
         if not drive_id:
             return
 
-        stale_keys = [cache_key for cache_key in self._drive_children_cache if cache_key[0] == drive_id]
-        for cache_key in stale_keys:
-            self._drive_children_cache.pop(cache_key, None)
+        with self._drive_cache_lock:
+            stale_keys = [cache_key for cache_key in self._drive_children_cache if cache_key[0] == drive_id]
+            for cache_key in stale_keys:
+                self._drive_children_cache.pop(cache_key, None)
 
         disk_removed = 0
         for cache_path in self._graph_cache_root.glob("*.json"):
@@ -609,9 +613,30 @@ class GraphClient:
             disk_cache_files_removed=disk_removed,
         )
 
+    def invalidate_drive_root_children_cache(self, drive_id: str) -> None:
+        """Drop only the library root children cache so the next root listing hits Graph (lightweight live check)."""
+        drive_id = str(drive_id or "").strip()
+        if not drive_id:
+            return
+        cache_key = (drive_id, "__root__")
+        with self._drive_cache_lock:
+            self._drive_children_cache.pop(cache_key, None)
+        cache_path = self._graph_children_cache_path(drive_id, "__root__")
+        try:
+            if cache_path.exists():
+                cache_path.unlink()
+        except Exception:
+            return
+        log_trace(
+            "graph_cache",
+            "invalidate_drive_root_children_cache",
+            drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+        )
+
     def clear_all_children_cache(self) -> None:
-        mem_count = len(self._drive_children_cache)
-        self._drive_children_cache.clear()
+        with self._drive_cache_lock:
+            mem_count = len(self._drive_children_cache)
+            self._drive_children_cache.clear()
         disk_removed = 0
         for cache_path in self._graph_cache_root.glob("*.json"):
             try:
@@ -637,7 +662,8 @@ class GraphClient:
         item_id = str(item_id or "").strip()
         if not drive_id or not item_id:
             return
-        self._drive_children_cache.pop((drive_id, item_id), None)
+        with self._drive_cache_lock:
+            self._drive_children_cache.pop((drive_id, item_id), None)
         path = self._graph_children_cache_path(drive_id, item_id)
         try:
             if path.exists():
@@ -836,14 +862,16 @@ class GraphClient:
 
     def has_cached_drive_root_children(self, drive_id: str) -> bool:
         cache_key = (drive_id, "__root__")
-        cached_items = self._drive_children_cache.get(cache_key)
+        with self._drive_cache_lock:
+            cached_items = self._drive_children_cache.get(cache_key)
         if cached_items is not None:
             return True
         return self._load_persistent_children_cache(drive_id, "__root__") is not None
 
     def has_cached_drive_item_children(self, drive_id: str, item_id: str) -> bool:
         cache_key = (drive_id, item_id)
-        cached_items = self._drive_children_cache.get(cache_key)
+        with self._drive_cache_lock:
+            cached_items = self._drive_children_cache.get(cache_key)
         if cached_items is not None:
             return True
         return self._load_persistent_children_cache(drive_id, item_id) is not None
@@ -931,48 +959,69 @@ class GraphClient:
         return self.get_paged(f"{AUTH_CONFIG['graph_base']}/sites/{site_id}/drives")
 
     def list_drive_root_children(self, drive_id: str) -> List[Dict[str, Any]]:
+        """Return library root children, preferring in-memory then **disk** cache before Graph.
+
+        Call :meth:`invalidate_drive_root_children_cache` before listing when the UI must match
+        live SharePoint (renames/deletes are not visible until cache is dropped).
+        """
         cache_key = (drive_id, "__root__")
-        if cache_key not in self._drive_children_cache:
-            cached_items = self._load_persistent_children_cache(drive_id, "__root__")
-            if cached_items is None:
-                cached_items = self.get_paged(
-                    f"{AUTH_CONFIG['graph_base']}/drives/{drive_id}/root/children"
-                )
-                self._save_persistent_children_cache(drive_id, "__root__", cached_items)
-            self._drive_children_cache[cache_key] = cached_items
-        return list(self._drive_children_cache[cache_key])
+        with self._drive_cache_lock:
+            if cache_key in self._drive_children_cache:
+                return list(self._drive_children_cache[cache_key])
+        cached_items = self._load_persistent_children_cache(drive_id, "__root__")
+        if cached_items is None:
+            cached_items = self.get_paged(
+                f"{AUTH_CONFIG['graph_base']}/drives/{drive_id}/root/children"
+            )
+            self._save_persistent_children_cache(drive_id, "__root__", cached_items)
+        with self._drive_cache_lock:
+            if cache_key not in self._drive_children_cache:
+                self._drive_children_cache[cache_key] = cached_items
+            return list(self._drive_children_cache[cache_key])
 
     def list_drive_root_children_cached_only(self, drive_id: str) -> List[Dict[str, Any]]:
         cache_key = (drive_id, "__root__")
-        cached_items = self._drive_children_cache.get(cache_key)
+        with self._drive_cache_lock:
+            hit = self._drive_children_cache.get(cache_key)
+        if hit is not None:
+            return list(hit)
+        cached_items = self._load_persistent_children_cache(drive_id, "__root__")
         if cached_items is None:
-            cached_items = self._load_persistent_children_cache(drive_id, "__root__")
-            if cached_items is None:
-                return []
-            self._drive_children_cache[cache_key] = cached_items
-        return list(cached_items)
+            return []
+        with self._drive_cache_lock:
+            if cache_key not in self._drive_children_cache:
+                self._drive_children_cache[cache_key] = cached_items
+            return list(self._drive_children_cache[cache_key])
 
     def list_drive_item_children(self, drive_id: str, item_id: str) -> List[Dict[str, Any]]:
         cache_key = (drive_id, item_id)
-        if cache_key not in self._drive_children_cache:
-            cached_items = self._load_persistent_children_cache(drive_id, item_id)
-            if cached_items is None:
-                cached_items = self.get_paged(
-                    f"{AUTH_CONFIG['graph_base']}/drives/{drive_id}/items/{item_id}/children"
-                )
-                self._save_persistent_children_cache(drive_id, item_id, cached_items)
-            self._drive_children_cache[cache_key] = cached_items
-        return list(self._drive_children_cache[cache_key])
+        with self._drive_cache_lock:
+            if cache_key in self._drive_children_cache:
+                return list(self._drive_children_cache[cache_key])
+        cached_items = self._load_persistent_children_cache(drive_id, item_id)
+        if cached_items is None:
+            cached_items = self.get_paged(
+                f"{AUTH_CONFIG['graph_base']}/drives/{drive_id}/items/{item_id}/children"
+            )
+            self._save_persistent_children_cache(drive_id, item_id, cached_items)
+        with self._drive_cache_lock:
+            if cache_key not in self._drive_children_cache:
+                self._drive_children_cache[cache_key] = cached_items
+            return list(self._drive_children_cache[cache_key])
 
     def list_drive_item_children_cached_only(self, drive_id: str, item_id: str) -> List[Dict[str, Any]]:
         cache_key = (drive_id, item_id)
-        cached_items = self._drive_children_cache.get(cache_key)
+        with self._drive_cache_lock:
+            hit = self._drive_children_cache.get(cache_key)
+        if hit is not None:
+            return list(hit)
+        cached_items = self._load_persistent_children_cache(drive_id, item_id)
         if cached_items is None:
-            cached_items = self._load_persistent_children_cache(drive_id, item_id)
-            if cached_items is None:
-                return []
-            self._drive_children_cache[cache_key] = cached_items
-        return list(cached_items)
+            return []
+        with self._drive_cache_lock:
+            if cache_key not in self._drive_children_cache:
+                self._drive_children_cache[cache_key] = cached_items
+            return list(self._drive_children_cache[cache_key])
 
     def get_drive_item(self, drive_id: str, item_id: str) -> Dict[str, Any]:
         return self.get(f"{AUTH_CONFIG['graph_base']}/drives/{drive_id}/items/{item_id}")
@@ -1693,6 +1742,10 @@ class GraphClient:
     ) -> List[Dict[str, Any]]:
         normalized_items: List[Dict[str, Any]] = []
         stack: List[Dict[str, str]] = [{"item_id": "", "parent_item_path": "/"}]
+        _walk_progress_interval = 2500
+        _next_walk_log = _walk_progress_interval
+        _info_progress_interval = 8000
+        _next_info_log = _info_progress_interval
 
         while stack:
             current = stack.pop()
@@ -1719,6 +1772,24 @@ class GraphClient:
                     parent_item_path=parent_item_path,
                 )
                 normalized_items.append(normalized)
+                n_done = len(normalized_items)
+                if n_done >= _next_walk_log:
+                    log_trace(
+                        "graph",
+                        "list_drive_all_items_progress",
+                        drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+                        items_normalized_so_far=n_done,
+                        stack_depth=len(stack),
+                    )
+                    _next_walk_log = n_done + _walk_progress_interval
+                if n_done >= _next_info_log:
+                    log_info(
+                        "destination_full_tree_enumeration_progress",
+                        drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+                        items_normalized_so_far=n_done,
+                        stack_depth=len(stack),
+                    )
+                    _next_info_log = n_done + _info_progress_interval
                 if normalized.get("is_folder"):
                     stack.append({
                         "item_id": normalized.get("id", ""),

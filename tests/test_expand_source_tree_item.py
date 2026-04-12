@@ -1,10 +1,10 @@
-"""Focused tests for MainWindow._expand_source_tree_item (QTreeWidget vs QTreeView)."""
+"""Focused tests for MainWindow._expand_source_tree_item (SharePoint source QTreeView)."""
 
 from __future__ import annotations
 
 from PySide6.QtCore import QModelIndex, Qt
 from PySide6.QtGui import QStandardItem, QStandardItemModel
-from PySide6.QtWidgets import QApplication, QTreeView, QTreeWidget, QTreeWidgetItem
+from PySide6.QtWidgets import QApplication, QTreeView, QTreeWidgetItem
 
 from ozlink_console.main_window import MainWindow
 from ozlink_console.tree_models.destination_planning_model import DestinationPlanningTreeModel
@@ -29,21 +29,6 @@ def test_expand_source_tree_item_qtreeview_valid_index():
     host.source_tree_widget = tree
     MainWindow._expand_source_tree_item(host, parent_ix)
     assert tree.isExpanded(parent_ix)
-
-
-def test_expand_source_tree_item_qtree_widget_item():
-    _app = QApplication.instance() or QApplication([])
-    tree = QTreeWidget()
-    tree.setHeaderLabels(["name"])
-    parent = QTreeWidgetItem(["parent"])
-    parent.addChild(QTreeWidgetItem(["child"]))
-    tree.addTopLevelItem(parent)
-    assert not parent.isExpanded()
-
-    host = type("Host", (), {})()
-    host.source_tree_widget = tree
-    MainWindow._expand_source_tree_item(host, parent)
-    assert parent.isExpanded()
 
 
 def test_expand_source_tree_item_qtreeview_with_widget_item_no_crash():

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QModelIndex, Qt
 from PySide6.QtWidgets import QApplication, QTreeWidget, QTreeWidgetItem
 
 from ozlink_console.main_window import MainWindow
@@ -80,30 +80,31 @@ def test_dev_log_watch_folder_badge_owners_model_view_collects_watch_rows():
 
 
 def test_dev_log_watch_folder_badge_owners_qtreewidget_still_walks_items():
+    """Destination tree is model-backed; probe walks DestinationPlanningTreeModel.iter_depth_first."""
     _qapp()
     mw = MainWindow.__new__(MainWindow)
-    tree = QTreeWidget()
-    tree.setColumnCount(1)
-    root = QTreeWidgetItem(["Root"])
-    tree.addTopLevelItem(root)
-    child = QTreeWidgetItem(["Employee Hours"])
-    child.setData(
-        0,
-        Qt.UserRole,
-        {
-            "name": "Employee Hours",
-            "base_display_label": "Folder: Employee Hours",
-            "planned_allocation": True,
-            "display_path": "Root\\Employee Hours",
-            "item_path": "Root\\Employee Hours",
-            "is_folder": True,
-            "tree_role": "destination",
-        },
-    )
-    root.addChild(child)
+    mw.destination_tree_widget = MagicMock()
+    mw._destination_tree_model_view = True
+    mw._planning_tree_top_level_count = lambda _t: 1
 
-    mw.destination_tree_widget = tree
-    mw._destination_tree_model_view = False
+    ix = MagicMock(spec=QModelIndex)
+    ix.isValid.return_value = True
+    ix.column.return_value = 0
+    ix.data.return_value = {
+        "name": "Employee Hours",
+        "base_display_label": "Folder: Employee Hours",
+        "planned_allocation": True,
+        "display_path": "Root\\Employee Hours",
+        "item_path": "Root\\Employee Hours",
+        "is_folder": True,
+        "tree_role": "destination",
+    }
+
+    class _Model:
+        def iter_depth_first(self):
+            yield ix
+
+    mw.destination_planning_model = _Model()
 
     captured = []
 

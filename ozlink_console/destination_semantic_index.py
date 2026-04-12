@@ -1,9 +1,8 @@
 """
-Destination future-model topology helpers (Phase 3 incremental projection).
+Destination planning topology helpers for in-memory ``model_nodes`` graphs.
 
-Pure functions over the in-memory ``model_nodes`` dict used by
-``_build_destination_future_model`` / incremental merge. Keeps sort and
-entry-root rules aligned with MainWindow without Qt dependencies.
+Used by tests and small utilities; sort and entry-root rules mirror historical
+MainWindow ordering without Qt dependencies.
 """
 
 from __future__ import annotations
@@ -40,7 +39,6 @@ def future_model_sort_key(model_nodes: dict[str, Any], semantic_path: str) -> tu
 def compute_incremental_merge_entry_roots(model_nodes: dict[str, Any], new_paths: set[str]) -> list[str]:
     """
     Entry roots: new paths whose parent is not also new (attach each subtree once).
-    Sort matches MainWindow._incremental_merge_destination_future_projection.
     """
     entry_roots = [
         p

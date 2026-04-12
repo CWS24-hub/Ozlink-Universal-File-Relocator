@@ -51,19 +51,9 @@ pip install pyinstaller
 
 Or manually from repo root: `python -m PyInstaller --noconfirm OzlinkConsole.spec`, then zip **`dist\OzlinkConsole`** yourself.
 
-## Client handoff: optional faster source tree (mapping / large libraries)
+## Client handoff: SharePoint source tree (planning)
 
-**Default:** the classic source tree (unchanged). **No action required** for normal deliveries.
-
-If the library is large and the **source** pane feels sluggish when scrolling or expanding:
-
-1. Open **Settings**.
-2. Under **Planning workspace — faster source tree (optional)**, turn on **Use faster source tree (restart required)**.
-3. **Fully quit** the app and start it again.
-
-To go back: turn the option **off** and restart. The setting is stored per Windows user profile (Qt `QSettings`).
-
-**Note:** In faster mode, **Source → Expand All** loads folder branches in the background (up to three concurrent Graph requests) and then expands all rows that are already materialized. Very large libraries may take a while; users can cancel with **Expand All** again (same as classic mode). IT can still force one launch with `OZLINK_SOURCE_QTREEVIEW=1` or `=0` if the environment variable is set.
+The planning **source** pane for SharePoint uses a virtualized tree view backed by an in-memory model (not the legacy widget tree). **Source → Expand All** loads folder branches in the background (up to a few concurrent Graph requests), then expands materialized rows; very large libraries may take a while, and users can cancel by choosing **Expand All** again to collapse loaded branches.
 
 ## Important assumptions
 

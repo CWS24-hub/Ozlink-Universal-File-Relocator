@@ -4,16 +4,9 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-import pytest
-from PySide6.QtCore import QModelIndex, Qt
-from PySide6.QtWidgets import QApplication, QTreeWidgetItem
+from PySide6.QtCore import QModelIndex
 
 from ozlink_console.main_window import MainWindow
-
-
-@pytest.fixture(scope="module")
-def qapp():
-    return QApplication.instance() or QApplication([])
 
 
 def test_invalidate_projection_index_clears_allocation_descendants_applied_on_path_mismatch():
@@ -59,7 +52,8 @@ def test_apply_visible_model_branch_uses_flag_not_child_presence():
     mw = MainWindow.__new__(MainWindow)
     tree = MagicMock()
     mw.destination_tree_widget = tree
-    mw._destination_tree_uses_model_view = lambda: True  # noqa: E731
+    mw._destination_descendant_apply_state = None
+    mw._destination_descendant_apply_queue = []
 
     dmodel = MagicMock()
     mw.destination_planning_model = dmodel
@@ -85,7 +79,7 @@ def test_apply_visible_model_branch_uses_flag_not_child_presence():
         applied["n"] += 1
         return 3
 
-    mw._apply_allocation_descendants_to_item = _fake_apply
+    mw._apply_allocation_descendants_to_model_index = _fake_apply
 
     mw._apply_visible_destination_allocation_descendants(destination_expanded_paths={"\\Alloc"})
     assert applied["n"] == 1
@@ -96,7 +90,8 @@ def test_apply_visible_model_skips_apply_when_descendants_already_applied():
     mw = MainWindow.__new__(MainWindow)
     tree = MagicMock()
     mw.destination_tree_widget = tree
-    mw._destination_tree_uses_model_view = lambda: True  # noqa: E731
+    mw._destination_descendant_apply_state = None
+    mw._destination_descendant_apply_queue = []
 
     dmodel = MagicMock()
     mw.destination_planning_model = dmodel
@@ -119,9 +114,9 @@ def test_apply_visible_model_skips_apply_when_descendants_already_applied():
     mw._destination_bind_should_apply_allocation_descendants_now = lambda _sem, _nt: True  # noqa: E731
 
     def _fail_apply(*_a, **_k):
-        raise AssertionError("_apply_allocation_descendants_to_item should not run when flag is set")
+        raise AssertionError("_apply_allocation_descendants_to_model_index should not run when flag is set")
 
-    mw._apply_allocation_descendants_to_item = _fail_apply
+    mw._apply_allocation_descendants_to_model_index = _fail_apply
 
     mw._apply_visible_destination_allocation_descendants(destination_expanded_paths={"\\Alloc"})
     dmodel.update_payload_for_index.assert_called_once()
@@ -129,24 +124,3 @@ def test_apply_visible_model_skips_apply_when_descendants_already_applied():
     p = {"node_origin": "plannedallocation", "is_folder": True, "allocation_descendants_applied": True}
     mut(p)
     assert p.get("children_loaded") is True
-
-
-def test_invalidate_projection_widget_clears_allocation_descendants_applied_on_path_mismatch(qapp):
-    mw = MainWindow.__new__(MainWindow)
-    item = QTreeWidgetItem()
-    move = {
-        "destination_path": "\\Root",
-        "target_name": "AllocFolder",
-        "source": {"is_folder": True, "name": "AllocFolder"},
-    }
-    nd = {
-        "node_origin": "plannedallocation",
-        "is_folder": True,
-        "children_loaded": True,
-        "allocation_descendants_applied": True,
-        "allocation_projection_destination_path_saved": "\\Root\\WrongName",
-    }
-    item.setData(0, Qt.UserRole, nd)
-    out = mw._invalidate_stale_destination_allocation_projection(item, nd, move)
-    assert out.get("children_loaded") is False
-    assert "allocation_descendants_applied" not in out

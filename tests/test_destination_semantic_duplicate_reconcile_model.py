@@ -1,10 +1,15 @@
-"""QTreeView destination tree: merge duplicate rows that share the same semantic path."""
+"""QTreeView destination tree: merge duplicate rows that share the same semantic path.
+
+Under SharePoint graph structural authority, visible real rows come from Graph loads; when a
+projected/proposed overlay row and a live Graph row share the same semantic path, reconcile here
+collapses them (see ``destination_authority_contract``).
+"""
 
 from __future__ import annotations
 
 import pytest
 from PySide6.QtCore import QModelIndex, Qt
-from PySide6.QtWidgets import QApplication, QTreeWidget, QTreeWidgetItem
+from PySide6.QtWidgets import QApplication
 
 from ozlink_console.main_window import MainWindow
 from ozlink_console.tree_models.destination_planning_model import DestinationPlanningTreeModel
@@ -30,8 +35,6 @@ def test_reconcile_semantic_duplicates_model_merges_twin_sub_folders(qapp):
         destination_index_key_fn=mw._destination_payload_index_key,
     )
     mw.destination_planning_model = model
-    mw._destination_tree_uses_model_view = lambda: True  # noqa: E731
-
     sub_path = r"Root\FTBMRoot\F\Sub"
     sub_projected = {
         "base_display_label": "folder: Sub",
@@ -103,8 +106,6 @@ def test_reconcile_merges_same_named_sub_folders_when_paths_differ(qapp):
         destination_index_key_fn=mw._destination_payload_index_key,
     )
     mw.destination_planning_model = model
-    mw._destination_tree_uses_model_view = lambda: True  # noqa: E731
-
     f_path = r"Root\FTBMRoot\F"
     f_payload = {
         "base_display_label": "folder: F [Allocated]",
@@ -195,8 +196,6 @@ def test_reconcile_merges_sub_siblings_when_one_name_is_full_path(qapp):
         destination_index_key_fn=mw._destination_payload_index_key,
     )
     mw.destination_planning_model = model
-    mw._destination_tree_uses_model_view = lambda: True  # noqa: E731
-
     f_path = r"Root\FTBMRoot\F"
     f_payload = {
         "base_display_label": "folder: F [Allocated]",
@@ -251,125 +250,61 @@ def test_reconcile_merges_sub_siblings_when_one_name_is_full_path(qapp):
 
 def test_find_destination_child_matches_sub_via_when_path_ends_sub(qapp):
     mw = MainWindow.__new__(MainWindow)
-    tree = QTreeWidget()
-    mw.destination_tree_widget = tree
-    parent = QTreeWidgetItem()
-    parent.setData(0, Qt.UserRole, {"is_folder": True, "item_path": r"Root\F", "name": "F"})
-    tree.addTopLevelItem(parent)
-    existing = QTreeWidgetItem()
-    existing.setData(
-        0,
-        Qt.UserRole,
-        {
-            "is_folder": True,
-            "name": "Sub - via F",
-            "item_path": r"Root\F\Sub - via F",
-            "tree_role": "destination",
-        },
+    mw.destination_tree_widget = object()
+    model = DestinationPlanningTreeModel()
+    mw.destination_planning_model = model
+    model.reset_root_payloads(
+        [{"is_folder": True, "item_path": r"Root\F", "name": "F", "base_display_label": "F", "tree_role": "destination"}]
     )
-    parent.addChild(existing)
-    found = mw._find_destination_child_by_path(parent, r"Root\F\Sub")
-    assert found is existing
+    f_ix = model.index(0, 0, QModelIndex())
+    model.replace_all_children(
+        f_ix,
+        [
+            {
+                "is_folder": True,
+                "name": "Sub - via F",
+                "item_path": r"Root\F\Sub - via F",
+                "tree_role": "destination",
+                "base_display_label": "Sub - via F",
+            }
+        ],
+    )
+    existing = model.index(0, 0, f_ix)
+    found = mw._find_destination_child_by_path(f_ix, r"Root\F\Sub")
+    assert found == existing
 
 
 def test_find_destination_child_falls_back_to_folder_label_when_paths_mismatch(qapp):
     """Allocation apply must not add a second folder when an existing row only matches by label."""
     mw = MainWindow.__new__(MainWindow)
-    tree = QTreeWidget()
-    mw.destination_tree_widget = tree
-
-    parent = QTreeWidgetItem()
-    parent.setData(
-        0,
-        Qt.UserRole,
-        {"is_folder": True, "item_path": r"Root\F", "tree_role": "destination", "name": "F"},
+    mw.destination_tree_widget = object()
+    model = DestinationPlanningTreeModel()
+    mw.destination_planning_model = model
+    model.reset_root_payloads(
+        [
+            {
+                "is_folder": True,
+                "item_path": r"Root\F",
+                "tree_role": "destination",
+                "name": "F",
+                "base_display_label": "F",
+            }
+        ]
     )
-    tree.addTopLevelItem(parent)
-
-    existing_sub = QTreeWidgetItem()
-    existing_sub.setData(
-        0,
-        Qt.UserRole,
-        {
-            "is_folder": True,
-            "base_display_label": "folder: Sub",
-            "item_path": "",
-            "display_path": "",
-            "tree_role": "destination",
-        },
+    f_ix = model.index(0, 0, QModelIndex())
+    model.replace_all_children(
+        f_ix,
+        [
+            {
+                "is_folder": True,
+                "base_display_label": "folder: Sub",
+                "item_path": "",
+                "display_path": "",
+                "tree_role": "destination",
+                "name": "Sub",
+            }
+        ],
     )
-    parent.addChild(existing_sub)
-
-    found = mw._find_destination_child_by_path(parent, r"Root\F\Sub")
-    assert found is existing_sub
-
-
-def test_reconcile_sibling_folders_qtreewidget_path(qapp):
-    """Default destination QTreeWidget: same-named folder siblings merge by display label."""
-    mw = MainWindow.__new__(MainWindow)
-    mw.destination_tree_widget = QTreeWidget()
-    mw.planned_moves = []
-    mw.proposed_folders = []
-    mw._memory_restore_in_progress = False
-    mw._suppress_selector_change_handlers = False
-    mw._log_restore_phase = lambda *_a, **_k: None  # noqa: E731
-
-    tree = mw.destination_tree_widget
-    f_item = QTreeWidgetItem()
-    f_item.setData(
-        0,
-        Qt.UserRole,
-        {
-            "is_folder": True,
-            "name": "F",
-            "item_path": r"Root\F",
-            "tree_role": "destination",
-            "node_origin": "plannedallocation",
-        },
-    )
-    tree.addTopLevelItem(f_item)
-
-    sub_shell = QTreeWidgetItem()
-    sub_shell.setData(
-        0,
-        Qt.UserRole,
-        {
-            "is_folder": True,
-            "base_display_label": "folder: Sub",
-            "item_path": r"Root\F\Sub_shell_only",
-            "tree_role": "destination",
-            "node_origin": "ProjectedDestination",
-        },
-    )
-    sub_real = QTreeWidgetItem()
-    sub_real.setData(
-        0,
-        Qt.UserRole,
-        {
-            "is_folder": True,
-            "base_display_label": "folder: Sub",
-            "item_path": r"Root\F\Sub",
-            "tree_role": "destination",
-            "node_origin": "sharepoint",
-        },
-    )
-    file3 = QTreeWidgetItem()
-    file3.setData(
-        0,
-        Qt.UserRole,
-        {
-            "is_folder": False,
-            "name": "File3.docx",
-            "item_path": r"Root\F\Sub\File3.docx",
-            "tree_role": "destination",
-        },
-    )
-    f_item.addChild(sub_shell)
-    sub_real.addChild(file3)
-    f_item.addChild(sub_real)
-    assert f_item.childCount() == 2
-
-    mw._reconcile_destination_semantic_duplicates("test")
-    assert f_item.childCount() == 1
-    merged = f_item.child(0)
-    assert merged.childCount() == 1
+    existing_sub = model.index(0, 0, f_ix)
+    found = mw._find_destination_child_by_path(f_ix, r"Root\F\Sub")
+    assert found == existing_sub

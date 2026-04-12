@@ -13,7 +13,7 @@ import logging
 import os
 import re
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, BinaryIO, Dict, Optional
@@ -172,6 +172,18 @@ def init_session_logging() -> Path:
         _SESSION_DIR = logs_root() / stamp
         _SESSION_DIR.mkdir(parents=True, exist_ok=True)
         _CRASH_SINK = CrashLogSink(_SESSION_DIR / "crash.log")
+        try:
+            ptr = logs_root() / "CURRENT_SESSION.txt"
+            started = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            ptr.write_text(
+                f"session_log_dir={_SESSION_DIR.resolve()}\n"
+                f"pid={os.getpid()}\n"
+                f"started_utc={started}\n"
+                "note=One folder per OS process. This file is overwritten if another console process starts.\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
         return _SESSION_DIR
 
 
@@ -500,6 +512,8 @@ def log_session_diagnostics_initialized() -> None:
     log_info(
         "Diagnostics initialized.",
         session_log_dir=str(sd),
+        process_id=os.getpid(),
+        current_session_pointer=str(logs_root() / "CURRENT_SESSION.txt"),
         log_files=files,
         rotating_max_mb=round(_ROTATE_BYTES / (1024 * 1024), 1),
         rotating_backups=_ROTATE_BACKUPS,

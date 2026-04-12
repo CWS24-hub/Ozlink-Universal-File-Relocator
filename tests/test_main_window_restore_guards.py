@@ -60,15 +60,106 @@ def test_enter_restore_abort_mode_logs_without_phase_argument_collision():
 
 
 class _MaterializeSkipHost:
-    """Minimal host for _materialize_destination_future_model early-exit tests."""
+    """Minimal host for _apply_destination_planning_overlays overlay-pass tests."""
 
     def __init__(self) -> None:
         self._destination_future_model_last_blocked_source_restore = False
         self._destination_future_projection_async_state = None
         self._destination_chunked_bind_state = None
         self._destination_future_bind_sync_active = False
+        self._destination_incremental_merge_in_progress = False
+        self._destination_root_prime_pending = False
+        self._destination_snapshot_chunked_restore_active = False
+        self._destination_trust_gate_pending_materialize = None
+        self.pending_root_drive_ids = {"source": "", "destination": ""}
+        self.proposed_folders = []
+        self.planned_moves = []
         self.cancel_projection_calls: list[str] = []
         self.logged: list[tuple[str, dict]] = []
+
+    def _planning_browse_mode(self, _key: str) -> str:
+        return "local"
+
+    def _destination_steady_state_full_materialize_redundant(self) -> bool:
+        return False
+
+    def _destination_lifecycle_trace_TEMP(self, *args, **kwargs) -> None:
+        return None
+
+    def _destination_materialize_reason_should_queue_until_async_finishes(self, _reason: str) -> bool:
+        return False
+
+    def _destination_full_tree_ready(self) -> bool:
+        return True
+
+    def _destination_sharepoint_planning_destination_active(self) -> bool:
+        return False
+
+    def _destination_future_model_blocked_by_source_restore(self, _reason) -> bool:
+        return False
+
+    def _destination_snapshot_spo_trust_valid(self, _did: str) -> bool:
+        return True
+
+    def _current_selected_destination_drive_id(self) -> str:
+        return ""
+
+    def _should_defer_destination_materialization(self, _reason) -> bool:
+        return False
+
+    def _destination_expanded_paths_for_planning_bind(self):
+        return []
+
+    def _destination_selected_path_for_planning_bind(self):
+        return ""
+
+    def _replay_unresolved_proposed_overlay(self, *_a, **_k) -> int:
+        return 0
+
+    def _replay_unresolved_allocation_overlay(self, *_a, **_k) -> int:
+        return 0
+
+    def _apply_visible_destination_allocation_descendants(self, **_k) -> int:
+        return 0
+
+    def _hydrate_destination_allocations_for_expanded_paths_model(self, *_a, **_k) -> None:
+        return None
+
+    def _hydrate_destination_prefix_chain_for_path_model(self, *_a, **_k) -> None:
+        return None
+
+    def _schedule_refresh_destination_tree_indicators(self) -> None:
+        return None
+
+    def _restore_expanded_tree_paths(self, *_a, **_k) -> None:
+        return None
+
+    def _restore_selected_tree_path(self, *_a, **_k) -> None:
+        return None
+
+    def _refresh_expand_all_button_for_panel(self, *_a, **_k) -> None:
+        return None
+
+    def _reconcile_destination_semantic_duplicates(self, *_a, **_k) -> None:
+        return None
+
+    def _destination_on_authoritative_tree_bind_committed(self, *_a, **_k) -> None:
+        return None
+
+    def _dev_log_watch_folder_badge_owners(self, *_a, **_k) -> None:
+        return None
+
+    def _current_destination_full_overlay_fingerprint(self) -> str:
+        return "fp"
+
+    def _bump_destination_materialized_overlay_fingerprint(self, **_k) -> None:
+        return None
+
+    def _set_tree_status_message(self, *_a, **_k) -> None:
+        return None
+
+    def _try_skip_redundant_destination_future_model_materialize(self, reason):
+        return MainWindow._try_skip_redundant_destination_future_model_materialize(self, reason)
 
     def _log_restore_phase(self, phase, **data):
         self.logged.append((phase, dict(data)))
@@ -76,42 +167,45 @@ class _MaterializeSkipHost:
     def _cancel_destination_future_async_projection(self, reason=""):
         self.cancel_projection_calls.append(str(reason or ""))
 
-    def _materialize_destination_future_model_body(
-        self, reason, *, allow_defer=True, prefer_chunked_projection=False, narrow_restore_real_snapshot=False
+    def _apply_destination_planning_overlays_body(
+        self,
+        reason,
+        *,
+        allow_defer=True,
+        prefer_chunked_projection=False,
+        narrow_restore_real_snapshot=False,
+        force_authoritative_bind=False,
     ):
-        return MainWindow._materialize_destination_future_model_body(
+        return MainWindow._apply_destination_planning_overlays_body(
             self,
             reason,
             allow_defer=allow_defer,
             prefer_chunked_projection=prefer_chunked_projection,
             narrow_restore_real_snapshot=narrow_restore_real_snapshot,
+            force_authoritative_bind=force_authoritative_bind,
         )
 
 
-def test_materialize_skips_folder_worker_success_while_projection_merge_in_progress():
+def test_materialize_cancels_async_projection_on_folder_worker_success():
+    """Overlay pass cancels in-flight async projection instead of skipping (no future-model merge pipeline)."""
     host = _MaterializeSkipHost()
     host._destination_future_projection_async_state = {"reason": "folder_worker_success"}
-    out = MainWindow._materialize_destination_future_model(host, "folder_worker_success")
+    host.destination_tree_widget = None
+    out = MainWindow._apply_destination_planning_overlays(host, "folder_worker_success", allow_defer=False)
     assert out == 0
-    assert host.cancel_projection_calls == []
-    assert any(
-        p == "destination_future_model_materialize_skipped"
-        and d.get("skip_reason") == "projection_merge_in_progress"
-        for p, d in host.logged
-    )
+    assert host.cancel_projection_calls == ["folder_worker_success"]
+    assert any(p == "destination_planning_overlay_pass" for p, _d in host.logged)
 
 
-def test_materialize_skips_folder_worker_success_while_chunked_bind_in_progress():
+def test_materialize_runs_overlay_pass_while_chunked_bind_state_stale():
+    """Chunked destination bind is removed; a non-None legacy field must not block overlay refresh."""
     host = _MaterializeSkipHost()
-    host._destination_chunked_bind_state = {"phase": "bind"}
-    out = MainWindow._materialize_destination_future_model(host, "folder_worker_success")
+    host._destination_chunked_bind_state = {"phase": "legacy_cleared_elsewhere"}
+    host.destination_tree_widget = None
+    out = MainWindow._apply_destination_planning_overlays(host, "folder_worker_success", allow_defer=False)
     assert out == 0
-    assert host.cancel_projection_calls == []
-    assert any(
-        p == "destination_future_model_materialize_skipped"
-        and d.get("skip_reason") == "chunked_bind_in_progress"
-        for p, d in host.logged
-    )
+    assert host.cancel_projection_calls == ["folder_worker_success"]
+    assert any(p == "destination_planning_overlay_pass" for p, _d in host.logged)
 
 
 def test_schedule_post_login_phase4_skips_when_restore_not_in_progress():
@@ -241,6 +335,15 @@ def test_schedule_post_login_phase4_invokes_safe_invoke_when_pending():
         def _restore_abort_active(self) -> bool:
             return bool(self._restore_abort_mode)
 
+        def _import_ok_trace(self, *args, **kwargs) -> None:
+            return None
+
+        def _import_ok_timing(self, *args, **kwargs) -> None:
+            return None
+
+        def _run_after_import_success_dialog_idle(self, callback_name, fn, *, delay_ms=50) -> None:
+            self._safe_invoke(callback_name, fn)
+
         def _post_login_restore_phase4(self) -> None:
             pass
 
@@ -252,14 +355,12 @@ def test_schedule_post_login_phase4_invokes_safe_invoke_when_pending():
     assert host.calls == ["phase4_destination_overlay_after_destination_ui"]
 
 
-def test_materialize_skips_folder_worker_success_while_bind_sync_active():
+def test_materialize_runs_overlay_pass_while_bind_sync_flag_stale():
+    """Sync future-model bind was removed; legacy bind-sync flag must not block overlay refresh."""
     host = _MaterializeSkipHost()
     host._destination_future_bind_sync_active = True
-    out = MainWindow._materialize_destination_future_model(host, "folder_worker_success")
+    host.destination_tree_widget = None
+    out = MainWindow._apply_destination_planning_overlays(host, "folder_worker_success", allow_defer=False)
     assert out == 0
-    assert host.cancel_projection_calls == []
-    assert any(
-        p == "destination_future_model_materialize_skipped"
-        and d.get("skip_reason") == "bind_sync_in_progress"
-        for p, d in host.logged
-    )
+    assert host.cancel_projection_calls == ["folder_worker_success"]
+    assert any(p == "destination_planning_overlay_pass" for p, _d in host.logged)

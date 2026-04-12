@@ -10,7 +10,6 @@ from PySide6.QtWidgets import QAbstractItemView, QApplication
 
 from ozlink_console.main_window import (
     DestinationPlanningTreeView,
-    DestinationPlanningTreeWidget,
     MainWindow,
     OZLINK_DESTINATION_PLANNING_DRAG_MIME,
     _destination_drop_band_margin_px,
@@ -348,7 +347,6 @@ def test_paste_here_allows_allocated_folder_when_is_folder_key_omitted():
 def test_normalize_paste_destination_row_ref_column_zero():
     _qapp()
     mw = MainWindow.__new__(MainWindow)
-    mw._destination_tree_uses_model_view = lambda: True
     model = QStandardItemModel()
     model.setColumnCount(3)
     row0 = QStandardItem("c0")
@@ -786,7 +784,7 @@ def test_deferred_planning_refresh_skips_destination_for_paste_quick_reason():
     mw._deferred_planning_refresh_reasons = ["planned_item_moved_paste_quick"]
     mw._deferred_source_projection_paths = set()
     materialized = []
-    mw._materialize_destination_future_model = lambda reason: materialized.append(reason)
+    mw._apply_destination_planning_overlays = lambda reason: materialized.append(reason)
     mw._schedule_source_projection_refresh_for_paths = lambda *a, **k: None
     mw.update_progress_summaries = lambda: None
     mw._set_window_title_status = lambda status_text="": None
@@ -806,7 +804,7 @@ def test_deferred_planning_refresh_skips_destination_for_manual_drag_reason():
     mw._deferred_planning_refresh_reasons = ["planned_item_moved_manual_drag"]
     mw._deferred_source_projection_paths = set()
     materialized = []
-    mw._materialize_destination_future_model = lambda reason: materialized.append(reason)
+    mw._apply_destination_planning_overlays = lambda reason: materialized.append(reason)
     mw._schedule_source_projection_refresh_for_paths = lambda *a, **k: None
     mw.update_progress_summaries = lambda: None
     mw._set_window_title_status = lambda status_text="": None
@@ -873,8 +871,7 @@ def test_upsert_allocated_merges_over_real_folder_for_reset_nested_payload():
     assert d.get("id") == "graph-folder-id"
     assert d.get("children_loaded") is True
 
-    nested = mw._build_destination_future_nested(model_nodes, path)
-    pl, _kids = nested
+    pl = model_nodes[path]["data"]
     assert "[Allocated]" in str(pl.get("base_display_label", ""))
     assert pl.get("planned_allocation") is True
 
@@ -1364,10 +1361,6 @@ def _real_folder_payload(label: str, path: str, **extra):
 def test_destination_planning_trees_viewport_native_drops_disabled():
     """Manual planning drag does not use Qt's native drop surface on the destination tree."""
     _qapp()
-    w = DestinationPlanningTreeWidget()
-    assert w.acceptDrops() is False
-    assert w.viewport().acceptDrops() is False
-    assert w.header().acceptDrops() is False
     v = DestinationPlanningTreeView()
     assert v.acceptDrops() is False
     assert v.viewport().acceptDrops() is False

@@ -450,7 +450,11 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         )
 
     def remove_placeholder_children(self, parent: QModelIndex) -> None:
-        parent_node = self._node(parent)
+        if parent.isValid() and parent.column() != 0:
+            parent = parent.siblingAtColumn(0)
+            if not parent.isValid():
+                return
+        parent_node = self._invisible if not parent.isValid() else self._node(parent)
         if parent_node is None or not parent_node._children:
             return
         removed_roles: List[str] = []

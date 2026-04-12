@@ -26,7 +26,6 @@ _CRASH_FILE_HANDLE = None
 def _install_native_crash_capture():
     global _CRASH_FILE_HANDLE
 
-    init_session_logging()
     crash_path = get_crash_log_path()
     _CRASH_FILE_HANDLE = get_crash_binary_log_file()
     banner = f"[native-crash] crash log started path={crash_path}\n"

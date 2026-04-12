@@ -1,0 +1,66 @@
+"""
+SharePoint destination tree — explicit structural authority contract.
+
+When :func:`graph_owns_visible_real_destination_structure` is true (non-local destination browsing
+with a planning model attached):
+
+* **Visible real rows** (folders/files that represent live SharePoint content) must be inserted only
+  by Graph root bind and per-folder load success handlers (e.g. ``replace_all_children`` on the
+  destination planning model from Graph payloads).
+
+* **Overlays** must not insert planning rows under Graph authority: they only
+  :meth:`~PySide6.QtCore.QAbstractItemModel.update_payload_for_index` on existing Graph-backed indices,
+  queue :class:`FolderLoadWorker` when a child path is missing, or (while expanding) show a loading row
+  via ``replace_all_children`` until Graph returns children. Legacy local-disk browsing may still use
+  ``append_child_payloads`` for proposed/allocation scaffolding.
+
+* **Full-library snapshot** (``MainWindow._destination_full_tree_snapshot``) is **background /
+  trust / digest / validation / reconcile assistance** only. It must not become the source of new
+  visible real rows in this mode (structural rows come only from Graph loads; overlays attach via
+  ``MainWindow._apply_destination_planning_overlays``).
+
+* The internal semantic path segment ``Root`` must **never** appear as a visible tree row; only live
+  Graph library children (e.g. ``RootTest2``) are top-level in the pane. SharePoint overlay topology
+  uses ``OVERLAY_LIB_ROOT_SEMANTIC`` in the in-memory future model (not rendered), not a ``Root`` node.
+
+Local disk destination browsing does not use this contract (future model may still carry real nodes
+from filesystem snapshot semantics).
+"""
+
+from __future__ import annotations
+
+from typing import Protocol, runtime_checkable
+
+
+@runtime_checkable
+class _DestinationAuthorityHost(Protocol):
+    def _planning_browse_mode(self, panel_key: str) -> str: ...
+
+
+def sharepoint_planning_tree_active(host: _DestinationAuthorityHost) -> bool:
+    """True when destination is not local *and* a destination planning model is present."""
+    if host._planning_browse_mode("destination") == "local":
+        return False
+    return getattr(host, "destination_planning_model", None) is not None
+
+
+def graph_owns_visible_real_destination_structure(host: _DestinationAuthorityHost) -> bool:
+    """
+    When True, visible real destination structure is owned by Graph loads, not future-model bind.
+
+    This is the single predicate for “SharePoint live graph structural authority” mode.
+    """
+    return sharepoint_planning_tree_active(host)
+
+
+def future_model_bind_may_insert_visible_real_rows(host: _DestinationAuthorityHost) -> bool:
+    """
+    Legacy helper: the old future-model sync bind path has been removed. When Graph owns structure,
+    this is always False so any remaining call sites treat the tree as overlay-only.
+    """
+    return not graph_owns_visible_real_destination_structure(host)
+
+
+def full_tree_snapshot_may_author_visible_real_rows(host: _DestinationAuthorityHost) -> bool:
+    """When False, enumerate snapshot must not be imported into the future model as visible real bind input."""
+    return not graph_owns_visible_real_destination_structure(host)

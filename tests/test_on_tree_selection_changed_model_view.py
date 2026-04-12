@@ -39,8 +39,6 @@ def test_on_tree_selection_changed_destination_sharepoint_qtreeview_uses_current
     mw._planning_browse_mode = lambda _k: "sharepoint"
     mw.destination_tree_widget = tree
     mw.source_tree_widget = MagicMock()
-    mw._destination_tree_uses_model_view = lambda: True
-    mw._source_tree_uses_model_view = lambda: False
     mw._full_trace_enabled = lambda: False
     ctx = {
         "panel_key": "destination",
@@ -97,8 +95,6 @@ def test_on_tree_selection_changed_destination_nonzero_column_uses_userrole_via_
     mw._planning_browse_mode = lambda _k: "sharepoint"
     mw.destination_tree_widget = tree
     mw.source_tree_widget = MagicMock()
-    mw._destination_tree_uses_model_view = lambda: True
-    mw._source_tree_uses_model_view = lambda: False
     mw._full_trace_enabled = lambda: False
     captured = {}
     ctx = {
@@ -156,8 +152,6 @@ def test_on_tree_selection_changed_source_nonzero_column_uses_userrole_via_helpe
     mw._planning_browse_mode = lambda _k: "sharepoint"
     mw.source_tree_widget = tree
     mw.destination_tree_widget = MagicMock()
-    mw._source_tree_uses_model_view = lambda: True
-    mw._destination_tree_uses_model_view = lambda: False
     mw._full_trace_enabled = lambda: False
     captured = {}
     ctx = {
