@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -259,6 +260,7 @@ class GraphResolveIdsService:
             FolderName=str(pf.folder_name or ""),
             DestinationPath=str(pf.destination_path or ""),
             DestinationId=str(pf.proposed_id or ""),
+            StableKey=str(pf.proposed_id or mapping_id or "").strip() or str(uuid.uuid4()),
             DestinationDriveId=current_drive,
             DestinationParentItemId=current_parent,
             ParentPath=str(pf.parent_path or ""),

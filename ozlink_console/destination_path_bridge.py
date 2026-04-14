@@ -2,10 +2,9 @@
 Destination planning paths for SharePoint / Graph: **graph-relative** canonical form.
 
 Canonical keys and lookups use the same path shape as visible Graph-backed rows, for example
-``Root3\\Finance\\Payroll`` — **not** a leading internal ``Root\\`` segment.
-
-Legacy persisted values may still start with ``Root\\`` (old internal namespace). Functions here
-strip that prefix when parsing; they never add it when building canonical paths.
+``Root3\\Finance\\Payroll``. Only the legacy **internal** namespace segment named exactly ``Root``
+(see :data:`LEGACY_INTERNAL_ROOT_SEGMENT`) is stripped — never real library folders such as
+``Root3``, ``Root2``, or ``FTBMRoot``.
 
 The sentinel :data:`OVERLAY_LIB_ROOT_SEMANTIC` in ``destination_overlay_identity`` is the only
 internal topology key for overlay wiring (not a visible folder and not the string ``Root``).

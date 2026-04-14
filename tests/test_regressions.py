@@ -1612,7 +1612,9 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._deferred_planning_refresh_reasons = ["move_folder"]
         window._deferred_source_projection_paths = {"FTBMRoot\\Contracts"}
         window._set_window_title_status = lambda status_text="": setattr(window, "_title_status", status_text)
-        window._apply_destination_planning_overlays = lambda reason: setattr(window, "_destination_materialize_reason", reason)
+        window._apply_destination_planning_overlays = lambda reason, **kwargs: setattr(
+            window, "_destination_materialize_reason", reason
+        )
         window._schedule_source_projection_refresh_for_paths = (
             lambda paths, reason, delay_ms=250, trigger_path="": setattr(
                 window,
@@ -1641,7 +1643,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._deferred_planning_refresh_reasons = ["planning_change_lightweight"]
         window._deferred_source_projection_paths = set()
         materialized = []
-        window._apply_destination_planning_overlays = lambda reason: materialized.append(reason)
+        window._apply_destination_planning_overlays = lambda reason, **kwargs: materialized.append(reason)
         window._schedule_source_projection_refresh_for_paths = lambda *a, **k: None
         window.update_progress_summaries = lambda: None
         window._set_window_title_status = lambda status_text="": None
@@ -1661,7 +1663,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._deferred_planning_refresh_reasons = ["planning_change_lightweight", "planned_item_moved"]
         window._deferred_source_projection_paths = set()
         materialized = []
-        window._apply_destination_planning_overlays = lambda reason: materialized.append(reason)
+        window._apply_destination_planning_overlays = lambda reason, **kwargs: materialized.append(reason)
         window._schedule_source_projection_refresh_for_paths = lambda *a, **k: None
         window.update_progress_summaries = lambda: None
         window._set_window_title_status = lambda status_text="": None
@@ -1688,7 +1690,9 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._cache_refresh_restore_active = True
         window._cache_refresh_skip_expanded_restore_panels = set()
         window._restore_workspace_tree_state = lambda ui_state: setattr(window, "_restored_ui_state", ui_state)
-        window._apply_destination_planning_overlays = lambda reason: setattr(window, "_cache_refresh_materialize_reason", reason)
+        window._apply_destination_planning_overlays = lambda reason, **kwargs: setattr(
+            window, "_cache_refresh_materialize_reason", reason
+        )
         window._start_destination_restore_materialization = lambda: setattr(window, "_destination_materialization_started", True)
         window._refresh_source_projection = lambda reason: setattr(window, "_source_projection_reason", reason)
         window._schedule_progress_summary_refresh = lambda delay_ms=180: setattr(window, "_progress_refresh_scheduled", delay_ms)

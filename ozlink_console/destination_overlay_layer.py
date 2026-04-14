@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-OverlayKind = Literal["proposed", "allocation", "projection", "badge"]
+OverlayKind = Literal["proposed", "allocation", "projection", "badge", "planned_workspace"]
 
 
 def overlay_row_marker(kind: OverlayKind) -> dict[str, Any]:

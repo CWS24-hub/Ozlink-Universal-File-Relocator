@@ -30,8 +30,22 @@ def _move_folder(idx: int, source_path: str, *, request_id: str = "") -> dict:
 
 
 def test_planned_move_is_file_allocation():
-    assert MainWindow._planned_move_is_file_allocation(_move_file(0, "a"))
-    assert not MainWindow._planned_move_is_file_allocation(_move_folder(0, "a"))
+    mw = _mw()
+    mw._move_target_name = MainWindow._move_target_name.__get__(mw, MainWindow)
+    assert mw._planned_move_is_file_allocation(_move_file(0, "a"))
+    assert not mw._planned_move_is_file_allocation(_move_folder(0, "a"))
+
+
+def test_planned_move_is_file_allocation_heuristic_docx_without_is_folder():
+    mw = _mw()
+    mw._move_target_name = MainWindow._move_target_name.__get__(mw, MainWindow)
+    m = {
+        "source_path": r"Root\HR\Contractor Resumes\Contractor bank.docx",
+        "destination_path": r"Hub\HR\Contractor bank.docx",
+        "target_name": "Contractor bank.docx",
+        "source": {"name": "Contractor bank.docx"},
+    }
+    assert mw._planned_move_is_file_allocation(m)
 
 
 def test_file_row_selected_yields_single_seed():

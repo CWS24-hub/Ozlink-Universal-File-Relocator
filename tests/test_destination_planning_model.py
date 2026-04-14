@@ -156,3 +156,35 @@ def test_destination_path_index_multi_candidate():
     )
     ixs2 = model.find_indices_for_canonical_destination_path(r"Root\a.txt")
     assert len(ixs2) == 1
+
+
+def test_find_indices_resolves_casefold_via_side_map_not_full_bucket_scan():
+    def key_fn(pl):
+        return str(pl.get("item_path", "") or "").strip()
+
+    model = DestinationPlanningTreeModel(destination_index_key_fn=key_fn)
+    model.reset_root_payloads(
+        [
+            {
+                "base_display_label": "Folder: Lib",
+                "name": "Lib",
+                "is_folder": True,
+                "item_path": r"Site\Lib",
+            }
+        ]
+    )
+    lib_ix = model.index(0, 0, QModelIndex())
+    model.append_child_payloads(
+        lib_ix,
+        [
+            {
+                "base_display_label": "File: Doc",
+                "name": "Contractor bank.docx",
+                "is_folder": False,
+                "item_path": r"Site\Lib\HR\Contractor bank.docx",
+            }
+        ],
+    )
+    mixed = model.find_indices_for_canonical_destination_path(r"site\lib\hr\contractor bank.docx")
+    assert len(mixed) == 1
+    assert (mixed[0].data(Qt.UserRole) or {}).get("name") == "Contractor bank.docx"

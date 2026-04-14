@@ -38,10 +38,11 @@ def aggregate_moves_signature(moves: list | None) -> str:
 
 
 def proposed_folders_signature(proposed_folders: list | None) -> str:
-    parts: list[tuple[str, str, str, str]] = []
+    parts: list[tuple[str, str, str, str, str]] = []
     for pf in proposed_folders or []:
         parts.append(
             (
+                str(getattr(pf, "StableKey", "") or ""),
                 str(getattr(pf, "DestinationPath", "") or ""),
                 str(getattr(pf, "FolderName", "") or ""),
                 str(getattr(pf, "ParentPath", "") or ""),

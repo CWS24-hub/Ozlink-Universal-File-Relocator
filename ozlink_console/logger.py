@@ -2,6 +2,15 @@ from __future__ import annotations
 
 """JSON line logs under ``logs_root()/<session>/``.
 
+Session folder name pattern: ``%Y-%m-%d_%H-%M-%S`` (see :func:`init_session_logging`).
+``logs_root()`` is ``LocalAppData/OzlinkIT/OzlinkITSharePointRelocationConsole/Logs`` (see
+:func:`ozlink_console.paths.logs_root`). The file ``CURRENT_SESSION.txt`` in that folder
+points at the latest process's session directory (overwritten per process).
+
+``destination_materialize_profile`` (message key from :func:`log_info`) routes to
+**destination_preview.log**, not ``app.log``, because :func:`resolve_log_stream` matches the
+substring ``destination_materialize`` (``OZLINK_DEST_MATERIALIZE_PROFILE=1`` required for emission).
+
 SharePoint Graph sync uses structured ``message`` keys such as ``graph_resolve_*`` and
 ``graph_refresh_*`` (fields: ``phase``, ``reason``, ``move_index``, ``candidates_tried``, etc.).
 Set environment variable ``OZLINK_FULL_TRACE=1`` for per-candidate path-miss traces during
@@ -12,6 +21,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
@@ -173,6 +183,27 @@ def init_session_logging() -> Path:
         _SESSION_DIR.mkdir(parents=True, exist_ok=True)
         _CRASH_SINK = CrashLogSink(_SESSION_DIR / "crash.log")
         try:
+            _ppid = None
+            if hasattr(os, "getppid"):
+                try:
+                    _ppid = int(os.getppid())
+                except (TypeError, ValueError, OSError):
+                    _ppid = None
+            launch_meta = {
+                "session_stamp": stamp,
+                "pid": os.getpid(),
+                "parent_pid": _ppid,
+                "executable": sys.executable,
+                "argv": list(sys.argv),
+                "cwd": os.getcwd(),
+            }
+            (_SESSION_DIR / "session_launch.json").write_text(
+                json.dumps(launch_meta, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        try:
             ptr = logs_root() / "CURRENT_SESSION.txt"
             started = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             ptr.write_text(
@@ -242,6 +273,10 @@ def resolve_log_stream(record: logging.LogRecord) -> str:
         return _STREAM_DEST_RECONCILE
     if ml.startswith("destination_reconcile_"):
         return _STREAM_DEST_RECONCILE
+    if ml.startswith("destination_snapshot_"):
+        return _STREAM_DEST_RECONCILE
+    if ml.startswith("destination_graph_child_load_"):
+        return _STREAM_DEST_PREVIEW
 
     # Standalone finalize-phase diagnostics (timer-sliced merge tail).
     if "destination_finalize_expand_progress" in ml or "destination_alloc_descendants_tick" in ml:
@@ -271,6 +306,25 @@ def resolve_log_stream(record: logging.LogRecord) -> str:
     if "destination_planning" in ml or "planning_tree" in ml:
         return _STREAM_DEST_PREVIEW
     if "destination_projection" in ml and "reconcile" not in ml:
+        return _STREAM_DEST_PREVIEW
+
+    if ml.startswith("destination_forensic_"):
+        return _STREAM_DEST_PREVIEW
+
+    if ml.startswith("destination_planned_chain_bind_"):
+        return _STREAM_DEST_PREVIEW
+    if (
+        ml.startswith("destination_planned_rows_")
+        or ml.startswith("destination_reconcile_planned_row_after_graph_replace")
+        or ml.startswith("destination_reconcile_planned_rows_")
+    ):
+        return _STREAM_DEST_PREVIEW
+
+    if ml.startswith("destination_authority_gate_eval"):
+        return _STREAM_DEST_PREVIEW
+    if ml.startswith("destination_authority_shell_ignored_after_authoritative_bind"):
+        return _STREAM_DEST_PREVIEW
+    if ml.startswith("destination_authority_shell_force_cleared_after_authoritative_bind"):
         return _STREAM_DEST_PREVIEW
 
     if "source_replace_children" in ml or "find_visible_source_item" in ml:

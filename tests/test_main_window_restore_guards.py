@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 from ozlink_console.main_window import MainWindow
 
 
@@ -164,8 +166,29 @@ class _MaterializeSkipHost:
     def _log_restore_phase(self, phase, **data):
         self.logged.append((phase, dict(data)))
 
+    def _log_restore_exception(self, *_a, **_k) -> None:
+        """Body uses this in ``except`` paths; real window logs — stub stays quiet."""
+
+    def _destination_audit_overlay_placement_after_pass(self, *_a) -> None:
+        return None
+
+    def _destination_materialize_profile_start_cycle(self) -> None:
+        return None
+
+    def _destination_materialize_profile_finish_cycle(self, _reason: str) -> None:
+        return None
+
+    def _destination_materialize_profile_span(self, _phase: str):
+        return nullcontext()
+
+    def _destination_reconcile_all_planned_parents_after_graph_update(self) -> None:
+        return None
+
     def _cancel_destination_future_async_projection(self, reason=""):
         self.cancel_projection_calls.append(str(reason or ""))
+
+    def _on_destination_state_mutation(self, *_a, **_k) -> None:
+        """Real :class:`MainWindow` always has this; stubs must not break overlay batch ``finally``."""
 
     def _schedule_proactive_graph_parent_chains_for_unresolved_overlays(self, *, reason: str) -> int:
         return 0

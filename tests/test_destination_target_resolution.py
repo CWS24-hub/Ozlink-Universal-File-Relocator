@@ -813,6 +813,51 @@ def test_deferred_planning_refresh_skips_destination_for_manual_drag_reason():
     assert not materialized
 
 
+def test_deferred_planning_refresh_graph_ids_resolve_overlays_without_idle_defer():
+    """Graph ID enrichment queues folder loads; deferring the full overlay pass lets replace_all_children drop planned rows."""
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    stub = MagicMock()
+    stub.viewport.return_value.update = lambda: None
+    mw.destination_tree_widget = stub
+    mw.source_tree_widget = None
+    mw._deferred_planning_refresh_pending = True
+    mw._deferred_planning_refresh_reasons = ["graph_ids_resolved_from_sharepoint_paths"]
+    mw._deferred_source_projection_paths = set()
+    mw.unresolved_proposed_by_parent_path = {"hub": {"one": object()}}
+    mw.unresolved_allocations_by_parent_path = {}
+    mw._destination_require_deferred_full_materialize_once = False
+    calls: list[tuple[str, bool]] = []
+
+    def _cap(reason, *, allow_defer=True, **kwargs):
+        calls.append((str(reason), bool(allow_defer)))
+        return 0
+
+    mw._apply_destination_planning_overlays = _cap
+    mw._schedule_source_projection_refresh_for_paths = lambda *a, **k: None
+    mw.update_progress_summaries = lambda: None
+    mw._set_window_title_status = lambda status_text="": None
+    mw._log_restore_exception = lambda *a, **k: None
+    mw._destination_steady_state_full_materialize_redundant = lambda: False
+    mw._destination_lifecycle_trace_TEMP = lambda *a, **k: None
+    MainWindow._run_deferred_planning_refresh(mw)
+    assert len(calls) == 1
+    assert calls[0][0] == "deferred_graph_ids_resolved_from_sharepoint_paths"
+    assert calls[0][1] is False
+
+
+def test_deferred_graph_ids_replay_uses_worker_slice_budget_reason():
+    """Proposed/allocation replay must not use the tight 24ms slice after graph-ID full materialize."""
+    _qapp()
+    mw = MainWindow.__new__(MainWindow)
+    assert mw._destination_restore_replay_reason_uses_worker_budget("folder_load")
+    assert mw._destination_restore_replay_reason_uses_worker_budget("folder_worker_success")
+    assert mw._destination_restore_replay_reason_uses_worker_budget(
+        "deferred_graph_ids_resolved_from_sharepoint_paths"
+    )
+    assert not mw._destination_restore_replay_reason_uses_worker_budget("idle_tick")
+
+
 def test_destination_model_priority_allocated_wins_over_real():
     _qapp()
     mw = MainWindow.__new__(MainWindow)

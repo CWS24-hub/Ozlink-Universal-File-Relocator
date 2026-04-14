@@ -61,6 +61,8 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         self._invisible._children = []
         self._destination_index_key_fn = destination_index_key_fn
         self._path_to_nodes: Dict[str, List[_Node]] = {}
+        # casefold(primary_key) -> exact dict key for O(1) lookup when canonical strings differ only by case.
+        self._path_cf_to_key: Dict[str, str] = {}
         self._structure_generation: int = 0
         self._invalid_internal_pointer_logged_gen: int = -1
 
@@ -281,6 +283,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             pass
         if not lst:
             del self._path_to_nodes[k]
+            self._path_cf_to_key.pop(k.casefold(), None)
 
     def _bucket_add_node(self, node: _Node) -> None:
         if self._destination_index_key_fn is None or node.is_placeholder():
@@ -291,6 +294,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         lst = self._path_to_nodes.setdefault(k, [])
         if node not in lst:
             lst.append(node)
+        self._path_cf_to_key[k.casefold()] = k
 
     def _unregister_subtree_paths(self, node: _Node) -> None:
         if self._destination_index_key_fn is None:
@@ -314,6 +318,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
 
     def _rebuild_path_index(self) -> None:
         self._path_to_nodes.clear()
+        self._path_cf_to_key.clear()
         if self._destination_index_key_fn is None:
             return
         for c in self._invisible._children or []:
@@ -336,12 +341,17 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             return []
         nodes = self._path_to_nodes.get(canonical_key) or []
         if not nodes:
+            pk = self._path_cf_to_key.get(canonical_key.casefold())
+            if pk:
+                nodes = self._path_to_nodes.get(pk) or []
+        if not nodes:
             cf = canonical_key.casefold()
             n_buckets = len(self._path_to_nodes)
             if n_buckets and n_buckets <= 4096:
                 for k, lst in self._path_to_nodes.items():
                     if k.casefold() == cf:
                         nodes = lst
+                        self._path_cf_to_key[cf] = k
                         break
         out: List[QModelIndex] = []
         for n in nodes:
@@ -354,6 +364,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         self.beginResetModel()
         self._invisible._children = []
         self._path_to_nodes.clear()
+        self._path_cf_to_key.clear()
         self.endResetModel()
         self._notify_structure_changed()
 
@@ -510,7 +521,21 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             return
         old_snapshot = dict(node.payload)
         self._bucket_remove_node(node, old_snapshot)
+        old_children = node._children
+        old_child_count = len(old_children) if old_children else 0
         mutator(node.payload)
+        pl = node.payload
+        stripped_children = False
+        if isinstance(pl, dict) and not pl.get("is_folder", True):
+            if old_child_count > 0:
+                self.beginRemoveRows(index, 0, old_child_count - 1)
+                for c in list(old_children or []):
+                    self._unregister_subtree_paths(c)
+                node._children = []
+                self.endRemoveRows()
+                stripped_children = True
+            elif old_children is None:
+                node._children = []
         self._bucket_add_node(node)
         parent = index.parent()
         row = index.row()
@@ -521,6 +546,8 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             bottom_right,
             [Qt.DisplayRole, Qt.DecorationRole, Qt.UserRole, Qt.ForegroundRole, Qt.BackgroundRole, Qt.ToolTipRole],
         )
+        if stripped_children:
+            self._notify_structure_changed()
 
     def emit_payload_changed(self, index: QModelIndex) -> None:
         if not index.isValid():

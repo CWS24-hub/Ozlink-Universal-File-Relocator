@@ -8,11 +8,16 @@ with a planning model attached):
   by Graph root bind and per-folder load success handlers (e.g. ``replace_all_children`` on the
   destination planning model from Graph payloads).
 
-* **Overlays** must not insert planning rows under Graph authority: they only
-  :meth:`~PySide6.QtCore.QAbstractItemModel.update_payload_for_index` on existing Graph-backed indices,
-  queue :class:`FolderLoadWorker` when a child path is missing, or (while expanding) show a loading row
-  via ``replace_all_children`` until Graph returns children. Legacy local-disk browsing may still use
-  ``append_child_payloads`` for proposed/allocation scaffolding.
+* **Overlays** attach to existing Graph-backed indices via
+  :meth:`~PySide6.QtCore.QAbstractItemModel.update_payload_for_index`, queue :class:`FolderLoadWorker`
+  when a child path is missing, and (while expanding) show a loading row via ``replace_all_children``
+  until Graph returns children.
+
+* **Planned workspace rows** (``row_kind`` ``planned_*``, ``verification_state`` ``planned_only``) may be
+  appended under live or planned parents so projections are visible before SharePoint contains those
+  folders. They are **not** live Graph structure (no driveItem ``id``); reconciliation merges them with
+  real children after Graph loads. Legacy local-disk browsing may still use ``append_child_payloads`` for
+  other scaffolding.
 
 * **Full-library snapshot** (``MainWindow._destination_full_tree_snapshot``) is **background /
   trust / digest / validation / reconcile assistance** only. It must not become the source of new

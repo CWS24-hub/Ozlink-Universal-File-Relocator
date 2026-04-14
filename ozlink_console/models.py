@@ -52,6 +52,8 @@ class ProposedFolder:
     DestinationDriveId: str = ""
     DestinationParentItemId: str = ""
     ParentPath: str = ""
+    """Stable draft-scoped id for correlating planned workspace rows with this proposal (persisted)."""
+    StableKey: str = ""
     IsSelectable: bool = True
     IsProposed: bool = True
     Status: str = "Proposed"
@@ -67,6 +69,7 @@ class ProposedFolder:
             DestinationDriveId=str(data.get("DestinationDriveId", "")),
             DestinationParentItemId=str(data.get("DestinationParentItemId", "")),
             ParentPath=str(data.get("ParentPath", "")),
+            StableKey=str(data.get("StableKey", data.get("stable_key", ""))),
             IsSelectable=bool(data.get("IsSelectable", True)),
             IsProposed=bool(data.get("IsProposed", True)),
             Status=str(data.get("Status", "Proposed")),

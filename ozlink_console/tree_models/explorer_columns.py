@@ -58,6 +58,20 @@ def explorer_icon_for_node(node_data: Dict[str, Any]) -> QIcon:
     return file_ic
 
 
+def planned_leaf_filename_implies_document_file(name: str) -> bool:
+    """True when the leaf name has a known document/media extension (planned bind fallback).
+
+    Used when ``move['source'].get('is_folder')`` is absent so folder moves without extensions
+    stay folder-shaped, while ``Contractor bank.docx``-style leaves still bind as ``planned_file``.
+
+    ``.zip`` is excluded: Explorer labels it as a compressed folder and real folder names can end in ``.zip``.
+    """
+    ext = Path(str(name or "").strip()).suffix.lower()
+    if not ext or ext == ".zip":
+        return False
+    return ext in _EXT_LABELS
+
+
 def _type_from_filename(name: str) -> str:
     ext = Path(name or "").suffix.lower()
     if ext in _EXT_LABELS:
@@ -88,12 +102,32 @@ def explorer_type_label(node_data: Dict[str, Any]) -> str:
         return _type_from_filename(str(node_data.get("name", "")))
     if node_data.get("proposed") or origin == "proposed":
         return "Proposed folder"
+
+    vs_planned = str(node_data.get("verification_state", "")).strip() == "planned_only"
+    rk = str(node_data.get("row_kind", "")).strip().lower()
+    if (
+        vs_planned
+        and rk in {"planned_folder", "planned_file"}
+        and not node_data.get("planned_allocation")
+        and origin != "plannedallocation"
+    ):
+        if rk == "planned_file":
+            return "Planned file"
+        if rk == "planned_folder":
+            return "Planned folder"
+
     if node_data.get("planned_allocation") or origin == "plannedallocation":
+        if node_data.get("is_folder"):
+            return "Allocated folder"
+        return "Allocated file"
+    if origin == "projecteddestination":
         if node_data.get("is_folder"):
             return "File folder"
         return _type_from_filename(str(node_data.get("name", "")))
-    if origin == "projecteddestination":
-        return "File folder"
+    if origin == "projectedallocationdescendant":
+        if node_data.get("is_folder"):
+            return "File folder"
+        return _type_from_filename(str(node_data.get("name", "")))
     if node_data.get("is_folder"):
         return "File folder"
     raw = node_data.get("raw") if isinstance(node_data.get("raw"), dict) else {}

@@ -156,7 +156,7 @@ def test_ensure_sharepoint_graph_walk_reanchors_under_visible_hub(monkeypatch):
     mw.normalize_memory_path = MainWindow.normalize_memory_path.__get__(mw, MainWindow)
     seen: list[str] = []
 
-    def _fc(_parent_ix, _path):
+    def _fc(_parent_ix, _path, **_kw):
         return None
 
     def _fv(path):

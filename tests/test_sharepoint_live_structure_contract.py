@@ -192,6 +192,12 @@ class _SharePointAuthoritativeMaterializeHost:
     def _log_restore_phase(self, phase, **data):
         self.logged.append((phase, dict(data)))
 
+    def _destination_audit_overlay_placement_after_pass(self, _reason: str) -> None:
+        return None
+
+    def _log_restore_exception(self, _phase, _exc) -> None:
+        return None
+
 
 def test_sharepoint_materialize_bypasses_full_tree_gate_when_graph_authority_active():
     """Graph-owned SharePoint structure: full-tree readiness must not block overlay materialize."""
@@ -209,6 +215,28 @@ def test_sharepoint_materialize_bypasses_full_tree_gate_when_graph_authority_act
         for p, d in host.logged
     )
     assert any(p == "destination_planning_overlay_pass" for p, _d in host.logged)
+
+
+def test_ensure_full_tree_not_blocked_by_memory_restore_when_graph_authority_active():
+    """Same as shell-wait bypass: Graph-owned destination tree must start full-tree walk during restore."""
+    mw = MainWindow.__new__(MainWindow)
+    mw._log_restore_phase = lambda *a, **k: None  # type: ignore[method-assign]
+    mw.pending_root_drive_ids = {"source": "", "destination": "d-graph"}
+    mw._destination_non_authoritative_shell_active = False
+    mw._memory_restore_in_progress = True
+    mw._destination_expand_burst_ctx = None
+    mw._destination_future_bind_sync_active = False
+    mw._destination_full_tree_worker = None
+    mw._destination_full_tree_snapshot = []
+    mw._destination_full_tree_completed_drive_id = ""
+    mw._planning_browse_mode = lambda k: "sharepoint" if k == "destination" else "local"
+    mw.destination_planning_model = object()
+    mw._destination_tree_shows_authority_pending_shell = lambda: False  # type: ignore[method-assign]
+    mw._destination_full_tree_ready = lambda: False  # type: ignore[method-assign]
+    started: list[str] = []
+    mw.start_destination_full_tree_worker = lambda d: started.append(str(d))  # type: ignore[method-assign]
+    MainWindow._ensure_sharepoint_destination_full_tree_worker_scheduled(mw, "d-graph")
+    assert started == ["d-graph"]
 
 
 def test_ensure_full_tree_not_blocked_by_memory_restore_when_authority_shell_active():

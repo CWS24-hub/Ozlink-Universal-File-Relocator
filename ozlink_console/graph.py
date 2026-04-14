@@ -1317,6 +1317,55 @@ class GraphClient:
         )
         return payload
 
+    def patch_drive_item(self, drive_id: str, item_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """PATCH a driveItem (e.g. move via ``parentReference``). Returns parsed JSON body."""
+        drive_id = str(drive_id or "").strip()
+        item_id = str(item_id or "").strip()
+        if not drive_id or not item_id:
+            raise ValueError("patch_drive_item requires drive_id and item_id.")
+        enc_drive = quote(drive_id, safe="")
+        enc_item = quote(item_id, safe="")
+        url = f"{AUTH_CONFIG['graph_base']}/drives/{enc_drive}/items/{enc_item}"
+        headers = dict(self.get_headers())
+        headers["Content-Type"] = "application/json"
+        response = requests.patch(url, headers=headers, json=dict(body or {}), timeout=120)
+        if response.status_code == 401 and self._try_acquire_token_silent(force_refresh=True):
+            headers = dict(self.get_headers())
+            headers["Content-Type"] = "application/json"
+            response = requests.patch(url, headers=headers, json=dict(body or {}), timeout=120)
+        if response.status_code == 429:
+            time.sleep(float(response.headers.get("Retry-After", "10")))
+            headers = dict(self.get_headers())
+            headers["Content-Type"] = "application/json"
+            response = requests.patch(url, headers=headers, json=dict(body or {}), timeout=120)
+        response.raise_for_status()
+        try:
+            if response.content:
+                return response.json()
+        except Exception:
+            pass
+        return {}
+
+    def move_drive_item_to_parent(
+        self,
+        drive_id: str,
+        item_id: str,
+        new_parent_drive_id: str,
+        new_parent_item_id: str,
+        *,
+        name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Move a driveItem to another folder on the same or given drive (Graph parentReference update)."""
+        body: Dict[str, Any] = {
+            "parentReference": {
+                "id": str(new_parent_item_id or "").strip(),
+                "driveId": str(new_parent_drive_id or "").strip(),
+            }
+        }
+        if name is not None and str(name).strip():
+            body["name"] = str(name).strip()
+        return self.patch_drive_item(drive_id, item_id, body)
+
     def _list_drive_children_uncached_paged_for_count(
         self,
         drive_id: str,

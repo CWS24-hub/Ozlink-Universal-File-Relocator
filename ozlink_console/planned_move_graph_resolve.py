@@ -6,8 +6,10 @@ import json
 import re
 from typing import Any, Callable, MutableSet, Optional
 
+from ozlink_console.destination_path_bridge import remap_under_visible_library_anchor, strip_legacy_internal_root_prefix
 from ozlink_console.graph import GraphClient
 from ozlink_console.logger import log_info, log_trace, log_warn
+from ozlink_console.paths import normalize_manifest_path
 
 
 def graph_dest_parent_negative_cache_key(
@@ -58,17 +60,32 @@ def _strip_leading_site_library_parts(parts: list[str], site_l: str, lib_l: str)
     return out
 
 
-def _strip_leading_planning_root_alias(parts: list[str]) -> list[str]:
-    """
-    Remove leading ``Root`` segment from planning / tree display paths.
+def _apply_visible_library_anchor_to_slash_relative(rel_slash: str, anchor_backslash: str) -> str:
+    """If ``anchor_backslash`` is the live library hub (e.g. ``Root3``), prepend when path omits it."""
+    rel_slash = str(rel_slash or "").replace("\\", "/").strip("/")
+    anch = str(anchor_backslash or "").strip()
+    if not anch or not rel_slash:
+        return rel_slash
+    rb = normalize_manifest_path(rel_slash.replace("/", "\\"))
+    ab = normalize_manifest_path(anch.replace("/", "\\"))
+    rb = strip_legacy_internal_root_prefix(rb)
+    ab = strip_legacy_internal_root_prefix(ab)
+    if not ab:
+        return rel_slash
+    out = remap_under_visible_library_anchor(rb, ab)
+    return out.replace("\\", "/").strip("/")
 
-    Graph drive-relative paths are from the document library root; SharePoint has no folder named
-    ``Root`` here. Do **not** strip ``FTBMRoot`` — that is often a real library folder name.
-    """
-    out = list(parts)
-    while out and out[0].strip().lower() == "root":
-        out = out[1:]
-    return out
+
+def _join_segments_strip_legacy_internal_root(segments: list[str]) -> list[str]:
+    """Join path segments and remove only the legacy internal ``Root\\`` prefix (not real ``Root3``, etc.)."""
+    parts = [s.strip() for s in segments if str(s or "").strip()]
+    if not parts:
+        return []
+    joined = normalize_manifest_path("\\".join(parts))
+    stripped = strip_legacy_internal_root_prefix(joined)
+    if not stripped:
+        return []
+    return [p for p in stripped.split("\\") if p]
 
 
 def allocation_path_to_drive_relative(
@@ -76,6 +93,7 @@ def allocation_path_to_drive_relative(
     *,
     library_name: str = "",
     site_name: str = "",
+    visible_library_anchor: str = "",
 ) -> str:
     """
     Convert stored allocation / tree paths to a path relative to the document library root
@@ -84,8 +102,11 @@ def allocation_path_to_drive_relative(
     Handles:
     - ``LibraryName\\FTBMRoot\\...`` (leading library segment)
     - ``Site / Library / FTBMRoot/...`` display paths
-    - Already-relative ``Root\\HR\\...`` or ``FTBMRoot\\...``
+    - Legacy internal ``Root\\`` prefix only (stripped via :func:`strip_legacy_internal_root_prefix`)
     - Repeated site/library prefixes from bad imports
+
+    When ``visible_library_anchor`` is set (live Graph skeleton hub, e.g. ``Root3``), paths that omit
+    that hub are remapped under it so Graph lookups and mkdir chains match the visible tree.
     """
     text = str(path or "").strip()
     if not text:
@@ -97,14 +118,16 @@ def allocation_path_to_drive_relative(
     if " / " in text:
         parts = [p.strip() for p in text.split(" / ") if p.strip()]
         parts = _strip_leading_site_library_parts(parts, site_l, lib_l)
-        parts = _strip_leading_planning_root_alias(parts)
-        return "/".join(parts).replace("\\", "/").strip("/")
+        segs = _join_segments_strip_legacy_internal_root(parts)
+        rel = "/".join(segs).strip("/")
+        return _apply_visible_library_anchor_to_slash_relative(rel, visible_library_anchor)
 
     segs = _path_segments(text)
     segs = [s.strip() for s in segs if s.strip()]
     segs = _strip_leading_site_library_parts(segs, site_l, lib_l)
-    segs = _strip_leading_planning_root_alias(segs)
-    return "/".join(segs).strip("/")
+    segs = _join_segments_strip_legacy_internal_root(segs)
+    rel = "/".join(segs).strip("/")
+    return _apply_visible_library_anchor_to_slash_relative(rel, visible_library_anchor)
 
 
 def _parent_and_leaf(relative_path: str) -> tuple[str, str]:
@@ -124,12 +147,17 @@ def drive_relative_path_candidates(
     library_name: str = "",
     site_name: str = "",
     max_candidates: int = 16,
+    visible_library_anchor: str = "",
+    restrict_to_live_graph_skeleton: bool = False,
 ) -> list[str]:
     """
     Build ordered unique relative paths to try with ``GET .../root:/path`` when imports use odd shapes.
 
-    First candidate is always ``allocation_path_to_drive_relative``; additional variants cover
-    slash-only splits, embedded ``library/site`` in the middle, and shallow chomps of unknown prefixes.
+    First candidate is always ``allocation_path_to_drive_relative`` (with optional anchor).
+
+    When ``restrict_to_live_graph_skeleton`` is True (SharePoint destination UI + known visible hub),
+    only that primary anchored candidate is returned so Graph never sees de-anchored alternates
+    (avoids mkdir / resolve at library root for paths that belong under the live hub).
     """
     candidates: list[str] = []
     seen: set[str] = set()
@@ -144,37 +172,55 @@ def drive_relative_path_candidates(
         candidates.append(rel)
 
     text = str(path or "").strip()
-    add(allocation_path_to_drive_relative(text, library_name=library_name, site_name=site_name))
+    add(
+        allocation_path_to_drive_relative(
+            text,
+            library_name=library_name,
+            site_name=site_name,
+            visible_library_anchor=visible_library_anchor,
+        )
+    )
 
     if not text:
         return candidates[:max_candidates]
 
+    if restrict_to_live_graph_skeleton:
+        return candidates[:max_candidates]
+
     flex = [p.strip() for p in re.split(r"[/\\]+", text) if p.strip()]
     flex = _strip_leading_site_library_parts(flex, site_l, lib_l)
-    flex = _strip_leading_planning_root_alias(flex)
+    flex = _join_segments_strip_legacy_internal_root(flex)
     if flex:
-        add("/".join(flex))
+        add(_apply_visible_library_anchor_to_slash_relative("/".join(flex), visible_library_anchor))
 
     if " / " in text:
         parts = [p.strip() for p in text.split(" / ") if p.strip()]
         for i, p in enumerate(parts):
             if lib_l and p.strip().lower() == lib_l and i + 1 < len(parts):
-                add("/".join(parts[i + 1 :]).replace("\\", "/").strip("/"))
+                add(
+                    _apply_visible_library_anchor_to_slash_relative(
+                        "/".join(parts[i + 1 :]).replace("\\", "/").strip("/"),
+                        visible_library_anchor,
+                    )
+                )
         if len(parts) >= 2 and lib_l and parts[0].lower() == lib_l:
-            add("/".join(parts[1:]).replace("\\", "/").strip("/"))
+            add(
+                _apply_visible_library_anchor_to_slash_relative(
+                    "/".join(parts[1:]).replace("\\", "/").strip("/"),
+                    visible_library_anchor,
+                )
+            )
 
     segs = _path_segments(text)
     segs = [s.strip() for s in segs if s.strip()]
-    # Avoid dropping arbitrary leading segments: in real drafts, those segments can include
-    # client-specific folders, and dropping them can resolve the *wrong* destination parent id.
-    # Only allow shallow chomp when dropped prefix segments are clearly "document-root-ish".
-    rootish = {"root", "ftbmroot"}
-    for drop in range(1, min(4, len(segs))):
-        dropped = [s.strip().lower() for s in segs[:drop]]
-        if dropped and all(d in rootish for d in dropped):
-            chunk = _strip_leading_site_library_parts(segs[drop:], site_l, lib_l)
-            if chunk:
-                add("/".join(chunk))
+    # Legacy-only: drop leading internal ``Root\`` segments via strip, never arbitrary client folders.
+    joined = normalize_manifest_path("\\".join(segs))
+    legacy_stripped = strip_legacy_internal_root_prefix(joined)
+    tail_segs = [s for s in legacy_stripped.split("\\") if s] if legacy_stripped else []
+    if tail_segs and tail_segs != segs:
+        chunk = _strip_leading_site_library_parts(tail_segs, site_l, lib_l)
+        if chunk:
+            add(_apply_visible_library_anchor_to_slash_relative("/".join(chunk), visible_library_anchor))
 
     return candidates[:max_candidates]
 
@@ -372,12 +418,18 @@ def enrich_single_planned_move(
     dest_parent_negative_cache: Optional[MutableSet[str]] = None,
     destination_parent_resolve_diag_sink: Optional[Callable[[dict[str, Any]], None]] = None,
     skip_dest_parent_negative_cache_read: bool = False,
+    visible_library_anchor_destination: str = "",
+    sharepoint_graph_authority_destination: bool = False,
 ) -> bool:
     """
-    Fill ``source`` / ``destination`` nested dicts with Graph ids when missing.
+    Fill ``source`` / ``destination`` nested dicts with Graph ids when missing (read-only GETs).
 
     For SharePoint execution, ``destination_item_id`` is the **parent folder** id where the item
     will be copied; the leaf segment of the destination path is the child name.
+
+    When ``sharepoint_graph_authority_destination`` is True, destination drive-relative candidates
+    are restricted to the live skeleton coordinate system: a visible library anchor path is
+    required, and de-anchored alternates are not emitted.
 
     Returns True if at least one id was set.
     """
@@ -467,11 +519,28 @@ def enrich_single_planned_move(
                 **base_log,
             )
         else:
-            candidates = drive_relative_path_candidates(
-                dst_path,
-                library_name=dest_library_name,
-                site_name=dest_site_name,
-            )
+            sp_auth = bool(sharepoint_graph_authority_destination)
+            anchor_d = str(visible_library_anchor_destination or "").strip()
+            if sp_auth and not anchor_d:
+                log_warn(
+                    "graph_resolve_destination_skip",
+                    reason="missing_visible_library_skeleton_anchor_under_graph_authority",
+                    raw_destination_path_excerpt=dst_path[:240],
+                    dest_library=dest_library_name[:80],
+                    dest_site=dest_site_name[:80],
+                    **base_log,
+                )
+                candidates = []
+            else:
+                candidates = drive_relative_path_candidates(
+                    dst_path,
+                    library_name=dest_library_name,
+                    site_name=dest_site_name,
+                    visible_library_anchor=anchor_d
+                    if sp_auth
+                    else str(visible_library_anchor_destination or "").strip(),
+                    restrict_to_live_graph_skeleton=sp_auth,
+                )
             if not candidates:
                 log_warn(
                     "graph_resolve_destination_skip",
@@ -669,8 +738,10 @@ def enrich_proposed_folder_record(
     dest_site_name: str = "",
     proposed_index: int | None = None,
     proposed_parent_resolve_diag_sink: Optional[Callable[[dict[str, Any]], None]] = None,
+    visible_library_anchor_destination: str = "",
+    sharepoint_graph_authority_destination: bool = False,
 ) -> bool:
-    """Set DestinationDriveId / DestinationParentItemId when missing (for Graph mkdir)."""
+    """Set DestinationDriveId / DestinationParentItemId when missing (read-only GETs)."""
     d_drive = str(dest_drive_id or "").strip()
     plog: dict[str, Any] = {
         "proposed_index": proposed_index if proposed_index is not None else -1,
@@ -698,10 +769,24 @@ def enrich_proposed_folder_record(
         )
         return False
 
+    sp_auth = bool(sharepoint_graph_authority_destination)
+    anchor_d = str(visible_library_anchor_destination or "").strip()
+    if sp_auth and not anchor_d:
+        log_warn(
+            "graph_resolve_proposed_skip",
+            reason="missing_visible_library_skeleton_anchor_under_graph_authority",
+            raw_parent_path_excerpt=parent_path[:240],
+            dest_library=dest_library_name[:80],
+            dest_site=dest_site_name[:80],
+            **plog,
+        )
+        return False
     candidates = drive_relative_path_candidates(
         parent_path,
         library_name=dest_library_name,
         site_name=dest_site_name,
+        visible_library_anchor=anchor_d,
+        restrict_to_live_graph_skeleton=sp_auth,
     )
     if not candidates:
         log_warn(
