@@ -2805,6 +2805,9 @@ class MainWindow(QMainWindow):
         # has a partial model (Qt isExpanded under-counts until rows exist).
         self._destination_restore_session_expanded_paths_intent: set[str] = set()
         self._destination_restore_session_selected_path_intent: str = ""
+        # Option 3 Phase 1: session tree snapshot applied to the planning model before Graph root bind.
+        self._destination_provisional_startup_applied = False
+        self._destination_last_startup_status_reason: str = ""
         self._restore_abort_mode = False
         self._restore_abort_reason = ""
         self._login_in_progress = False
@@ -17234,6 +17237,7 @@ class MainWindow(QMainWindow):
         self._restore_finalization_deferred_reason = ""
         try:
             self._apply_browse_modes_from_session_state()
+            self._destination_apply_provisional_session_snapshot_if_eligible(phase="post_login_phase2_pre_selectors")
             self._run_restore_phase("phase2_restore_selectors", self._restore_selector_matches)
             self._log_restore_phase("phase2_post_login_restore_after_selectors")
             self._run_restore_phase(
@@ -17325,16 +17329,22 @@ class MainWindow(QMainWindow):
                     )
                     return
                 if not self._destination_root_bind_is_authoritative():
-                    self._restore_destination_overlay_pending = True
-                    self._log_restore_phase(
-                        "destination_replay_deferred_until_final_root_bind",
-                        reason="destination_root_bind_not_authoritative_yet",
-                        planned_moves_count=len(self.planned_moves),
-                        proposed_folders_count=len(self.proposed_folders),
-                        active_request_signature=self.active_root_request_signatures.get("destination"),
-                        loaded_request_signature=self.loaded_root_request_signatures.get("destination"),
+                    if not getattr(self, "_destination_provisional_startup_applied", False):
+                        self._restore_destination_overlay_pending = True
+                        self._log_restore_phase(
+                            "destination_replay_deferred_until_final_root_bind",
+                            reason="destination_root_bind_not_authoritative_yet",
+                            planned_moves_count=len(self.planned_moves),
+                            proposed_folders_count=len(self.proposed_folders),
+                            active_request_signature=self.active_root_request_signatures.get("destination"),
+                            loaded_request_signature=self.loaded_root_request_signatures.get("destination"),
+                        )
+                        return
+                    log_info(
+                        "destination_phase4_overlay_on_provisional_shell",
+                        reason="authoritative_graph_root_pending",
+                        top_level_count=self._planning_tree_top_level_count(dest_tree),
                     )
-                    return
 
                 applied_count = 0
                 if getattr(self, "_sharepoint_lazy_mode", False):
@@ -21713,6 +21723,82 @@ class MainWindow(QMainWindow):
     def _destination_tree_uses_model_view(self):
         return bool(getattr(self, "_destination_tree_model_view", False))
 
+    def _destination_tree_snapshot_dict_to_nested_spec(self, snap: dict):
+        """Convert a persisted workspace tree snapshot node into a NestedSpec for DestinationPlanningTreeModel."""
+        if not isinstance(snap, dict):
+            return None
+        data = dict((snap or {}).get("data") or {})
+        if not data:
+            return None
+        kids_specs: list = []
+        for ch in list(snap.get("children") or []):
+            if not isinstance(ch, dict):
+                continue
+            sub = self._destination_tree_snapshot_dict_to_nested_spec(ch)
+            if sub is not None:
+                kids_specs.append(sub)
+        return (data, kids_specs)
+
+    def _destination_apply_provisional_session_snapshot_if_eligible(self, *, phase: str) -> bool:
+        """Option 3 Phase 1: paint the last saved destination snapshot immediately as cached provisional."""
+        if self._planning_browse_mode("destination") == "local":
+            return False
+        if str(os.environ.get("OZLINK_PROVISIONAL_DESTINATION_STARTUP", "") or "").strip().lower() in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            log_info(
+                "destination_provisional_startup_skipped",
+                phase=str(phase)[:80],
+                reason="env_OZLINK_PROVISIONAL_DESTINATION_STARTUP_disabled",
+            )
+            return False
+        if not self._destination_tree_uses_model_view():
+            return False
+        model = getattr(self, "destination_planning_model", None)
+        tree = getattr(self, "destination_tree_widget", None)
+        if model is None or tree is None:
+            return False
+        snaps = list(self._pending_session_tree_snapshots.get("destination") or []) or list(
+            (getattr(self, "_runtime_session_tree_snapshots", {}) or {}).get("destination") or []
+        )
+        if not snaps:
+            log_info("destination_provisional_startup_skipped", phase=str(phase)[:80], reason="no_destination_snapshot")
+            return False
+        destination_stamp_snapshot_tree_workspace_state(snaps)
+        roots: list = []
+        for snap in snaps:
+            spec = self._destination_tree_snapshot_dict_to_nested_spec(snap if isinstance(snap, dict) else {})
+            if spec is not None:
+                roots.append(spec)
+        if not roots:
+            log_info("destination_provisional_startup_skipped", phase=str(phase)[:80], reason="empty_snapshot_roots")
+            return False
+        node_ct = self._count_tree_snapshot_nodes(snaps)
+        try:
+            tree.setUpdatesEnabled(False)
+            model.reset_nested(roots)
+        finally:
+            try:
+                tree.setUpdatesEnabled(True)
+            except Exception:
+                pass
+        self._destination_provisional_startup_applied = True
+        msg = "Loaded saved workspace snapshot. Verifying live SharePoint content…"
+        self._destination_last_startup_status_reason = "provisional_snapshot_first_paint"
+        self._set_tree_status_message("destination", msg, loading=True)
+        log_info(
+            "destination_provisional_startup_applied",
+            phase=str(phase)[:80],
+            root_rows=len(roots),
+            snapshot_nodes=int(node_ct),
+            workspace_row_state="cached_provisional_and_planned_only_under_stamp",
+        )
+        self._schedule_snapshot_branch_refresh("destination", delay_ms=120)
+        return True
+
     def _destination_payload_from_graph_item(self, item):
         prefix = "Folder" if item.get("is_folder") else "File"
         base_label = self._tree_name_column_label(item.get("name", "Unnamed Item"))
@@ -21730,6 +21816,29 @@ class MainWindow(QMainWindow):
         model = getattr(self, "destination_planning_model", None)
         if tree is None or status is None or model is None:
             return
+        prov_by_id: dict[str, dict] = {}
+        if (
+            panel_key == "destination"
+            and self._planning_browse_mode("destination") != "local"
+            and getattr(self, "_destination_provisional_startup_applied", False)
+        ):
+            try:
+                for r in range(model.rowCount(QModelIndex())):
+                    ix = model.index(r, 0, QModelIndex())
+                    pl0 = ix.data(Qt.UserRole) or {}
+                    if not isinstance(pl0, dict):
+                        continue
+                    gid0 = str(pl0.get("id") or "").strip()
+                    if gid0:
+                        prov_by_id[gid0] = dict(pl0)
+            except Exception:
+                prov_by_id = {}
+            if prov_by_id:
+                log_info(
+                    "destination_provisional_root_merge_prepare",
+                    provisional_root_ids=len(prov_by_id),
+                    graph_root_items=len(items or []),
+                )
         self._root_tree_bind_in_progress = True
         tree.blockSignals(True)
         tree.setUpdatesEnabled(False)
@@ -21774,6 +21883,7 @@ class MainWindow(QMainWindow):
                     step_kind="structural_bind",
                     extra="empty",
                 )
+                self._destination_provisional_startup_applied = False
                 return
             if self._planning_browse_mode("destination") != "local":
                 sorted_items = sorted(
@@ -21784,6 +21894,23 @@ class MainWindow(QMainWindow):
                     pl = self._destination_payload_from_graph_item(it)
                     self._apply_tree_item_visual_state(None, pl)
                     payloads.append(pl)
+                if prov_by_id:
+                    merged_payloads: list[dict] = []
+                    for pl in payloads:
+                        gid = str(pl.get("id") or "").strip()
+                        if gid and gid in prov_by_id:
+                            m = dict(prov_by_id[gid])
+                            m.update(dict(pl))
+                            m["workspace_row_state"] = WORKSPACE_ROW_STATE_LIVE_CONFIRMED
+                            merged_payloads.append(m)
+                            log_info(
+                                "destination_provisional_promoted_live_root_bind",
+                                graph_item_id_suffix=gid[-16:] if len(gid) > 16 else gid,
+                            )
+                        else:
+                            merged_payloads.append(pl)
+                    payloads = merged_payloads
+                self._destination_provisional_startup_applied = False
                 did_shell = str(
                     self.pending_root_drive_ids.get("destination") or self._current_selected_destination_drive_id() or ""
                 ).strip()

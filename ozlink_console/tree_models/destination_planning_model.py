@@ -7,12 +7,15 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QAbstractItemModel, QModelIndex, Qt, Signal
-from PySide6.QtGui import QBrush
+from PySide6.QtGui import QBrush, QColor
 
 from ozlink_console.logger import log_info
 from ozlink_console.sharepoint_destination_overlay_attach import (
     WORKSPACE_ROW_STATE_CACHED_PROVISIONAL,
     WORKSPACE_ROW_STATE_LIVE_CONFIRMED,
+    WORKSPACE_ROW_STATE_PLANNED_ONLY,
+    destination_payload_is_planned_workspace_row,
+    destination_payload_workspace_row_state,
 )
 from ozlink_console.tree_models.explorer_columns import (
     EXPLORER_COLUMN_COUNT,
@@ -206,7 +209,18 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             return p if col == 0 else None
         if role == Qt.ForegroundRole:
             c = p.get("_model_foreground")
-            return QBrush(c) if c is not None else None
+            if c is not None:
+                return QBrush(c)
+            if col != 0:
+                return None
+            ws = destination_payload_workspace_row_state(p)
+            if ws == WORKSPACE_ROW_STATE_CACHED_PROVISIONAL:
+                return QBrush(QColor(145, 105, 45))
+            if destination_payload_is_planned_workspace_row(p) or ws == WORKSPACE_ROW_STATE_PLANNED_ONLY:
+                return QBrush(QColor(65, 105, 175))
+            if ws == WORKSPACE_ROW_STATE_LIVE_CONFIRMED:
+                return None
+            return None
         if role == Qt.BackgroundRole:
             c = p.get("_model_background")
             return QBrush(c) if c is not None else None
