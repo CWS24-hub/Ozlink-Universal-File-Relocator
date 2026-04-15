@@ -10,6 +10,10 @@ from PySide6.QtCore import QAbstractItemModel, QModelIndex, Qt, Signal
 from PySide6.QtGui import QBrush
 
 from ozlink_console.logger import log_info
+from ozlink_console.sharepoint_destination_overlay_attach import (
+    WORKSPACE_ROW_STATE_CACHED_PROVISIONAL,
+    WORKSPACE_ROW_STATE_LIVE_CONFIRMED,
+)
 from ozlink_console.tree_models.explorer_columns import (
     EXPLORER_COLUMN_COUNT,
     EXPLORER_COLUMN_LABELS,
@@ -394,11 +398,42 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         self._rebuild_path_index()
         self._notify_structure_changed()
 
-    def replace_all_children(self, parent: QModelIndex, child_payloads: List[Dict[str, Any]]) -> None:
+    def replace_all_children(
+        self,
+        parent: QModelIndex,
+        child_payloads: List[Dict[str, Any]],
+        *,
+        graph_child_bind: bool = False,
+    ) -> None:
         parent_node = self._node(parent)
         if parent_node is None:
             return
         old_count = self.rowCount(parent)
+        prov_by_id: Dict[str, Dict[str, Any]] = {}
+        if graph_child_bind and old_count:
+            for old_child in list(parent_node._children or []):
+                opl = getattr(old_child, "payload", None)
+                if not isinstance(opl, dict) or opl.get("placeholder"):
+                    continue
+                if str(opl.get("workspace_row_state") or "").strip() != WORKSPACE_ROW_STATE_CACHED_PROVISIONAL:
+                    continue
+                gid0 = str(opl.get("id") or "").strip()
+                if gid0:
+                    prov_by_id[gid0] = dict(opl)
+        if graph_child_bind and prov_by_id:
+            merged: List[Dict[str, Any]] = []
+            for inc in child_payloads:
+                if not isinstance(inc, dict):
+                    continue
+                gid = str(inc.get("id") or "").strip()
+                if gid and gid in prov_by_id:
+                    m = dict(prov_by_id[gid])
+                    m.update(dict(inc))
+                    m["workspace_row_state"] = WORKSPACE_ROW_STATE_LIVE_CONFIRMED
+                    merged.append(m)
+                else:
+                    merged.append(dict(inc))
+            child_payloads = merged
         if old_count:
             for old_child in list(parent_node._children or []):
                 self._unregister_subtree_paths(old_child)

@@ -131,6 +131,22 @@ class DestScrollProfiler:
             self._timeline.append({"t_ms": (now - base) * 1000.0, "kind": "scroll_pulse", "detail": kind})
         self._idle.start(self.IDLE_MS)
 
+    def note_heavy_work_deferred(self, kind: str) -> None:
+        """Record maintenance work intentionally deferred because a scroll interaction window is active."""
+        if not self._active():
+            return
+        if not self._capturing:
+            return
+        base = self._window_t0_perf or time.perf_counter()
+        if len(self._timeline) < self.MAX_TIMELINE:
+            self._timeline.append(
+                {
+                    "t_ms": (time.perf_counter() - base) * 1000.0,
+                    "kind": "heavy_work_deferred",
+                    "detail": str(kind)[:120],
+                }
+            )
+
     def note_model_signal(self, name: str, *, row_span: int = 1) -> None:
         if not self._active():
             return

@@ -60,6 +60,8 @@ class SharePointSourceTreeModel(QAbstractItemModel):
         # Canonical path key -> node (O(1) lookup for find_visible_source_item_by_path when fn is set).
         self._source_index_key_fn = source_index_key_fn
         self._path_to_node: Dict[str, _Node] = {}
+        # Case-insensitive lookup (planning memory vs Graph payload casing).
+        self._path_to_node_ci: Dict[str, _Node] = {}
         self._structure_generation: int = 0
 
     def _bump_structure_generation(self) -> None:
@@ -210,6 +212,21 @@ class SharePointSourceTreeModel(QAbstractItemModel):
         except Exception:
             return ""
 
+    def _path_register_node(self, key: str, node: _Node) -> None:
+        if not key or self._source_index_key_fn is None:
+            return
+        self._path_to_node[key] = node
+        self._path_to_node_ci[key.casefold()] = node
+
+    def _path_unregister_node(self, key: str, node: _Node) -> None:
+        if not key or self._source_index_key_fn is None:
+            return
+        if self._path_to_node.get(key) is node:
+            del self._path_to_node[key]
+        cf = key.casefold()
+        if self._path_to_node_ci.get(cf) is node:
+            del self._path_to_node_ci[cf]
+
     def _iter_subtree_nodes(self, node: _Node):
         yield node
         ch = node._children
@@ -225,8 +242,8 @@ class SharePointSourceTreeModel(QAbstractItemModel):
             if n.is_placeholder():
                 continue
             k = self._path_key_for_payload(n.payload)
-            if k and self._path_to_node.get(k) is n:
-                del self._path_to_node[k]
+            if k:
+                self._path_unregister_node(k, n)
 
     def _register_subtree_paths(self, node: _Node) -> None:
         if self._source_index_key_fn is None:
@@ -236,10 +253,11 @@ class SharePointSourceTreeModel(QAbstractItemModel):
                 continue
             k = self._path_key_for_payload(n.payload)
             if k:
-                self._path_to_node[k] = n
+                self._path_register_node(k, n)
 
     def _rebuild_path_index(self) -> None:
         self._path_to_node.clear()
+        self._path_to_node_ci.clear()
         if self._source_index_key_fn is None:
             return
         for c in self._invisible._children or []:
@@ -261,6 +279,8 @@ class SharePointSourceTreeModel(QAbstractItemModel):
         if not canonical_key or self._source_index_key_fn is None:
             return QModelIndex()
         node = self._path_to_node.get(canonical_key)
+        if node is None and canonical_key:
+            node = self._path_to_node_ci.get(canonical_key.casefold())
         if node is None:
             return QModelIndex()
         return self._index_for_node(node)
@@ -269,6 +289,7 @@ class SharePointSourceTreeModel(QAbstractItemModel):
         self.beginResetModel()
         self._invisible._children = []
         self._path_to_node.clear()
+        self._path_to_node_ci.clear()
         self.endResetModel()
         self._bump_structure_generation()
 
@@ -430,10 +451,10 @@ class SharePointSourceTreeModel(QAbstractItemModel):
         mutator(node.payload)
         new_key = self._path_key_for_payload(node.payload)
         if self._source_index_key_fn is not None:
-            if old_key and self._path_to_node.get(old_key) is node:
-                del self._path_to_node[old_key]
+            if old_key:
+                self._path_unregister_node(old_key, node)
             if new_key and not node.is_placeholder():
-                self._path_to_node[new_key] = node
+                self._path_register_node(new_key, node)
         parent = index.parent()
         row = index.row()
         top_left = self.index(row, 0, parent)

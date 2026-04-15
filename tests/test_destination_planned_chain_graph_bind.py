@@ -120,6 +120,89 @@ def _graph_mw_with_sales_branch(monkeypatch):
     return mw, dm
 
 
+def _graph_mw_unloaded_library_hub(monkeypatch):
+    """Single library hub Root3 with ``children_loaded`` false (Graph children not materialized yet)."""
+    monkeypatch.setattr(
+        "ozlink_console.destination_authority_contract.graph_owns_visible_real_destination_structure",
+        lambda _h: True,
+    )
+    _app()
+    mw = MainWindow.__new__(MainWindow)
+    mw._planning_browse_mode = lambda k: "sharepoint" if k == "destination" else "local"
+    dm = DestinationPlanningTreeModel(destination_index_key_fn=MainWindow._destination_payload_index_key.__get__(mw, MainWindow))
+    mw.destination_planning_model = dm
+    tw = QTreeView()
+    tw.setModel(dm)
+    mw.destination_tree_widget = tw
+    mw._memory_restore_in_progress = False
+    mw._memory_restore_background_trees = False
+
+    for name in (
+        "normalize_memory_path",
+        "_canonical_destination_projection_path",
+        "_path_segments",
+        "_tree_item_path",
+        "_destination_parent_match_details",
+        "_destination_row_raw_path_for_path_lookup_match",
+        "_destination_semantic_path",
+        "_destination_resolution_rank",
+        "_select_canonical_destination_item",
+        "_destination_sibling_folder_dedup_key",
+        "_destination_sibling_folder_collision_key",
+        "_destination_find_child_by_last_segment_folder_name",
+        "_canonical_destination_path_with_visible_library_anchor",
+        "_allocation_projection_path",
+        "_allocation_parent_path",
+        "_get_unresolved_allocation_candidates_for_parent",
+        "_paths_equivalent",
+        "_destination_row_semantic_path",
+        "_unresolved_overlay_target_paths_equivalent",
+        "_find_destination_child_by_path",
+        "_find_visible_destination_item_by_path",
+        "_destination_model_index_user_role_dict",
+        "_destination_row_is_live_graph_structure",
+        "_sharepoint_bind_planned_segment_chain",
+        "_build_sharepoint_planned_folder_payload",
+        "_build_sharepoint_planned_file_payload",
+        "_tree_name_column_label",
+        "_apply_tree_item_visual_state",
+        "_ensure_planned_allocation_overlay_on_real_model_index",
+        "_mark_allocation_resolved",
+        "_refresh_destination_item_visibility_index",
+        "_destination_visible_path_lookup_canonical_keys_ex",
+    ):
+        setattr(mw, name, getattr(MainWindow, name).__get__(mw, MainWindow))
+
+    mw._log_restore_phase = lambda *a, **k: None
+    mw._destination_visible_library_anchor_canonical_path = lambda: "Root3"
+    mw._request_graph_destination_children_load = lambda *_a, **_k: None
+    mw._log_sharepoint_overlay_destination_anchor_normalized = lambda **_k: None
+    mw._sync_restore_destination_overlay_pending_from_unresolved_queues = lambda: None
+    mw._unresolved_overlay_pass_audit_touch_illegal = lambda: None
+    mw._unresolved_overlay_pass_audit_touch_removal = lambda *_a, **_k: None
+    mw._log_unresolved_queue_removal_event = lambda **_k: None
+
+    root3 = {
+        "name": "Root3",
+        "id": "id-root3",
+        "is_folder": True,
+        "item_path": "Root3",
+        "destination_path": "Root3",
+        "tree_role": "destination",
+        "children_loaded": False,
+        "drive_id": "d1",
+        "library_id": "d1",
+    }
+    MainWindow._apply_tree_item_visual_state(mw, None, root3)
+    dm.reset_root_payloads([root3])
+
+    mw._destination_row_is_live_graph_structure = lambda pl: destination_payload_is_live_graph_row(pl)
+    mw.unresolved_allocations_by_parent_path = {}
+    mw.planned_moves = []
+    mw.proposed_folders = []
+    return mw, dm
+
+
 def _graph_mw_for_nested_proposed(monkeypatch):
     """Sales live folder + unresolved nested ProposedFolder rows (parent under planned [Planned] row)."""
     monkeypatch.setattr(
@@ -247,6 +330,23 @@ def _child_names(dm, pix):
         pl = dm.index(r, 0, pix).data(Qt.UserRole) or {}
         out.append(str(pl.get("name") or ""))
     return out
+
+
+def test_ensure_sharepoint_graph_only_defers_planned_under_unloaded_library_children(monkeypatch):
+    """Regression: ``not_loaded`` under a live hub with ``children_loaded`` false must not create planned folders."""
+    mw, _dm = _graph_mw_unloaded_library_hub(monkeypatch)
+    calls: list[tuple] = []
+
+    def _no_planned_bind(*_a, **_k):
+        calls.append(1)
+        raise AssertionError("structural planned bind must not run before Graph children load")
+
+    mw._sharepoint_bind_planned_segment_chain = _no_planned_bind
+    out = MainWindow._ensure_destination_projection_path_sharepoint_graph_only(
+        mw, r"Root3\Finance\Payroll", leaf_is_file=False
+    )
+    assert out is None
+    assert calls == []
 
 
 def test_ensure_sharepoint_graph_only_creates_planned_chain_under_visible_parent(monkeypatch):

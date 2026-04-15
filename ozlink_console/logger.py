@@ -68,6 +68,21 @@ _ROTATE_BACKUPS = 4
 _SESSION_DIR: Optional[Path] = None
 _SESSION_LOCK = threading.Lock()
 
+
+def running_under_pytest() -> bool:
+    """True when this process is a pytest test run (not the interactive app)."""
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return True
+    if "pytest" in sys.modules:
+        return True
+    try:
+        argv0 = str(sys.argv[0] or "").lower()
+        if "pytest" in argv0:
+            return True
+    except Exception:
+        pass
+    return False
+
 _DEST_SCROLL_PROFILE_FILE_LOGGER: Optional[logging.Logger] = None
 _DEST_SCROLL_PROFILE_FILE_LOGGER_LOCK = threading.Lock()
 
@@ -179,7 +194,12 @@ def init_session_logging() -> Path:
         if _SESSION_DIR is not None:
             return _SESSION_DIR
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        _SESSION_DIR = logs_root() / stamp
+        # Pytest and other automated runs get their own subtree so a normal app session folder is not
+        # created alongside real user sessions under logs_root().
+        if running_under_pytest():
+            _SESSION_DIR = logs_root() / "_pytest_sessions" / stamp
+        else:
+            _SESSION_DIR = logs_root() / stamp
         _SESSION_DIR.mkdir(parents=True, exist_ok=True)
         _CRASH_SINK = CrashLogSink(_SESSION_DIR / "crash.log")
         try:
@@ -196,6 +216,7 @@ def init_session_logging() -> Path:
                 "executable": sys.executable,
                 "argv": list(sys.argv),
                 "cwd": os.getcwd(),
+                "pytest_session": running_under_pytest(),
             }
             (_SESSION_DIR / "session_launch.json").write_text(
                 json.dumps(launch_meta, indent=2),
@@ -204,13 +225,18 @@ def init_session_logging() -> Path:
         except OSError:
             pass
         try:
-            ptr = logs_root() / "CURRENT_SESSION.txt"
+            if running_under_pytest():
+                ptr = logs_root() / "_pytest_sessions" / "CURRENT_PYTEST_SESSION.txt"
+                ptr_note = "pytest_or_automated_test_run"
+            else:
+                ptr = logs_root() / "CURRENT_SESSION.txt"
+                ptr_note = "interactive_app"
             started = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             ptr.write_text(
                 f"session_log_dir={_SESSION_DIR.resolve()}\n"
                 f"pid={os.getpid()}\n"
                 f"started_utc={started}\n"
-                "note=One folder per OS process. This file is overwritten if another console process starts.\n",
+                f"note=One folder per OS process ({ptr_note}).\n",
                 encoding="utf-8",
             )
         except OSError:
@@ -276,6 +302,10 @@ def resolve_log_stream(record: logging.LogRecord) -> str:
     if ml.startswith("destination_snapshot_"):
         return _STREAM_DEST_RECONCILE
     if ml.startswith("destination_graph_child_load_"):
+        return _STREAM_DEST_PREVIEW
+    if ml.startswith("graph_child_"):
+        return _STREAM_DEST_PREVIEW
+    if ml.startswith("graph_subtree_"):
         return _STREAM_DEST_PREVIEW
 
     # Standalone finalize-phase diagnostics (timer-sliced merge tail).
@@ -563,11 +593,17 @@ def log_session_diagnostics_initialized() -> None:
     """Log session paths once handlers exist (call after get_logger first use)."""
     sd = get_session_logs_dir()
     files = sorted([*_STREAM_FILES.values(), "crash.log", "dest_scroll_profile.log"])
+    ptr = (
+        logs_root() / "_pytest_sessions" / "CURRENT_PYTEST_SESSION.txt"
+        if running_under_pytest()
+        else logs_root() / "CURRENT_SESSION.txt"
+    )
     log_info(
         "Diagnostics initialized.",
         session_log_dir=str(sd),
         process_id=os.getpid(),
-        current_session_pointer=str(logs_root() / "CURRENT_SESSION.txt"),
+        current_session_pointer=str(ptr),
+        pytest_session=bool(running_under_pytest()),
         log_files=files,
         rotating_max_mb=round(_ROTATE_BYTES / (1024 * 1024), 1),
         rotating_backups=_ROTATE_BACKUPS,
@@ -582,6 +618,7 @@ __all__ = [
     "get_logger",
     "get_session_logs_dir",
     "init_session_logging",
+    "running_under_pytest",
     "log_dest_scroll_profile_json",
     "log_error",
     "log_info",
