@@ -608,10 +608,49 @@ class MemoryManager:
         self,
         candidate: dict[str, Any],
     ) -> tuple[SessionState, list[AllocationRow], list[ProposedFolder], dict[str, Any]]:
-        session_state = candidate.get("session_state") if isinstance(candidate.get("session_state"), SessionState) else SessionState()
-        allocations = [AllocationRow.from_dict(item) for item in candidate.get("allocations_raw", [])]
-        proposed = [ProposedFolder.from_dict(item) for item in candidate.get("proposed_raw", [])]
-        return session_state, allocations, proposed, candidate.get("session_raw", {})
+        """Load session/allocations/proposed from the candidate's on-disk paths (not stale inspect caches)."""
+        session_raw: dict[str, Any] = {}
+        session_path = candidate.get("session_path")
+        try:
+            if session_path is not None:
+                sp = Path(session_path)
+                if sp.is_file():
+                    session_raw = self._read_json_path(sp, {})
+        except Exception:
+            session_raw = {}
+        if not isinstance(session_raw, dict) or not session_raw:
+            embedded_raw = candidate.get("session_raw")
+            if isinstance(embedded_raw, dict):
+                session_raw = dict(embedded_raw)
+        session_state = SessionState.from_dict(session_raw if isinstance(session_raw, dict) else {})
+
+        allocations_raw = candidate.get("allocations_raw", [])
+        alloc_path = candidate.get("allocations_path")
+        try:
+            if alloc_path is not None:
+                ap = Path(alloc_path)
+                if ap.is_file():
+                    ar = self._read_json_path(ap, [])
+                    if isinstance(ar, list):
+                        allocations_raw = ar
+        except Exception:
+            pass
+        allocations = [AllocationRow.from_dict(item) for item in allocations_raw if isinstance(item, dict)]
+
+        proposed_raw = candidate.get("proposed_raw", [])
+        proposed_path = candidate.get("proposed_path")
+        try:
+            if proposed_path is not None:
+                pp = Path(proposed_path)
+                if pp.is_file():
+                    pr = self._read_json_path(pp, [])
+                    if isinstance(pr, list):
+                        proposed_raw = pr
+        except Exception:
+            pass
+        proposed = [ProposedFolder.from_dict(item) for item in proposed_raw if isinstance(item, dict)]
+
+        return session_state, allocations, proposed, session_raw if isinstance(session_raw, dict) else {}
 
     def initialize_store(self) -> None:
         defaults = {

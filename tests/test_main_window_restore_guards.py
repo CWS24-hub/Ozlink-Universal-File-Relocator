@@ -88,6 +88,9 @@ class _MaterializeSkipHost:
     def _destination_lifecycle_trace_TEMP(self, *args, **kwargs) -> None:
         return None
 
+    def _startup_post_snapshot_trace_event(self, *_a, **_k) -> None:
+        return None
+
     def _destination_materialize_reason_should_queue_until_async_finishes(self, _reason: str) -> bool:
         return False
 

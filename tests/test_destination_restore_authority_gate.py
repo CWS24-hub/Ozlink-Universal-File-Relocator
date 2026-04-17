@@ -64,6 +64,21 @@ def test_authority_supersedes_false_when_pending_shell_and_root_not_authoritativ
     assert reason == "authority_pending_shell_visible"
 
 
+def test_authority_supersedes_true_when_destination_root_worker_still_running_but_bind_authoritative():
+    """GUI-thread root success can commit before QThread reports finished; gate must still supersede."""
+    from unittest.mock import MagicMock
+
+    from ozlink_console.main_window import MainWindow
+
+    mw = _minimal_mw_graph_destination_authoritative()
+    fake_worker = MagicMock()
+    fake_worker.isRunning.return_value = True
+    mw.root_load_workers = {"destination": {"worker": fake_worker}}
+    ok, reason = MainWindow._destination_graph_authority_supersedes_memory_restore_gate_core(mw)
+    assert ok is True
+    assert reason == ""
+
+
 def test_authority_supersedes_true_when_root_authoritative_despite_non_authoritative_shell_flag():
     from ozlink_console.main_window import MainWindow
 

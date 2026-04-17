@@ -22,11 +22,15 @@ def test_invalidate_projection_index_clears_allocation_descendants_applied_on_pa
         "children_loaded": True,
         "allocation_descendants_applied": True,
         "allocation_projection_destination_path_saved": "\\Root\\WrongName",
+        "allocation_projection_resume_source_token": "abc",
+        "allocation_projection_resume_desc_index": 3,
+        "allocation_projection_resume_descendants_total": 10,
     }
     bad_ix = QModelIndex()
     result = mw._invalidate_stale_destination_allocation_projection_index(bad_ix, nd, move)
     assert result.get("children_loaded") is False
     assert "allocation_descendants_applied" not in result
+    assert "allocation_projection_resume_source_token" not in result
 
 
 def test_mark_allocation_descendants_applied_updates_model_payload():
@@ -75,7 +79,7 @@ def test_apply_visible_model_branch_uses_flag_not_child_presence():
     mw._destination_bind_should_apply_allocation_descendants_now = lambda _sem, _nt: True  # noqa: E731
     applied = {"n": 0}
 
-    def _fake_apply(_parent, _mv):
+    def _fake_apply(_parent, _mv, **_kw):
         applied["n"] += 1
         return 3
 

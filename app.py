@@ -1,12 +1,15 @@
+import atexit
 import os
+import signal
 import sys
 import threading
 import faulthandler
 
-from PySide6.QtCore import QtMsgType, qInstallMessageHandler
+from PySide6.QtCore import QtMsgType, QThreadPool, QTimer, qInstallMessageHandler
 from PySide6.QtWidgets import QApplication
 
 from ozlink_console.logger import (
+    flush_logger,
     get_crash_binary_log_file,
     get_crash_log_path,
     init_session_logging,
@@ -14,6 +17,8 @@ from ozlink_console.logger import (
     log_info,
     log_session_diagnostics_initialized,
     log_trace,
+    qt_threadpool_snapshot,
+    thread_inventory_snapshot,
 )
 from ozlink_console.paths import ensure_app_storage_directories
 from ozlink_console.dev_mode import apply_cli_dev_flag
@@ -21,6 +26,67 @@ from ozlink_console.main_window import MainWindow
 
 
 _CRASH_FILE_HANDLE = None
+
+
+def _log_shutdown_thread_inventory(phase: str, **extra: object) -> None:
+    """Emit JSON-safe thread list for diagnosing python.exe lingering after UI shutdown."""
+    try:
+        inv = thread_inventory_snapshot()
+        qt_snap = qt_threadpool_snapshot()
+        log_info(
+            "shutdown_trace",
+            event="thread_inventory",
+            phase=str(phase)[:120],
+            **inv,
+            **qt_snap,
+            **{k: v for k, v in extra.items() if v is not None},
+        )
+    except Exception as exc:
+        log_info("shutdown_trace", event="thread_inventory_failed", phase=str(phase)[:120], error=str(exc)[:240])
+    try:
+        flush_logger()
+    except Exception:
+        pass
+
+
+def _atexit_process_marker() -> None:
+    """Last Python-level hook before interpreter teardown (if the process actually exits)."""
+    try:
+        _log_shutdown_thread_inventory("atexit")
+        log_info("shutdown_trace", event="process_termination_marker", note="after_atexit_python_shutdown_pending")
+        flush_logger()
+    except Exception as exc:
+        try:
+            log_error("atexit_shutdown_marker_failed.", error=str(exc)[:500])
+            flush_logger()
+        except Exception:
+            pass
+
+
+def _drain_global_qthreadpool_after_exec(*, phase: str) -> None:
+    """Second-chance pool drain after app.exec() returns (runnables may still be queued)."""
+    try:
+        tp = QThreadPool.globalInstance()
+        log_info(
+            "shutdown_trace",
+            event="qthreadpool_post_app_exec_enter",
+            phase=str(phase)[:80],
+            **qt_threadpool_snapshot(),
+        )
+        tp.waitForDone(12000)
+        try:
+            tp.clear()
+        except Exception:
+            pass
+        tp.waitForDone(4000)
+        log_info(
+            "shutdown_trace",
+            event="qthreadpool_post_app_exec_exit",
+            phase=str(phase)[:80],
+            **qt_threadpool_snapshot(),
+        )
+    except Exception as exc:
+        log_info("shutdown_trace", event="qthreadpool_post_app_exec_failed", error=str(exc)[:240])
 
 
 def _install_native_crash_capture():
@@ -98,6 +164,7 @@ def run_app():
     os.environ.setdefault("OZLINK_FULL_TRACE", "0")
     ensure_app_storage_directories()
     init_session_logging()
+    atexit.register(_atexit_process_marker)
     _install_global_exception_hooks()
     _install_native_crash_capture()
     app = QApplication(sys.argv)
@@ -108,16 +175,56 @@ def run_app():
     def _on_about_to_quit():
         log_info("QApplication aboutToQuit emitted.")
         log_trace("app", "about_to_quit")
+        log_info(
+            "shutdown_trace",
+            event="aboutToQuit",
+            note="qt_emits_before_event_loop_returns_from_exec",
+            **thread_inventory_snapshot(),
+            **qt_threadpool_snapshot(),
+        )
+        _log_shutdown_thread_inventory("aboutToQuit")
 
     app.aboutToQuit.connect(_on_about_to_quit)
 
     window = MainWindow()
     log_trace("app", "main_window_constructed")
+    # Console Ctrl+C: avoid KeyboardInterrupt inside Qt/model code (e.g. overlay invariant DFS).
+    try:
+
+        def _sigint_graceful_quit(_signum, _frame):
+            try:
+                window._application_shutting_down = True
+            except Exception:
+                pass
+            try:
+                QTimer.singleShot(0, app.quit)
+            except Exception:
+                pass
+
+        signal.signal(signal.SIGINT, _sigint_graceful_quit)
+    except (ValueError, OSError):
+        pass
     window.show()
     log_trace("app", "main_window_shown")
 
-    return app.exec()
+    exit_code = int(app.exec())
+    _drain_global_qthreadpool_after_exec(phase="post_app_exec")
+    log_info(
+        "shutdown_trace",
+        event="app_exec_returned",
+        exit_code=exit_code,
+        note="qt_event_loop_exited",
+        **thread_inventory_snapshot(),
+        **qt_threadpool_snapshot(),
+    )
+    _log_shutdown_thread_inventory("shutdown_end_post_app_exec")
+    flush_logger()
+    return exit_code
 
 
 if __name__ == "__main__":
-    sys.exit(run_app())
+    _ec = run_app()
+    log_info("shutdown_trace", event="main_after_run_app", exit_code=int(_ec), note="before_sys_exit")
+    _log_shutdown_thread_inventory("main_after_run_app")
+    flush_logger()
+    sys.exit(_ec)

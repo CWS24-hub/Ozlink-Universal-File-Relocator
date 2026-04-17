@@ -814,7 +814,7 @@ def test_deferred_planning_refresh_skips_destination_for_manual_drag_reason():
 
 
 def test_deferred_planning_refresh_graph_ids_resolve_overlays_without_idle_defer():
-    """Graph ID enrichment queues folder loads; deferring the full overlay pass lets replace_all_children drop planned rows."""
+    """Graph ID enrichment may queue folder loads; overlay entry uses allow_defer=True for idle/chunk scheduling."""
     _qapp()
     mw = MainWindow.__new__(MainWindow)
     stub = MagicMock()
@@ -843,7 +843,7 @@ def test_deferred_planning_refresh_graph_ids_resolve_overlays_without_idle_defer
     MainWindow._run_deferred_planning_refresh(mw)
     assert len(calls) == 1
     assert calls[0][0] == "deferred_graph_ids_resolved_from_sharepoint_paths"
-    assert calls[0][1] is False
+    assert calls[0][1] is True
 
 
 def test_deferred_graph_ids_replay_uses_worker_slice_budget_reason():

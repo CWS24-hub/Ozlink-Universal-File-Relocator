@@ -125,6 +125,51 @@ def test_destination_structure_changed_signal_on_mutations():
     assert sum(hits) > before
 
 
+def test_destination_structure_changed_coalesced_emits_once_per_batch():
+    model = DestinationPlanningTreeModel()
+    hits = []
+    model.destination_structure_changed.connect(lambda: hits.append(1))
+    root_ix = model.index(0, 0, QModelIndex())
+    model.reset_root_payloads(
+        [
+            {
+                "base_display_label": "Folder: Root",
+                "name": "Root",
+                "is_folder": True,
+                "item_path": "Root",
+            }
+        ]
+    )
+    hits.clear()
+    model.begin_coalesce_destination_structure_signal()
+    try:
+        model.replace_all_children(
+            root_ix,
+            [
+                {
+                    "base_display_label": "File: a.txt",
+                    "name": "a.txt",
+                    "is_folder": False,
+                    "item_path": r"Root\a.txt",
+                }
+            ],
+        )
+        model.append_child_payloads(
+            root_ix,
+            [
+                {
+                    "base_display_label": "File: b.txt",
+                    "name": "b.txt",
+                    "is_folder": False,
+                    "item_path": r"Root\b.txt",
+                }
+            ],
+        )
+    finally:
+        model.end_coalesce_destination_structure_signal()
+    assert len(hits) == 1
+
+
 def test_destination_path_index_multi_candidate():
     def key_fn(pl):
         return str(pl.get("item_path", "") or "").strip()

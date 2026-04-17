@@ -71,7 +71,7 @@ def test_collect_source_descendants_graph_fallback_when_partial_subtree_empty():
 
     assert out == graph_rows
     g.list_drive_subtree_items_normalized.assert_called_once()
-    assert any(e.get("branch") == "graph_fallback_empty_partial_walk" for e in logged)
+    assert any(e.get("branch") == "graph_subtree" for e in logged)
     assert any(e.get("graph_attempted") is True for e in logged)
 
 

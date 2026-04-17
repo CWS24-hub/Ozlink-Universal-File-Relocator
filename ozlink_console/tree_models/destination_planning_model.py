@@ -10,6 +10,7 @@ from PySide6.QtCore import QAbstractItemModel, QModelIndex, Qt, Signal
 from PySide6.QtGui import QBrush, QColor
 
 from ozlink_console.logger import log_info
+from ozlink_console.paths import normalize_manifest_path
 from ozlink_console.sharepoint_destination_overlay_attach import (
     WORKSPACE_ROW_STATE_CACHED_PROVISIONAL,
     WORKSPACE_ROW_STATE_LIVE_CONFIRMED,
@@ -72,9 +73,25 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         self._path_cf_to_key: Dict[str, str] = {}
         self._structure_generation: int = 0
         self._invalid_internal_pointer_logged_gen: int = -1
+        self._coalesce_dest_structure_signal_depth: int = 0
+        self._pending_dest_structure_signal: bool = False
+
+    def begin_coalesce_destination_structure_signal(self) -> None:
+        """Batch multiple structural mutations; emit :attr:`destination_structure_changed` once on end."""
+        self._coalesce_dest_structure_signal_depth = int(getattr(self, "_coalesce_dest_structure_signal_depth", 0) or 0) + 1
+
+    def end_coalesce_destination_structure_signal(self) -> None:
+        d = int(getattr(self, "_coalesce_dest_structure_signal_depth", 0) or 1) - 1
+        self._coalesce_dest_structure_signal_depth = max(0, d)
+        if d == 0 and getattr(self, "_pending_dest_structure_signal", False):
+            self._pending_dest_structure_signal = False
+            self.destination_structure_changed.emit()
 
     def _notify_structure_changed(self) -> None:
         self._structure_generation += 1
+        if int(getattr(self, "_coalesce_dest_structure_signal_depth", 0) or 0) > 0:
+            self._pending_dest_structure_signal = True
+            return
         self.destination_structure_changed.emit()
 
     def _log_invalid_internal_pointer_once(self, *, context: str, ptr: Any) -> None:
@@ -398,6 +415,274 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         self._rebuild_path_index()
         self._notify_structure_changed()
 
+    def _remove_root_row(self, row: int) -> None:
+        parent_node = self._invisible
+        ch = parent_node._children or []
+        if row < 0 or row >= len(ch):
+            return
+        old = ch[row]
+        self._unregister_subtree_paths(old)
+        inv = QModelIndex()
+        self.beginRemoveRows(inv, row, row)
+        ch.pop(row)
+        parent_node._children = ch
+        self.endRemoveRows()
+        self._reindex(parent_node)
+        self._notify_structure_changed()
+
+    def _insert_root_child_at(self, row: int, pl: Dict[str, Any]) -> None:
+        parent_node = self._invisible
+        ch = list(parent_node._children or [])
+        row = max(0, min(int(row), len(ch)))
+        child_list = None if pl.get("is_folder") else []
+        inv = QModelIndex()
+        self.beginInsertRows(inv, row, row)
+        node = _Node(parent_node, row, dict(pl), child_list)
+        ch.insert(row, node)
+        parent_node._children = ch
+        self._reindex(parent_node)
+        self.endInsertRows()
+        self._register_subtree_paths_from_roots([node])
+        self._notify_structure_changed()
+
+    @staticmethod
+    def _sort_key_graph_root(pl: Dict[str, Any]) -> Tuple[bool, str]:
+        return (not bool(pl.get("is_folder")), str(pl.get("name") or "").lower())
+
+    def _root_graph_insertion_row(self, incoming_pl: Dict[str, Any]) -> int:
+        """Return insert row for a new structural root child, ordered with existing structural rows."""
+        inv = QModelIndex()
+        sk = self._sort_key_graph_root(incoming_pl)
+        n = self.rowCount(inv)
+        for r in range(n):
+            pl = self.index(r, 0, inv).data(Qt.UserRole) or {}
+            if not isinstance(pl, dict):
+                continue
+            if destination_payload_is_planned_workspace_row(pl):
+                return r
+            ws = destination_payload_workspace_row_state(pl)
+            if ws == WORKSPACE_ROW_STATE_PLANNED_ONLY:
+                return r
+            if pl.get("placeholder"):
+                continue
+            if self._sort_key_graph_root(pl) > sk:
+                return r
+        return n
+
+    def _merge_preserves_root_row_without_graph_id(self, pl: Dict[str, Any]) -> bool:
+        """Keep snapshot / provisional scaffolding roots when Graph lists only drive-backed rows."""
+        if not isinstance(pl, dict):
+            return False
+        if destination_payload_is_planned_workspace_row(pl):
+            return True
+        if destination_payload_workspace_row_state(pl) == WORKSPACE_ROW_STATE_PLANNED_ONLY:
+            return True
+        if destination_payload_workspace_row_state(pl) == WORKSPACE_ROW_STATE_CACHED_PROVISIONAL:
+            return True
+        if str(pl.get("row_kind") or "").strip().lower() == "cached_provisional_shell":
+            return True
+        return False
+
+    @staticmethod
+    def _merge_root_row_path_key(pl: Dict[str, Any]) -> str:
+        """Canonical key for matching a snapshot root row to an incoming Graph root by path (ids may change)."""
+        if not isinstance(pl, dict):
+            return ""
+        raw = str(pl.get("item_path") or pl.get("semantic_path") or pl.get("destination_path") or "").strip()
+        if raw:
+            return normalize_manifest_path(raw)
+        nm = str(pl.get("name") or "").strip()
+        return normalize_manifest_path(nm) if nm else ""
+
+    def merge_sharepoint_library_root_graph_children(
+        self,
+        graph_payloads: List[Dict[str, Any]],
+        *,
+        enrich_only: bool = False,
+    ) -> Dict[str, int]:
+        """Merge live Graph root children into the existing tree without resetting the model.
+
+        Preserves planned workspace rows, updates matching rows by drive item id, removes structural
+        rows missing from the Graph listing, and inserts new Graph rows in sorted order.
+
+        When ``enrich_only`` is True (quiet startup / snapshot already visible), matching rows are
+        updated and new Graph rows are inserted, but existing structural root rows are not removed
+        just because the shallow root listing omitted them.
+        """
+        inv = QModelIndex()
+        stats = {"updated": 0, "inserted": 0, "removed": 0, "skipped_planned": 0, "enrich_only": int(bool(enrich_only))}
+
+        incoming: List[Dict[str, Any]] = [
+            dict(p) for p in (graph_payloads or []) if isinstance(p, dict) and str(p.get("id") or "").strip()
+        ]
+        incoming.sort(key=self._sort_key_graph_root)
+        incoming_by_id = {str(p["id"]).strip(): p for p in incoming}
+        incoming_by_path: Dict[str, Dict[str, Any]] = {}
+        for p in incoming:
+            pk = self._merge_root_row_path_key(p)
+            if pk and pk not in incoming_by_path:
+                incoming_by_path[pk] = p
+
+        used: set[str] = set()
+        for r in range(self.rowCount(inv)):
+            ix = self.index(r, 0, inv)
+            pl = ix.data(Qt.UserRole) or {}
+            if not isinstance(pl, dict) or pl.get("placeholder"):
+                continue
+            if destination_payload_is_planned_workspace_row(pl):
+                stats["skipped_planned"] += 1
+                continue
+            if destination_payload_workspace_row_state(pl) == WORKSPACE_ROW_STATE_PLANNED_ONLY:
+                stats["skipped_planned"] += 1
+                continue
+            gid = str(pl.get("id") or "").strip()
+            if not gid:
+                continue
+            inc = incoming_by_id.get(gid)
+            if inc is None:
+                continue
+            used.add(gid)
+            prev_children_loaded = bool(pl.get("children_loaded")) if pl.get("is_folder") else False
+            inc_copy = dict(inc)
+
+            def mutator(payload: Dict[str, Any], _prev=prev_children_loaded, _inc=inc_copy) -> None:
+                payload.update(_inc)
+                payload["workspace_row_state"] = WORKSPACE_ROW_STATE_LIVE_CONFIRMED
+                if payload.get("is_folder") and _prev:
+                    payload["children_loaded"] = True
+
+            self.update_payload_for_index(ix, mutator)
+            stats["updated"] += 1
+
+        for r in range(self.rowCount(inv) - 1, -1, -1):
+            pl = self.index(r, 0, inv).data(Qt.UserRole) or {}
+            if not isinstance(pl, dict):
+                continue
+            if destination_payload_is_planned_workspace_row(pl):
+                continue
+            if destination_payload_workspace_row_state(pl) == WORKSPACE_ROW_STATE_PLANNED_ONLY:
+                continue
+            if pl.get("placeholder"):
+                role = str(pl.get("placeholder_role") or "")
+                if incoming_by_id and role in ("empty_library_message", "loading_in_progress", "terminal_empty"):
+                    self._remove_root_row(r)
+                    stats["removed"] += 1
+                continue
+            gid = str(pl.get("id") or "").strip()
+            if not gid:
+                if incoming_by_id and not self._merge_preserves_root_row_without_graph_id(pl) and not enrich_only:
+                    self._remove_root_row(r)
+                    stats["removed"] += 1
+                continue
+            if gid not in incoming_by_id:
+                pk = self._merge_root_row_path_key(pl)
+                inc_path = incoming_by_path.get(pk) if pk else None
+                if inc_path is not None:
+                    inc_gid = str(inc_path.get("id") or "").strip()
+                    if inc_gid and inc_gid not in used:
+                        ix = self.index(r, 0, inv)
+                        prev_children_loaded = bool(pl.get("children_loaded")) if pl.get("is_folder") else False
+                        inc_copy = dict(inc_path)
+
+                        def mutator_path(
+                            payload: Dict[str, Any], _prev=prev_children_loaded, _inc=inc_copy
+                        ) -> None:
+                            payload.update(_inc)
+                            payload["workspace_row_state"] = WORKSPACE_ROW_STATE_LIVE_CONFIRMED
+                            if payload.get("is_folder") and _prev:
+                                payload["children_loaded"] = True
+
+                        self.update_payload_for_index(ix, mutator_path)
+                        used.add(inc_gid)
+                        stats["updated"] += 1
+                        continue
+                if not enrich_only:
+                    self._remove_root_row(r)
+                    stats["removed"] += 1
+
+        for inc in incoming:
+            gid = str(inc.get("id") or "").strip()
+            if not gid or gid in used:
+                continue
+            row_ins = self._root_graph_insertion_row(inc)
+            self._insert_root_child_at(row_ins, inc)
+            used.add(gid)
+            stats["inserted"] += 1
+
+        self._rebuild_path_index()
+        return stats
+
+    def merge_bootstrap_cached_provisional_folder_paths(
+        self,
+        folder_paths: List[str],
+        *,
+        drive_id: str = "",
+    ) -> Dict[str, int]:
+        """Insert missing ``cached_provisional`` folder rows along canonical paths (legacy import / no Graph id).
+
+        Reuses existing rows when ``find_indices_for_canonical_destination_path`` hits. Intended to run
+        after a Graph root bind (or on top of a stamped snapshot shell) so allocation/projection
+        overlays can attach before drive-item ids exist.
+        """
+        stats = {"inserted": 0, "reused": 0, "skipped": 0}
+        if self._destination_index_key_fn is None:
+            return stats
+        did = str(drive_id or "").strip()
+        uniq: List[str] = []
+        seen: set[str] = set()
+        for p in folder_paths or []:
+            n = normalize_manifest_path(str(p or "").strip())
+            if not n or n in seen:
+                continue
+            seen.add(n)
+            uniq.append(n)
+        uniq.sort(key=lambda x: (len(x.split("\\")), x.lower()))
+        for raw in uniq:
+            parts = [x for x in raw.replace("/", "\\").split("\\") if x]
+            if not parts:
+                continue
+            parent_ix = QModelIndex()
+            for i, seg in enumerate(parts):
+                full = normalize_manifest_path("\\".join(parts[: i + 1]))
+                hits = self.find_indices_for_canonical_destination_path(full)
+                if hits:
+                    parent_ix = hits[0]
+                    stats["reused"] += 1
+                    continue
+                pl: Dict[str, Any] = {
+                    "name": seg,
+                    "base_display_label": str(seg or ""),
+                    "tree_label": "Folder",
+                    "is_folder": True,
+                    "semantic_path": full,
+                    "item_path": full,
+                    "destination_path": full,
+                    "tree_role": "destination",
+                    "workspace_row_state": WORKSPACE_ROW_STATE_CACHED_PROVISIONAL,
+                    "children_loaded": False,
+                    "load_failed": False,
+                    "drive_id": did,
+                    "id": "",
+                    "row_kind": "cached_provisional_shell",
+                    "verification_state": "cached_provisional_shell",
+                }
+                self.append_child_payloads(parent_ix, [pl])
+                stats["inserted"] += 1
+                nh = self.find_indices_for_canonical_destination_path(full)
+                if not nh:
+                    stats["skipped"] += 1
+                    break
+                parent_ix = nh[0]
+        if stats["inserted"] or stats["reused"]:
+            log_info(
+                "destination_model_bootstrap_folder_paths_merged",
+                inserted=int(stats["inserted"]),
+                reused=int(stats["reused"]),
+                skipped=int(stats["skipped"]),
+                path_count=len(uniq),
+            )
+        return stats
+
     def set_empty_library_message(self, text: str) -> None:
         payload = {
             "placeholder": True,
@@ -697,6 +982,9 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             return node
         if pl.get("is_folder"):
             if pl.get("_destination_expand_affordance"):
+                return _Node(parent_node, row, pl, [])
+            # Snapshot / authoritative bind: empty subtree is real rowCount 0, not lazy-unloaded.
+            if bool(pl.get("children_loaded")):
                 return _Node(parent_node, row, pl, [])
             return _Node(parent_node, row, pl, None)
         return _Node(parent_node, row, pl, [])

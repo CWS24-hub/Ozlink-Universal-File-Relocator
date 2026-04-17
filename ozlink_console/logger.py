@@ -611,6 +611,48 @@ def log_session_diagnostics_initialized() -> None:
     )
 
 
+def thread_inventory_snapshot() -> Dict[str, Any]:
+    """JSON-safe snapshot of :func:`threading.enumerate` for shutdown / post-exec diagnostics."""
+    threads = threading.enumerate()
+    rows: list[Dict[str, Any]] = []
+    non_daemon = 0
+    for th in threads:
+        try:
+            d = bool(th.daemon)
+            if not d:
+                non_daemon += 1
+            rows.append(
+                {
+                    "name": str(getattr(th, "name", "") or ""),
+                    "daemon": d,
+                    "ident": getattr(th, "ident", None),
+                    "alive": bool(th.is_alive()) if hasattr(th, "is_alive") else None,
+                }
+            )
+        except Exception as exc:
+            rows.append({"name": repr(th), "daemon": None, "ident": None, "error": str(exc)[:120]})
+    return {
+        "thread_count": len(threads),
+        "non_daemon_count": non_daemon,
+        "threads": rows,
+    }
+
+
+def qt_threadpool_snapshot() -> Dict[str, Any]:
+    """Best-effort QThreadPool counters for shutdown (lazy-imports Qt)."""
+    try:
+        from PySide6.QtCore import QThreadPool
+
+        tp = QThreadPool.globalInstance()
+        return {
+            "qthreadpool_activeThreadCount": int(tp.activeThreadCount()),
+            "qthreadpool_maxThreadCount": int(tp.maxThreadCount()),
+            "qthreadpool_expiryTimeout_ms": int(tp.expiryTimeout()),
+        }
+    except Exception as exc:
+        return {"qthreadpool_error": str(exc)[:240]}
+
+
 __all__ = [
     "flush_logger",
     "get_crash_binary_log_file",
@@ -627,5 +669,7 @@ __all__ = [
     "log_warn",
     "reset_logging_for_tests",
     "resolve_log_stream",
+    "thread_inventory_snapshot",
+    "qt_threadpool_snapshot",
     "trace_enabled",
 ]
