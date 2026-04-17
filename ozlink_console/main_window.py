@@ -65,7 +65,10 @@ from PySide6.QtCore import (
     QByteArray,
     QMimeData,
     QSignalBlocker,
+    QThreadPool,
 )
+from shiboken6 import isValid as _shiboken_is_valid
+
 from PySide6.QtGui import (
     QAction,
     QBrush,
@@ -94,7 +97,15 @@ from ozlink_console.tree_models.explorer_columns import (
 from ozlink_console.tree_models.sharepoint_source_model import SharePointSourceTreeModel
 from ozlink_console.tree_models.destination_planning_model import DestinationPlanningTreeModel, NestedSpec
 from ozlink_console.dev_mode import is_dev_mode
-from ozlink_console.logger import log_error, log_info, log_trace, log_warn
+from ozlink_console.logger import (
+    flush_logger,
+    log_error,
+    log_info,
+    log_trace,
+    log_warn,
+    qt_threadpool_snapshot,
+    thread_inventory_snapshot,
+)
 from ozlink_console.memory import MemoryManager, WORKSPACE_SNAPSHOT_SCHEMA_VERSION
 from ozlink_console.version_info import APP_VERSION
 from ozlink_console.models import AllocationRow, ProposedFolder, SessionState, SubmissionBatch
@@ -1439,6 +1450,14 @@ class DestinationSnapshotLightValidationWorker(QThread):
 
 
 class CacheRefreshWorker(QThread):
+    """Clears persisted Graph children caches for the given drive ids (disk + in-memory).
+
+    **Destructive / “hard refresh” semantics:** used for SharePoint **source** refresh and for
+    **destination** only when the user explicitly requests **Rebuild Cache / Full Resync** (or
+    equivalent), after which ``MainWindow.load_library_root`` may show a loading placeholder.
+    **Not** used as the default **destination** Refresh Cache path under Option 3 incremental mode.
+    """
+
     success = Signal(dict)
     error = Signal(str)
 
@@ -1456,6 +1475,49 @@ class CacheRefreshWorker(QThread):
             self.success.emit({"drive_ids": list(self.drive_ids)})
         except Exception as e:
             log_trace("worker", "CacheRefreshWorker_error", error_excerpt=str(e)[:500])
+            self.error.emit(str(e))
+
+
+class DestinationIncrementalGraphRefreshWorker(QThread):
+    """Background Graph verification for Option 3 destination refresh (no tree placeholder / no model wipe)."""
+
+    success = Signal(dict)
+    error = Signal(str)
+
+    def __init__(self, graph: GraphClient, drive_id: str, context: Dict[str, Any]):
+        super().__init__()
+        self.graph = graph
+        self.drive_id = str(drive_id or "").strip()
+        self.context = dict(context or {})
+
+    def run(self):
+        did = self.drive_id
+        log_trace("worker", "DestinationIncrementalGraphRefreshWorker_start", drive_id_suffix=did[-16:] if len(did) > 16 else did)
+        try:
+            self.graph.invalidate_drive_root_children_cache(did)
+            items = self.graph.list_drive_root_items_normalized(
+                did,
+                site_id=str(self.context.get("site_id") or ""),
+                site_name=str(self.context.get("site_name") or ""),
+                library_id=str(self.context.get("library_id") or ""),
+                library_name=str(self.context.get("library_name") or ""),
+                tree_role=str(self.context.get("tree_role") or "destination"),
+                cache_only=False,
+            )
+            delta: Dict[str, Any] = {}
+            try:
+                delta = self.graph.sync_drive_children_delta(did, allow_initial_bootstrap=True)
+            except Exception as de:
+                delta = {"ok": False, "reason": "delta_optional_failed", "error": str(de)[:240]}
+            log_trace(
+                "worker",
+                "DestinationIncrementalGraphRefreshWorker_success",
+                item_count=len(items or []),
+                delta_ok=bool(delta.get("ok", True)),
+            )
+            self.success.emit({"drive_id": did, "items": items or [], "delta": delta or {}})
+        except Exception as e:
+            log_trace("worker", "DestinationIncrementalGraphRefreshWorker_error", error_excerpt=str(e)[:500])
             self.error.emit(str(e))
 
 
@@ -2696,9 +2758,19 @@ class _ReactiveNotifyList(list):
         return self
 
 
+def _shutdown_mutation_skip_for_host(host: Any, mutation_path: str, **extra: Any) -> bool:
+    """Call :meth:`MainWindow._if_shutdown_skip_mutation` when present (partial test hosts may omit it)."""
+    fn = getattr(host, "_if_shutdown_skip_mutation", None)
+    if not callable(fn):
+        return False
+    return bool(fn(mutation_path, **extra))
+
+
 class MainWindow(QMainWindow):
     # After this many seconds without re-validation, SharePoint snapshot trust expires (staleness guard).
     _DESTINATION_SPO_SNAPSHOT_TRUST_TTL_SEC = 300.0
+    # First path segment only; persisted planning paths may prefix library-relative trees with this.
+    _LEGACY_SNAPSHOT_LIBRARY_RELATIVE_ROOT_SEGMENTS = frozenset({"root"})
 
     @staticmethod
     def _source_tree_model_view_effective() -> bool:
@@ -2758,12 +2830,16 @@ class MainWindow(QMainWindow):
         self.folder_load_workers = {}
         self.folder_load_retired_workers = {}
         self.cache_refresh_worker = None
+        self.destination_incremental_refresh_worker = None
+        self._cache_refresh_option3_destination = False
+        self._destination_cache_refresh_force_full_resync = False
         self.session_keepalive_worker = None
         self._cache_refresh_restore_active = False
         self._pending_cache_refresh_ui_state = None
         self._pending_cache_refresh_panels = set()
         self._cache_refresh_skip_expanded_restore_panels = set()
         self._pending_cache_refresh_tree_snapshots = {}
+        self._cache_refresh_refreshed_panels_snapshot = set()
         self._pending_session_workspace_ui_state = None
         self._pending_session_tree_snapshots = {}
         self._pending_snapshot_branch_refresh = {"source": set(), "destination": set()}
@@ -2807,6 +2883,26 @@ class MainWindow(QMainWindow):
         self._destination_restore_session_selected_path_intent: str = ""
         # Option 3 Phase 1: session tree snapshot applied to the planning model before Graph root bind.
         self._destination_provisional_startup_applied = False
+        self._destination_provisional_startup_status_message = ""
+        # TEMP: set when a deep snapshot was painted; used to log any later model reset/clear.
+        self._destination_startup_snapshot_mount_seen = False
+        # Drive id for the library whose session snapshot was mounted (loading placeholder must not wipe it).
+        self._destination_snapshot_mount_drive_id: str = ""
+        # After first Graph root bind merge (or shallow reset) for destination — overlay teardown may run.
+        self._destination_startup_snapshot_preservation_applied: bool = False
+        # SharePoint source: recursive session snapshot mounted before Graph root bind (Phase 1 shell).
+        self._source_startup_snapshot_mount_seen: bool = False
+        self._source_snapshot_mount_drive_id: str = ""
+        # Cached canonical path set (casefold) from session destination_tree_snapshot JSON.
+        self._destination_session_snapshot_path_cf_set_cache: set | None = None
+        # TEMP: first 10 phases after startup_snapshot_first_visible (wall-clock diagnostics).
+        self._startup_post_snapshot_trace_t0: float = 0.0
+        self._startup_post_snapshot_trace_prev: float = 0.0
+        self._startup_post_snapshot_trace_seq: int = 0
+        # After session snapshot mount: defer first global planned-parent reconcile off hot overlay path.
+        self._destination_defer_first_terminal_planned_reconcile_pending: bool = False
+        # Normal startup: bypass Graph child-load gate while materializing projection visibility.
+        self._destination_startup_projection_visibility_pass_active = False
         self._destination_last_startup_status_reason: str = ""
         self._restore_abort_mode = False
         self._restore_abort_reason = ""
@@ -2868,6 +2964,9 @@ class MainWindow(QMainWindow):
         self._destination_suppress_steady_materialize_skip_once = False
         # Force one full deferred planning refresh materialize after destination Graph root bind.
         self._destination_require_deferred_full_materialize_once = False
+        # After quiet in-place root merge (snapshot preserved, no root remove/insert), skip structural
+        # overlay / invariant churn until planning overlay backlog or a non-deferred overlay entry clears it.
+        self._destination_quiet_startup_overlay_structural_suppress = False
         self._destination_restore_materialization_user_paused = False
         self._destination_preserved_children_by_worker = {}
         # True only while applying Graph folder children (same role as source folder expand).
@@ -2950,6 +3049,8 @@ class MainWindow(QMainWindow):
         # and crash in DestinationPlanningModel.data (native access violation).
         self._destination_idle_materialize_reentrancy_block = 0
         self._lazy_destination_projection_pending_reason = ""
+        self._application_shutting_down = False
+        self._shutdown_close_event_active = False
         self._lazy_destination_projection_timer = QTimer(self)
         self._lazy_destination_projection_timer.setSingleShot(True)
         self._lazy_destination_projection_timer.timeout.connect(self._run_lazy_destination_projection_refresh)
@@ -3000,6 +3101,21 @@ class MainWindow(QMainWindow):
         self._destination_indicator_refresh_deferred_for_scroll = False
         self._destination_materialize_pended_for_scroll_reason = ""
         self._destination_materialize_pended_for_scroll_kwargs: dict = {}
+        # Graph-resolve overlay / post-startup chunking (GUI thread budgets).
+        self._destination_overlay_active_materialize_reason: str = ""
+        self._destination_graph_overlay_deferred_frame_kick: bool = False
+        self._destination_chunk_planned_workspace_fixpoint: bool = False
+        self._destination_fixpoint_slice_incomplete: bool = False
+        self._destination_fixpoint_slice_continuations: int = 0
+        self._destination_global_reconcile_chunk_state: dict | None = None
+        self._destination_startup_global_reconcile_chunk_ms: float = 18.0
+        self._destination_startup_fixpoint_slice_s: float = 0.012
+        # Late full-tree idle success: merge + overlay without one GUI-thread mega-pass.
+        self._destination_full_tree_idle_light_overlay: bool = False
+        self._destination_full_tree_idle_merge_chunk_active: bool = False
+        self._destination_ft_idle_merge_state: dict | None = None
+        self._destination_full_tree_idle_chunk_budget_s: float = 0.01
+        self._destination_full_tree_idle_chunk_max_entries: int = 32
         self._dest_scroll_profile_enabled = QSettings().value("debug/dest_scroll_profile", True, type=bool)
         self._dest_scroll_profiler = None
         try:
@@ -3091,10 +3207,17 @@ class MainWindow(QMainWindow):
         self._destination_descendant_apply_state = None
         self._destination_descendant_apply_queue: deque = deque()
         self._destination_descendant_apply_budget_s = 0.005
+        self._destination_graph_descendant_apply_budget_s = 0.01
+        self._destination_graph_descendant_apply_max_ops_per_tick = 8
         self._destination_descendant_apply_timer = QTimer(self)
         self._destination_descendant_apply_timer.setSingleShot(True)
         self._destination_descendant_apply_timer.timeout.connect(self._run_destination_descendant_apply_tick)
         self._destination_descendant_apply_paused_for_finalize_alloc = False
+        self._destination_descendant_apply_tick_running = False
+        self._destination_descendant_apply_graph_bind_depth = 0
+        # Reentrancy / suppression during :meth:`_destination_finalize_inflight_descendant_apply_for_snapshot_capture`.
+        self._destination_snapshot_capture_drain_depth = 0
+        self._destination_snapshot_capture_drain_active = False
         # When an allocation has more than this many collected descendants, file-level
         # projected_descendant rows are deferred until the user expands the allocation
         # (folders still projected eagerly for structure). planned_moves stays authoritative.
@@ -6380,29 +6503,48 @@ class MainWindow(QMainWindow):
 
         title = QLabel(title_text)
         title.setObjectName("SectionTitle")
-        refresh_cache_button = QPushButton(_REFRESH_CACHE_TREE_GLYPH)
-        refresh_cache_button.setObjectName("IconToolButton")
-        refresh_cache_button.setToolTip(_REFRESH_CACHE_TREE_TOOLTIP_IDLE)
-        refresh_cache_button.clicked.connect(
-            lambda _=False, panel_key=panel_key: self.handle_refresh_cache_for_panel(panel_key)
-        )
         expand_button = QPushButton(_EXPAND_ALL_TREE_GLYPH_EXPAND)
         expand_button.setObjectName("IconToolButton")
         expand_button.setToolTip("Expand all folders in this tree (may load in the background)")
         expand_button.clicked.connect(lambda _=False, panel_key=panel_key: self.handle_expand_all(panel_key))
         if panel_key == "source":
+            refresh_cache_button = QPushButton(_REFRESH_CACHE_TREE_GLYPH)
+            refresh_cache_button.setObjectName("IconToolButton")
+            refresh_cache_button.setToolTip(_REFRESH_CACHE_TREE_TOOLTIP_IDLE)
+            refresh_cache_button.clicked.connect(
+                lambda _=False, panel_key=panel_key: self.handle_refresh_cache_for_panel(panel_key)
+            )
             self.source_expand_all_button = expand_button
             self.source_refresh_cache_button = refresh_cache_button
+            tree_refresh_widget = refresh_cache_button
         else:
+            dest_refresh_tb = QToolButton()
+            dest_refresh_tb.setObjectName("IconToolButton")
+            dest_refresh_tb.setText(_REFRESH_CACHE_TREE_GLYPH)
+            dest_refresh_tb.setToolTip(
+                _REFRESH_CACHE_TREE_TOOLTIP_IDLE + " Use the arrow for Rebuild Cache / Full Resync (clears and reloads)."
+            )
+            dest_refresh_tb.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+            dest_menu = QMenu(dest_refresh_tb)
+            act_rebuild = QAction("Rebuild Cache / Full Resync…", dest_refresh_tb)
+            act_rebuild.setToolTip(
+                "Clears the SharePoint folder cache for this library and reloads the destination tree from Microsoft 365. "
+                "Slower; use when the incremental refresh is not enough."
+            )
+            act_rebuild.triggered.connect(self._handle_destination_rebuild_cache_full_resync)
+            dest_menu.addAction(act_rebuild)
+            dest_refresh_tb.setMenu(dest_menu)
+            dest_refresh_tb.clicked.connect(lambda: self.handle_refresh_cache_for_panel("destination"))
             self.destination_expand_all_button = expand_button
-            self.destination_refresh_cache_button = refresh_cache_button
+            self.destination_refresh_cache_button = dest_refresh_tb
+            tree_refresh_widget = dest_refresh_tb
 
         title_row = QHBoxLayout()
         title_row.setContentsMargins(0, 0, 0, 0)
         title_row.setSpacing(10)
         title_row.addWidget(title)
         title_row.addStretch()
-        title_row.addWidget(refresh_cache_button)
+        title_row.addWidget(tree_refresh_widget)
         title_row.addWidget(expand_button)
 
         surface = QFrame()
@@ -6974,6 +7116,13 @@ class MainWindow(QMainWindow):
     def _queue_deferred_planning_refresh(
         self, reason, *, source_projection_paths=None, delay_ms=None, notify_saved=True
     ):
+        if getattr(self, "_application_shutting_down", False):
+            log_info(
+                "shutdown_trace",
+                event="deferred_planning_refresh_queue_skipped",
+                reason=str(reason or "")[:220],
+            )
+            return
         reason_text = str(reason or "").strip() or "planning_change"
         if reason_text not in self._deferred_planning_refresh_reasons:
             self._deferred_planning_refresh_reasons.append(reason_text)
@@ -6996,6 +7145,24 @@ class MainWindow(QMainWindow):
         timer.start(interval)
 
     def _run_deferred_planning_refresh(self):
+        if getattr(self, "_application_shutting_down", False):
+            timer = getattr(self, "_deferred_planning_refresh_timer", None)
+            if timer is not None:
+                try:
+                    timer.stop()
+                except Exception:
+                    pass
+            had_pending = bool(getattr(self, "_deferred_planning_refresh_pending", False))
+            self._deferred_planning_refresh_pending = False
+            self._deferred_planning_refresh_reasons = []
+            self._deferred_source_projection_paths = set()
+            log_info(
+                "shutdown_trace",
+                event="deferred_planning_refresh_skipped",
+                reason="application_shutting_down",
+                had_pending_refresh=had_pending,
+            )
+            return
         if not getattr(self, "_deferred_planning_refresh_pending", False):
             return
         if self._restore_abort_active():
@@ -7044,6 +7211,24 @@ class MainWindow(QMainWindow):
                     unresolved_proposed=int(self._unresolved_proposed_queue_size() or 0),
                     unresolved_allocation=int(self._unresolved_allocation_queue_size() or 0),
                 )
+        _quiet_struct_sup = bool(getattr(self, "_destination_quiet_startup_overlay_structural_suppress", False))
+        if _quiet_struct_sup:
+            if overlay_backlog > 0:
+                self._destination_quiet_startup_overlay_structural_suppress = False
+                log_info(
+                    "destination_quiet_startup_overlay_suppress_cleared",
+                    reason="unresolved_overlay_backlog_nonzero",
+                    unresolved_proposed=int(self._unresolved_proposed_queue_size() or 0),
+                    unresolved_allocation=int(self._unresolved_allocation_queue_size() or 0),
+                )
+            else:
+                force_dest_full = False
+                skip_full_destination_future_model = True
+                log_info(
+                    "destination_quiet_startup_deferred_overlay_suppressed",
+                    reasons=str(combined_reason)[:220],
+                    skip_full_destination_future_model=True,
+                )
         self._destination_lifecycle_trace_TEMP(
             fn="_run_deferred_planning_refresh",
             reason=combined_reason,
@@ -7068,6 +7253,21 @@ class MainWindow(QMainWindow):
                     non_incremental_reasons=violators,
                 )
 
+        _vp_finalize_before = -1
+        try:
+            if getattr(self, "destination_planning_model", None) is not None:
+                _vp_fb, _av_fb = self._destination_enumerate_visible_planned_paths_and_all_visible()
+                _vp_finalize_before = len(_vp_fb)
+        except Exception:
+            _vp_finalize_before = -1
+        log_info(
+            "destination_finalize_started",
+            combined_reason=str(combined_reason)[:220],
+            skip_full_destination_future_model=bool(skip_full_destination_future_model),
+            force_destination_full=bool(force_dest_full),
+            visible_planned_before=int(_vp_finalize_before),
+        )
+        _finalize_overlay_structural = False
         with _PerfExplorerTimer(
             "run_deferred_planning_refresh",
             combined_reason=combined_reason,
@@ -7080,13 +7280,10 @@ class MainWindow(QMainWindow):
                         (not skip_full_destination_future_model or force_dest_full)
                         and not self._destination_steady_state_full_materialize_redundant()
                     ):
-                        # Graph path/id enrichment runs proactive parent-chain work first, which queues
-                        # destination folder loads. ``pending_folder_loads`` makes
-                        # ``_should_defer_destination_materialization`` true, so the full overlay pass
-                        # (replay unresolved proposed/allocation) was deferred while folder workers
-                        # immediately ran ``replace_all_children`` — planned rows flashed then vanished
-                        # until a much later idle/full-tree pass (see logs: deferred_graph_ids + waiting_for_idle_window).
-                        _no_defer_for_graph_resolve = "graph_ids_resolved_from_sharepoint_paths" in reasons
+                        _finalize_overlay_structural = True
+                        # Graph path/id enrichment may queue folder loads; allow idle defer again so the
+                        # GUI thread can paint between materialize/reconcile chunks (see startup chunking).
+                        _graph_resolve = "graph_ids_resolved_from_sharepoint_paths" in reasons
                         if (
                             bool(getattr(self, "_memory_restore_in_progress", False))
                             and self._destination_graph_authority_supersedes_memory_restore_gate()
@@ -7104,7 +7301,8 @@ class MainWindow(QMainWindow):
                         _t_def = time.perf_counter()
                         self._apply_destination_planning_overlays(
                             _mat_reason,
-                            allow_defer=not _no_defer_for_graph_resolve,
+                            allow_defer=True,
+                            prefer_chunked_projection=bool(_graph_resolve),
                         )
                         if _forensic_deferred:
                             log_info(
@@ -7116,7 +7314,7 @@ class MainWindow(QMainWindow):
                                     (time.perf_counter() - _t_def) * 1000.0, 2
                                 ),
                                 skip_full_destination_future_model=bool(skip_full_destination_future_model),
-                                allow_defer_destination=not bool(_no_defer_for_graph_resolve),
+                                allow_defer_destination=True,
                                 overlay_terminal_reconcile_done_after_apply=bool(
                                     getattr(self, "_destination_overlay_terminal_reconcile_done", False)
                                 ),
@@ -7135,6 +7333,22 @@ class MainWindow(QMainWindow):
                     )
             except Exception as exc:
                 self._log_restore_exception("deferred_planning_refresh.source", exc)
+
+            _vp_finalize_after = -1
+            try:
+                if getattr(self, "destination_planning_model", None) is not None:
+                    _vp_fa, _av_fa = self._destination_enumerate_visible_planned_paths_and_all_visible()
+                    _vp_finalize_after = len(_vp_fa)
+            except Exception:
+                _vp_finalize_after = -1
+            log_info(
+                "destination_finalize_finished",
+                combined_reason=str(combined_reason)[:220],
+                skip_full_destination_future_model=bool(skip_full_destination_future_model),
+                visible_planned_before=int(_vp_finalize_before),
+                visible_planned_after=int(_vp_finalize_after),
+                ran_full_destination_overlay_pass=bool(_finalize_overlay_structural),
+            )
 
             self.update_progress_summaries()
             self._set_window_title_status()
@@ -7382,6 +7596,22 @@ class MainWindow(QMainWindow):
         runtime_snapshots[panel_key] = list(snapshots or [])
         return runtime_snapshots[panel_key]
 
+    def _promote_destination_workspace_snapshot_after_structure_change(self) -> None:
+        """After projected descendants or allocation subtree mutations, refresh the cached destination snapshot.
+
+        Session ``DestinationTreeSnapshot`` is only refreshed when ``include_workspace_ui=True`` saves run.
+        Without this, incremental injection can leave persisted JSON stale until a full workspace save
+        (e.g. close/sign-out), so the next launch replays from an incomplete tree while resume metadata
+        still reflects progress — matching scroll-deferred overlay / re-hydration behavior.
+        """
+        if getattr(self, "_destination_snapshot_capture_drain_active", False):
+            return
+        try:
+            self._refresh_runtime_tree_snapshot("destination")
+        except Exception as exc:
+            self._log_restore_exception("promote_destination_snapshot_refresh", exc)
+        self._schedule_workspace_ui_persist(panel_key="destination", delay_ms=850)
+
     def _schedule_workspace_ui_persist(self, delay_ms=1200, *, panel_key=None):
         try:
             if panel_key in {"source", "destination"}:
@@ -7553,25 +7783,290 @@ class MainWindow(QMainWindow):
 
         super().show()
 
-    def closeEvent(self, event):
+    def _log_shutdown_trace_stage(self, stage: str, t_stage_start: float, **extra) -> float:
+        """End of a shutdown stage: log elapsed_ms since ``t_stage_start``; return new perf_counter for next stage."""
+        elapsed_ms = round((time.perf_counter() - t_stage_start) * 1000.0, 2)
+        log_info("shutdown_trace", event="stage_end", stage=stage, elapsed_ms=elapsed_ms, **extra)
+        return time.perf_counter()
+
+    def _if_shutdown_skip_mutation(self, mutation_path: str, **extra: Any) -> bool:
+        """When True, caller must fast-return; logs one structured line per skip."""
+        if not getattr(self, "_application_shutting_down", False):
+            return False
         try:
-            self._flush_deferred_planning_refresh()
+            log_info(
+                "shutdown_trace",
+                event="shutdown_mutation_skipped",
+                mutation_path=str(mutation_path)[:200],
+                **{k: v for k, v in extra.items() if v is not None},
+            )
         except Exception:
             pass
+        return True
+
+    def _stop_all_shutdown_mutation_timers(self) -> None:
+        """Stop Qt timers that can enqueue destination / planning work during :meth:`closeEvent`."""
+        for name in (
+            "_wait_timer",
+            "_destination_full_tree_materialize_timer",
+            "_destination_idle_materialize_timer",
+            "_lazy_destination_projection_timer",
+            "_destination_expand_burst_timer",
+            "_destination_future_projection_timer",
+            "_destination_bind_reconcile_after_workers_timer",
+            "_destination_indicator_refresh_timer",
+            "_destination_tree_scroll_idle_timer",
+            "_destination_lbs_recompute_timer",
+            "_destination_structure_reactive_coalesce_timer",
+            "_destination_descendant_apply_timer",
+            "_destination_overlay_source_invariant_timer",
+            "_progress_summary_refresh_timer",
+            "_deferred_planning_refresh_timer",
+            "_source_background_preload_timer",
+            "_destination_incremental_merge_timer",
+            "_graph_linkage_progress_success_hide_timer",
+            "_session_keepalive_timer",
+            "_loading_visual_timer",
+            "_planning_graph_assurance_hide_timer",
+        ):
+            timer = getattr(self, name, None)
+            if timer is None:
+                continue
+            try:
+                timer.stop()
+            except Exception:
+                pass
+
+    def _abort_destination_descendant_apply_for_shutdown(self) -> None:
+        timer = getattr(self, "_destination_descendant_apply_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+        dq = getattr(self, "_destination_descendant_apply_queue", None)
+        q_before = len(dq) if dq else 0
+        had_state = getattr(self, "_destination_descendant_apply_state", None) is not None
+        if dq is not None:
+            try:
+                dq.clear()
+            except Exception:
+                pass
+        self._destination_descendant_apply_state = None
+        self._destination_descendant_apply_tick_running = False
+        self._destination_descendant_apply_inline_drain = False
+        log_info(
+            "shutdown_trace",
+            event="descendant_apply_queue_cleared",
+            queue_len_before=int(q_before),
+            had_active_state=bool(had_state),
+        )
+
+    def _shutdown_abort_restore_side_pipelines(self) -> None:
+        """Stop graph-enrichment generators and async destination projection without full restore-abort semantics."""
+        try:
+            self._close_post_import_graph_enrichment_generator()
+        except Exception:
+            pass
+        try:
+            self._post_import_graph_enrich_run_id = int(getattr(self, "_post_import_graph_enrich_run_id", 0)) + 1
+        except Exception:
+            pass
+        try:
+            self._cancel_destination_future_async_projection("application_shutdown")
+        except Exception:
+            pass
+        try:
+            self._cancel_destination_incremental_merge_session("application_shutdown")
+        except Exception:
+            pass
+
+    def _shutdown_worker_safe_join(self, worker: Any, *, timeout_ms: int = 2500) -> None:
+        """``requestInterruption`` + ``wait`` without touching deleted ``QThread`` wrappers."""
+        if worker is None:
+            return
+        try:
+            if not _shiboken_is_valid(worker):
+                return
+        except Exception:
+            return
+        try:
+            if not hasattr(worker, "isRunning") or not worker.isRunning():
+                return
+        except RuntimeError:
+            return
+        except Exception:
+            return
+        try:
+            if isinstance(worker, QThread):
+                try:
+                    worker.quit()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            worker.requestInterruption()
+        except RuntimeError:
+            return
+        except Exception:
+            pass
+        try:
+            if not _shiboken_is_valid(worker):
+                return
+            worker.wait(int(timeout_ms))
+        except RuntimeError:
+            return
+        except Exception:
+            pass
+
+    def closeEvent(self, event):
+        t0 = time.perf_counter()
+        t = t0
+        if getattr(self, "_shutdown_close_event_active", False):
+            log_info("shutdown_trace", event="closeEvent_reentrant_guard_skip")
+            try:
+                event.accept()
+            except Exception:
+                pass
+            return
+        self._shutdown_close_event_active = True
+        log_info("shutdown_trace", event="closeEvent_enter")
+        log_info("shutdown_trace", event="shutdown_begin")
+        try:
+            log_info(
+                "shutdown_trace",
+                event="shutdown_begin_inventory",
+                **thread_inventory_snapshot(),
+                **qt_threadpool_snapshot(),
+            )
+        except Exception as exc:
+            log_info("shutdown_trace", event="shutdown_begin_inventory_failed", error=str(exc)[:240])
+        wu = getattr(self, "_workspace_ui_persist_timer", None)
+        wu_was_active = bool(wu.isActive()) if wu is not None else False
+        if wu is not None:
+            try:
+                wu.stop()
+            except Exception:
+                pass
+        dirty_ui = sorted(getattr(self, "_workspace_ui_snapshot_dirty_panels", set()) or [])
+        log_info(
+            "shutdown_trace",
+            event="workspace_ui_persist_timer_stopped",
+            had_dirty_panels=dirty_ui,
+            workspace_ui_timer_was_active=wu_was_active,
+        )
+        t_stop0 = time.perf_counter()
+        log_info("shutdown_trace", event="stop_timers_begin")
+        self._stop_all_shutdown_mutation_timers()
+        log_info(
+            "shutdown_trace",
+            event="stop_timers_end",
+            elapsed_ms=round((time.perf_counter() - t_stop0) * 1000.0, 2),
+        )
+        self._application_shutting_down = True
+
+        t_da0 = time.perf_counter()
+        log_info("shutdown_trace", event="descendant_apply_abort_begin")
+        self._abort_destination_descendant_apply_for_shutdown()
+        log_info(
+            "shutdown_trace",
+            event="descendant_apply_abort_end",
+            elapsed_ms=round((time.perf_counter() - t_da0) * 1000.0, 2),
+        )
+
+        t_rs0 = time.perf_counter()
+        log_info("shutdown_trace", event="restore_abort_begin")
+        self._shutdown_abort_restore_side_pipelines()
+        log_info(
+            "shutdown_trace",
+            event="restore_abort_end",
+            elapsed_ms=round((time.perf_counter() - t_rs0) * 1000.0, 2),
+        )
+
+        try:
+            self._deferred_planning_refresh_pending = False
+            self._deferred_planning_refresh_reasons = []
+            self._deferred_source_projection_paths = set()
+        except Exception:
+            pass
+        t = self._log_shutdown_trace_stage(
+            "deferred_planning_cleared_no_flush",
+            t,
+            note="close_gate_skip_materialize_flush_deferred_planning_refresh_not_run",
+        )
+
+        self._destination_branch_forensic_log("close_pre_save_live_model")
         try:
             self._shutdown_running_workers_for_close()
         except Exception as exc:
             self._log_restore_exception("closeEvent.shutdown_workers", exc)
+        t = self._log_shutdown_trace_stage("shutdown_workers", t)
+
+        t_tp0 = time.perf_counter()
+        try:
+            self._drain_global_qthreadpool_for_shutdown()
+        except Exception as exc:
+            log_info("shutdown_trace", event="qthreadpool_drain_outer_failed", error=str(exc)[:240])
+        log_info(
+            "shutdown_trace",
+            event="qthreadpool_drain_stage",
+            elapsed_ms=round((time.perf_counter() - t_tp0) * 1000.0, 2),
+        )
+
+        t_sn0 = time.perf_counter()
+        log_info("shutdown_trace", event="snapshot_begin")
+        t_sv0 = time.perf_counter()
+        log_info("shutdown_trace", event="save_begin")
         try:
             self._save_draft_shell(force=True, include_workspace_ui=True)
         except Exception:
             pass
+        log_info(
+            "shutdown_trace",
+            event="save_end",
+            elapsed_ms=round((time.perf_counter() - t_sv0) * 1000.0, 2),
+        )
+        log_info(
+            "shutdown_trace",
+            event="snapshot_end",
+            elapsed_ms=round((time.perf_counter() - t_sn0) * 1000.0, 2),
+            note="tree_snapshot_built_inside_save_draft_shell",
+        )
+        self._destination_branch_forensic_log(
+            "close_post_save_persisted_session_json",
+            snapshots=self._destination_branch_forensic_read_persisted_session_snapshot(),
+        )
+        t = self._log_shutdown_trace_stage("save_draft_shell_close", t, include_workspace_ui=True)
         try:
             self._auto_export_draft_on_exit()
         except Exception:
             pass
-        self.save_window_preferences()
+        t = self._log_shutdown_trace_stage("auto_export_draft_on_exit", t)
+        try:
+            self.save_window_preferences()
+        except Exception:
+            pass
+        t = self._log_shutdown_trace_stage("save_window_preferences", t)
         super().closeEvent(event)
+        try:
+            log_info(
+                "shutdown_trace",
+                event="shutdown_end",
+                total_elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 2),
+                **thread_inventory_snapshot(),
+                **qt_threadpool_snapshot(),
+            )
+            log_info(
+                "shutdown_trace",
+                event="closeEvent_exit",
+                total_elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 2),
+                **thread_inventory_snapshot(),
+                **qt_threadpool_snapshot(),
+            )
+            flush_logger()
+        except Exception as exc:
+            log_info("shutdown_trace", event="shutdown_end_thread_inventory_failed", error=str(exc)[:240])
 
     def _shutdown_running_workers_for_close(self):
         """Best-effort worker shutdown to avoid QThread destruction during app exit."""
@@ -7593,6 +8088,7 @@ class MainWindow(QMainWindow):
             "discovery_worker",
             "full_count_worker",
             "cache_refresh_worker",
+            "destination_incremental_refresh_worker",
             "_destination_full_tree_worker",
             "_preview_worker",
             "session_keepalive_worker",
@@ -7600,6 +8096,7 @@ class MainWindow(QMainWindow):
             "_destination_snapshot_light_validation_worker",
             "_manifest_run_worker",
             "_snapshot_pipeline_run_worker",
+            "_graph_truth_worker",
         ):
             _add_worker(getattr(self, attr_name, None))
 
@@ -7613,26 +8110,70 @@ class MainWindow(QMainWindow):
             if isinstance(entry, dict):
                 _add_worker(entry.get("worker"))
 
-        running_workers = [worker for worker in workers if hasattr(worker, "isRunning") and worker.isRunning()]
+        for retired_map in (
+            getattr(self, "_retired_preview_workers", None) or {},
+            getattr(self, "_retired_destination_full_tree_workers", None) or {},
+            getattr(self, "_retired_full_count_workers", None) or {},
+        ):
+            for w in retired_map.values():
+                _add_worker(w)
+
+        for retired_map in (getattr(self, "root_load_retired_workers", None) or {}, getattr(self, "folder_load_retired_workers", None) or {}):
+            for entry in retired_map.values():
+                if isinstance(entry, dict):
+                    _add_worker(entry.get("worker"))
+
+        running_workers = []
+        for worker in workers:
+            try:
+                if not _shiboken_is_valid(worker):
+                    continue
+                if hasattr(worker, "isRunning") and worker.isRunning():
+                    running_workers.append(worker)
+            except RuntimeError:
+                continue
+            except Exception:
+                continue
         if not running_workers:
+            log_info("shutdown_trace", event="shutdown_workers", running_worker_count=0, wait_ms=0.0)
             return
 
         log_info("Close requested with running workers.", running_worker_count=len(running_workers))
+        t_wait0 = time.perf_counter()
         for worker in running_workers:
+            self._shutdown_worker_safe_join(worker, timeout_ms=2500)
             try:
-                worker.requestInterruption()
-            except Exception:
-                pass
-
-        for worker in running_workers:
-            try:
-                if not worker.wait(2500):
+                if _shiboken_is_valid(worker) and worker.isRunning():
                     log_warn(
                         "Worker still running during close wait.",
                         worker_type=type(worker).__name__,
                     )
             except Exception:
                 pass
+        log_info(
+            "shutdown_trace",
+            event="shutdown_workers",
+            running_worker_count=len(running_workers),
+            wait_ms=round((time.perf_counter() - t_wait0) * 1000.0, 2),
+        )
+
+    def _drain_global_qthreadpool_for_shutdown(self) -> None:
+        """Wait for Qt global pool workers; clear queued runnables so process can exit."""
+        tp = QThreadPool.globalInstance()
+        log_info("shutdown_trace", event="qthreadpool_drain_enter", **qt_threadpool_snapshot())
+        try:
+            tp.waitForDone(8000)
+        except Exception:
+            pass
+        try:
+            tp.clear()
+        except Exception:
+            pass
+        try:
+            tp.waitForDone(3000)
+        except Exception:
+            pass
+        log_info("shutdown_trace", event="qthreadpool_drain_exit", **qt_threadpool_snapshot())
 
     def _auto_export_draft_on_exit(self):
         if self.memory_manager is None:
@@ -7693,7 +8234,7 @@ class MainWindow(QMainWindow):
         self._restore_selected_candidate_path = ""
         self.planned_moves = []
         self._plan_leaf_exclusions = set()
-        self._clear_source_projection_descendants_cache()
+        self._clear_source_projection_descendants_cache(reason="runtime_draft_cleared", caller="_clear_runtime_draft_state")
         self.proposed_folders = []
         self._memory_restore_complete = False
         self._restore_destination_overlay_pending = False
@@ -8408,7 +8949,8 @@ class MainWindow(QMainWindow):
         return snap_sig, prop_sig, moves_sig, full_fp
 
     def _current_destination_full_overlay_fingerprint(self, *, force_refresh_snapshot: bool = True) -> str:
-        self._refresh_destination_real_tree_snapshot(force=bool(force_refresh_snapshot))
+        _light_idle = bool(getattr(self, "_destination_full_tree_idle_light_overlay", False))
+        self._refresh_destination_real_tree_snapshot(force=bool(force_refresh_snapshot) and not _light_idle)
         return self._destination_overlay_fingerprint_context(False)[3]
 
     def _destination_materialize_reason_may_skip_without_interrupting_async(self, reason: str) -> bool:
@@ -9055,7 +9597,7 @@ class MainWindow(QMainWindow):
         for p in getattr(session_state, "NeedsReviewDismissedInheritedSourcePaths", None) or []:
             if isinstance(p, str) and p.strip():
                 self._needs_review_dismissed_inherited_paths.add(self.normalize_memory_path(p))
-        self._clear_source_projection_descendants_cache()
+        self._clear_source_projection_descendants_cache(reason="restored_memory_payload", caller="_restore_memory_payload")
         self.proposed_folders = list(proposed)
         self._ensure_proposed_folders_stable_keys_assigned()
         self._reset_unresolved_proposed_queue()
@@ -9070,6 +9612,16 @@ class MainWindow(QMainWindow):
             planned_moves_restored=len(allocations),
             proposed_folders_restored=len(proposed),
         )
+        try:
+            _sess_n = int(self._count_tree_snapshot_nodes(list(session_state.DestinationTreeSnapshot or [])))
+            log_info(
+                "snapshot_restore_forensic",
+                phase="restore_memory_payload_session_only",
+                session_json_destination_snapshot_count_loaded=int(_sess_n),
+                note="workspace_sidecar_merged_later_in_begin_session_workspace_ui_restore",
+            )
+        except Exception:
+            pass
         self._log_restore_state_snapshot("restore_runtime_applied")
 
     def _load_draft_shell_into_runtime(self):
@@ -9231,6 +9783,11 @@ class MainWindow(QMainWindow):
         graph_audit_stored = dict(audit)
         graph_audit_stored["phase"] = str(trigger_phase or "workspace_snapshot")
         graph_audit_stored["last_run_utc"] = datetime.now(timezone.utc).isoformat()
+        dest_snap = list(getattr(state, "DestinationTreeSnapshot", []) or [])
+        try:
+            dest_tree_node_count = int(self._count_tree_snapshot_nodes(dest_snap))
+        except Exception:
+            dest_tree_node_count = -1
         return {
             "schema_version": WORKSPACE_SNAPSHOT_SCHEMA_VERSION,
             "snapshot_type": "workspace_full",
@@ -9244,6 +9801,9 @@ class MainWindow(QMainWindow):
             },
             "allocation_graph_identity": allocation_graph_identity,
             "graph_linkage_audit": graph_audit_stored,
+            # Mirror of SessionState.DestinationTreeSnapshot for startup merge when session JSON is stale/minimal.
+            "destination_tree_snapshot": dest_snap,
+            "destination_tree_snapshot_node_count": dest_tree_node_count,
         }
 
     def _persist_workspace_snapshot_file(self, *, phase: str = "") -> None:
@@ -9345,13 +9905,35 @@ class MainWindow(QMainWindow):
             if not self._ensure_active_draft_session():
                 return False
 
+            _shut = getattr(self, "_application_shutting_down", False)
+            _t_build = time.perf_counter() if _shut else None
             state = self._build_current_draft_shell_state(include_workspace_ui=include_workspace_ui)
+            if include_workspace_ui:
+                self._destination_branch_forensic_log(
+                    "save_draft_shell_built_state_snapshot",
+                    snapshots=list(state.DestinationTreeSnapshot or []),
+                )
+            if _t_build is not None:
+                _dn = -1
+                if include_workspace_ui:
+                    try:
+                        _dn = int(self._count_tree_snapshot_nodes(list(state.DestinationTreeSnapshot or [])))
+                    except Exception:
+                        _dn = -1
+                log_info(
+                    "shutdown_trace",
+                    event="draft_shell_built_state",
+                    elapsed_ms=round((time.perf_counter() - _t_build) * 1000.0, 2),
+                    include_workspace_ui=include_workspace_ui,
+                    destination_snapshot_nodes=_dn,
+                )
             self._draft_shell_state = state
             self._draft_shell_raw = state.to_dict()
             self.active_draft_session_id = state.DraftId
             allocation_rows = self._build_memory_allocation_rows()
             proposed_rows = self._build_memory_proposed_folders()
             allow_empty_overwrite = bool(force)
+            _t_mem = time.perf_counter() if _shut else None
             self.memory_manager.save_allocations(
                 allocation_rows,
                 allow_empty=allow_empty_overwrite or self._restored_allocation_count == 0,
@@ -9366,6 +9948,23 @@ class MainWindow(QMainWindow):
                 fingerprint=state.SessionFingerprint,
                 status="Healthy",
             )
+            if include_workspace_ui and self._destination_branch_forensic_enabled():
+                mmp = getattr(self.memory_manager, "paths", {}) or {}
+                log_info(
+                    "destination_branch_forensic",
+                    stage="close_save_targets",
+                    session_state_write_path=str(mmp.get("session") or ""),
+                    workspace_sidecar_write_path=str(mmp.get("workspace_snapshot") or ""),
+                    destination_snapshot_nodes=int(
+                        self._count_tree_snapshot_nodes(list(state.DestinationTreeSnapshot or []))
+                    ),
+                )
+            if _t_mem is not None:
+                log_info(
+                    "shutdown_trace",
+                    event="draft_shell_memory_persist",
+                    elapsed_ms=round((time.perf_counter() - _t_mem) * 1000.0, 2),
+                )
             log_info(
                 "Draft shell saved.",
                 draft_id=state.DraftId,
@@ -9374,6 +9973,7 @@ class MainWindow(QMainWindow):
                 proposed_count=len(proposed_rows),
             )
             if include_workspace_ui:
+                _t_ws = time.perf_counter() if _shut else None
                 try:
                     self._persist_workspace_snapshot_file(phase="draft_save_include_workspace_ui")
                 except Exception as snap_exc:
@@ -9382,6 +9982,30 @@ class MainWindow(QMainWindow):
                         phase="draft_save_include_workspace_ui",
                         error=str(snap_exc),
                     )
+                finally:
+                    if _t_ws is not None:
+                        log_info(
+                            "shutdown_trace",
+                            event="draft_shell_workspace_sidecar_file",
+                            elapsed_ms=round((time.perf_counter() - _t_ws) * 1000.0, 2),
+                        )
+                try:
+                    _sess_w = int(self._count_tree_snapshot_nodes(list(state.DestinationTreeSnapshot or [])))
+                    _ws_opt = self.memory_manager.read_workspace_snapshot_optional()
+                    _side_w = int(
+                        self._count_tree_snapshot_nodes(list((_ws_opt or {}).get("destination_tree_snapshot") or []))
+                    )
+                    log_info(
+                        "snapshot_persist_forensic",
+                        session_json_destination_snapshot_count_written=int(_sess_w),
+                        workspace_sidecar_destination_snapshot_count_written=int(_side_w),
+                        session_json_destination_snapshot_top_level_written=len(list(state.DestinationTreeSnapshot or [])),
+                        workspace_sidecar_destination_snapshot_top_level_written=(
+                            len(list((_ws_opt or {}).get("destination_tree_snapshot") or []))
+                        ),
+                    )
+                except Exception:
+                    pass
             return True
         except Exception as exc:
             log_warn("Draft shell save failed.", error=str(exc))
@@ -10232,7 +10856,9 @@ class MainWindow(QMainWindow):
             if pm_override is not None:
                 self.planned_moves = list(pm_override)
                 self.refresh_planned_moves_table()
-                self._clear_source_projection_descendants_cache()
+                self._clear_source_projection_descendants_cache(
+                    reason="workspace_reset_backup_pm_override", caller="apply_draft_reset_backup"
+                )
             self._rebuild_submission_visual_cache()
             self.update_progress_summaries()
             if self.current_session_context.get("connected"):
@@ -10331,9 +10957,15 @@ class MainWindow(QMainWindow):
             self.source_refresh_cache_button.setText(_REFRESH_CACHE_TREE_GLYPH)
             self.source_refresh_cache_button.setToolTip(_REFRESH_CACHE_TREE_TOOLTIP_IDLE)
         if hasattr(self, "destination_refresh_cache_button"):
-            self.destination_refresh_cache_button.setEnabled(True)
-            self.destination_refresh_cache_button.setText(_REFRESH_CACHE_TREE_GLYPH)
-            self.destination_refresh_cache_button.setToolTip(_REFRESH_CACHE_TREE_TOOLTIP_IDLE)
+            tb = self.destination_refresh_cache_button
+            tb.setEnabled(True)
+            tb.setText(_REFRESH_CACHE_TREE_GLYPH)
+            if isinstance(tb, QToolButton):
+                tb.setToolTip(
+                    _REFRESH_CACHE_TREE_TOOLTIP_IDLE + " Use the arrow for Rebuild Cache / Full Resync (clears and reloads)."
+                )
+            else:
+                tb.setToolTip(_REFRESH_CACHE_TREE_TOOLTIP_IDLE)
 
     def handle_refresh_cache_for_panel(self, panel_key):
         if panel_key not in {"source", "destination"}:
@@ -10347,9 +10979,33 @@ class MainWindow(QMainWindow):
             return
         self._request_cache_refresh_for_panels({panel_key})
 
+    def _handle_destination_rebuild_cache_full_resync(self):
+        if self._planning_browse_mode("destination") == "local":
+            QMessageBox.information(
+                self,
+                "Rebuild Cache",
+                "Switch the destination browse mode to SharePoint to rebuild the Microsoft 365 cache.",
+            )
+            return
+        decision = QMessageBox.question(
+            self,
+            "Rebuild Cache / Full Resync",
+            "This clears the cached folder listings for the destination library and reloads the full tree from Microsoft 365.\n\n"
+            "The main refresh button performs a faster incremental update that keeps the workspace visible.\n\n"
+            "Continue with full rebuild?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if decision != QMessageBox.Yes:
+            return
+        self._destination_cache_refresh_force_full_resync = True
+        self._request_cache_refresh_for_panels({"destination"})
+
     def _request_cache_refresh_for_panels(self, panel_keys):
         try:
             if self.cache_refresh_worker and self.cache_refresh_worker.isRunning():
+                return
+            if getattr(self, "destination_incremental_refresh_worker", None) and self.destination_incremental_refresh_worker.isRunning():
                 return
             target_panels = {key for key in (panel_keys or set()) if key in {"source", "destination"}}
             if not target_panels:
@@ -10358,21 +11014,35 @@ class MainWindow(QMainWindow):
             self._cache_refresh_restore_active = True
             self._pending_cache_refresh_ui_state = self._capture_workspace_tree_state()
             self._pending_cache_refresh_panels = set()
+            force_dest_full = bool(getattr(self, "_destination_cache_refresh_force_full_resync", False))
+            self._destination_cache_refresh_force_full_resync = False
+            dest_option3 = (
+                "destination" in target_panels
+                and self._planning_browse_mode("destination") != "local"
+                and not force_dest_full
+            )
+            self._cache_refresh_option3_destination = dest_option3
             # Restoring thousands of expanded paths immediately after cache refresh causes
             # aggressive lazy-load churn and UI scroll jank, especially for source.
-            self._cache_refresh_skip_expanded_restore_panels = set(target_panels)
+            self._cache_refresh_skip_expanded_restore_panels = set()
+            if "source" in target_panels:
+                self._cache_refresh_skip_expanded_restore_panels.add("source")
+            if "destination" in target_panels and not dest_option3:
+                self._cache_refresh_skip_expanded_restore_panels.add("destination")
             self._pending_cache_refresh_tree_snapshots = {
                 "source": self._capture_tree_items_snapshot("source"),
                 "destination": self._capture_tree_items_snapshot("destination"),
             }
-            self._cancel_expand_all("source")
-            self._cancel_expand_all("destination")
-            self._destination_expand_all_after_full_tree = False
-            self._set_expand_all_button_label("source", False)
-            self._set_expand_all_button_label("destination", False)
-            destination_button = self._expand_all_button_for_panel("destination")
-            if destination_button is not None:
-                destination_button.setEnabled(True)
+            if "source" in target_panels:
+                self._cancel_expand_all("source")
+                self._set_expand_all_button_label("source", False)
+            if "destination" in target_panels and not dest_option3:
+                self._cancel_expand_all("destination")
+                self._destination_expand_all_after_full_tree = False
+                self._set_expand_all_button_label("destination", False)
+                destination_button = self._expand_all_button_for_panel("destination")
+                if destination_button is not None:
+                    destination_button.setEnabled(True)
             source_site = self.planning_inputs.get("Source Site").currentData() if hasattr(self, "planning_inputs") else None
             source_library = self.planning_inputs.get("Source Library").currentData() if hasattr(self, "planning_inputs") else None
             destination_site = self.planning_inputs.get("Destination Site").currentData() if hasattr(self, "planning_inputs") else None
@@ -10382,16 +11052,27 @@ class MainWindow(QMainWindow):
                 drive_ids.append(source_library.get("id"))
                 self._pending_cache_refresh_panels.add("source")
             if "destination" in target_panels and isinstance(destination_library, dict) and destination_library.get("id"):
-                drive_ids.append(destination_library.get("id"))
                 self._pending_cache_refresh_panels.add("destination")
+                if not dest_option3:
+                    drive_ids.append(destination_library.get("id"))
 
-            if not drive_ids:
+            dest_incr_alone = (
+                dest_option3
+                and self._pending_cache_refresh_panels == {"destination"}
+                and isinstance(destination_site, dict)
+                and isinstance(destination_library, dict)
+                and destination_library.get("id")
+            )
+            if not drive_ids and not dest_incr_alone:
                 self._cache_refresh_restore_active = False
                 self._pending_cache_refresh_ui_state = None
                 self._pending_cache_refresh_panels = set()
+                self._cache_refresh_refreshed_panels_snapshot = set()
                 self._cache_refresh_skip_expanded_restore_panels = set()
                 self._pending_cache_refresh_tree_snapshots = {}
                 return
+
+            self._cache_refresh_refreshed_panels_snapshot = set(self._pending_cache_refresh_panels)
 
             if "source" in self._pending_cache_refresh_panels:
                 self._set_tree_status_message("source", "Refreshing source cache...", loading=True)
@@ -10399,21 +11080,44 @@ class MainWindow(QMainWindow):
                     self.source_refresh_cache_button.setEnabled(False)
                     self.source_refresh_cache_button.setToolTip(_REFRESH_CACHE_TREE_TOOLTIP_BUSY)
             if "destination" in self._pending_cache_refresh_panels:
-                self._set_tree_status_message("destination", "Refreshing destination cache...", loading=True)
+                msg = (
+                    "Refreshing live SharePoint content…"
+                    if dest_option3
+                    else "Refreshing destination cache..."
+                )
+                self._set_tree_status_message("destination", msg, loading=bool(dest_option3))
                 if hasattr(self, "destination_refresh_cache_button"):
                     self.destination_refresh_cache_button.setEnabled(False)
                     self.destination_refresh_cache_button.setToolTip(_REFRESH_CACHE_TREE_TOOLTIP_BUSY)
             if hasattr(self, "planned_moves_status"):
                 label = (
-                    "Refreshing source and destination cache..."
-                    if self._pending_cache_refresh_panels == {"source", "destination"}
+                    "Refreshing source cache; refreshing live SharePoint content on destination…"
+                    if self._pending_cache_refresh_panels == {"source", "destination"} and dest_option3
                     else (
-                        "Refreshing source cache..."
-                        if "source" in self._pending_cache_refresh_panels
-                        else "Refreshing destination cache..."
+                        "Refreshing source and destination cache..."
+                        if self._pending_cache_refresh_panels == {"source", "destination"}
+                        else (
+                            "Refreshing source cache..."
+                            if "source" in self._pending_cache_refresh_panels
+                            else (
+                                "Refreshing live SharePoint content…"
+                                if dest_option3
+                                else "Refreshing destination cache..."
+                            )
+                        )
                     )
                 )
                 self.planned_moves_status.setText(label)
+
+            if dest_incr_alone:
+                log_info(
+                    "graph_cache_refresh_requested",
+                    panels=["destination"],
+                    mode="destination_incremental_option3",
+                    destination_library=str((destination_library or {}).get("name", "")) if isinstance(destination_library, dict) else "",
+                )
+                self._start_destination_incremental_graph_refresh_worker(destination_site, destination_library)
+                return
 
             self.cache_refresh_worker = CacheRefreshWorker(self.graph, drive_ids)
             self.cache_refresh_worker.success.connect(lambda payload: self._safe_invoke("cache_refresh.success", self.on_cache_refresh_success, payload))
@@ -10423,13 +11127,16 @@ class MainWindow(QMainWindow):
             log_info(
                 "graph_cache_refresh_requested",
                 panels=sorted(self._pending_cache_refresh_panels),
+                mode="disk_clear_then_reload" if not dest_option3 else "disk_clear_mixed_incremental_destination",
                 source_library=str((source_library or {}).get("name", "")) if isinstance(source_library, dict) else "",
                 destination_library=str((destination_library or {}).get("name", "")) if isinstance(destination_library, dict) else "",
+                destination_incremental_option3=bool(dest_option3),
             )
         except Exception as exc:
             self._cache_refresh_restore_active = False
             self._pending_cache_refresh_ui_state = None
             self._pending_cache_refresh_panels = set()
+            self._cache_refresh_refreshed_panels_snapshot = set()
             self._cache_refresh_skip_expanded_restore_panels = set()
             log_error("Graph cache refresh failed.", error=str(exc))
             QMessageBox.warning(self, "Refresh Cache", "Could not refresh the SharePoint cache right now.")
@@ -12749,6 +13456,9 @@ class MainWindow(QMainWindow):
         self._safe_invoke("destination_expand_burst_pipeline", self._run_destination_expand_burst_pipeline)
 
     def _run_destination_expand_burst_pipeline(self) -> None:
+        if _shutdown_mutation_skip_for_host(self, "_run_destination_expand_burst_pipeline"):
+            self._destination_expand_burst_queue = []
+            return
         entries = self._destination_expand_burst_queue
         self._destination_expand_burst_queue = []
         if not entries:
@@ -13640,6 +14350,9 @@ class MainWindow(QMainWindow):
         timer.start(max(0, int(delay_ms)))
 
     def _run_lazy_destination_projection_refresh(self):
+        if _shutdown_mutation_skip_for_host(self, "_run_lazy_destination_projection_refresh"):
+            self._lazy_destination_projection_pending_reason = ""
+            return
         if getattr(self, "_sharepoint_lazy_mode", False):
             self._lazy_destination_projection_pending_reason = ""
             return
@@ -13854,6 +14567,8 @@ class MainWindow(QMainWindow):
         timer.start(max(0, int(delay_ms)))
 
     def _run_deferred_destination_materialization(self):
+        if _shutdown_mutation_skip_for_host(self, "_run_deferred_destination_materialization"):
+            return
         reason = getattr(self, "_destination_idle_materialize_pending_reason", "") or "idle_destination_materialize"
         if int(getattr(self, "_destination_idle_materialize_reentrancy_block", 0) or 0) > 0:
             self._schedule_deferred_destination_materialization(reason, delay_ms=220)
@@ -14019,6 +14734,12 @@ class MainWindow(QMainWindow):
             and self._destination_full_tree_ready()
             and self._destination_tree_shows_authority_pending_shell()
         ):
+            if getattr(self, "_destination_quiet_startup_overlay_structural_suppress", False):
+                log_info(
+                    "startup_lifecycle_temp_full_tree_shell_flush_suppressed",
+                    reason="quiet_startup_overlay_structural_suppress",
+                )
+                return
             did = str(
                 self.pending_root_drive_ids.get("destination") or self._current_selected_destination_drive_id() or ""
             ).strip()
@@ -14149,8 +14870,8 @@ class MainWindow(QMainWindow):
                 if bool(getattr(self, "_destination_non_authoritative_shell_active", False)):
                     return False, "non_authoritative_shell_active"
                 return False, "destination_root_bind_not_authoritative"
-            if MainWindow._root_load_worker_running(self, "destination"):
-                return False, "destination_root_worker_running"
+            # Root bind is already authoritative: the QThread may still report isRunning() briefly
+            # after success is delivered on the GUI thread — do not block restore-gate supersede.
         except Exception:
             return False, "predicate_exception"
         return True, ""
@@ -14158,9 +14879,10 @@ class MainWindow(QMainWindow):
     def _destination_graph_authority_supersedes_memory_restore_gate(self) -> bool:
         """When True, stale ``_memory_restore_in_progress`` must not block destination reconcile/overlays/follow-up.
 
-        Graph-visible structure is Graph-owned, root bind matches the active request, and we are not waiting
-        on a destination root worker slot. Stale shell latches after an authoritative root bind do not
-        block this predicate; shell state is cleared from ``_destination_on_authoritative_tree_bind_committed``.
+        Graph-visible structure is Graph-owned and root bind matches the active request. A destination
+        ``RootLoadWorker`` thread may still report running briefly after GUI-thread success; that must
+        not block supersede. Stale shell latches after an authoritative root bind do not block this
+        predicate; shell state is cleared from ``_destination_on_authoritative_tree_bind_committed``.
         """
         result, fail_reason = self._destination_graph_authority_supersedes_memory_restore_gate_core()
         root_auth = False
@@ -16497,7 +17219,7 @@ class MainWindow(QMainWindow):
     def on_cache_refresh_worker_finished(self):
         try:
             self.cache_refresh_worker = None
-            self._restore_refresh_cache_icon_buttons()
+            QTimer.singleShot(0, self._maybe_restore_cache_refresh_icon_buttons_after_jobs)
             if not self._pending_cache_refresh_panels:
                 self._cache_refresh_restore_active = False
         except Exception as exc:
@@ -16525,17 +17247,34 @@ class MainWindow(QMainWindow):
                 and isinstance(destination_library, dict)
                 and destination_library.get("id")
             ):
-                self.loaded_root_request_signatures["destination"] = None
-                self.load_library_root("destination", destination_site, destination_library, force_refresh=False)
+                if bool(getattr(self, "_cache_refresh_option3_destination", False)):
+                    self._start_destination_incremental_graph_refresh_worker(destination_site, destination_library)
+                else:
+                    log_info(
+                        "destination_cache_refresh_destructive_full_resync_path",
+                        reason="rebuild_or_non_option3_destination_refresh",
+                        note="load_library_root_may_apply_loading_placeholder",
+                    )
+                    self.loaded_root_request_signatures["destination"] = None
+                    self.load_library_root("destination", destination_site, destination_library, force_refresh=False)
 
             if hasattr(self, "planned_moves_status"):
+                dest_incr = bool(getattr(self, "_cache_refresh_option3_destination", False))
                 label = (
-                    "Source and destination cache refreshed. Reloading libraries."
-                    if self._pending_cache_refresh_panels == {"source", "destination"}
+                    "Source cache cleared; refreshing live SharePoint content on destination…"
+                    if self._pending_cache_refresh_panels == {"source", "destination"} and dest_incr
                     else (
-                        "Source cache refreshed. Reloading source library."
-                        if "source" in self._pending_cache_refresh_panels
-                        else "Destination cache refreshed. Reloading destination library."
+                        "Source and destination cache refreshed. Reloading libraries."
+                        if self._pending_cache_refresh_panels == {"source", "destination"}
+                        else (
+                            "Source cache refreshed. Reloading source library."
+                            if "source" in self._pending_cache_refresh_panels
+                            else (
+                                "Refreshing live SharePoint content…"
+                                if dest_incr
+                                else "Destination cache refreshed. Reloading destination library."
+                            )
+                        )
                     )
                 )
                 self.planned_moves_status.setText(label)
@@ -16544,7 +17283,9 @@ class MainWindow(QMainWindow):
 
     def _finalize_cache_refresh_workspace_restore(self):
         ui_state = self._pending_cache_refresh_ui_state
-        refreshed_panels = set(self._pending_cache_refresh_panels or set())
+        refreshed_panels = set(getattr(self, "_cache_refresh_refreshed_panels_snapshot", set()) or set())
+        if not refreshed_panels:
+            refreshed_panels = set(self._pending_cache_refresh_panels or set())
         ui_state_for_restore = dict(ui_state or {})
         for panel_key in refreshed_panels:
             if panel_key in {"source", "destination"} and panel_key in self._cache_refresh_skip_expanded_restore_panels:
@@ -16575,20 +17316,166 @@ class MainWindow(QMainWindow):
         self._cache_refresh_restore_active = False
         self._pending_cache_refresh_ui_state = None
         self._pending_cache_refresh_panels = set()
+        self._cache_refresh_refreshed_panels_snapshot = set()
         self._cache_refresh_skip_expanded_restore_panels = set()
         self._pending_cache_refresh_tree_snapshots = {}
         self._schedule_progress_summary_refresh()
+
+    def _maybe_restore_cache_refresh_icon_buttons_after_jobs(self):
+        try:
+            if self.cache_refresh_worker and self.cache_refresh_worker.isRunning():
+                return
+            wr = getattr(self, "destination_incremental_refresh_worker", None)
+            if wr is not None and wr.isRunning():
+                return
+            self._restore_refresh_cache_icon_buttons()
+        except Exception as exc:
+            self._log_restore_exception("_maybe_restore_cache_refresh_icon_buttons_after_jobs", exc)
+
+    def _start_destination_incremental_graph_refresh_worker(self, site: dict, library: dict) -> None:
+        drive_id = str((library or {}).get("id") or "").strip()
+        if not drive_id or getattr(self, "graph", None) is None:
+            self._on_destination_incremental_graph_refresh_error("missing_graph_client_or_drive_id")
+            return
+        if getattr(self, "destination_incremental_refresh_worker", None) and self.destination_incremental_refresh_worker.isRunning():
+            return
+        if not isinstance(site, dict) or not isinstance(library, dict):
+            self._on_destination_incremental_graph_refresh_error("missing_site_or_library_selection")
+            return
+        worker_context = {
+            "site_id": site.get("id", ""),
+            "site_name": site.get("name", ""),
+            "library_id": library.get("id", drive_id),
+            "library_name": library.get("name", ""),
+            "tree_role": "destination",
+        }
+        self.destination_incremental_refresh_worker = DestinationIncrementalGraphRefreshWorker(
+            self.graph, drive_id, worker_context
+        )
+        self.destination_incremental_refresh_worker.success.connect(
+            lambda payload: self._safe_invoke(
+                "destination_incremental_graph_refresh.success",
+                self._on_destination_incremental_graph_refresh_success,
+                payload,
+            )
+        )
+        self.destination_incremental_refresh_worker.error.connect(
+            lambda msg: self._safe_invoke(
+                "destination_incremental_graph_refresh.error",
+                self._on_destination_incremental_graph_refresh_error,
+                msg,
+            )
+        )
+        self.destination_incremental_refresh_worker.finished.connect(
+            lambda: self._safe_invoke(
+                "destination_incremental_graph_refresh.finished",
+                self._on_destination_incremental_graph_refresh_finished,
+            )
+        )
+        self.destination_incremental_refresh_worker.start()
+        log_info(
+            "destination_incremental_graph_refresh_worker_started",
+            drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+            incremental_refresh_no_tree_wipe=True,
+            note="default_destination_refresh_avoids_load_library_root_placeholder",
+        )
+
+    def _on_destination_incremental_graph_refresh_finished(self):
+        try:
+            self.destination_incremental_refresh_worker = None
+            QTimer.singleShot(0, self._maybe_restore_cache_refresh_icon_buttons_after_jobs)
+        except Exception as exc:
+            self._log_restore_exception("_on_destination_incremental_graph_refresh_finished", exc)
+
+    def _on_destination_incremental_graph_refresh_error(self, message: str):
+        try:
+            log_warn("destination_incremental_graph_refresh_failed", error=str(message)[:500])
+            self._set_tree_status_message(
+                "destination",
+                "Destination refresh could not complete; the tree was not cleared.",
+                loading=False,
+            )
+            pending = set(self._pending_cache_refresh_panels or set())
+            pending.discard("destination")
+            self._pending_cache_refresh_panels = pending
+            if not pending:
+                self._finalize_cache_refresh_workspace_restore()
+        except Exception as exc:
+            self._log_restore_exception("_on_destination_incremental_graph_refresh_error", exc)
+
+    def _on_destination_incremental_graph_refresh_success(self, payload: dict):
+        try:
+            items = payload.get("items") or []
+            drive_id = str(payload.get("drive_id") or "").strip()
+            delta = payload.get("delta") or {}
+            model = getattr(self, "destination_planning_model", None)
+            stats: dict = {}
+            if model is not None and self._planning_browse_mode("destination") != "local":
+                raw_items = items if isinstance(items, list) else []
+                payloads = self._destination_root_payloads_from_graph_items(raw_items)
+                stats = model.merge_sharepoint_library_root_graph_children(payloads)
+            tree = getattr(self, "destination_tree_widget", None)
+            if tree is not None:
+                tree.setEnabled(True)
+            inv = int((delta or {}).get("invalidated_folders") or 0)
+            entries = (delta or {}).get("invalidated_entries") or []
+            if drive_id and inv > 0 and isinstance(entries, list):
+                self._apply_graph_delta_to_visible_trees(drive_id, entries)
+            dest_did = str(
+                self.pending_root_drive_ids.get("destination")
+                or self._current_selected_destination_drive_id()
+                or ""
+            ).strip()
+            if dest_did and drive_id and str(drive_id).strip() == dest_did and inv > 0:
+                self._invalidate_destination_full_tree_for_live_reconcile(drive_id)
+                QTimer.singleShot(
+                    0,
+                    lambda d=drive_id: self._safe_invoke(
+                        "destination_reconcile_after_incremental_cache_refresh",
+                        self._ensure_sharepoint_destination_full_tree_worker_scheduled,
+                        d,
+                    ),
+                )
+            self._set_tree_status_message(
+                "destination",
+                "Live SharePoint content refresh applied (workspace was not cleared).",
+                loading=False,
+            )
+            self._refresh_tree_column_width("destination")
+            if not self._destination_steady_state_full_materialize_redundant():
+                self._apply_destination_planning_overlays("incremental_destination_cache_refresh")
+            log_info(
+                "destination_incremental_cache_refresh_merged",
+                drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+                graph_root_children=len(items or []),
+                merge_stats=stats,
+                merge_updated=int((stats or {}).get("updated") or 0),
+                merge_inserted=int((stats or {}).get("inserted") or 0),
+                merge_removed=int((stats or {}).get("removed") or 0),
+                merge_skipped_planned=int((stats or {}).get("skipped_planned") or 0),
+                delta_pages=int((delta or {}).get("pages") or 0),
+                delta_invalidated_folders=inv,
+                destructive_placeholder_refresh=False,
+            )
+            pending = set(self._pending_cache_refresh_panels or set())
+            pending.discard("destination")
+            self._pending_cache_refresh_panels = pending
+            if not pending:
+                self._finalize_cache_refresh_workspace_restore()
+        except Exception as exc:
+            self._log_restore_exception("_on_destination_incremental_graph_refresh_success", exc)
 
     def on_cache_refresh_error(self, error):
         try:
             self._cache_refresh_restore_active = False
             self._pending_cache_refresh_ui_state = None
             self._pending_cache_refresh_panels = set()
+            self._cache_refresh_refreshed_panels_snapshot = set()
             self._cache_refresh_skip_expanded_restore_panels = set()
             self._pending_cache_refresh_tree_snapshots = {}
             if hasattr(self, "planned_moves_status"):
                 self.planned_moves_status.setText("Could not refresh the SharePoint cache.")
-            self._restore_refresh_cache_icon_buttons()
+            self._maybe_restore_cache_refresh_icon_buttons_after_jobs()
             QMessageBox.warning(self, "Refresh Cache", "The SharePoint cache could not be refreshed.")
             self._log_restore_exception("on_cache_refresh_error", Exception(str(error)))
         except Exception as exc:
@@ -16786,7 +17673,7 @@ class MainWindow(QMainWindow):
             self._login_in_progress = False
             self.discovered_sites = []
             self.planned_moves = []
-            self._clear_source_projection_descendants_cache()
+            self._clear_source_projection_descendants_cache(reason="login_error_cleared", caller="_handle_m365_sign_in_error")
             self.proposed_folders = []
             self._reset_full_count_state()
             self._reset_destination_full_tree_state()
@@ -17052,12 +17939,25 @@ class MainWindow(QMainWindow):
             site_id = str(selected_site.get("id", "") or "").strip()
             if not libraries and site_id and self.graph is not None:
                 try:
+                    self._startup_post_snapshot_trace_event(
+                        "list_site_drives_enter",
+                        selector_group=str(selector_group),
+                        site_id_excerpt=str(site_id)[:32],
+                    )
+                    _t_drv = time.perf_counter()
                     drives = self.graph.list_site_drives(site_id)
                     libraries = [
                         self.graph.normalize_drive(drive)
                         for drive in drives
                         if self.graph.is_usable_document_library(drive)
                     ]
+                    self._startup_post_snapshot_trace_event(
+                        "list_site_drives_exit",
+                        selector_group=str(selector_group),
+                        wall_ms=round((time.perf_counter() - _t_drv) * 1000.0, 2),
+                        raw_drive_count=len(drives) if drives is not None else -1,
+                        usable_library_count=len(libraries),
+                    )
                     selected_site["libraries"] = libraries
                 except Exception as exc:
                     log_warn(
@@ -17220,6 +18120,90 @@ class MainWindow(QMainWindow):
     def _trigger_delayed_destination_library_restore(self):
         self.on_library_selector_changed("destination", force=True)
 
+    def _startup_post_snapshot_trace_reset(self) -> None:
+        self._startup_post_snapshot_trace_t0 = time.perf_counter()
+        self._startup_post_snapshot_trace_prev = float(self._startup_post_snapshot_trace_t0)
+        self._startup_post_snapshot_trace_seq = 0
+
+    def _startup_post_snapshot_trace_event(self, phase: str, **extra: Any) -> None:
+        """Log up to 10 phases after ``startup_snapshot_first_visible`` for startup hang diagnosis."""
+        t0 = float(getattr(self, "_startup_post_snapshot_trace_t0", 0.0) or 0.0)
+        if t0 <= 0.0:
+            return
+        seq = int(getattr(self, "_startup_post_snapshot_trace_seq", 0) or 0)
+        if seq >= 10:
+            return
+        now = time.perf_counter()
+        prev = float(getattr(self, "_startup_post_snapshot_trace_prev", t0) or t0)
+        self._startup_post_snapshot_trace_seq = seq + 1
+        self._startup_post_snapshot_trace_prev = now
+        payload = {
+            "seq": seq,
+            "phase": str(phase)[:200],
+            "elapsed_ms_since_first_visible": round((now - t0) * 1000.0, 2),
+            "delta_ms_since_prev": round((now - prev) * 1000.0, 2),
+        }
+        for k, v in extra.items():
+            if v is None:
+                continue
+            payload[str(k)[:80]] = v
+        log_info("startup_post_snapshot_phase", **payload)
+
+    def _post_login_restore_phase2_finally_body(self) -> None:
+        self._suppress_selector_change_handlers = False
+        self._memory_ui_rebind_in_progress = False
+        # Async tree materialization continues while this flag is True; logs use
+        # restore_in_progress=False so operators are not misled during long expand/projection.
+        self._memory_restore_background_trees = True
+        self._log_restore_state_snapshot(
+            "restore_phase2_complete_waiting_for_destination_queue",
+            destination_replay_invoked=False,
+            draft_id=self.active_draft_session_id,
+            autosave_suppressed=self._suppress_autosave,
+        )
+        if (self.planned_moves or self.proposed_folders) and not getattr(self, "_sharepoint_lazy_mode", False):
+            self._restore_narrow_destination_future_snapshot_once = True
+            self._log_restore_phase(
+                "restore_narrow_destination_future_snapshot_scheduled",
+                planned_moves_count=len(self.planned_moves or []),
+                proposed_folders_count=len(self.proposed_folders or []),
+            )
+        # Defer phase-4 to keep the success dialog responsive while visible.
+        self._run_after_import_success_dialog_idle(
+            "phase4_destination_overlay_deferred",
+            self._post_login_restore_phase4,
+            delay_ms=50,
+        )
+        self._log_restore_phase("phase2_post_login_restore_exit")
+        if self._planning_browse_mode("destination") != "local":
+            self._log_restore_phase(
+                "destination_restore_sharepoint_authority_contract",
+                expansion_selection_overlay_after_graph_or_queued_loads=True,
+                no_fabricated_visible_real_from_snapshot_bind=True,
+            )
+
+    def _post_login_restore_phase2_selectors_and_planned_moves_inner(self) -> None:
+        self._startup_post_snapshot_trace_event("phase2_restore_selector_matches_enter")
+        _t_sel = time.perf_counter()
+        self._run_restore_phase("phase2_restore_selectors", self._restore_selector_matches)
+        self._startup_post_snapshot_trace_event(
+            "phase2_restore_selector_matches_exit",
+            wall_ms=round((time.perf_counter() - _t_sel) * 1000.0, 2),
+        )
+        self._log_restore_phase("phase2_post_login_restore_after_selectors")
+        self._startup_post_snapshot_trace_event("phase3_refresh_planned_moves_enter")
+        _t_pm = time.perf_counter()
+        self._run_restore_phase(
+            "phase3_refresh_planned_moves",
+            lambda: self.refresh_planned_moves_table(),
+        )
+        self._startup_post_snapshot_trace_event(
+            "phase3_refresh_planned_moves_exit",
+            wall_ms=round((time.perf_counter() - _t_pm) * 1000.0, 2),
+        )
+        self._log_restore_phase("phase2_post_login_restore_after_planned_moves")
+        self._log_restore_state_snapshot("restore_ui_bound", destination_replay_invoked=False)
+
     def _post_login_restore_phase2(self):
         if not self.current_session_context.get("connected"):
             self._log_restore_phase("phase2_restore_selectors skipped", reason="session not connected")
@@ -17235,49 +18219,36 @@ class MainWindow(QMainWindow):
         self._suppress_selector_change_handlers = True
         self._restore_finalization_deferred_active = False
         self._restore_finalization_deferred_reason = ""
+        prov_applied = False
         try:
             self._apply_browse_modes_from_session_state()
-            self._destination_apply_provisional_session_snapshot_if_eligible(phase="post_login_phase2_pre_selectors")
-            self._run_restore_phase("phase2_restore_selectors", self._restore_selector_matches)
-            self._log_restore_phase("phase2_post_login_restore_after_selectors")
-            self._run_restore_phase(
-                "phase3_refresh_planned_moves",
-                lambda: self.refresh_planned_moves_table(),
+            prov_applied = bool(
+                self._destination_apply_provisional_session_snapshot_if_eligible(phase="post_login_phase2_pre_selectors")
             )
-            self._log_restore_phase("phase2_post_login_restore_after_planned_moves")
-            self._log_restore_state_snapshot("restore_ui_bound", destination_replay_invoked=False)
-        finally:
-            self._suppress_selector_change_handlers = False
-            self._memory_ui_rebind_in_progress = False
-            # Async tree materialization continues while this flag is True; logs use
-            # restore_in_progress=False so operators are not misled during long expand/projection.
-            self._memory_restore_background_trees = True
-            self._log_restore_state_snapshot(
-                "restore_phase2_complete_waiting_for_destination_queue",
-                destination_replay_invoked=False,
-                draft_id=self.active_draft_session_id,
-                autosave_suppressed=self._suppress_autosave,
+        except Exception:
+            self._post_login_restore_phase2_finally_body()
+            raise
+
+        if prov_applied:
+            # Yield one event-loop tick so Qt can paint the provisional snapshot before synchronous
+            # ``list_site_drives`` / root workers / planned-moves table refresh run on this thread.
+            self._startup_post_snapshot_trace_event("phase2_deferred_tail_scheduled", defer_ms=0)
+
+            def _deferred_tail():
+                try:
+                    self._post_login_restore_phase2_selectors_and_planned_moves_inner()
+                finally:
+                    self._post_login_restore_phase2_finally_body()
+
+            QTimer.singleShot(
+                0,
+                lambda: self._safe_invoke("post_login_phase2_after_provisional_snapshot", _deferred_tail),
             )
-            if (self.planned_moves or self.proposed_folders) and not getattr(self, "_sharepoint_lazy_mode", False):
-                self._restore_narrow_destination_future_snapshot_once = True
-                self._log_restore_phase(
-                    "restore_narrow_destination_future_snapshot_scheduled",
-                    planned_moves_count=len(self.planned_moves or []),
-                    proposed_folders_count=len(self.proposed_folders or []),
-                )
-            # Defer phase-4 to keep the success dialog responsive while visible.
-            self._run_after_import_success_dialog_idle(
-                "phase4_destination_overlay_deferred",
-                self._post_login_restore_phase4,
-                delay_ms=50,
-            )
-            self._log_restore_phase("phase2_post_login_restore_exit")
-            if self._planning_browse_mode("destination") != "local":
-                self._log_restore_phase(
-                    "destination_restore_sharepoint_authority_contract",
-                    expansion_selection_overlay_after_graph_or_queued_loads=True,
-                    no_fabricated_visible_real_from_snapshot_bind=True,
-                )
+        else:
+            try:
+                self._post_login_restore_phase2_selectors_and_planned_moves_inner()
+            finally:
+                self._post_login_restore_phase2_finally_body()
 
     def _schedule_post_login_restore_phase4_if_pending(self) -> None:
         """Re-run phase-4 when the first invoke ran before the destination tree was ready."""
@@ -17304,6 +18275,7 @@ class MainWindow(QMainWindow):
     def _post_login_restore_phase4(self):
         _ph4_t0 = time.perf_counter()
         self._import_ok_trace("post_login_restore_phase4_enter")
+        self._startup_post_snapshot_trace_event("post_login_restore_phase4_enter")
         try:
             if self._restore_abort_active():
                 self._log_restore_phase(
@@ -17313,6 +18285,8 @@ class MainWindow(QMainWindow):
                 )
                 self._finalize_memory_restore_if_ready("phase4_skipped_restore_abort")
                 return
+            if self._planning_browse_mode("destination") != "local":
+                self._destination_merge_planning_bootstrap_folder_paths_if_needed(phase="post_login_restore_phase4")
             if not self._restore_destination_overlay_pending:
                 self._log_restore_phase("phase4_destination_overlay skipped", reason="no proposed folders pending")
                 self._finalize_memory_restore_if_ready("phase4_no_overlay_pending")
@@ -18111,9 +19085,209 @@ class MainWindow(QMainWindow):
             "destination": list(getattr(state, "DestinationTreeSnapshot", []) or []),
         }
 
+    def _select_destination_tree_snapshot_for_startup(
+        self,
+        session_destination_snaps: list,
+        *,
+        workspace_sidecar: dict | None,
+    ) -> tuple[list, str, int, int]:
+        """Choose richer destination tree by recursive node count: session JSON vs WorkspaceSnapshot sidecar."""
+        session_list = list(session_destination_snaps or [])
+        try:
+            n_sess = int(self._count_tree_snapshot_nodes(session_list))
+        except Exception:
+            n_sess = 0
+        side_list: list = []
+        if isinstance(workspace_sidecar, dict):
+            raw = workspace_sidecar.get("destination_tree_snapshot")
+            if isinstance(raw, list):
+                side_list = list(raw)
+        try:
+            n_side = int(self._count_tree_snapshot_nodes(side_list))
+        except Exception:
+            n_side = 0
+        if n_side > n_sess:
+            return side_list, "WorkspaceSnapshot.destination_tree_snapshot", n_sess, n_side
+        return session_list, "SessionState.DestinationTreeSnapshot", n_sess, n_side
+
     def _runtime_tree_snapshot_for_panel(self, panel_key):
         snapshots = getattr(self, "_runtime_session_tree_snapshots", {}) or {}
         return list(snapshots.get(panel_key, []) or [])
+
+    def _destination_branch_forensic_enabled(self) -> bool:
+        return str(os.environ.get("OZLINK_DEST_BRANCH_FORENSIC", "") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+
+    def _destination_branch_forensic_targets(self) -> list[str]:
+        raw = str(
+            os.environ.get(
+                "OZLINK_DEST_BRANCH_FORENSIC_TARGETS",
+                "Pictures [Allocated];Contractor Resumes [Allocated]",
+            )
+            or ""
+        ).strip()
+        if not raw:
+            return []
+        return [x.strip() for x in raw.split(";") if str(x or "").strip()]
+
+    def _destination_branch_forensic_match_payload(self, payload: dict, targets_cf: list[str]) -> bool:
+        if not isinstance(payload, dict) or not targets_cf:
+            return False
+        texts = [
+            str(payload.get("base_display_label") or ""),
+            str(payload.get("name") or ""),
+            str(payload.get("item_path") or ""),
+            str(payload.get("display_path") or ""),
+            str(payload.get("destination_path") or ""),
+        ]
+        cands = [t.casefold() for t in texts if t]
+        if not cands:
+            return False
+        for t in targets_cf:
+            if any(t in c for c in cands):
+                return True
+            if t.endswith("[allocated]"):
+                bare = t[: -len("[allocated]")].strip()
+                if bare and any(bare in c for c in cands):
+                    return True
+        return False
+
+    def _destination_branch_forensic_collect_model(self) -> list[dict[str, Any]]:
+        dm = getattr(self, "destination_planning_model", None)
+        if dm is None:
+            return []
+        targets_cf = [x.casefold() for x in self._destination_branch_forensic_targets() if x]
+        if not targets_cf:
+            return []
+        out: list[dict[str, Any]] = []
+        root = QModelIndex()
+        stack = [root]
+        while stack:
+            parent = stack.pop()
+            rc = dm.rowCount(parent)
+            for r in range(rc):
+                ix = dm.index(r, 0, parent)
+                if not ix.isValid():
+                    continue
+                pl = dict(ix.data(Qt.UserRole) or {})
+                stack.append(ix)
+                if pl.get("placeholder") or not bool(pl.get("is_folder", False)):
+                    continue
+                if not self._destination_branch_forensic_match_payload(pl, targets_cf):
+                    continue
+                branch_path = self._canonical_destination_projection_path(
+                    self._tree_item_path(pl) or pl.get("destination_path") or pl.get("display_path") or ""
+                ) or self.normalize_memory_path(
+                    self._tree_item_path(pl) or pl.get("destination_path") or pl.get("display_path") or ""
+                )
+                child_paths: list[str] = []
+                crc = dm.rowCount(ix)
+                for cr in range(crc):
+                    cix = dm.index(cr, 0, ix)
+                    if not cix.isValid():
+                        continue
+                    cd = dict(cix.data(Qt.UserRole) or {})
+                    if cd.get("placeholder"):
+                        continue
+                    cp = self._canonical_destination_projection_path(
+                        self._tree_item_path(cd) or cd.get("destination_path") or cd.get("display_path") or ""
+                    ) or self.normalize_memory_path(
+                        self._tree_item_path(cd) or cd.get("destination_path") or cd.get("display_path") or ""
+                    )
+                    if cp:
+                        child_paths.append(cp)
+                out.append(
+                    {
+                        "branch_path": str(branch_path or "")[:500],
+                        "branch_label": str(pl.get("base_display_label") or pl.get("name") or "")[:220],
+                        "child_count": len(child_paths),
+                        "child_paths": sorted(set(child_paths)),
+                    }
+                )
+        return out
+
+    def _destination_branch_forensic_collect_snapshot(self, snapshots: list[dict]) -> list[dict[str, Any]]:
+        targets_cf = [x.casefold() for x in self._destination_branch_forensic_targets() if x]
+        if not targets_cf:
+            return []
+        out: list[dict[str, Any]] = []
+
+        def _walk(node):
+            if not isinstance(node, dict):
+                return
+            data = dict(node.get("data") or {})
+            if self._destination_branch_forensic_match_payload(data, targets_cf):
+                branch_path = self._canonical_destination_projection_path(
+                    data.get("item_path") or data.get("destination_path") or data.get("display_path") or ""
+                ) or self.normalize_memory_path(
+                    data.get("item_path") or data.get("destination_path") or data.get("display_path") or ""
+                )
+                child_paths: list[str] = []
+                for ch in list(node.get("children") or []):
+                    cd = dict((ch or {}).get("data") or {})
+                    if cd.get("placeholder"):
+                        continue
+                    cp = self._canonical_destination_projection_path(
+                        cd.get("item_path") or cd.get("destination_path") or cd.get("display_path") or ""
+                    ) or self.normalize_memory_path(
+                        cd.get("item_path") or cd.get("destination_path") or cd.get("display_path") or ""
+                    )
+                    if cp:
+                        child_paths.append(cp)
+                out.append(
+                    {
+                        "branch_path": str(branch_path or "")[:500],
+                        "branch_label": str(data.get("base_display_label") or data.get("name") or "")[:220],
+                        "child_count": len(child_paths),
+                        "child_paths": sorted(set(child_paths)),
+                    }
+                )
+            for ch in list(node.get("children") or []):
+                _walk(ch)
+
+        for root in list(snapshots or []):
+            _walk(root)
+        return out
+
+    def _destination_branch_forensic_read_persisted_session_snapshot(self) -> list[dict]:
+        mm = getattr(self, "memory_manager", None)
+        if mm is None:
+            return []
+        p = (getattr(mm, "paths", {}) or {}).get("session")
+        if p is None:
+            return []
+        try:
+            raw = json.loads(Path(p).read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        return list((raw or {}).get("DestinationTreeSnapshot") or [])
+
+    def _destination_branch_forensic_log(self, stage: str, *, snapshots: list[dict] | None = None) -> None:
+        if not self._destination_branch_forensic_enabled():
+            return
+        try:
+            model_rows = self._destination_branch_forensic_collect_model()
+        except Exception:
+            model_rows = []
+        snap_rows = []
+        if snapshots is not None:
+            try:
+                snap_rows = self._destination_branch_forensic_collect_snapshot(list(snapshots or []))
+            except Exception:
+                snap_rows = []
+        log_info(
+            "destination_branch_forensic",
+            stage=str(stage)[:80],
+            target_branches=self._destination_branch_forensic_targets(),
+            model_match_count=len(model_rows),
+            snapshot_match_count=len(snap_rows),
+            model_rows=model_rows,
+            snapshot_rows=snap_rows,
+        )
 
     def _count_tree_snapshot_nodes(self, snapshots):
         count = 0
@@ -18129,6 +19303,111 @@ class MainWindow(QMainWindow):
         for snapshot in list(snapshots or []):
             _walk(snapshot)
         return count
+
+    def _count_destination_model_non_placeholder_nodes(self) -> int:
+        """All non-placeholder rows in the destination planning model (matches snapshot node cardinality)."""
+        model = getattr(self, "destination_planning_model", None)
+        if model is None or not hasattr(model, "iter_depth_first"):
+            return 0
+        n = 0
+        for ix in model.iter_depth_first():
+            pl = ix.data(Qt.UserRole) or {}
+            if pl.get("placeholder"):
+                continue
+            n += 1
+        return n
+
+    def _destination_forensic_destination_model_counts(self) -> dict:
+        """Iter-depth vs non-placeholder counts (snapshot mount uses non-placeholder)."""
+        model = getattr(self, "destination_planning_model", None)
+        if model is None or not hasattr(model, "iter_depth_first"):
+            return {"model_nodes_iter_depth_first": 0, "model_nodes_non_placeholder": 0}
+        n_iter = 0
+        n_np = 0
+        for ix in model.iter_depth_first():
+            n_iter += 1
+            pl = ix.data(Qt.UserRole) or {}
+            if not pl.get("placeholder"):
+                n_np += 1
+        return {"model_nodes_iter_depth_first": n_iter, "model_nodes_non_placeholder": n_np}
+
+    def _destination_expand_has_materialized_non_placeholder_children(self, index: QModelIndex) -> bool:
+        """True if folder already has real child rows — never replace with a loading placeholder row."""
+        model = getattr(self, "destination_planning_model", None)
+        if model is None or index is None or not index.isValid():
+            return False
+        try:
+            rc = int(model.rowCount(index))
+        except Exception:
+            return False
+        for r in range(rc):
+            try:
+                cix = model.index(r, 0, index)
+                pl = cix.data(Qt.UserRole) or {}
+            except Exception:
+                continue
+            if isinstance(pl, dict) and not pl.get("placeholder"):
+                return True
+        return False
+
+    def _destination_prune_pending_snapshot_branch_refresh_after_provisional_mount(self, snaps: list) -> None:
+        """Drop pending snapshot branch-refresh paths already present in the model after reset_nested."""
+        ps = getattr(self, "_pending_snapshot_branch_refresh", None)
+        if not isinstance(ps, dict):
+            return
+        pending = set(ps.get("destination") or set())
+        before = len(pending)
+        if not pending:
+            log_info(
+                "snapshot_mount_forensic",
+                selected_snapshot_node_count=int(self._count_tree_snapshot_nodes(snaps)),
+                mounted_snapshot_node_count_after_initial_mount=int(self._count_destination_model_non_placeholder_nodes()),
+                pending_branch_paths_count_before_mount=0,
+                pending_branch_paths_count_after_mount=0,
+                pruned_already_materialized_paths=0,
+                skipped_snapshot_branches_sample=[],
+            )
+            return
+        model = getattr(self, "destination_planning_model", None)
+        if model is None or not hasattr(model, "find_indices_for_canonical_destination_path"):
+            log_info(
+                "snapshot_mount_forensic",
+                selected_snapshot_node_count=int(self._count_tree_snapshot_nodes(snaps)),
+                mounted_snapshot_node_count_after_initial_mount=int(self._count_destination_model_non_placeholder_nodes()),
+                pending_branch_paths_count_before_mount=int(before),
+                pending_branch_paths_count_after_mount=int(before),
+                pruned_already_materialized_paths=0,
+                skipped_snapshot_branches_sample=["model_or_lookup_missing"],
+            )
+            return
+        still: set[str] = set()
+        pruned_canon: list[str] = []
+        skipped: list[str] = []
+        for p in pending:
+            raw = str(p or "").strip()
+            if not raw:
+                continue
+            canon = self._canonical_destination_projection_path(raw)
+            if not canon:
+                still.add(raw)
+                skipped.append("canonical_empty:" + raw[:160])
+                continue
+            hits = model.find_indices_for_canonical_destination_path(canon)
+            if hits:
+                pruned_canon.append(canon[:220])
+            else:
+                still.add(raw)
+                skipped.append("not_in_model_after_mount:" + canon[:220])
+        ps["destination"] = still
+        log_info(
+            "snapshot_mount_forensic",
+            selected_snapshot_node_count=int(self._count_tree_snapshot_nodes(snaps)),
+            mounted_snapshot_node_count_after_initial_mount=int(self._count_destination_model_non_placeholder_nodes()),
+            pending_branch_paths_count_before_mount=int(before),
+            pending_branch_paths_count_after_mount=len(still),
+            pruned_already_materialized_paths=len(pruned_canon),
+            skipped_snapshot_branches_sample=skipped[:16],
+        )
 
     def _tree_snapshot_node_count_gt(self, snapshots, threshold: int) -> bool:
         """True if total snapshot nodes strictly exceed threshold. Stops after threshold+1 nodes."""
@@ -18310,6 +19589,13 @@ class MainWindow(QMainWindow):
                     item = find_item(target_path)
             else:
                 item = find_item(target_path)
+                if item is None and panel_key == "destination":
+                    dm = getattr(self, "destination_planning_model", None)
+                    canon_d = self._canonical_destination_projection_path(target_path)
+                    if dm is not None and canon_d:
+                        _hits = dm.find_indices_for_canonical_destination_path(canon_d)
+                        if _hits:
+                            item = _hits[0]
             if item is None:
                 remaining_paths.add(target_path)
                 continue
@@ -18403,7 +19689,46 @@ class MainWindow(QMainWindow):
     def _begin_session_workspace_ui_restore(self):
         ui_state = self._session_workspace_ui_state()
         tree_snapshots = self._session_workspace_tree_snapshots()
-        dest_snaps = list(tree_snapshots.get("destination", []) or [])
+        dest_snaps_session = list(tree_snapshots.get("destination", []) or [])
+        mm = getattr(self, "memory_manager", None)
+        sidecar = mm.read_workspace_snapshot_optional() if mm is not None else None
+        dest_snaps, sel_src, n_sess_nodes, n_side_nodes = self._select_destination_tree_snapshot_for_startup(
+            dest_snaps_session,
+            workspace_sidecar=sidecar,
+        )
+        if sel_src.startswith("Workspace") and isinstance(self._draft_shell_state, SessionState):
+            self._draft_shell_state.DestinationTreeSnapshot = list(dest_snaps)
+        try:
+            n_final = int(self._count_tree_snapshot_nodes(dest_snaps))
+        except Exception:
+            n_final = -1
+        mmp = getattr(mm, "paths", {}) if mm is not None else {}
+        log_info(
+            "snapshot_restore_forensic",
+            session_json_destination_snapshot_node_count_loaded=int(n_sess_nodes),
+            workspace_sidecar_destination_snapshot_node_count_loaded=int(n_side_nodes),
+            session_json_destination_snapshot_top_level_count=len(dest_snaps_session),
+            workspace_sidecar_destination_snapshot_top_level_count=(
+                len(list(sidecar.get("destination_tree_snapshot") or [])) if isinstance(sidecar, dict) else 0
+            ),
+            final_startup_selected_snapshot_source=str(sel_src),
+            final_startup_selected_snapshot_count=int(n_final),
+            session_state_path=str(mmp.get("session") or "") if mmp else "",
+            workspace_sidecar_path=str(mmp.get("workspace_snapshot") or "") if mmp else "",
+            runtime_destination_snapshot_top_level_pre_restore=len(
+                list((getattr(self, "_runtime_session_tree_snapshots", {}) or {}).get("destination", []) or [])
+            ),
+        )
+        if self._destination_branch_forensic_enabled() and mm is not None:
+            log_info(
+                "destination_branch_forensic",
+                stage="startup_snapshot_source_precedence",
+                session_state_path=str(mmp.get("session") or ""),
+                workspace_sidecar_path=str(mmp.get("workspace_snapshot") or ""),
+                startup_destination_snapshot_source=str(sel_src),
+                startup_destination_snapshot_node_count=int(n_final),
+                startup_destination_snapshot_top_level_count=len(dest_snaps),
+            )
         destination_stamp_snapshot_tree_workspace_state(dest_snaps)
         self._runtime_session_tree_snapshots = {
             "source": list(tree_snapshots.get("source", []) or []),
@@ -18421,7 +19746,7 @@ class MainWindow(QMainWindow):
         ])
         has_tree_snapshots = any([
             tree_snapshots.get("source"),
-            tree_snapshots.get("destination"),
+            dest_snaps,
         ])
         if not has_state and not has_tree_snapshots:
             self._pending_session_workspace_ui_state = None
@@ -18458,7 +19783,7 @@ class MainWindow(QMainWindow):
                 else list(dest_snaps)
             )
             for panel_key in ("source", "destination")
-            if tree_snapshots.get(panel_key)
+            if (tree_snapshots.get(panel_key) if panel_key != "destination" else dest_snaps)
         }
         source_snapshot_targets = self._snapshot_refresh_targets_from_snapshot("source", self._pending_session_tree_snapshots.get("source", []))
         destination_snapshot_targets = self._snapshot_refresh_targets_from_snapshot("destination", self._pending_session_tree_snapshots.get("destination", []))
@@ -18496,7 +19821,13 @@ class MainWindow(QMainWindow):
     def _restore_workspace_tree_panel_state(self, panel_key, ui_state):
         if not ui_state:
             return
-        expanded_paths = ui_state.get(f"{panel_key}_expanded_paths", set()) or set()
+        expanded_paths = set(ui_state.get(f"{panel_key}_expanded_paths", set()) or set())
+        if panel_key == "destination":
+            snaps = list((self._pending_session_tree_snapshots or {}).get("destination", []) or []) or list(
+                (getattr(self, "_runtime_session_tree_snapshots", {}) or {}).get("destination", []) or []
+            )
+            if snaps:
+                expanded_paths |= self._snapshot_refresh_targets_from_snapshot("destination", snaps)
         selected_path = str(ui_state.get(f"{panel_key}_selected_path", "") or "")
         expanded_all = bool(ui_state.get(f"{panel_key}_expanded_all", False))
         self._restore_expanded_tree_paths(panel_key, expanded_paths)
@@ -18750,6 +20081,50 @@ class MainWindow(QMainWindow):
         if panel_key == "destination":
             model = getattr(self, "destination_planning_model", None)
             if model is not None:
+                msg_s = str(message or "").strip()
+                did_pending = str((getattr(self, "pending_root_drive_ids", {}) or {}).get("destination") or "").strip()
+                mount_did = str(getattr(self, "_destination_snapshot_mount_drive_id", "") or "").strip()
+                loading_msg = msg_s.lower().startswith("loading")
+                same_library_as_snapshot_mount = (not mount_did or not did_pending or mount_did == did_pending)
+                if loading_msg and same_library_as_snapshot_mount and (
+                    getattr(self, "_destination_provisional_startup_applied", False)
+                    or getattr(self, "_destination_startup_snapshot_mount_seen", False)
+                ):
+                    quiet = str(
+                        getattr(self, "_destination_provisional_startup_status_message", "") or ""
+                    ).strip() or (
+                        "Loaded saved workspace snapshot. Verifying live SharePoint content…"
+                    )
+                    self._set_tree_status_message(panel_key, quiet, loading=False)
+                    try:
+                        tree.setEnabled(True)
+                    except Exception:
+                        pass
+                    log_info(
+                        "startup_lifecycle_temp_placeholder_suppressed",
+                        panel_key="destination",
+                        would_have_set=msg_s[:160],
+                        preserved_snapshot_mount=True,
+                        snapshot_mount_drive_id_suffix=mount_did[-16:] if len(mount_did) > 16 else mount_did,
+                        pending_root_drive_id_suffix=did_pending[-16:] if len(did_pending) > 16 else did_pending,
+                        same_library_as_snapshot_mount=same_library_as_snapshot_mount,
+                    )
+                    if self._full_trace_enabled():
+                        log_trace(
+                            "tree",
+                            "set_tree_placeholder",
+                            panel_key=panel_key,
+                            message_excerpt=msg_s[:200],
+                            suppressed_for_provisional_snapshot=True,
+                            tree_kind="destination_qtreeview_model",
+                        )
+                    return
+                if self._destination_startup_snapshot_mount_seen:
+                    self._destination_startup_lifecycle_temp_post_snapshot_mutation(
+                        "set_tree_placeholder",
+                        "set_empty_library_message",
+                        message_excerpt=msg_s[:160],
+                    )
                 model.set_empty_library_message(message or "")
                 tree.setEnabled(False)
                 self._set_tree_status_message(
@@ -18872,6 +20247,15 @@ class MainWindow(QMainWindow):
         snapshots = []
         if tree is None:
             return snapshots
+        if panel_key == "destination":
+            try:
+                self._destination_flush_descendant_apply_resume_to_model_payloads()
+            except Exception:
+                pass
+            try:
+                self._destination_finalize_inflight_descendant_apply_for_snapshot_capture()
+            except Exception:
+                pass
         if panel_key == "source":
             model = getattr(self, "source_sharepoint_model", None)
             if model is None:
@@ -18986,6 +20370,11 @@ class MainWindow(QMainWindow):
             runtime_snapshots = {"source": [], "destination": []}
             self._runtime_session_tree_snapshots = runtime_snapshots
         runtime_snapshots[panel_key] = list(snapshots or [])
+        if panel_key == "destination":
+            self._destination_branch_forensic_log(
+                "startup_post_restore_model_vs_snapshot",
+                snapshots=list(snapshots or []),
+            )
 
     def _abort_destination_chunked_bind_for_snapshot_restore(self):
         st = getattr(self, "_destination_chunked_bind_state", None)
@@ -19037,35 +20426,57 @@ class MainWindow(QMainWindow):
                 try:
                     tree.setUpdatesEnabled(False)
                     tree.setEnabled(True)
+                    snapshot_nodes = int(self._count_tree_snapshot_nodes(snapshots))
+                    if self._planning_browse_mode("source") != "sharepoint":
+                        log_info(
+                            "source_sharepoint_snapshot_shell_skipped",
+                            reason="browse_mode_not_sharepoint",
+                            snapshot_nodes=snapshot_nodes,
+                        )
+                        self._finalize_tree_snapshot_restore(panel_key, snapshots, status_message)
+                        if on_complete:
+                            on_complete()
+                        return
+                    match, reason = self._source_sharepoint_snapshot_shell_identity_matches(snapshots)
+                    if not match:
+                        log_info(
+                            "source_sharepoint_snapshot_shell_skipped",
+                            reason=str(reason),
+                            snapshot_nodes=snapshot_nodes,
+                        )
+                        self._finalize_tree_snapshot_restore(panel_key, snapshots, status_message)
+                        if on_complete:
+                            on_complete()
+                        return
                     model.clear()
-
-                    # Restore only root rows; deep child reconstruction can be
-                    # heavy and competes with lazy folder expansion.
-                    root_payloads = []
-                    for snap in snapshots:
-                        data = dict(((snap or {}).get("data") or {}))
-                        if not data:
-                            continue
-                        data["children_loaded"] = False
-                        data["load_failed"] = False
-                        data.setdefault("tree_role", "source")
-                        root_payloads.append(data)
-
-                    if not root_payloads:
+                    self._source_startup_snapshot_mount_seen = False
+                    mounted_nodes = 0
+                    with _PerfExplorerTimer(
+                        "tree_snapshot_mount_recursive_source_shell",
+                        panel_key="source",
+                        top_level_snapshots=len(snapshots or []),
+                    ):
+                        mounted_nodes = int(model.mount_from_session_snapshot_roots(list(snapshots or [])))
+                    self._source_startup_snapshot_mount_seen = mounted_nodes > 0
+                    self._source_snapshot_mount_drive_id = str(
+                        self._current_source_library_identity_tuple().get("drive_id") or ""
+                    ).strip()
+                    log_info(
+                        "source_sharepoint_snapshot_shell_applied",
+                        reason=str(reason),
+                        snapshot_nodes=snapshot_nodes,
+                        mounted_nodes=int(mounted_nodes),
+                        identity_match=True,
+                    )
+                    if mounted_nodes <= 0:
                         self._set_tree_status_message(panel_key, "This library is empty.", loading=False)
                         model.set_empty_library_message("This library is empty.")
                         tree.setEnabled(False)
                     else:
-                        with _PerfExplorerTimer(
-                            "tree_snapshot_reset_root_payloads",
-                            panel_key="source",
-                            root_count=len(root_payloads),
-                        ):
-                            model.reset_root_payloads(root_payloads)
                         self._set_tree_status_message(
                             panel_key,
-                            f"Loading tree snapshot… ({len(root_payloads)}/{len(snapshots)})",
-                            loading=True,
+                            f"Loading tree snapshot… ({mounted_nodes}/{snapshot_nodes})",
+                            loading=False,
                         )
 
                     self._finalize_tree_snapshot_restore(panel_key, snapshots, status_message)
@@ -19300,6 +20711,9 @@ class MainWindow(QMainWindow):
                 nd.pop("allocation_projection_destination_path_saved", None)
                 nd.pop("allocation_projection_children_signature", None)
                 nd.pop("allocation_descendants_applied", None)
+                nd.pop("allocation_projection_resume_source_token", None)
+                nd.pop("allocation_projection_resume_desc_index", None)
+                nd.pop("allocation_projection_resume_descendants_total", None)
                 return nd
         sig = str(nd.get("allocation_projection_children_signature") or "").strip()
         if sig and self._destination_allocation_folder_shows_materialized_children_index(index):
@@ -19309,6 +20723,9 @@ class MainWindow(QMainWindow):
                 nd.pop("allocation_projection_destination_path_saved", None)
                 nd.pop("allocation_projection_children_signature", None)
                 nd.pop("allocation_descendants_applied", None)
+                nd.pop("allocation_projection_resume_source_token", None)
+                nd.pop("allocation_projection_resume_desc_index", None)
+                nd.pop("allocation_projection_resume_descendants_total", None)
                 return nd
         return nd
 
@@ -19336,6 +20753,94 @@ class MainWindow(QMainWindow):
 
         dmodel.update_payload_for_index(index, _mut)
         return nd
+
+    def _source_forensic_model_node_counts(self) -> dict:
+        model = getattr(self, "source_sharepoint_model", None)
+        if model is None:
+            return {"model_top_level_rows": 0, "model_nodes_depth_first": 0}
+        inv = QModelIndex()
+        try:
+            top = int(model.rowCount(inv))
+        except Exception:
+            top = 0
+        try:
+            df = len(model.iter_depth_first())
+        except Exception:
+            df = 0
+        return {"model_top_level_rows": top, "model_nodes_depth_first": df}
+
+    def _current_source_library_identity_tuple(self) -> dict:
+        out: dict = {"browse_mode": self._planning_browse_mode("source"), "drive_id": "", "site_key": "", "library_name": ""}
+        inputs = getattr(self, "planning_inputs", None) or {}
+        site_sel = inputs.get("Source Site")
+        lib_sel = inputs.get("Source Library")
+        site = site_sel.currentData() if site_sel is not None else None
+        lib = lib_sel.currentData() if lib_sel is not None else None
+        if isinstance(lib, dict):
+            out["drive_id"] = str(lib.get("id") or "").strip()
+            out["library_name"] = str(lib.get("name") or "").strip()
+        if isinstance(site, dict):
+            out["site_key"] = str(site.get("site_key") or site.get("id") or site.get("web_url") or "").strip()
+        return out
+
+    def _source_snapshot_identity_fingerprint_from_snapshots(self, snapshots) -> dict | None:
+        drive_id = ""
+        site_key = ""
+        library_name = ""
+        for snap in snapshots or []:
+            d = (snap or {}).get("data") or {}
+            if not isinstance(d, dict) or d.get("placeholder"):
+                continue
+            did = str(d.get("drive_id") or d.get("library_id") or "").strip()
+            if did:
+                drive_id = did
+            sk = str(d.get("site_id") or d.get("site_key") or "").strip()
+            if sk:
+                site_key = sk
+            if not library_name:
+                library_name = str(d.get("library_name") or "").strip()
+            if drive_id:
+                break
+        if not drive_id:
+            return None
+        return {"drive_id": drive_id, "site_key": site_key, "library_name": library_name}
+
+    def _source_sharepoint_snapshot_shell_identity_matches(self, snapshots) -> tuple[bool, str]:
+        if self._planning_browse_mode("source") != "sharepoint":
+            return False, "browse_mode_not_sharepoint"
+        shell = getattr(self, "_draft_shell_state", None)
+        state = shell if isinstance(shell, SessionState) else SessionState()
+        saved_mode = str(getattr(state, "SourceBrowseMode", "") or "").strip().lower()
+        if saved_mode and saved_mode != "sharepoint":
+            return False, "session_saved_browse_mode_not_sharepoint"
+        fp = self._source_snapshot_identity_fingerprint_from_snapshots(snapshots)
+        if fp is None:
+            return False, "snapshot_missing_drive_identity"
+        cur = self._current_source_library_identity_tuple()
+        if str(cur.get("browse_mode") or "") != "sharepoint":
+            return False, "current_browse_mode_not_sharepoint"
+        cur_drive = str(cur.get("drive_id") or "").strip()
+        fp_drive = str(fp.get("drive_id") or "").strip()
+        if cur_drive and fp_drive and cur_drive.casefold() != fp_drive.casefold():
+            return False, "drive_id_mismatch"
+        if not cur_drive and fp_drive:
+            # Cache-refresh / error recovery may run before library selectors are populated; trust the
+            # pending root bind drive when it matches the snapshot fingerprint.
+            pending = str((getattr(self, "pending_root_drive_ids", {}) or {}).get("source") or "").strip()
+            if pending and pending.casefold() == fp_drive.casefold():
+                cur_drive = pending
+            else:
+                return False, "current_library_not_selected"
+        elif not cur_drive:
+            return False, "current_library_not_selected"
+        csk = str(cur.get("site_key") or "").strip()
+        fsk = str(fp.get("site_key") or "").strip()
+        if csk and fsk and csk.casefold() != fsk.casefold():
+            return False, "site_identity_mismatch"
+        ssk = str(getattr(state, "SelectedSourceSiteKey", "") or "").strip()
+        if ssk and fsk and ssk.casefold() != fsk.casefold():
+            return False, "site_key_mismatch_session_vs_snapshot"
+        return True, "identity_ok"
 
     def _startup_tree_snapshot_node_limit(self):
         """Used only when OZLINK_SKIP_LARGE_SNAPSHOT_RESTORE=1: skip restore above this node count.
@@ -19394,31 +20899,55 @@ class MainWindow(QMainWindow):
         if tree is None or not snapshots:
             return False
 
-        # QTreeView model-view mode: reset only root rows from snapshots.
+        # QTreeView model-view mode: SharePoint source uses recursive snapshot shell when identity matches.
         if panel_key == "source":
             model = getattr(self, "source_sharepoint_model", None)
             if model is not None:
                 try:
                     tree.setUpdatesEnabled(False)
                     tree.setEnabled(True)
+                    snapshot_nodes = int(self._count_tree_snapshot_nodes(snapshots))
+                    if self._planning_browse_mode("source") != "sharepoint":
+                        log_info(
+                            "source_sharepoint_snapshot_shell_skipped",
+                            reason="browse_mode_not_sharepoint",
+                            snapshot_nodes=snapshot_nodes,
+                        )
+                        self._finalize_tree_snapshot_restore(panel_key, snapshots, status_message)
+                        return True
+                    match, reason = self._source_sharepoint_snapshot_shell_identity_matches(snapshots)
+                    if not match:
+                        log_info(
+                            "source_sharepoint_snapshot_shell_skipped",
+                            reason=str(reason),
+                            snapshot_nodes=snapshot_nodes,
+                        )
+                        self._finalize_tree_snapshot_restore(panel_key, snapshots, status_message)
+                        return True
                     model.clear()
-
-                    root_payloads = []
-                    for snap in snapshots:
-                        data = dict(((snap or {}).get("data") or {}))
-                        if not data:
-                            continue
-                        data["children_loaded"] = False
-                        data["load_failed"] = False
-                        data.setdefault("tree_role", "source")
-                        root_payloads.append(data)
-
-                    if not root_payloads:
+                    self._source_startup_snapshot_mount_seen = False
+                    mounted_nodes = int(model.mount_from_session_snapshot_roots(list(snapshots or [])))
+                    self._source_startup_snapshot_mount_seen = mounted_nodes > 0
+                    self._source_snapshot_mount_drive_id = str(
+                        self._current_source_library_identity_tuple().get("drive_id") or ""
+                    ).strip()
+                    log_info(
+                        "source_sharepoint_snapshot_shell_applied",
+                        reason=str(reason),
+                        snapshot_nodes=snapshot_nodes,
+                        mounted_nodes=int(mounted_nodes),
+                        identity_match=True,
+                    )
+                    if mounted_nodes <= 0:
                         self._set_tree_status_message(panel_key, "This library is empty.", loading=False)
                         model.set_empty_library_message("This library is empty.")
                         tree.setEnabled(False)
                     else:
-                        model.reset_root_payloads(root_payloads)
+                        self._set_tree_status_message(
+                            panel_key,
+                            f"Restored saved source tree ({mounted_nodes} items). Verifying…",
+                            loading=False,
+                        )
 
                     self._finalize_tree_snapshot_restore(panel_key, snapshots, status_message)
                     return True
@@ -19495,6 +21024,13 @@ class MainWindow(QMainWindow):
         did = str(drive_id or "").strip()
         if not did:
             return
+        _prep_enter = self._destination_forensic_destination_model_counts()
+        log_info(
+            "destination_graph_load_prep_forensic",
+            phase="enter_before_cache_and_flags",
+            drive_id_suffix=did[-16:] if len(did) > 16 else did,
+            **_prep_enter,
+        )
         gc = getattr(self, "graph", None)
         if gc is not None:
             gc.invalidate_drive_root_children_cache(did)
@@ -19509,12 +21045,25 @@ class MainWindow(QMainWindow):
         self._destination_sharepoint_root_graph_bound_drive_id = ""
         self._destination_full_library_reconcile_pending = False
         self._destination_authority_pending_shell = False
+        _prep_exit = self._destination_forensic_destination_model_counts()
         log_info(
             "destination_ui_cleared_before_graph_load",
             drive_id_suffix=did[-16:] if len(did) > 16 else did,
+            **_prep_exit,
+            prep_enter_model_nodes_non_placeholder=int(_prep_enter.get("model_nodes_non_placeholder") or 0),
+            prep_enter_model_nodes_iter_depth_first=int(_prep_enter.get("model_nodes_iter_depth_first") or 0),
+            prep_delta_non_placeholder=int(_prep_exit.get("model_nodes_non_placeholder", 0) - _prep_enter.get("model_nodes_non_placeholder", 0)),
         )
 
     def load_library_root(self, panel_key, site, library, force_refresh=False):
+        """Load or reload a library root via ``RootLoadWorker`` (may call ``set_tree_placeholder``).
+
+        **Option 3 note:** default **destination** “Refresh Cache” should use the incremental
+        path (``DestinationIncrementalGraphRefreshWorker`` + root merge), not this method, so the
+        visible tree is not replaced with a loading shell. This method remains correct for **initial
+        bind**, **missing drive**, ``force_refresh=True``, **Rebuild Cache / Full Resync**, and
+        **source** refresh flows where a full root reload is intentional.
+        """
         try:
             self._log_library_restore_step(
                 "load_root_step_01_enter",
@@ -19596,7 +21145,25 @@ class MainWindow(QMainWindow):
                 self._destination_prepare_live_sharepoint_root_load(drive_id)
 
             self._log_library_restore_step("load_root_step_05_placeholder_enter", panel_key=panel_key)
+            _before_ph = (
+                self._destination_forensic_destination_model_counts()
+                if panel_key == "destination"
+                else {}
+            )
             self.set_tree_placeholder(panel_key, "Loading root content...")
+            if panel_key == "destination":
+                _after_ph = self._destination_forensic_destination_model_counts()
+                log_info(
+                    "destination_startup_model_step",
+                    step="after_set_tree_placeholder_loading_root",
+                    model_nodes_non_placeholder_before=int(_before_ph.get("model_nodes_non_placeholder") or 0),
+                    model_nodes_iter_depth_first_before=int(_before_ph.get("model_nodes_iter_depth_first") or 0),
+                    model_nodes_non_placeholder_after=int(_after_ph.get("model_nodes_non_placeholder") or 0),
+                    model_nodes_iter_depth_first_after=int(_after_ph.get("model_nodes_iter_depth_first") or 0),
+                    delta_non_placeholder=int(
+                        _after_ph.get("model_nodes_non_placeholder", 0) - _before_ph.get("model_nodes_non_placeholder", 0)
+                    ),
+                )
             self._log_restore_phase("root_load placeholder_set", panel_key=panel_key, request_signature=request_signature)
             self._log_library_restore_step("load_root_step_05_placeholder_exit", panel_key=panel_key)
 
@@ -19659,11 +21226,211 @@ class MainWindow(QMainWindow):
             self._cleanup_root_worker(panel_key, worker_id)
             if str(panel_key or "") == "destination":
                 self._schedule_destination_bind_reconcile_after_workers()
+                try:
+                    self._destination_try_clear_stale_foreground_memory_restore_gate(
+                        "on_root_worker_finished_destination"
+                    )
+                except Exception:
+                    pass
             self._refresh_planning_loading_banner()
             if hasattr(self, "planned_moves_table"):
                 self.refresh_planned_moves_table()
         except Exception as exc:
             self._log_restore_exception("on_root_worker_finished", exc)
+
+    def _destination_post_root_success_deferred_startup(
+        self,
+        drive_id: str,
+        worker_id: Any,
+        items: list,
+        pre_bind_top_item_name: str,
+    ) -> None:
+        """Heavy destination tail of on_root_load_success; must run after event-loop idle (snapshot SharePoint bind)."""
+        panel_key = "destination"
+        if self._restore_abort_active():
+            return
+        active_entry = self.root_load_workers.get(panel_key)
+        if not active_entry or active_entry.get("id") != worker_id:
+            self._log_worker_lifecycle("stale_success_skipped", "root", worker_id, panel_key, drive_id=drive_id)
+            return
+        if self.pending_root_drive_ids.get(panel_key) != drive_id:
+            self._log_restore_phase("root_worker_success stale_payload_skipped", panel_key=panel_key, drive_id=drive_id)
+            return
+
+        self._destination_merge_planning_bootstrap_folder_paths_if_needed(phase="on_root_load_success")
+        self._refresh_tree_column_width(panel_key)
+
+        dm_live = getattr(self, "destination_planning_model", None)
+        _n_top = int(dm_live.rowCount(QModelIndex())) if dm_live is not None else -1
+        _labels: list[str] = []
+        if dm_live is not None:
+            inv = QModelIndex()
+            for _ti in range(min(_n_top, 32)):
+                _ix = dm_live.index(_ti, 0, inv)
+                _labels.append(str(_ix.data(Qt.DisplayRole) or ""))
+        log_info(
+            "destination_bound_from_live_graph",
+            top_level_row_count=_n_top,
+            display_label_preview=_labels,
+            drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+        )
+
+        post_bind_top_item_name = ""
+        post_bind_top_item_semantic_path = ""
+        tree_for_top_item, _ = self._get_tree_and_status(panel_key)
+        if tree_for_top_item is not None:
+            if hasattr(tree_for_top_item, "topLevelItemCount") and tree_for_top_item.topLevelItemCount() > 0:
+                top_item = tree_for_top_item.topLevelItem(0)
+                post_bind_top_item_name = str(top_item.text(0) or "")
+                node_data = top_item.data(0, Qt.UserRole) or {}
+                post_bind_top_item_semantic_path = str(node_data.get("semantic_path") or "")
+
+        self._log_restore_phase(
+            "destination_root_top_item_bound",
+            before_name=pre_bind_top_item_name,
+            after_name=post_bind_top_item_name,
+            after_semantic_path=post_bind_top_item_semantic_path,
+            still_root_name=post_bind_top_item_name.strip().lower() == "root",
+        )
+
+        restored_runtime_snapshot = False
+        pending_session_panels_pre = (
+            set(self._pending_session_workspace_restore_panels)
+            if self._pending_session_workspace_ui_state
+            else set()
+        )
+        pending_session_chunked_ui_deferred = False
+        if (
+            self._live_root_refresh_request_signature.get(panel_key, "")
+            and self.loaded_root_request_signatures.get(panel_key)
+            == self._live_root_refresh_request_signature.get(panel_key, "")
+            and self._live_root_refresh_ui_state.get(panel_key)
+        ):
+            self._restore_workspace_tree_panel_state(panel_key, self._live_root_refresh_ui_state[panel_key])
+            self._live_root_refresh_request_signature[panel_key] = ""
+            self._live_root_refresh_ui_state[panel_key] = None
+        elif panel_key not in pending_session_panels_pre and self._maybe_restore_runtime_snapshot_after_root_bind(
+            panel_key
+        ):
+            restored_runtime_snapshot = True
+            self._schedule_snapshot_branch_refresh(panel_key, delay_ms=0)
+
+        if panel_key in pending_session_panels_pre and self._pending_session_workspace_ui_state:
+            panel_ui_state = self._pending_session_workspace_ui_state
+            panel_snapshots = list(self._pending_session_tree_snapshots.get(panel_key, []) or [])
+            pending_session_panels = set(self._pending_session_workspace_restore_panels)
+            if bool(panel_ui_state.get(f"{panel_key}_expanded_all", False)) and panel_snapshots:
+                snap_msg = "Expanded from local snapshot. Refreshing live content..."
+                node_count = self._count_tree_snapshot_nodes(panel_snapshots)
+                sync_max = self._snapshot_sync_restore_max_nodes()
+                chunked_pending = node_count > sync_max
+
+                def _pending_snap_selection_only():
+                    self._refresh_expand_all_button_for_panel(panel_key)
+                    self._restore_selected_tree_path(
+                        panel_key,
+                        str(panel_ui_state.get(f"{panel_key}_selected_path", "") or ""),
+                    )
+
+                def _pending_snap_after_chunked():
+                    _pending_snap_selection_only()
+                    self._refresh_tree_ui_after_root_bind(panel_key, restored_runtime_snapshot=True)
+
+                on_done = _pending_snap_after_chunked if chunked_pending else _pending_snap_selection_only
+                ok_snap = self._restore_tree_items_snapshot_if_reasonable(
+                    panel_key,
+                    panel_snapshots,
+                    snap_msg,
+                    context="pending_session_after_root_bind",
+                    on_complete=on_done,
+                )
+                if ok_snap:
+                    if not chunked_pending:
+                        restored_runtime_snapshot = True
+                    else:
+                        pending_session_chunked_ui_deferred = True
+                else:
+                    self._restore_workspace_tree_panel_state(panel_key, panel_ui_state)
+            else:
+                self._restore_workspace_tree_panel_state(panel_key, panel_ui_state)
+            pending_session_panels.discard(panel_key)
+            self._pending_session_workspace_restore_panels = pending_session_panels
+            self._schedule_snapshot_branch_refresh(panel_key, delay_ms=0)
+            if not pending_session_panels:
+                self._pending_session_workspace_ui_state = None
+                self._pending_session_tree_snapshots = {}
+
+        self._graph_dest_parent_negative_cache.clear()
+        self._schedule_deferred_background_load("destination", drive_id)
+        self._log_restore_phase(
+            "destination_replay_after_root_rebuild_started",
+            request_signature=self.loaded_root_request_signatures.get(panel_key),
+            planned_moves_count=len(self.planned_moves),
+            proposed_folders_count=len(self.proposed_folders),
+        )
+        self._reset_unresolved_proposed_queue()
+        self._reset_unresolved_allocation_queue()
+        self._sync_restore_destination_overlay_pending_from_unresolved_queues()
+        if getattr(self, "_destination_startup_snapshot_mount_seen", False):
+            self._destination_defer_first_terminal_planned_reconcile_pending = True
+
+        if not pending_session_chunked_ui_deferred:
+            self._refresh_tree_ui_after_root_bind(panel_key, restored_runtime_snapshot=restored_runtime_snapshot)
+
+        if self._planning_browse_mode("destination") != "local":
+            dm2 = getattr(self, "destination_planning_model", None)
+            _n2 = int(dm2.rowCount(QModelIndex())) if dm2 is not None else -1
+            log_info(
+                "restore_applied_after_live_bind",
+                destination_top_level_rows=_n2,
+                drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+                note="after_refresh_tree_ui_after_root_bind",
+            )
+
+        pending_refresh_panels = self._pending_cache_refresh_panels if self._cache_refresh_restore_active else set()
+        if self._cache_refresh_restore_active and panel_key in pending_refresh_panels:
+            pending_refresh_panels.discard(panel_key)
+            self._pending_cache_refresh_panels = pending_refresh_panels
+            if not pending_refresh_panels:
+                self._finalize_cache_refresh_workspace_restore()
+
+        surv = self._destination_projection_survival_context_after_root_bind()
+        self._log_restore_phase(
+            "destination_replay_after_root_rebuild_complete",
+            request_signature=self.loaded_root_request_signatures.get(panel_key),
+            future_state_count=surv["future_state_count"],
+            visible_proposed_count=self._count_visible_destination_proposed_nodes(),
+            unresolved_overlay_entries=surv["unresolved_overlay_entries"],
+            restore_destination_overlay_pending=surv["restore_destination_overlay_pending"],
+            survived_logical=surv["survived_logical"],
+        )
+        self._log_restore_phase(
+            "destination_projection_survived_root_bind",
+            request_signature=self.loaded_root_request_signatures.get(panel_key),
+            future_state_count=surv["future_state_count"],
+            unresolved_overlay_entries=surv["unresolved_overlay_entries"],
+            restore_destination_overlay_pending=surv["restore_destination_overlay_pending"],
+            survived=surv["survived_logical"],
+        )
+
+        self._schedule_workspace_ui_persist(panel_key=panel_key)
+        if drive_id and self._graph_settings_delta_sync_enabled():
+            QTimer.singleShot(
+                6400,
+                lambda d=drive_id: self._run_drive_delta_sync_best_effort(d),
+            )
+        QTimer.singleShot(
+            2200,
+            lambda: self._safe_invoke(
+                "graph_resolve_after_destination_root",
+                self._try_resolve_planned_move_graph_ids_debounced,
+            ),
+        )
+
+        if self._destination_should_run_startup_projection_materialization():
+            self._destination_run_startup_projection_materialization(phase="after_sharepoint_root_bind")
+
+        self._log_restore_phase("root_worker_success completed", panel_key=panel_key, item_count=len(items))
 
     def on_root_load_success(self, payload, worker_id):
         _dsp_r = getattr(self, "_dest_scroll_profiler", None)
@@ -19703,6 +21470,12 @@ class MainWindow(QMainWindow):
                     name_preview=_prev,
                     drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
                 )
+                root_items = items or []
+                if root_items:
+                    _r0 = root_items[0]
+                    self._destination_graph_root_name = str(
+                        (_r0.get("name") if isinstance(_r0, dict) else getattr(_r0, "name", "")) or ""
+                    ).strip()
             # Always apply live Graph root payloads: do not treat a richer visible tree (including
             # overlays / expanded rows) as a reason to skip rebinding authoritative library children.
             if panel_key == "source":
@@ -19710,12 +21483,19 @@ class MainWindow(QMainWindow):
             if panel_key == "destination":
                 existing_future_state_count = self._count_visible_destination_future_state_nodes()
                 if existing_future_state_count > 0:
-                    self._log_restore_phase(
-                        "destination_projection_lost_on_root_clear",
-                        panel_key=panel_key,
-                        future_state_count=existing_future_state_count,
-                        reason="destination_root_rebuild_incoming",
-                    )
+                    if getattr(self, "_destination_startup_snapshot_mount_seen", False):
+                        log_info(
+                            "startup_lifecycle_temp_destination_root_rebuild_log_bypassed",
+                            future_state_count=int(existing_future_state_count),
+                            note="in_place_graph_root_merge_preserves_snapshot_rows",
+                        )
+                    else:
+                        self._log_restore_phase(
+                            "destination_projection_lost_on_root_clear",
+                            panel_key=panel_key,
+                            future_state_count=existing_future_state_count,
+                            reason="destination_root_rebuild_incoming",
+                        )
             self._log_restore_phase(
                 "root_worker_success isolation_flag_state",
                 panel_key=panel_key,
@@ -19740,6 +21520,43 @@ class MainWindow(QMainWindow):
                 elif hasattr(tree_for_top_item, "topLevelItemCount") and tree_for_top_item.topLevelItemCount() > 0:
                     pre_bind_top_item_name = str(tree_for_top_item.topLevelItem(0).text(0) or "")
             self._apply_root_payload_to_tree(panel_key, items)
+            _destination_sharepoint_snapshot_early_return = (
+                panel_key == "destination"
+                and self._planning_browse_mode("destination") != "local"
+                and getattr(self, "_destination_startup_snapshot_mount_seen", False)
+            )
+            if _destination_sharepoint_snapshot_early_return:
+                self.loaded_root_request_signatures[panel_key] = active_entry.get("request_signature")
+                self._log_restore_phase(
+                    "root_bind applied",
+                    panel_key=panel_key,
+                    worker_id=worker_id,
+                    request_signature=self.loaded_root_request_signatures.get(panel_key),
+                )
+                try:
+                    self._destination_try_clear_stale_foreground_memory_restore_gate("on_root_load_success_after_signature")
+                except Exception:
+                    pass
+                log_info(
+                    "startup_lifecycle_temp_root_success_return_immediate",
+                    panel_key=panel_key,
+                    drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+                    item_count=len(items or []),
+                )
+                QTimer.singleShot(
+                    0,
+                    lambda d=drive_id, w=worker_id, it=items, pre=pre_bind_top_item_name: self._safe_invoke(
+                        "destination_post_root_success_deferred_startup",
+                        self._destination_post_root_success_deferred_startup,
+                        d,
+                        w,
+                        it,
+                        pre,
+                    ),
+                )
+                return
+            if panel_key == "destination" and self._planning_browse_mode("destination") != "local":
+                self._destination_merge_planning_bootstrap_folder_paths_if_needed(phase="on_root_load_success")
             self._refresh_tree_column_width(panel_key)
             self.loaded_root_request_signatures[panel_key] = active_entry.get("request_signature")
             self._log_restore_phase(
@@ -19749,6 +21566,10 @@ class MainWindow(QMainWindow):
                 request_signature=self.loaded_root_request_signatures.get(panel_key),
             )
             if panel_key == "destination" and self._planning_browse_mode("destination") != "local":
+                try:
+                    self._destination_try_clear_stale_foreground_memory_restore_gate("on_root_load_success_after_signature")
+                except Exception:
+                    pass
                 dm_live = getattr(self, "destination_planning_model", None)
                 _n_top = int(dm_live.rowCount(QModelIndex())) if dm_live is not None else -1
                 _labels: list[str] = []
@@ -19822,6 +21643,11 @@ class MainWindow(QMainWindow):
                             panel_key,
                             str(panel_ui_state.get(f"{panel_key}_selected_path", "") or ""),
                         )
+                        if panel_key == "destination":
+                            self._destination_branch_forensic_log(
+                                "startup_post_restore_model_vs_snapshot",
+                                snapshots=list(panel_snapshots or []),
+                            )
 
                     def _pending_snap_after_chunked():
                         _pending_snap_selection_only()
@@ -19865,6 +21691,8 @@ class MainWindow(QMainWindow):
                 self._reset_unresolved_proposed_queue()
                 self._reset_unresolved_allocation_queue()
                 self._sync_restore_destination_overlay_pending_from_unresolved_queues()
+                if getattr(self, "_destination_startup_snapshot_mount_seen", False):
+                    self._destination_defer_first_terminal_planned_reconcile_pending = True
             if not pending_session_chunked_ui_deferred:
                 self._refresh_tree_ui_after_root_bind(panel_key, restored_runtime_snapshot=restored_runtime_snapshot)
             if panel_key == "destination" and self._planning_browse_mode("destination") != "local":
@@ -21033,6 +22861,8 @@ class MainWindow(QMainWindow):
         Rapid row churn during scroll or multi-row repairs could freeze the UI for tens of seconds.
         """
         try:
+            if getattr(self, "_application_shutting_down", False):
+                return
             if int(getattr(self, "_destination_overlay_batch_structure_depth", 0) or 0) > 0:
                 t_sr = getattr(self, "_destination_structure_reactive_coalesce_timer", None)
                 if t_sr is not None:
@@ -21052,6 +22882,8 @@ class MainWindow(QMainWindow):
                     t_sr.start(max(0, deb))
                 return
             self._on_destination_state_mutation("destination_model_structure_changed", None)
+        except KeyboardInterrupt:
+            log_info("shutdown_trace", event="flush_destination_structure_reactive_interrupted")
         except Exception as exc:
             self._log_restore_exception("flush_destination_structure_reactive_coalesced", exc)
 
@@ -21737,7 +23569,548 @@ class MainWindow(QMainWindow):
             sub = self._destination_tree_snapshot_dict_to_nested_spec(ch)
             if sub is not None:
                 kids_specs.append(sub)
+        # Session snapshot rows are authoritative for startup: persisted ``children`` is the
+        # materialized subtree, so Graph lazy-folder plumbing must not replace it with placeholders.
+        if bool(data.get("is_folder")):
+            data["children_loaded"] = True
+            data["load_failed"] = False
         return (data, kids_specs)
+
+    def _destination_planned_moves_need_graph_bootstrap(self, moves) -> bool:
+        """True when any planned move has a destination path but no Graph destination id."""
+        try:
+            for m in moves or []:
+                if not isinstance(m, dict):
+                    continue
+                dest_path = str(m.get("DestinationPath") or m.get("destination_path") or "").strip()
+                if not dest_path:
+                    continue
+                did = str(m.get("DestinationId") or m.get("destination_id") or "").strip()
+                if not did:
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def _destination_proposed_folders_need_graph_bootstrap(self, proposed) -> bool:
+        """True when any proposed folder row lacks a Graph destination id."""
+        try:
+            for row in proposed or []:
+                if not isinstance(row, dict):
+                    continue
+                did = str(row.get("DestinationId") or row.get("destination_id") or "").strip()
+                if not did:
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def _destination_collect_canonical_folder_paths_for_bootstrap(self) -> list[str]:
+        """Collect unique graph-relative folder paths for bootstrap (planned moves + proposed folders)."""
+        paths: set[str] = set()
+        moves = list(getattr(self, "planned_moves", None) or [])
+        proposed = list(getattr(self, "proposed_folders", None) or [])
+        for m in moves:
+            if not isinstance(m, dict):
+                continue
+            raw_dest = str(m.get("DestinationPath") or m.get("destination_path") or "").strip()
+            if not raw_dest:
+                continue
+            move_norm = dict(m)
+            move_norm["destination_path"] = raw_dest
+            try:
+                proj = self._allocation_projection_path(move_norm)
+            except Exception:
+                proj = ""
+            if not proj:
+                continue
+            try:
+                canon_full = self._canonical_planned_memory_path_for_graph_match(proj)
+            except Exception:
+                canon_full = ""
+            if not canon_full:
+                continue
+            try:
+                is_file = self._planned_move_terminal_is_file_leaf(m)
+            except Exception:
+                is_file = False
+            if is_file:
+                segs = self._path_segments(canon_full)
+                canon_folder = "\\".join(segs[:-1]) if len(segs) > 1 else ""
+            else:
+                canon_folder = canon_full
+            if canon_folder:
+                paths.add(canon_folder)
+        for row in proposed:
+            raw = ""
+            if isinstance(row, dict):
+                raw = str(row.get("DestinationPath") or row.get("destination_path") or "").strip()
+                if not raw:
+                    parent = str(row.get("ParentPath") or row.get("parent_path") or "").strip()
+                    name = str(row.get("FolderName") or row.get("folder_name") or "").strip()
+                    if parent and name:
+                        raw = self.normalize_memory_path(f"{parent}\\{name}")
+            elif isinstance(row, ProposedFolder):
+                raw = str(self._proposed_destination_path(row) or "").strip()
+            if not raw:
+                continue
+            try:
+                canon = self._canonical_planned_memory_path_for_graph_match(raw)
+            except Exception:
+                canon = ""
+            if canon:
+                paths.add(canon)
+        return sorted(paths)
+
+    def _destination_collect_folder_prefix_paths_for_import_projection_materialize(self) -> list[str]:
+        """All cumulative folder prefixes for canonical destination paths (strict ancestor scaffolding)."""
+        out: set[str] = set()
+        moves = list(getattr(self, "planned_moves", None) or [])
+        proposed = list(getattr(self, "proposed_folders", None) or [])
+        for m in moves:
+            if not isinstance(m, dict):
+                continue
+            raw_dest = str(m.get("DestinationPath") or m.get("destination_path") or "").strip()
+            if not raw_dest:
+                continue
+            move_norm = dict(m)
+            move_norm["destination_path"] = raw_dest
+            try:
+                proj = self._allocation_projection_path(move_norm)
+            except Exception:
+                proj = ""
+            if not proj:
+                continue
+            try:
+                canon_full = self._canonical_planned_memory_path_for_graph_match(proj)
+            except Exception:
+                canon_full = ""
+            if not canon_full:
+                continue
+            try:
+                is_file = self._planned_move_terminal_is_file_leaf(m)
+            except Exception:
+                is_file = False
+            segs = self._path_segments(canon_full)
+            if is_file and len(segs) > 1:
+                segs = segs[:-1]
+            for i in range(len(segs)):
+                p = self.normalize_memory_path("\\".join(segs[: i + 1]))
+                if p:
+                    out.add(p)
+        for row in proposed:
+            raw = ""
+            if isinstance(row, dict):
+                raw = str(row.get("DestinationPath") or row.get("destination_path") or "").strip()
+                if not raw:
+                    parent = str(row.get("ParentPath") or row.get("parent_path") or "").strip()
+                    name = str(row.get("FolderName") or row.get("folder_name") or "").strip()
+                    if parent and name:
+                        raw = self.normalize_memory_path(f"{parent}\\{name}")
+            elif isinstance(row, ProposedFolder):
+                raw = str(self._proposed_destination_path(row) or "").strip()
+            if not raw:
+                continue
+            try:
+                canon = self._canonical_planned_memory_path_for_graph_match(raw)
+            except Exception:
+                canon = ""
+            if not canon:
+                continue
+            segs = self._path_segments(canon)
+            for i in range(len(segs)):
+                p = self.normalize_memory_path("\\".join(segs[: i + 1]))
+                if p:
+                    out.add(p)
+        return sorted(out)
+
+    def _destination_projection_discovery_aggregate(self, dm) -> dict[str, Any]:
+        """Planning-driven projection discovery counts (independent of children_loaded / Graph / expansion).
+
+        ``total_projected_rows_discovered`` counts folder-prefix scaffolding units plus terminal file
+        targets from ``planned_moves``, and takes the max with visible allocation-folder rows so logs
+        never read ``0`` when either planning or the model already carries allocation structure.
+        """
+        prefix_paths: list[str] = []
+        try:
+            prefix_paths = list(self._destination_collect_folder_prefix_paths_for_import_projection_materialize())
+        except Exception:
+            prefix_paths = []
+        terminal_files = 0
+        invalid_moves = 0
+        for m in getattr(self, "planned_moves", None) or []:
+            if not isinstance(m, dict):
+                invalid_moves += 1
+                continue
+            try:
+                if self._planned_move_terminal_is_file_leaf(m):
+                    terminal_files += 1
+            except Exception:
+                invalid_moves += 1
+
+        def _payload_from_dest_index(ix) -> dict:
+            if dm is None or not hasattr(ix, "data"):
+                return {}
+            try:
+                if ix.model() is not dm:
+                    return {}
+            except RuntimeError:
+                return {}
+            try:
+                return dict(ix.data(Qt.UserRole) or {})
+            except RuntimeError:
+                return {}
+
+        model_alloc_folders = 0
+        if dm is not None and hasattr(dm, "iter_depth_first"):
+            for ix in dm.iter_depth_first():
+                pl = _payload_from_dest_index(ix)
+                if not isinstance(pl, dict) or pl.get("placeholder"):
+                    continue
+                if not self.node_is_planned_allocation(pl) or not bool(pl.get("is_folder", True)):
+                    continue
+                model_alloc_folders += 1
+        planning_units = int(len(prefix_paths)) + int(terminal_files)
+        total_discovered = max(int(planning_units), int(model_alloc_folders))
+        pm = len(getattr(self, "planned_moves", None) or [])
+        pf = len(getattr(self, "proposed_folders", None) or [])
+        return {
+            "prefix_paths": prefix_paths,
+            "prefix_folder_units": int(len(prefix_paths)),
+            "terminal_file_targets": int(terminal_files),
+            "planned_moves_total": int(pm),
+            "proposed_folders_total": int(pf),
+            "model_allocation_folder_rows": int(model_alloc_folders),
+            "planning_derived_units": int(planning_units),
+            "total_projected_rows_discovered": int(total_discovered),
+            "invalid_move_rows": int(invalid_moves),
+        }
+
+    def _destination_import_projection_drive_id_for_bootstrap(self) -> str:
+        drive_id = ""
+        try:
+            session = getattr(self, "session_state", None)
+            if session is not None:
+                drive_id = str(getattr(session, "sharepoint_destination_drive_id", "") or "").strip()
+        except Exception:
+            drive_id = ""
+        if not drive_id:
+            try:
+                drive_id = str(self.pending_root_drive_ids.get("destination") or "").strip()
+            except Exception:
+                drive_id = ""
+        return drive_id
+
+    def _destination_session_has_usable_tree_snapshot(self) -> bool:
+        snaps = list((getattr(self, "_runtime_session_tree_snapshots", {}) or {}).get("destination") or [])
+        if snaps:
+            return True
+        pend = list((getattr(self, "_pending_session_tree_snapshots", {}) or {}).get("destination") or [])
+        if pend:
+            return True
+        st = self._draft_shell_state if isinstance(self._draft_shell_state, SessionState) else None
+        if st is not None and list(getattr(st, "DestinationTreeSnapshot", []) or []):
+            return True
+        return False
+
+    def _destination_should_run_startup_projection_materialization(self) -> bool:
+        if self._planning_browse_mode("destination") == "local":
+            return False
+        if not destination_authority_contract.graph_owns_visible_real_destination_structure(self):
+            return False
+        if self._destination_session_has_usable_tree_snapshot():
+            return True
+        if list(getattr(self, "planned_moves", None) or []):
+            return True
+        if list(getattr(self, "proposed_folders", None) or []):
+            return True
+        return False
+
+    def _destination_run_startup_projection_materialization(self, *, phase: str) -> None:
+        if (
+            getattr(self, "_destination_startup_snapshot_mount_seen", False)
+            and self._planning_browse_mode("destination") != "local"
+        ):
+            log_info(
+                "startup_lifecycle_temp_startup_projection_deferred",
+                phase=str(phase)[:120],
+                defer_ms=0,
+            )
+
+            def _go():
+                t0 = time.perf_counter()
+                try:
+                    self._destination_run_startup_projection_materialization_sync(phase=phase)
+                finally:
+                    log_info(
+                        "startup_lifecycle_temp_deferred_import_projection_chunk",
+                        kind="startup_projection_after_root_bind",
+                        phase=str(phase)[:120],
+                        wall_ms=round((time.perf_counter() - t0) * 1000.0, 2),
+                    )
+
+            QTimer.singleShot(0, lambda: self._safe_invoke("destination_startup_projection_idle", _go))
+            return
+        self._destination_run_startup_projection_materialization_sync(phase=phase)
+
+    def _destination_run_startup_projection_materialization_sync(self, *, phase: str) -> None:
+        log_info("startup_projection_materialization_started", phase=str(phase)[:120])
+        log_info("startup_descendant_materialization_started", phase=str(phase)[:120], full_descendant_restore=True)
+        self._startup_post_snapshot_trace_event(
+            "startup_descendant_materialization_enter",
+            phase_excerpt=str(phase)[:120],
+        )
+        _t_sd = time.perf_counter()
+        self._destination_startup_projection_visibility_pass_active = True
+        try:
+            self._destination_import_projection_materialize_all_descendants(
+                phase=f"startup_{phase}", bootstrap_stats=None
+            )
+        except Exception as exc:
+            log_info(
+                "startup_projection_materialization_failed",
+                phase=str(phase)[:120],
+                error=str(exc)[:240],
+            )
+            raise
+        finally:
+            self._destination_startup_projection_visibility_pass_active = False
+        self._startup_post_snapshot_trace_event(
+            "startup_descendant_materialization_exit",
+            phase_excerpt=str(phase)[:120],
+            wall_ms=round((time.perf_counter() - _t_sd) * 1000.0, 2),
+        )
+        log_info("startup_projection_materialization_finished", phase=str(phase)[:120])
+
+    def _destination_import_projection_materialize_all_descendants(
+        self, *, phase: str, bootstrap_stats: dict | None = None
+    ) -> None:
+        """Option 3: after bootstrap, materialize full projected descendant tree without expand/Graph gates."""
+        if self._planning_browse_mode("destination") == "local":
+            return
+        if not destination_authority_contract.graph_owns_visible_real_destination_structure(self):
+            return
+        dm = getattr(self, "destination_planning_model", None)
+        if dm is None or not hasattr(dm, "iter_depth_first"):
+            return
+        skipped: list[str] = []
+        rows_before = 0
+        try:
+            rows_before = sum(1 for _ in dm.iter_depth_first())
+        except Exception:
+            rows_before = 0
+        disc: dict[str, Any] = {}
+        try:
+            disc = self._destination_projection_discovery_aggregate(dm)
+        except Exception as exc:
+            disc = {
+                "prefix_paths": [],
+                "prefix_folder_units": 0,
+                "terminal_file_targets": 0,
+                "planned_moves_total": 0,
+                "proposed_folders_total": 0,
+                "model_allocation_folder_rows": 0,
+                "planning_derived_units": 0,
+                "total_projected_rows_discovered": 0,
+                "invalid_move_rows": 0,
+                "discovery_error": str(exc)[:200],
+            }
+            skipped.append(f"discovery_aggregate:{str(exc)[:120]}")
+        discovered = int((disc or {}).get("total_projected_rows_discovered") or 0)
+        prefix_paths = list((disc or {}).get("prefix_paths") or [])
+        log_info(
+            "projection_discovery_started",
+            phase=str(phase)[:80],
+            total_projected_rows_discovered=int(discovered),
+            prefix_folder_units=int((disc or {}).get("prefix_folder_units") or 0),
+            terminal_file_targets=int((disc or {}).get("terminal_file_targets") or 0),
+            planned_moves_total=int((disc or {}).get("planned_moves_total") or 0),
+            proposed_folders_total=int((disc or {}).get("proposed_folders_total") or 0),
+            model_allocation_folder_rows=int((disc or {}).get("model_allocation_folder_rows") or 0),
+            planning_derived_units=int((disc or {}).get("planning_derived_units") or 0),
+        )
+        missing_parents_created = 0
+        if prefix_paths and hasattr(dm, "merge_bootstrap_cached_provisional_folder_paths"):
+            did = self._destination_import_projection_drive_id_for_bootstrap()
+            try:
+                pre_stats = dm.merge_bootstrap_cached_provisional_folder_paths(prefix_paths, drive_id=did)
+                missing_parents_created = int((pre_stats or {}).get("inserted") or 0)
+            except Exception as exc:
+                skipped.append(f"prefix_merge:{str(exc)[:120]}")
+        log_info(
+            "projection_discovery_finished",
+            phase=str(phase)[:80],
+            total_projected_rows_discovered=int(discovered),
+            prefix_path_count=len(prefix_paths),
+            planning_derived_units=int((disc or {}).get("planning_derived_units") or 0),
+            source_counts_planned_moves=int((disc or {}).get("planned_moves_total") or 0),
+            source_counts_proposed_folders=int((disc or {}).get("proposed_folders_total") or 0),
+            source_counts_allocation_derived_model_folders=int((disc or {}).get("model_allocation_folder_rows") or 0),
+            rows_skipped_invalid_moves=int((disc or {}).get("invalid_move_rows") or 0),
+        )
+        log_info(
+            "projection_materialization_started",
+            phase=str(phase)[:80],
+            total_projected_rows_discovered=int(discovered),
+            prefix_path_count=len(prefix_paths),
+        )
+        fixpoint_applied = 0
+        inv = QModelIndex()
+        try:
+            ntop = int(dm.rowCount(inv))
+        except Exception:
+            ntop = 0
+        for r in range(max(0, ntop)):
+            try:
+                ix = dm.index(r, 0, inv)
+            except Exception:
+                continue
+            if not ix.isValid():
+                continue
+            try:
+                fixpoint_applied += int(
+                    self._materialize_planned_workspace_proposed_descendants_fixpoint(ix, max_rounds=200) or 0
+                )
+            except Exception as exc:
+                skipped.append(f"fixpoint_row{r}:{str(exc)[:100]}")
+        alloc_pass = 0
+        flag_skipped_in_hydration = 0
+        for ix in dm.iter_depth_first():
+            try:
+                pl = self._destination_model_index_user_role_dict(ix)
+            except Exception:
+                continue
+            if not self.node_is_planned_allocation(pl) or not bool(pl.get("is_folder", True)):
+                continue
+            if bool(pl.get("children_loaded")) and bool(pl.get("allocation_descendants_applied")):
+                flag_skipped_in_hydration += 1
+            try:
+                if hasattr(dm, "is_index_live") and not dm.is_index_live(ix):
+                    skipped.append(f"stale_index:{str(self._tree_item_path(pl) or '')[:120]}")
+                    continue
+            except Exception:
+                pass
+            try:
+                self._load_destination_projected_descendants_index(ix)
+                alloc_pass += 1
+            except Exception as exc:
+                skipped.append(f"load_proj:{str(self._tree_item_path(pl) or '')[:80]}:{str(exc)[:60]}")
+            if alloc_pass % 24 == 0:
+                try:
+                    QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+                except Exception:
+                    pass
+        rows_after = rows_before
+        try:
+            rows_after = sum(1 for _ in dm.iter_depth_first())
+        except Exception:
+            pass
+        inserted = max(0, rows_after - rows_before)
+        bs = bootstrap_stats if isinstance(bootstrap_stats, dict) else {}
+        log_info(
+            "projection_materialization_finished",
+            phase=str(phase)[:80],
+            total_projected_rows_discovered=int(discovered),
+            total_rows_inserted=int(inserted),
+            total_rows_reused=int((bs.get("reused") or 0)) + int(fixpoint_applied),
+            total_missing_parents_created=int(missing_parents_created),
+            allocation_folder_hydration_passes=int(alloc_pass),
+            allocation_rows_already_hydrated_flags=int(flag_skipped_in_hydration),
+            skipped_count=len(skipped),
+            skipped_sample=" | ".join(skipped[:12])[:2000],
+        )
+        if str(phase or "").startswith("startup_"):
+            log_info(
+                "startup_descendant_materialization_finished",
+                phase=str(phase)[:80],
+                full_descendant_restore=bool(
+                    int(alloc_pass) > 0 or int(inserted) > 0 or int(fixpoint_applied) > 0 or int(missing_parents_created) > 0
+                ),
+                rows_inserted=int(inserted),
+                allocation_folder_hydration_passes=int(alloc_pass),
+                fixpoint_segments_applied=int(fixpoint_applied),
+                prefix_paths_count=int(len(prefix_paths)),
+            )
+
+    def _destination_merge_planning_bootstrap_folder_paths_if_needed(self, *, phase: str) -> None:
+        """Legacy import: merge cached_provisional folder shells from planning when Graph ids are missing."""
+        if self._planning_browse_mode("destination") == "local":
+            return
+        moves = list(getattr(self, "planned_moves", None) or [])
+        proposed = list(getattr(self, "proposed_folders", None) or [])
+        need = self._destination_planned_moves_need_graph_bootstrap(moves) or self._destination_proposed_folders_need_graph_bootstrap(
+            proposed
+        )
+        if not need:
+            return
+        folder_paths = self._destination_collect_canonical_folder_paths_for_bootstrap()
+        drive_id = self._destination_import_projection_drive_id_for_bootstrap()
+        try:
+            model = getattr(self, "destination_planning_model", None)
+        except Exception:
+            model = None
+        if model is None or not hasattr(model, "merge_bootstrap_cached_provisional_folder_paths"):
+            return
+        stats = {"inserted": 0, "reused": 0, "skipped": 0}
+        if folder_paths:
+            try:
+                stats = model.merge_bootstrap_cached_provisional_folder_paths(folder_paths, drive_id=drive_id)
+            except Exception as exc:
+                log_info(
+                    "destination_legacy_import_bootstrap_merge_failed",
+                    phase=str(phase)[:80],
+                    error=str(exc)[:200],
+                )
+                return
+            log_info(
+                "destination_legacy_import_bootstrap_merged",
+                phase=str(phase)[:80],
+                inserted=int((stats or {}).get("inserted") or 0),
+                reused=int((stats or {}).get("reused") or 0),
+                skipped=int((stats or {}).get("skipped") or 0),
+                path_count=len(folder_paths),
+            )
+        if (
+            getattr(self, "_destination_startup_snapshot_mount_seen", False)
+            and str(phase) == "on_root_load_success"
+            and self._planning_browse_mode("destination") != "local"
+        ):
+            log_info(
+                "startup_lifecycle_temp_bootstrap_import_projection_deferred",
+                phase=str(phase)[:80],
+                defer_ms=0,
+            )
+
+            def _go_bootstrap():
+                t0 = time.perf_counter()
+                try:
+                    self._destination_import_projection_materialize_all_descendants(
+                        phase=phase, bootstrap_stats=stats
+                    )
+                except Exception as exc:
+                    log_info(
+                        "destination_import_projection_materialize_failed",
+                        phase=str(phase)[:80],
+                        error=str(exc)[:240],
+                    )
+                finally:
+                    log_info(
+                        "startup_lifecycle_temp_deferred_import_projection_chunk",
+                        kind="bootstrap_merge_after_root_success",
+                        phase=str(phase)[:80],
+                        wall_ms=round((time.perf_counter() - t0) * 1000.0, 2),
+                    )
+
+            QTimer.singleShot(0, lambda: self._safe_invoke("destination_bootstrap_import_projection_idle", _go_bootstrap))
+            return
+        try:
+            self._destination_import_projection_materialize_all_descendants(phase=phase, bootstrap_stats=stats)
+        except Exception as exc:
+            log_info(
+                "destination_import_projection_materialize_failed",
+                phase=str(phase)[:80],
+                error=str(exc)[:240],
+            )
 
     def _destination_apply_provisional_session_snapshot_if_eligible(self, *, phase: str) -> bool:
         """Option 3 Phase 1: paint the last saved destination snapshot immediately as cached provisional."""
@@ -21787,8 +24160,24 @@ class MainWindow(QMainWindow):
                 pass
         self._destination_provisional_startup_applied = True
         msg = "Loaded saved workspace snapshot. Verifying live SharePoint content…"
+        self._destination_provisional_startup_status_message = msg
+        self._destination_startup_snapshot_mount_seen = True
+        self._destination_session_snapshot_path_cf_set_cache = None
+        self._destination_snapshot_mount_drive_id = str(
+            (getattr(self, "pending_root_drive_ids", {}) or {}).get("destination")
+            or self._current_selected_destination_drive_id()
+            or ""
+        ).strip()
         self._destination_last_startup_status_reason = "provisional_snapshot_first_paint"
-        self._set_tree_status_message("destination", msg, loading=True)
+        self._set_tree_status_message("destination", msg, loading=False)
+        self._startup_post_snapshot_trace_reset()
+        log_info(
+            "startup_snapshot_first_visible",
+            phase=str(phase)[:80],
+            root_rows=len(roots),
+            snapshot_nodes=int(node_ct),
+            status_loading=False,
+        )
         log_info(
             "destination_provisional_startup_applied",
             phase=str(phase)[:80],
@@ -21796,6 +24185,17 @@ class MainWindow(QMainWindow):
             snapshot_nodes=int(node_ct),
             workspace_row_state="cached_provisional_and_planned_only_under_stamp",
         )
+        snap_exp = self._snapshot_refresh_targets_from_snapshot("destination", snaps)
+        if snap_exp:
+            try:
+                self._restore_expanded_destination_paths(snap_exp)
+            except Exception as exc:
+                self._log_restore_exception("destination_provisional_snapshot_expand", exc)
+            try:
+                self._hydrate_destination_allocations_for_expanded_paths_model(snap_exp)
+            except Exception as exc:
+                self._log_restore_exception("destination_provisional_snapshot_hydrate", exc)
+        self._destination_prune_pending_snapshot_branch_refresh_after_provisional_mount(snaps)
         self._schedule_snapshot_branch_refresh("destination", delay_ms=120)
         return True
 
@@ -21811,47 +24211,120 @@ class MainWindow(QMainWindow):
         node_data["workspace_row_state"] = WORKSPACE_ROW_STATE_LIVE_CONFIRMED
         return node_data
 
+    def _destination_root_payloads_from_graph_items(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        sorted_items = sorted(
+            items or [],
+            key=lambda value: (not value.get("is_folder", False), str(value.get("name") or "").lower()),
+        )
+        out: List[Dict[str, Any]] = []
+        for it in sorted_items:
+            if not isinstance(it, dict):
+                continue
+            pl = self._destination_payload_from_graph_item(it)
+            self._apply_tree_item_visual_state(None, pl)
+            out.append(pl)
+        return out
+
     def _apply_root_payload_to_destination_model_view(self, panel_key, items):
         tree, status = self._get_tree_and_status(panel_key)
         model = getattr(self, "destination_planning_model", None)
         if tree is None or status is None or model is None:
             return
-        prov_by_id: dict[str, dict] = {}
-        if (
-            panel_key == "destination"
-            and self._planning_browse_mode("destination") != "local"
-            and getattr(self, "_destination_provisional_startup_applied", False)
-        ):
-            try:
-                for r in range(model.rowCount(QModelIndex())):
-                    ix = model.index(r, 0, QModelIndex())
-                    pl0 = ix.data(Qt.UserRole) or {}
-                    if not isinstance(pl0, dict):
-                        continue
-                    gid0 = str(pl0.get("id") or "").strip()
-                    if gid0:
-                        prov_by_id[gid0] = dict(pl0)
-            except Exception:
-                prov_by_id = {}
-            if prov_by_id:
-                log_info(
-                    "destination_provisional_root_merge_prepare",
-                    provisional_root_ids=len(prov_by_id),
-                    graph_root_items=len(items or []),
-                )
+        pre_graph_snapshot_mount = False
         self._root_tree_bind_in_progress = True
         tree.blockSignals(True)
         tree.setUpdatesEnabled(False)
         try:
             tree.setEnabled(True)
-            model.clear()
-            self._destination_lifecycle_trace_TEMP(
-                fn="_apply_root_payload_to_destination_model_view",
-                reason="after_model_clear_before_graph_payloads",
-                step_kind="model_reset",
-                extra=f"graph_item_count={len(items or [])}",
-            )
+            if panel_key == "destination":
+                log_info(
+                    "destination_startup_model_step",
+                    step="apply_root_payload_enter",
+                    **self._destination_forensic_destination_model_counts(),
+                )
+            if (
+                panel_key == "destination"
+                and self._planning_browse_mode("destination") != "local"
+            ):
+                pending_dest_snaps = list(
+                    (getattr(self, "_pending_session_tree_snapshots", {}) or {}).get("destination") or []
+                )
+                if (
+                    pending_dest_snaps
+                    and items
+                    and not getattr(self, "_destination_provisional_startup_applied", False)
+                ):
+                    roots_pp: list = []
+                    for snap in pending_dest_snaps:
+                        spec = self._destination_tree_snapshot_dict_to_nested_spec(
+                            snap if isinstance(snap, dict) else {}
+                        )
+                        if spec is not None:
+                            roots_pp.append(spec)
+                    if roots_pp:
+                        destination_stamp_snapshot_tree_workspace_state(list(pending_dest_snaps))
+                        model.reset_nested(roots_pp)
+                        self._destination_startup_snapshot_mount_seen = True
+                        self._destination_session_snapshot_path_cf_set_cache = None
+                        self._destination_snapshot_mount_drive_id = str(
+                            (getattr(self, "pending_root_drive_ids", {}) or {}).get("destination")
+                            or self._current_selected_destination_drive_id()
+                            or ""
+                        ).strip()
+                        pre_graph_snapshot_mount = True
+                        log_info(
+                            "destination_pending_session_snapshot_bind_before_graph_root",
+                            root_rows=len(roots_pp),
+                            snapshot_nodes=int(self._count_tree_snapshot_nodes(pending_dest_snaps)),
+                        )
+                        self._destination_prune_pending_snapshot_branch_refresh_after_provisional_mount(
+                            list(pending_dest_snaps)
+                        )
+                        log_info(
+                            "destination_startup_model_step",
+                            step="after_pre_graph_snapshot_reset_nested",
+                            **self._destination_forensic_destination_model_counts(),
+                        )
+            prov_by_id: dict[str, dict] = {}
+            if (
+                panel_key == "destination"
+                and self._planning_browse_mode("destination") != "local"
+                and (
+                    getattr(self, "_destination_provisional_startup_applied", False)
+                    or pre_graph_snapshot_mount
+                    or getattr(self, "_destination_startup_snapshot_mount_seen", False)
+                )
+            ):
+                try:
+                    for r in range(model.rowCount(QModelIndex())):
+                        ix = model.index(r, 0, QModelIndex())
+                        pl0 = ix.data(Qt.UserRole) or {}
+                        if not isinstance(pl0, dict):
+                            continue
+                        gid0 = str(pl0.get("id") or "").strip()
+                        if gid0:
+                            prov_by_id[gid0] = dict(pl0)
+                except Exception:
+                    prov_by_id = {}
+                if prov_by_id:
+                    log_info(
+                        "destination_provisional_root_merge_prepare",
+                        provisional_root_ids=len(prov_by_id),
+                        graph_root_items=len(items or []),
+                    )
             if not items:
+                self._destination_startup_lifecycle_temp_post_snapshot_mutation(
+                    "_apply_root_payload_to_destination_model_view",
+                    "model.clear",
+                    branch="empty_graph_root",
+                )
+                model.clear()
+                self._destination_lifecycle_trace_TEMP(
+                    fn="_apply_root_payload_to_destination_model_view",
+                    reason="after_model_clear_before_graph_payloads",
+                    step_kind="model_reset",
+                    extra="empty_library",
+                )
                 self._set_tree_status_message(panel_key, "This library is empty.", loading=False)
                 model.set_empty_library_message("This library is empty.")
                 tree.setEnabled(False)
@@ -21910,21 +24383,167 @@ class MainWindow(QMainWindow):
                         else:
                             merged_payloads.append(pl)
                     payloads = merged_payloads
+                snap_preserving = bool(
+                    (
+                        bool(getattr(self, "_destination_provisional_startup_applied", False))
+                        or bool(pre_graph_snapshot_mount)
+                        or bool(getattr(self, "_destination_startup_snapshot_mount_seen", False))
+                    )
+                    and hasattr(model, "merge_sharepoint_library_root_graph_children")
+                )
+                rows_top_before = int(model.rowCount(QModelIndex()))
+                nodes_before = 0
+                try:
+                    nodes_before = sum(1 for _ in model.iter_depth_first())
+                except Exception:
+                    nodes_before = 0
+                _fc_pre = self._destination_forensic_destination_model_counts()
                 self._destination_provisional_startup_applied = False
                 did_shell = str(
                     self.pending_root_drive_ids.get("destination") or self._current_selected_destination_drive_id() or ""
                 ).strip()
                 self._destination_sharepoint_root_graph_bound_drive_id = did_shell
-                self._destination_full_library_reconcile_pending = True
-                self._destination_authority_pending_shell = True
-                model.reset_root_payloads(payloads)
+                merge_stats: dict | None = None
+                if snap_preserving:
+                    self._destination_full_library_reconcile_pending = False
+                    self._destination_authority_pending_shell = False
+                    self._destination_non_authoritative_shell_active = False
+                    log_info(
+                        "startup_snapshot_preservation_started",
+                        graph_root_items=len(payloads),
+                        model_top_level_rows_before=int(rows_top_before),
+                        model_nodes_before=int(nodes_before),
+                        model_nodes_non_placeholder_before=int(_fc_pre.get("model_nodes_non_placeholder") or 0),
+                        model_nodes_iter_depth_first_before=int(_fc_pre.get("model_nodes_iter_depth_first") or 0),
+                        drive_id_suffix=did_shell[-16:] if len(did_shell) > 16 else did_shell,
+                        enrich_only=True,
+                    )
+                    try:
+                        merge_stats = model.merge_sharepoint_library_root_graph_children(
+                            payloads,
+                            enrich_only=True,
+                        )
+                    except Exception as exc:
+                        log_info(
+                            "startup_snapshot_preservation_merge_failed",
+                            error=str(exc)[:220],
+                            fallback="no_clear_keep_visible_tree",
+                        )
+                        merge_stats = {
+                            "updated": 0,
+                            "inserted": 0,
+                            "removed": 0,
+                            "skipped_planned": 0,
+                            "merge_exception": 1,
+                        }
+                    _graph_merge_exc = int((merge_stats or {}).get("merge_exception") or 0)
+                    _pres_mode = "in_place_enrich_merge" if _graph_merge_exc == 0 else "merge_exception_visible_tree_kept"
+                    _err_fb = 0
+                    _rm = int((merge_stats or {}).get("removed") or 0)
+                    _ins = int((merge_stats or {}).get("inserted") or 0)
+                    _upd = int((merge_stats or {}).get("updated") or 0)
+                    nodes_after_merge = 0
+                    try:
+                        nodes_after_merge = sum(1 for _ in model.iter_depth_first())
+                    except Exception:
+                        nodes_after_merge = 0
+                    _fc_post = self._destination_forensic_destination_model_counts()
+                    rows_top_after = int(model.rowCount(QModelIndex()))
+                    log_info(
+                        "startup_lifecycle_temp_root_bind_top_level_delta",
+                        snap_preserving=True,
+                        top_level_rows_before=int(rows_top_before),
+                        top_level_rows_after=int(rows_top_after),
+                        merge_removed=int(_rm),
+                        merge_inserted=int(_ins),
+                        merge_updated=int(_upd),
+                        enrich_only=True,
+                        merge_exception=bool(_graph_merge_exc),
+                    )
+                    _merge_quiet = bool(_rm == 0)
+                    preserve_success = bool(_rm == 0 and _graph_merge_exc == 0)
+                    log_info(
+                        "startup_snapshot_preservation_finished",
+                        root_bind_mode=_pres_mode,
+                        updated=_upd,
+                        inserted=_ins,
+                        removed=_rm,
+                        skipped_planned=int((merge_stats or {}).get("skipped_planned") or 0),
+                        preserve_success=bool(preserve_success),
+                        model_nodes_after=int(nodes_after_merge),
+                        model_nodes_non_placeholder_after=int(_fc_post.get("model_nodes_non_placeholder") or 0),
+                        model_nodes_iter_depth_first_after=int(_fc_post.get("model_nodes_iter_depth_first") or 0),
+                    )
+                    log_info(
+                        "startup_root_bind_preserve_result",
+                        root_bind_mode=_pres_mode,
+                        updated=_upd,
+                        inserted=_ins,
+                        removed=_rm,
+                        preserve_success=bool(preserve_success),
+                        snapshot_replaced_or_preserved="preserved_in_place",
+                    )
+                    log_info(
+                        "startup_snapshot_replaced_or_preserved",
+                        outcome="preserved",
+                        removed_root_rows=int(_rm),
+                        inserted_root_rows=int(_ins),
+                    )
+                    self._destination_startup_snapshot_preservation_applied = True
+                else:
+                    self._destination_full_library_reconcile_pending = True
+                    self._destination_authority_pending_shell = True
+                    self._destination_startup_lifecycle_temp_post_snapshot_mutation(
+                        "_apply_root_payload_to_destination_model_view",
+                        "model.clear",
+                        branch="non_provisional_shallow_graph_bind",
+                    )
+                    model.clear()
+                    self._destination_lifecycle_trace_TEMP(
+                        fn="_apply_root_payload_to_destination_model_view",
+                        reason="after_model_clear_before_graph_payloads",
+                        step_kind="model_reset",
+                        extra=f"graph_item_count={len(items or [])}",
+                    )
+                    model.reset_root_payloads(payloads)
+                    _err_fb = 0
+                    _rm = 0
+                    _ins = len(payloads)
+                    _upd = 0
+                    _merge_quiet = False
+                    log_info(
+                        "startup_snapshot_preservation_finished",
+                        root_bind_mode="clear_and_reset_shallow_graph",
+                        graph_root_items=len(payloads),
+                    )
+                    log_info(
+                        "startup_snapshot_replaced_or_preserved",
+                        outcome="replaced_clear_and_reset_shallow",
+                        removed_root_rows=-1,
+                        inserted_root_rows=len(payloads),
+                    )
+                    log_info(
+                        "startup_lifecycle_temp_root_bind_top_level_delta",
+                        snap_preserving=False,
+                        top_level_rows_before=int(rows_top_before),
+                        top_level_rows_after=int(model.rowCount(QModelIndex())),
+                        merge_removed=0,
+                        merge_inserted=int(_ins),
+                        merge_updated=0,
+                        enrich_only=False,
+                        merge_exception=False,
+                    )
+                    self._destination_startup_snapshot_preservation_applied = True
                 self._log_restore_phase(
                     "destination_root_bind_live_graph_children",
                     shallow_graph_root_children=len(sorted_items),
                     drive_id_suffix=did_shell[-16:] if len(did_shell) > 16 else did_shell,
                     note="no_structural_placeholder_row_status_bar_only",
                 )
-                self._destination_non_authoritative_shell_active = True
+                if snap_preserving:
+                    self._destination_non_authoritative_shell_active = False
+                else:
+                    self._destination_non_authoritative_shell_active = True
                 self._log_restore_phase(
                     "destination_authority_pipeline",
                     step="destination_root_bind_live_graph_pending_full_enumerate",
@@ -21939,13 +24558,35 @@ class MainWindow(QMainWindow):
                     extra=f"graph_root_children={len(sorted_items)}",
                 )
                 self._destination_suppress_steady_materialize_skip_once = True
-                self._destination_require_deferred_full_materialize_once = True
+                self._destination_quiet_startup_overlay_structural_suppress = bool(snap_preserving and _merge_quiet)
+                if self._destination_quiet_startup_overlay_structural_suppress:
+                    log_info(
+                        "destination_quiet_startup_overlay_structural_suppress_on",
+                        preserve_success=True,
+                        removed=int(_rm),
+                        inserted=int(_ins),
+                        updated=int(_upd),
+                    )
+                self._destination_require_deferred_full_materialize_once = not _merge_quiet
                 self._mark_destination_real_tree_snapshot_stale()
-                self._set_tree_status_message(
-                    panel_key,
-                    "Destination library: reconciling full structure from Microsoft 365…",
-                    loading=True,
-                )
+                if snap_preserving:
+                    self._set_tree_status_message(
+                        panel_key,
+                        "Destination library ready — live details sync in the background.",
+                        loading=False,
+                    )
+                elif _merge_quiet:
+                    self._set_tree_status_message(
+                        panel_key,
+                        "Destination library ready — live details sync in the background.",
+                        loading=False,
+                    )
+                else:
+                    self._set_tree_status_message(
+                        panel_key,
+                        "Destination library: reconciling full structure from Microsoft 365…",
+                        loading=True,
+                    )
 
                 def _kick_authority(_did_bind=did_shell):
                     d_kick = str(_did_bind or "").strip() or str(
@@ -21961,6 +24602,19 @@ class MainWindow(QMainWindow):
                     self._ensure_sharepoint_destination_full_tree_worker_scheduled(d_kick)
 
                 QTimer.singleShot(0, lambda: self._safe_invoke("destination_authority_full_tree_kick", _kick_authority))
+                try:
+                    if self._destination_should_run_startup_projection_materialization():
+                        if getattr(self, "_destination_startup_snapshot_mount_seen", False):
+                            # Ordering: deferred hub runs bootstrap/refresh/UI first; projection is scheduled there.
+                            pass
+                        else:
+                            self._destination_run_startup_projection_materialization(phase="after_sharepoint_root_bind")
+                except Exception as exc:
+                    log_info(
+                        "startup_projection_materialization_outer_failed",
+                        phase="after_sharepoint_root_bind",
+                        error=str(exc)[:220],
+                    )
                 return
             sorted_items = sorted(items, key=lambda value: (not value.get("is_folder", False), value.get("name", "").lower()))
             payloads = []
@@ -21968,6 +24622,12 @@ class MainWindow(QMainWindow):
                 pl = self._destination_payload_from_graph_item(it)
                 self._apply_tree_item_visual_state(None, pl)
                 payloads.append(pl)
+            self._destination_startup_lifecycle_temp_post_snapshot_mutation(
+                "_apply_root_payload_to_destination_model_view",
+                "model.clear",
+                branch="local_destination_root",
+            )
+            model.clear()
             model.reset_root_payloads(payloads)
             self._destination_lifecycle_trace_TEMP(
                 fn="_apply_root_payload_to_destination_model_view",
@@ -21986,6 +24646,16 @@ class MainWindow(QMainWindow):
             tree.setUpdatesEnabled(True)
             tree.blockSignals(False)
             self._root_tree_bind_in_progress = False
+
+    def _destination_startup_lifecycle_temp_post_snapshot_mutation(
+        self, fn: str, action: str, **extra: Any
+    ) -> None:
+        """TEMP: log destination model mutations after the first provisional snapshot mount."""
+        if not getattr(self, "_destination_startup_snapshot_mount_seen", False):
+            return
+        payload = {"fn": str(fn)[:120], "action": str(action)[:120]}
+        payload.update({k: v for k, v in extra.items() if v is not None})
+        log_info("startup_lifecycle_temp_post_snapshot_model_mutation", **payload)
 
     def _destination_log_blocked_structural_mutation_TEMP(self, *, phase: str, detail: str = "") -> None:
         """TEMP: log when destination planning model would add rows outside Graph bind / folder replace / reconcile attach."""
@@ -22307,25 +24977,49 @@ class MainWindow(QMainWindow):
         graph_struct = destination_authority_contract.graph_owns_visible_real_destination_structure(self)
         model = self.destination_planning_model
         has_future_children = self._destination_parent_has_future_state_children_model(index)
+        preserve_materialized_children = self._destination_expand_has_materialized_non_placeholder_children(index)
         load_row = {
             "placeholder": True,
             "placeholder_role": "loading_in_progress",
             "base_display_label": "Loading...",
             "tree_role": "destination",
         }
+        sp_early = self._destination_semantic_path(node_data) or self._tree_item_path(node_data) or ""
         if not has_future_children:
             if graph_struct:
-                model.replace_all_children(index, [load_row])
+                if not preserve_materialized_children:
+                    model.replace_all_children(index, [load_row])
+                    log_info(
+                        "destination_expand_loading_placeholder_set",
+                        path_kind="model_view",
+                        early=True,
+                        semantic_path_excerpt=str(sp_early)[:240],
+                        worker_key=worker_key,
+                    )
+                else:
+                    log_info(
+                        "destination_expand_preserve_snapshot_subtree_skip_loading_replace",
+                        semantic_path_excerpt=str(sp_early)[:400],
+                        worker_key=worker_key,
+                        **self._destination_forensic_destination_model_counts(),
+                    )
             else:
-                model.set_loading_children(index)
-            sp_early = self._destination_semantic_path(node_data) or self._tree_item_path(node_data) or ""
-            log_info(
-                "destination_expand_loading_placeholder_set",
-                path_kind="model_view",
-                early=True,
-                semantic_path_excerpt=str(sp_early)[:240],
-                worker_key=worker_key,
-            )
+                if not preserve_materialized_children:
+                    model.set_loading_children(index)
+                    log_info(
+                        "destination_expand_loading_placeholder_set",
+                        path_kind="model_view",
+                        early=True,
+                        semantic_path_excerpt=str(sp_early)[:240],
+                        worker_key=worker_key,
+                    )
+                else:
+                    log_info(
+                        "destination_expand_preserve_snapshot_subtree_skip_loading_placeholder_non_graph",
+                        semantic_path_excerpt=str(sp_early)[:400],
+                        worker_key=worker_key,
+                        **self._destination_forensic_destination_model_counts(),
+                    )
         item_path = self._tree_item_path(node_data)
         if item_path and item_path in self._pending_snapshot_branch_refresh.get(panel_key, set()):
             self._snapshot_branch_refresh_baseline_by_worker[worker_key] = (
@@ -22335,18 +25029,41 @@ class MainWindow(QMainWindow):
         if preserved_children:
             self._destination_preserved_children_by_worker[worker_key] = preserved_children
         if has_future_children:
-            if graph_struct:
-                model.replace_all_children(index, [load_row])
-            else:
-                model.set_loading_children(index)
             sp_late = self._destination_semantic_path(node_data) or self._tree_item_path(node_data) or ""
-            log_info(
-                "destination_expand_loading_placeholder_set",
-                path_kind="model_view",
-                early=False,
-                semantic_path_excerpt=str(sp_late)[:240],
-                worker_key=worker_key,
-            )
+            if graph_struct:
+                if not preserve_materialized_children:
+                    model.replace_all_children(index, [load_row])
+                    log_info(
+                        "destination_expand_loading_placeholder_set",
+                        path_kind="model_view",
+                        early=False,
+                        semantic_path_excerpt=str(sp_late)[:240],
+                        worker_key=worker_key,
+                    )
+                else:
+                    log_info(
+                        "destination_expand_preserve_snapshot_subtree_skip_loading_replace_future_children",
+                        semantic_path_excerpt=str(sp_late)[:400],
+                        worker_key=worker_key,
+                        **self._destination_forensic_destination_model_counts(),
+                    )
+            else:
+                if not preserve_materialized_children:
+                    model.set_loading_children(index)
+                    log_info(
+                        "destination_expand_loading_placeholder_set",
+                        path_kind="model_view",
+                        early=False,
+                        semantic_path_excerpt=str(sp_late)[:240],
+                        worker_key=worker_key,
+                    )
+                else:
+                    log_info(
+                        "destination_expand_preserve_snapshot_subtree_skip_loading_placeholder_non_graph_future_children",
+                        semantic_path_excerpt=str(sp_late)[:400],
+                        worker_key=worker_key,
+                        **self._destination_forensic_destination_model_counts(),
+                    )
 
         if graph_struct:
             sp_req = self._destination_semantic_path(node_data) or self._tree_item_path(node_data) or ""
@@ -23163,6 +25880,21 @@ class MainWindow(QMainWindow):
             if isinstance(pf, ProposedFolder):
                 self._ensure_proposed_folder_stable_key(pf)
 
+    def _destination_reconcile_option3_snapshot_path_fallback_eligible(self, snap: dict) -> bool:
+        """True when persisted snapshot path may be used as last-resort intended canonical (finalize enrich)."""
+        if not isinstance(snap, dict) or snap.get("placeholder"):
+            return False
+        if destination_payload_is_planned_workspace_row(snap):
+            return True
+        if destination_payload_workspace_row_state(snap) == WORKSPACE_ROW_STATE_CACHED_PROVISIONAL:
+            return True
+        if bool(snap.get("planned_allocation")) or bool(snap.get("planned_allocation_descendant")):
+            return True
+        rk = str(snap.get("row_kind") or "").strip().lower()
+        if rk in {"planned_folder", "planned_file", "cached_provisional_shell"}:
+            return True
+        return False
+
     def _destination_reconcile_resolve_intended_canonical_meta(
         self, snap: dict, *, parent_folder_canonical: str
     ) -> tuple[str, dict[str, Any]]:
@@ -23283,16 +26015,6 @@ class MainWindow(QMainWindow):
             elif len(file_matches) > 1:
                 meta["matched_source_type"] = "allocation_file_parent_name_heuristic_ambiguous"
 
-        if graph_auth and ghost_path_excerpt:
-            log_info(
-                "destination_snapshot_path_ignored",
-                path_excerpt=str(ghost_path_excerpt)[:400],
-                planning_uuid_excerpt=str(snap.get("planning_uuid") or "")[:80],
-                allocation_id_excerpt=str(snap.get("allocation_id") or "")[:80],
-                proposed_folder_stable_id_excerpt=str(snap.get("proposed_folder_stable_id") or "")[:80],
-                matched_planning_source_type=str(meta.get("matched_source_type") or "")[:80],
-                detail="snapshot_paths_not_used_as_intended_under_graph_authority",
-            )
         br = self._destination_forensic_canon_diff_branch_hit(str(parent_folder_canonical or "").strip())
         if br and graph_auth:
             sname = str(snap.get("name") or "").strip()
@@ -23324,6 +26046,32 @@ class MainWindow(QMainWindow):
                     meta.get("matched_source_type") == "proposed_folder_name_parent_heuristic_ambiguous"
                 ),
                 detail="reconcile_resolve_empty_compare_proposed_parent_raw_vs_visible_parent_graph_canon",
+            )
+        if graph_auth and ghost_path_excerpt and self._destination_reconcile_option3_snapshot_path_fallback_eligible(snap):
+            fb = self._canonical_planned_memory_path_for_graph_match(ghost_path_excerpt)
+            if fb:
+                meta["intended_fallback_last_resort_snapshot"] = True
+                if not str(meta.get("matched_source_type") or "").strip():
+                    meta["matched_source_type"] = "option3_snapshot_path_fallback"
+                log_info(
+                    "destination_reconcile_intended_snapshot_path_fallback",
+                    canonical_intended=str(fb)[:400],
+                    snapshot_raw_excerpt=str(ghost_path_excerpt)[:400],
+                    planning_uuid_excerpt=str(snap.get("planning_uuid") or "")[:80],
+                    allocation_id_excerpt=str(snap.get("allocation_id") or "")[:80],
+                    row_kind_excerpt=str(snap.get("row_kind") or "")[:40],
+                    workspace_row_state_excerpt=str(snap.get("workspace_row_state") or "")[:40],
+                )
+                return fb, meta
+        if graph_auth and ghost_path_excerpt:
+            log_info(
+                "destination_snapshot_path_ignored",
+                path_excerpt=str(ghost_path_excerpt)[:400],
+                planning_uuid_excerpt=str(snap.get("planning_uuid") or "")[:80],
+                allocation_id_excerpt=str(snap.get("allocation_id") or "")[:80],
+                proposed_folder_stable_id_excerpt=str(snap.get("proposed_folder_stable_id") or "")[:80],
+                matched_planning_source_type=str(meta.get("matched_source_type") or "")[:80],
+                detail="snapshot_paths_not_used_as_intended_under_graph_authority",
             )
         return "", meta
 
@@ -23497,6 +26245,7 @@ class MainWindow(QMainWindow):
             intended_canon, _resolve_meta = self._destination_reconcile_resolve_intended_canonical_meta(
                 snap, parent_folder_canonical=ctx_parent_canon
             )
+            intended_canon = self._normalize_to_graph_canonical_path(str(intended_canon or "").strip())
             snap_path_model = str(snap.get("item_path") or snap.get("destination_path") or "").strip()
             if graph_auth_rec and not str(intended_canon or "").strip():
                 lost_sub = 1 + self._destination_count_planned_snapshot_tree_nodes(nested)
@@ -24286,54 +27035,53 @@ class MainWindow(QMainWindow):
             run_exact_target_after=bool(run_exact_target_after),
         )
 
-    def _destination_reconcile_all_planned_parents_after_graph_update(
-        self, *, gate_already_verified: bool = False, run_exact_target_after: bool = True
-    ) -> None:
-        """Re-run planned workspace reconcile for every parent that has planned rows (idempotent).
-
-        Drive this from structural updates (Graph replace, overlay pass, authority shell clear), not from
-        expand/UI alone, so branches that share no folder-load event still reattach.
-        """
-        if getattr(self, "_destination_global_planned_reconcile_active", False):
+    def _destination_reconcile_global_planned_parents_process_chunk(self) -> None:
+        st = getattr(self, "_destination_global_reconcile_chunk_state", None)
+        if not isinstance(st, dict):
+            self._destination_global_planned_reconcile_active = False
             return
-        if self._planning_browse_mode("destination") == "local":
-            return
-        if not destination_authority_contract.graph_owns_visible_real_destination_structure(self):
-            return
-        if not gate_already_verified:
-            allow, _diag = self._destination_reconcile_global_gate_eval()
-            if not allow:
-                log_info("destination_reconcile_gate_blocked", **_diag)
-                return
-            log_info("destination_reconcile_gate_allowed", **_diag)
-        self._destination_global_planned_reconcile_active = True
-        had_zero_attachment = False
-        start_sig = ""
-        start_gen = int(getattr(self, "_planning_cache_generation", 0) or 0)
-        try:
-            parent_paths = self._destination_collect_planned_reconcile_parent_canonical_paths()
-            planned_n = len(parent_paths)
-            vis_n = 0
-            for _pp in parent_paths:
-                _ix = self._destination_find_planning_index_for_overlay_target_path(
-                    _pp, for_planned_workspace_reconcile=True
-                )
-                if _ix is not None and _ix.isValid():
-                    vis_n += 1
-            start_sig = f"p{planned_n};v{vis_n};cov{round(float(vis_n) / float(max(1, planned_n)), 5)}"
+        if self._destination_user_scroll_interaction_active():
             log_info(
-                "destination_reconcile_global_pass_started",
-                parent_count=len(parent_paths),
+                "startup_lifecycle_temp_interaction_deferral",
+                work_kind="global_planned_reconcile_chunk",
+                parent_count_pending=int(len(st["parent_paths"]) - int(st["i"])),
+                detail="destination_tree_scroll_window_active",
             )
-            total_reattached = 0
-            for pp in parent_paths:
+            QTimer.singleShot(
+                120,
+                lambda: self._safe_invoke(
+                    "destination_global_reconcile_chunk_after_scroll",
+                    self._destination_reconcile_global_planned_parents_process_chunk,
+                ),
+            )
+            return
+        parent_paths = list(st["parent_paths"])
+        i = int(st["i"])
+        budget_ms = float(st.get("budget_ms") or 18.0)
+        t0 = time.perf_counter()
+        log_info(
+            "startup_lifecycle_temp_reconcile_chunk_begin",
+            phase="global_planned",
+            parent_count_pending=int(len(parent_paths) - i),
+            budget_ms=round(budget_ms, 2),
+        )
+        processed = 0
+        try:
+            while i < len(parent_paths) and (time.perf_counter() - t0) * 1000.0 < budget_ms:
+                pp = parent_paths[i]
                 ix = self._destination_find_planning_index_for_overlay_target_path(
                     pp, for_planned_workspace_reconcile=True
                 )
                 if ix is None or not ix.isValid():
+                    i += 1
+                    st["i"] = i
+                    processed += 1
                     continue
                 pl_fold = self._destination_model_index_user_role_dict(ix)
                 if not bool(pl_fold.get("is_folder", False)):
+                    i += 1
+                    st["i"] = i
+                    processed += 1
                     continue
                 _, _, map_has_parent = self._destination_get_planned_rows_map_raw_entry(pp)
                 snap = self._destination_planned_snapshot_for_parent_reconcile(pp, ix)
@@ -24361,6 +27109,9 @@ class MainWindow(QMainWindow):
                             parent_path=str(pp or "")[:400],
                             detail="global_pass_invariant_map_has_parent_but_snapshot_empty",
                         )
+                    i += 1
+                    st["i"] = i
+                    processed += 1
                     continue
                 log_info(
                     "destination_reconcile_global_parent",
@@ -24372,31 +27123,56 @@ class MainWindow(QMainWindow):
                     snap,
                     allow_reappend=True,
                 )
-                total_reattached += int((stats or {}).get("reattached", 0) or 0)
+                st["total_reattached"] = int(st.get("total_reattached", 0)) + int(
+                    (stats or {}).get("reattached", 0) or 0
+                )
                 if map_has_parent and prc:
                     rea = int((stats or {}).get("reattached", 0) or 0)
                     mat = int((stats or {}).get("matched_live", 0) or 0)
                     if rea == 0 and mat == 0:
-                        had_zero_attachment = True
+                        st["had_zero_attachment"] = True
                         log_error(
                             "destination_reconcile_stored_snapshot_zero_attachment",
                             parent_path=str(pp or "")[:400],
                             planned_row_count=prc,
                             detail="reconcile_returned_no_matched_live_or_reattached",
                         )
-            log_info(
-                "destination_reconcile_global_pass_completed",
-                total_parents=len(parent_paths),
-                total_reattached=int(total_reattached),
-            )
-            self._destination_reconcile_last_coverage_sig = str(start_sig or "")
-            self._destination_reconcile_last_had_zero_attachment = bool(had_zero_attachment)
-            self._destination_reconcile_last_plan_gen = int(start_gen)
+                i += 1
+                st["i"] = i
+                processed += 1
         except Exception as exc:
-            self._log_restore_exception("destination_reconcile_all_planned_parents_after_graph_update", exc)
-        finally:
+            self._log_restore_exception("destination_reconcile_global_planned_parents_chunk", exc)
+            self._destination_global_reconcile_chunk_state = None
             self._destination_global_planned_reconcile_active = False
-        if run_exact_target_after:
+            return
+        wall_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        log_info(
+            "startup_lifecycle_temp_reconcile_chunk_end",
+            phase="global_planned",
+            wall_ms=wall_ms,
+            parent_count_processed=int(processed),
+        )
+        if i < len(parent_paths):
+            QTimer.singleShot(
+                0,
+                lambda: self._safe_invoke(
+                    "destination_global_reconcile_chunk_continue",
+                    self._destination_reconcile_global_planned_parents_process_chunk,
+                ),
+            )
+            return
+        log_info(
+            "destination_reconcile_global_pass_completed",
+            total_parents=len(parent_paths),
+            total_reattached=int(st.get("total_reattached", 0)),
+        )
+        self._destination_reconcile_last_coverage_sig = str(st.get("start_sig") or "")
+        self._destination_reconcile_last_had_zero_attachment = bool(st.get("had_zero_attachment", False))
+        self._destination_reconcile_last_plan_gen = int(st.get("start_gen", 0) or 0)
+        run_eta = bool(st.get("run_exact_target_after", True))
+        self._destination_global_reconcile_chunk_state = None
+        self._destination_global_planned_reconcile_active = False
+        if run_eta:
             try:
                 with self._destination_materialize_profile_span("destination_run_exact_target_enforcement_pass"):
                     self._destination_run_exact_target_enforcement_pass("after_global_planned_reconcile")
@@ -24405,6 +27181,67 @@ class MainWindow(QMainWindow):
                     "destination_exact_target_enforcement_after_global_planned_reconcile", exc
                 )
             self._on_destination_state_mutation("after_global_planned_reconcile", None)
+
+    def _destination_reconcile_all_planned_parents_after_graph_update(
+        self, *, gate_already_verified: bool = False, run_exact_target_after: bool = True
+    ) -> None:
+        """Re-run planned workspace reconcile for every parent that has planned rows (idempotent).
+
+        Drive this from structural updates (Graph replace, overlay pass, authority shell clear), not from
+        expand/UI alone, so branches that share no folder-load event still reattach.
+        """
+        if getattr(self, "_destination_global_planned_reconcile_active", False):
+            self._destination_global_reconcile_chunk_state = None
+            self._destination_global_planned_reconcile_active = False
+        if self._planning_browse_mode("destination") == "local":
+            return
+        if not destination_authority_contract.graph_owns_visible_real_destination_structure(self):
+            return
+        if not gate_already_verified:
+            allow, _diag = self._destination_reconcile_global_gate_eval()
+            if not allow:
+                log_info("destination_reconcile_gate_blocked", **_diag)
+                return
+            log_info("destination_reconcile_gate_allowed", **_diag)
+        self._destination_global_planned_reconcile_active = True
+        start_gen = int(getattr(self, "_planning_cache_generation", 0) or 0)
+        try:
+            parent_paths = self._destination_collect_planned_reconcile_parent_canonical_paths()
+            planned_n = len(parent_paths)
+            vis_n = 0
+            for _pp in parent_paths:
+                _ix = self._destination_find_planning_index_for_overlay_target_path(
+                    _pp, for_planned_workspace_reconcile=True
+                )
+                if _ix is not None and _ix.isValid():
+                    vis_n += 1
+            start_sig = f"p{planned_n};v{vis_n};cov{round(float(vis_n) / float(max(1, planned_n)), 5)}"
+            log_info(
+                "destination_reconcile_global_pass_started",
+                parent_count=len(parent_paths),
+            )
+            overlay_mat = getattr(self, "_destination_overlay_active_materialize_reason", "") or ""
+            use_chunk = len(parent_paths) > 3 or "deferred_graph_ids_resolved" in overlay_mat
+            budget_ms = (
+                float(getattr(self, "_destination_startup_global_reconcile_chunk_ms", 18.0) or 18.0)
+                if use_chunk
+                else 2000.0
+            )
+            self._destination_global_reconcile_chunk_state = {
+                "parent_paths": parent_paths,
+                "i": 0,
+                "total_reattached": 0,
+                "had_zero_attachment": False,
+                "start_sig": str(start_sig or ""),
+                "start_gen": int(start_gen),
+                "run_exact_target_after": bool(run_exact_target_after),
+                "budget_ms": float(budget_ms),
+            }
+            self._destination_reconcile_global_planned_parents_process_chunk()
+        except Exception as exc:
+            self._log_restore_exception("destination_reconcile_all_planned_parents_after_graph_update", exc)
+            self._destination_global_reconcile_chunk_state = None
+            self._destination_global_planned_reconcile_active = False
 
     def _destination_collect_unresolved_overlay_target_canonical_paths(self) -> list[str]:
         """Canonical destination parent paths that still need overlay attachment (proposed + allocations)."""
@@ -24749,6 +27586,53 @@ class MainWindow(QMainWindow):
             folder_path_excerpt=str(folder_semantic_path)[:260],
         )
 
+    def _destination_finalize_pass_log_reason(self, reason: str) -> bool:
+        """High-signal finalize/reconcile phases (avoid logging every lightweight overlay tick)."""
+        r = str(reason or "").lower()
+        if r in {"destination_full_tree_idle_success", "destination_authority_shell_hard_flush"}:
+            return True
+        for needle in (
+            "deferred_",
+            "graph_ids_resolved",
+            "folder_worker_success",
+            "idle_destination",
+            "phase4",
+            "import_",
+            "draft_reset",
+            "destination_reconcile",
+            "cache_refresh",
+            "lazy_",
+            "source_restore_flush",
+        ):
+            if needle in r:
+                return True
+        return False
+
+    def _destination_intended_workspace_prefix_closure_casefold(self, intended: list[str]) -> set[str]:
+        """Prefix paths of every intended target (folder chain), for exact-target misplaced checks.
+
+        Without this, intermediate ``planned_only`` folder rows under a file target are misclassified
+        as misplaced and removed during finalize even though they are required workspace scaffolding.
+        """
+        out: set[str] = set()
+        graph_auth = destination_authority_contract.graph_owns_visible_real_destination_structure(self)
+        for p in intended or []:
+            raw_full = str(p or "").strip()
+            if not raw_full:
+                continue
+            segs = self._path_segments(raw_full)
+            acc: list[str] = []
+            for s in segs:
+                acc.append(s)
+                walk = "\\".join(acc)
+                adj = walk
+                if graph_auth:
+                    adj = self._canonical_destination_path_with_visible_library_anchor(walk) or walk
+                c = self._canonical_destination_projection_path(adj) or self.normalize_memory_path(adj)
+                if c:
+                    out.add(c.casefold())
+        return out
+
     def _destination_collect_intended_workspace_target_canonical_paths(self) -> list[str]:
         """Canonical paths allocations/proposed intend to occupy (for placement audit)."""
         out: list[str] = []
@@ -24851,10 +27735,10 @@ class MainWindow(QMainWindow):
             self._log_restore_exception("destination_overlay_placement_audit_walk_failed", exc)
             return
         vis_set = {v.casefold() for v in visible_planned}
-        intended_cf = {i.casefold() for i in intended}
+        intended_cf_closure = self._destination_intended_workspace_prefix_closure_casefold(intended)
         all_vis_cf = {p.casefold() for p in all_visible_realish_paths}
         missing = [p for p in intended if p.casefold() not in vis_set]
-        misplaced = [v for v in visible_planned if v.casefold() not in intended_cf]
+        misplaced = [v for v in visible_planned if v.casefold() not in intended_cf_closure]
         exact_visible_planned = len([p for p in intended if p.casefold() in vis_set])
         problematic_samples: list[dict[str, str]] = []
         for p in missing[:20]:
@@ -25005,9 +27889,10 @@ class MainWindow(QMainWindow):
             with self._destination_materialize_profile_span(enumerate_phase):
                 vp, av = self._destination_enumerate_visible_planned_paths_and_all_visible()
             icf = {i.casefold() for i in intended}
+            icf_closure = self._destination_intended_workspace_prefix_closure_casefold(intended)
             vset = {p.casefold() for p in vp}
             missing = [p for p in intended if p.casefold() not in vset]
-            misplaced = [p for p in vp if p.casefold() not in icf]
+            misplaced = [p for p in vp if p.casefold() not in icf_closure]
             return vp, av, icf, missing, misplaced
 
         vp0, av0, intended_cf, missing_before, misplaced_before = _snapshot(
@@ -25047,6 +27932,7 @@ class MainWindow(QMainWindow):
             set(misplaced_before),
             key=lambda p: (-len(self._path_segments(p)), str(p).lower()),
         )
+        _icf_closure_removal = self._destination_intended_workspace_prefix_closure_casefold(intended)
         with self._destination_materialize_profile_span("exact_target_misplaced_removal_loop"):
             for mpath in misplaced_sorted:
                 ix = self._destination_find_planning_index_for_overlay_target_path(mpath)
@@ -25061,7 +27947,7 @@ class MainWindow(QMainWindow):
                 dp = str(pl.get("destination_path") or pl.get("item_path") or "").strip()
                 if dp:
                     dpc = self._canonical_destination_projection_path(dp) or self.normalize_memory_path(dp)
-                    if dpc and dpc.casefold() in intended_cf:
+                    if dpc and dpc.casefold() in _icf_closure_removal:
                         to_hint = dpc
                 col0 = ix.siblingAtColumn(0) if ix.column() != 0 else ix
                 try:
@@ -25181,7 +28067,7 @@ class MainWindow(QMainWindow):
                     )
                 _ppl_et = self._destination_model_index_user_role_dict(pcol)
                 _def_et, _miss_et, _cc_et = self._graph_authority_planned_structural_bind_deferred_miss(
-                    int_path, live_graph_parent_pl=_ppl_et
+                    int_path, live_graph_parent_pl=_ppl_et, parent_anchor_index_valid=True
                 )
                 if _def_et:
                     log_info(
@@ -25205,6 +28091,19 @@ class MainWindow(QMainWindow):
                     terminal_is_file=bool(term_file),
                 )
                 bind_tried.append(str(int_path))
+                if bound is not None and bound.isValid() and not term_file:
+                    _bpl = self._destination_model_index_user_role_dict(bound)
+                    if (
+                        destination_payload_is_live_graph_row(_bpl)
+                        and bool(_bpl.get("is_folder", True))
+                        and not bool(_bpl.get("children_loaded"))
+                        and not bool(_bpl.get("load_failed"))
+                        and self._destination_row_may_lazy_enumerate_graph_children(_bpl)
+                    ):
+                        _bc = bound.siblingAtColumn(0) if bound.column() != 0 else bound
+                        self._request_graph_destination_children_load(
+                            _bc, reason="exact_target_enforcement_live_folder"
+                        )
                 log_info(
                     "destination_exact_target_force_create",
                     intended_path=str(int_path)[:400],
@@ -25252,10 +28151,9 @@ class MainWindow(QMainWindow):
     ):
         """Resolve a planning path to a Graph-backed or planned-workspace QModelIndex; queue Graph loads when needed.
 
-        Under Graph authority, we defer planned structural chains when a visible lookup is ``empty_model``, or when it
-        is ``not_loaded`` **and** the immediate parent is live Graph with ``children_loaded`` false (lazy subtree).
-        Otherwise ``not_loaded`` is treated as a bindable miss (e.g. new folder name under an already-enumerated parent).
-        ``canonical_mismatch`` and non-Graph modes keep existing planned-chain behaviour.
+        Under Graph authority, planned structural chains bind when a parent index exists; visible lookup ``not_loaded``
+        no longer suppresses bind (Option 3). Only ``empty_model`` defers planned-chain creation. Graph loads may still
+        be queued for traversal elsewhere; they are not a gate for materializing intended canonical chains.
         """
         from ozlink_console.destination_path_bridge import (
             canonical_planning_path_from_library_relative_segments,
@@ -25332,6 +28230,7 @@ class MainWindow(QMainWindow):
                                 current_path,
                                 normalized_target=_nt_cur,
                                 live_graph_parent_pl=_ppl_gate,
+                                parent_anchor_index_valid=True,
                             )
                             if _defer:
                                 self._log_restore_phase(
@@ -26511,6 +29410,9 @@ class MainWindow(QMainWindow):
             p["allocation_descendants_applied"] = True
             p["children_loaded"] = True
             p["projection_unresolved_terminal"] = False
+            p.pop("allocation_projection_resume_source_token", None)
+            p.pop("allocation_projection_resume_desc_index", None)
+            p.pop("allocation_projection_resume_descendants_total", None)
 
         model.update_payload_for_index(col0, _mut)
 
@@ -26521,6 +29423,9 @@ class MainWindow(QMainWindow):
         nd["allocation_descendants_applied"] = True
         nd["children_loaded"] = True
         nd["projection_unresolved_terminal"] = False
+        nd.pop("allocation_projection_resume_source_token", None)
+        nd.pop("allocation_projection_resume_desc_index", None)
+        nd.pop("allocation_projection_resume_descendants_total", None)
         parent_item.setData(0, Qt.UserRole, nd)
 
     def _source_payload_from_graph_item(self, item):
@@ -26547,8 +29452,23 @@ class MainWindow(QMainWindow):
         tree.setUpdatesEnabled(False)
         try:
             tree.setEnabled(True)
-            model.clear()
+            pre_fc = self._source_forensic_model_node_counts()
+            try:
+                pre_df = int(pre_fc.get("model_nodes_depth_first") or 0)
+            except Exception:
+                pre_df = 0
+            snap_preserving = (
+                self._planning_browse_mode("source") == "sharepoint"
+                and bool(getattr(self, "_source_startup_snapshot_mount_seen", False))
+            )
             if not items:
+                if snap_preserving:
+                    log_info(
+                        "source_sharepoint_shell_before_empty_graph_clear",
+                        **pre_fc,
+                    )
+                self._source_startup_snapshot_mount_seen = False
+                model.clear()
                 self._set_tree_status_message(panel_key, "This library is empty.", loading=False)
                 model.set_empty_library_message("This library is empty.")
                 tree.setEnabled(False)
@@ -26559,6 +29479,42 @@ class MainWindow(QMainWindow):
                 pl = self._source_payload_from_graph_item(it)
                 self._apply_tree_item_visual_state(None, pl)
                 payloads.append(pl)
+            if snap_preserving and hasattr(model, "merge_sharepoint_source_root_graph_children"):
+                log_info(
+                    "source_startup_shell_before_graph_root_merge",
+                    graph_root_items=len(payloads),
+                    **pre_fc,
+                )
+                try:
+                    stats = model.merge_sharepoint_source_root_graph_children(payloads, enrich_only=True)
+                except Exception as exc:
+                    log_info(
+                        "source_startup_shell_graph_root_merge_failed",
+                        error=str(exc)[:220],
+                        fallback="clear_and_reset_shallow_graph",
+                    )
+                    stats = None
+                if stats is not None:
+                    post_fc = self._source_forensic_model_node_counts()
+                    log_info(
+                        "source_startup_shell_graph_root_merge",
+                        **stats,
+                    )
+                    log_info(
+                        "source_startup_shell_after_graph_root_merge",
+                        **post_fc,
+                    )
+                    self._set_tree_status_message(panel_key, f"{len(items)} root item(s) loaded.", loading=False)
+                    self._prewarm_source_path_lookup_cache_after_source_root_bind()
+                    self._source_startup_snapshot_mount_seen = False
+                    return
+            if pre_df > 0 and not snap_preserving:
+                log_info(
+                    "source_model_clear_before_shallow_graph_bind",
+                    pre_nodes_depth_first=pre_df,
+                    graph_root_items=len(payloads),
+                )
+            model.clear()
             model.reset_root_payloads(payloads)
             self._set_tree_status_message(panel_key, f"{len(items)} root item(s) loaded.", loading=False)
             self._prewarm_source_path_lookup_cache_after_source_root_bind()
@@ -27713,19 +30669,100 @@ class MainWindow(QMainWindow):
                     return True
         return False
 
+    @staticmethod
+    def _planning_path_key_backslash(path: str) -> str:
+        s = str(path).strip().replace("/", "\\")
+        while s.startswith("\\"):
+            s = s[1:]
+        return s
+
+    def _strip_legacy_snapshot_wrapper_segment(self, path: str) -> str:
+        """Drop one leading legacy library-relative segment (e.g. ``Root``) before graph-root anchoring.
+
+        Only runs when :attr:`_destination_graph_root_name` is set, the path is not already under
+        that graph root, and the first non-empty segment matches a known legacy singleton (segment
+        equality, case-insensitive). Structural segment split — no substring trimming.
+        """
+        if not path:
+            return path
+        graph_root = getattr(self, "_destination_graph_root_name", None)
+        gr = str(graph_root or "").strip()
+        if not gr:
+            return path
+        s = self._planning_path_key_backslash(path)
+        if not s:
+            return path
+        gr_cf = gr.casefold()
+        s_cf = s.casefold()
+        if s_cf == gr_cf or s_cf.startswith(gr_cf + "\\"):
+            return path
+        segments = [p for p in s.split("\\") if p]
+        if len(segments) < 2:
+            return path
+        if segments[0].casefold() not in self._LEGACY_SNAPSHOT_LIBRARY_RELATIVE_ROOT_SEGMENTS:
+            return path
+        stripped = "\\".join(segments[1:])
+        log_info(
+            "destination_path_pre_normalization_guard",
+            original_path=str(path)[:2000],
+            stripped_path=str(stripped)[:2000],
+            graph_root=str(gr)[:500],
+        )
+        return stripped
+
+    def _normalize_to_graph_canonical_path(self, path: str) -> str:
+        if not path:
+            return path
+
+        graph_root = getattr(self, "_destination_graph_root_name", None)
+
+        if not graph_root:
+            return path
+
+        gr = str(graph_root).strip()
+        if not gr:
+            return path
+
+        working = self._strip_legacy_snapshot_wrapper_segment(path)
+        wk = self._planning_path_key_backslash(working)
+        gr_cf = gr.casefold()
+        wk_cf = wk.casefold()
+        if wk_cf == gr_cf or wk_cf.startswith(gr_cf + "\\"):
+            return wk
+
+        normalized_path = f"{gr}\\{wk}"
+        log_info(
+            "destination_path_normalized",
+            original=str(path)[:2000],
+            normalized=str(normalized_path)[:2000],
+            graph_root=str(gr)[:500],
+        )
+        return normalized_path
+
     def _proposed_parent_path(self, proposed_folder):
         if isinstance(proposed_folder, ProposedFolder):
-            raw_path = self.normalize_memory_path(proposed_folder.ParentPath or proposed_folder.DestinationPath)
+            pp = str(proposed_folder.ParentPath or "").strip()
+            if pp:
+                proposed_parent_path = self._normalize_to_graph_canonical_path(pp)
+                raw_path = self.normalize_memory_path(proposed_parent_path)
+            else:
+                raw_path = self.normalize_memory_path(
+                    self._normalize_to_graph_canonical_path(str(proposed_folder.DestinationPath or "").strip())
+                )
             return self._canonical_destination_projection_path(raw_path)
         return ""
 
     def _proposed_destination_path(self, proposed_folder):
         if isinstance(proposed_folder, ProposedFolder):
-            raw_path = self.normalize_memory_path(str(proposed_folder.DestinationPath or "").strip())
+            raw_path = self.normalize_memory_path(
+                self._normalize_to_graph_canonical_path(str(proposed_folder.DestinationPath or "").strip())
+            )
             canon = self._canonical_destination_projection_path(raw_path)
             if canon:
                 return canon
-            parent = self.normalize_memory_path(str(proposed_folder.ParentPath or "").strip())
+            parent = self.normalize_memory_path(
+                self._normalize_to_graph_canonical_path(str(proposed_folder.ParentPath or "").strip())
+            )
             name = str(proposed_folder.FolderName or "").strip()
             if parent and name:
                 combined = self.normalize_memory_path(f"{parent}\\{name}")
@@ -27745,6 +30782,7 @@ class MainWindow(QMainWindow):
         if not isinstance(move, dict):
             return []
         raw = str(move.get("destination_path", "") or "").strip()
+        raw = self._normalize_to_graph_canonical_path(raw)
         if not raw:
             return []
         canon = self._canonical_planned_memory_path_for_graph_match(raw)
@@ -27770,6 +30808,7 @@ class MainWindow(QMainWindow):
         if not isinstance(move, dict):
             return ""
         raw = str(move.get("destination_path", "") or "").strip()
+        raw = self._normalize_to_graph_canonical_path(raw)
         if not raw:
             return ""
         if self._allocation_destination_path_includes_target_leaf(move):
@@ -27845,6 +30884,7 @@ class MainWindow(QMainWindow):
         if not isinstance(move, dict):
             return ""
         raw = str(move.get("destination_path", "") or "").strip()
+        raw = self._normalize_to_graph_canonical_path(raw)
         target_name = str(self._move_target_name(move) or "").strip()
         if raw and target_name and self._allocation_destination_path_includes_target_leaf(move):
             out = self._canonical_destination_projection_path(self.normalize_memory_path(raw)) or self.normalize_memory_path(
@@ -29362,11 +32402,29 @@ class MainWindow(QMainWindow):
         if getattr(self, "_planned_file_children_by_parent_cf", None) is None:
             self._rebuild_planned_file_parent_index_for_overlay_pass()
             _owned_pf_index = True
+        n = 0
         try:
-            return self._materialize_planned_workspace_proposed_descendants_fixpoint_core(col0, max_rounds=max_rounds)
+            n = self._materialize_planned_workspace_proposed_descendants_fixpoint_core(col0, max_rounds=max_rounds)
         finally:
             if _owned_pf_index:
                 self._planned_file_children_by_parent_cf = None
+        if getattr(self, "_destination_fixpoint_slice_incomplete", False) and getattr(
+            self, "_destination_chunk_planned_workspace_fixpoint", False
+        ):
+            c = int(getattr(self, "_destination_fixpoint_slice_continuations", 0) or 0)
+            if c < 160:
+                self._destination_fixpoint_slice_continuations = c + 1
+                _ix_cap = subtree_root_ix
+                _mr_cap = int(max_rounds)
+
+                def _c():
+                    self._materialize_planned_workspace_proposed_descendants_fixpoint(_ix_cap, max_rounds=_mr_cap)
+
+                QTimer.singleShot(
+                    0,
+                    lambda: self._safe_invoke("destination_fixpoint_time_slice", _c),
+                )
+        return n
 
     def _materialize_planned_workspace_proposed_descendants_fixpoint_core(
         self, col0: QModelIndex, *, max_rounds: int
@@ -29402,6 +32460,17 @@ class MainWindow(QMainWindow):
         unique_planned_ws_parent_ptrs: set[int] = set()
         planned_parents_visited = 0
         worklist_steps = 0
+        self._destination_fixpoint_slice_incomplete = False
+        deadline_perf = None
+        _fix_slice_t0 = time.perf_counter()
+        if getattr(self, "_destination_chunk_planned_workspace_fixpoint", False):
+            _slice_s = float(getattr(self, "_destination_startup_fixpoint_slice_s", 0.012) or 0.012)
+            deadline_perf = _fix_slice_t0 + _slice_s
+            log_info(
+                "startup_lifecycle_temp_materialize_chunk_begin",
+                phase="planned_workspace_fixpoint",
+                budget_ms=round(_slice_s * 1000.0, 2),
+            )
         if fen:
             log_info(
                 "destination_forensic_fixpoint_round_start",
@@ -29411,6 +32480,17 @@ class MainWindow(QMainWindow):
                 max_revisits_per_node=int(max_revisits_per_node),
             )
         while queue and worklist_steps < max_worklist_steps:
+            if deadline_perf is not None and time.perf_counter() >= deadline_perf:
+                self._destination_fixpoint_slice_incomplete = bool(queue)
+                if self._destination_fixpoint_slice_incomplete:
+                    log_info(
+                        "startup_lifecycle_temp_materialize_chunk_end",
+                        phase="planned_workspace_fixpoint",
+                        wall_ms=round((time.perf_counter() - _fix_slice_t0) * 1000.0, 2),
+                        parent_count_processed=int(planned_parents_visited),
+                        note="time_slice_yield_with_pending_worklist",
+                    )
+                break
             worklist_steps += 1
             ix = queue.popleft()
             if not ix.isValid():
@@ -29565,6 +32645,9 @@ class MainWindow(QMainWindow):
                 hit_worklist_cap=bool(worklist_steps >= max_worklist_steps),
             )
 
+        if getattr(self, "_destination_fixpoint_slice_incomplete", False):
+            return int(total_applied)
+
         stack: list[QModelIndex] = [col0]
         seen_mark: set[int] = set()
         while stack:
@@ -29717,7 +32800,7 @@ class MainWindow(QMainWindow):
                     _psk = self._ensure_proposed_folder_stable_key(proposed_folder)
                     _ppl_pf = self._destination_model_index_user_role_dict(col0)
                     _def_pf, _miss_pf, _cc_pf = self._graph_authority_planned_structural_bind_deferred_miss(
-                        dcanon, live_graph_parent_pl=_ppl_pf
+                        dcanon, live_graph_parent_pl=_ppl_pf, parent_anchor_index_valid=True
                     )
                     if _def_pf:
                         log_info(
@@ -30091,48 +33174,462 @@ class MainWindow(QMainWindow):
 
         dmodel.update_payload_for_index(ix, _mut)
 
-    def _decorate_destination_graph_subtree_for_allocation_move(self, alloc_folder_ix: QModelIndex, move) -> int:
-        dmodel = getattr(self, "destination_planning_model", None)
-        if dmodel is None or not alloc_folder_ix.isValid():
-            return 0
-        parent_data = dict(alloc_folder_ix.data(Qt.UserRole) or {})
-        graph_auth = destination_authority_contract.graph_owns_visible_real_destination_structure(self)
-        tree_or_proj = self._tree_item_path(parent_data) or self._allocation_projection_path(move)
-        allocation_destination_path = (
-            self._canonical_destination_path_with_visible_library_anchor(tree_or_proj)
-            if graph_auth
-            else (
-                self._canonical_destination_projection_path(tree_or_proj)
-                or self.normalize_memory_path(tree_or_proj)
-            )
+    def _decorate_destination_graph_subtree_for_allocation_move(
+        self,
+        alloc_folder_ix: QModelIndex,
+        move,
+        *,
+        on_complete=None,
+        enqueue_reason: str = "",
+        collect_reason: str = "",
+    ) -> int:
+        """Project source subtree under a Graph-auth allocation folder (chunked; no single-wave bind).
+
+        Reuses existing destination rows when paths match; otherwise injects one planned segment per timer slice.
+        """
+        self._enqueue_destination_descendant_apply_to_model(
+            alloc_folder_ix,
+            move,
+            on_complete,
+            enqueue_reason=enqueue_reason,
+            collect_reason=collect_reason,
         )
-        if not allocation_destination_path:
-            return 0
+        return 0
+
+    def _pause_destination_descendant_apply_for_finalize_alloc(self) -> None:
+        """Stop allocation-descendant apply while merge finalize runs alloc_step (lazy_ap / lazy_df)."""
+        if getattr(self, "_destination_descendant_apply_paused_for_finalize_alloc", False):
+            return
+        self._destination_descendant_apply_paused_for_finalize_alloc = True
+        t = getattr(self, "_destination_descendant_apply_timer", None)
+        if t is not None and t.isActive():
+            t.stop()
+
+    def _resume_destination_descendant_apply_after_finalize_alloc(self) -> None:
+        """Restart descendant apply after finalize alloc_step (or merge cancel)."""
+        if not getattr(self, "_destination_descendant_apply_paused_for_finalize_alloc", False):
+            return
+        self._destination_descendant_apply_paused_for_finalize_alloc = False
+        if self._destination_descendant_apply_state is not None or self._destination_descendant_apply_queue:
+            self._schedule_destination_descendant_apply_tick()
+
+    def _schedule_destination_descendant_apply_tick(self) -> None:
+        if getattr(self, "_application_shutting_down", False):
+            return
+        if getattr(self, "_destination_descendant_apply_paused_for_finalize_alloc", False):
+            return
+        t = getattr(self, "_destination_descendant_apply_timer", None)
+        if t is None:
+            self._destination_descendant_apply_inline_drain = True
+            try:
+                while getattr(self, "_destination_descendant_apply_state", None) is not None or getattr(
+                    self, "_destination_descendant_apply_queue", None
+                ):
+                    self._run_destination_descendant_apply_tick()
+            finally:
+                self._destination_descendant_apply_inline_drain = False
+            return
+        if not t.isActive():
+            t.start(0)
+
+    def _destination_allocation_projection_resume_token(self, move, source_root_data) -> str:
+        """Stable token tying persisted resume cursor to source subtree cache + allocation destination (not Graph structure)."""
+        if not isinstance(move, dict):
+            return ""
+        try:
+            sk = self._source_projection_descendants_cache_key_graph_subtree_stable(source_root_data or {})
+        except Exception:
+            sk = ()
+        dest = self._allocation_projection_path(move) or ""
+        dest_c = self._canonical_destination_projection_path(dest) or ""
+        raw = f"{sk!s}|{dest_c}"
+        try:
+            return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+        except Exception:
+            return ""
+
+    def _destination_flush_descendant_apply_resume_to_model_payloads(self) -> None:
+        """Stamp snapshot-bound allocation rows with graph-descendant apply cursor so session capture can resume after restart."""
+        dm = getattr(self, "destination_planning_model", None)
+        if dm is None:
+            return
+        st = getattr(self, "_destination_descendant_apply_state", None)
+        if not isinstance(st, dict) or not st.get("graph_walk"):
+            return
+        pix = st.get("parent_ix")
+        move = st.get("move")
+        descendants = list(st.get("descendants") or [])
+        if not isinstance(pix, QModelIndex) or not pix.isValid() or not isinstance(move, dict):
+            return
+        col0 = pix.siblingAtColumn(0) if pix.column() != 0 else pix
+        if not col0.isValid():
+            return
         source_item = self._find_source_item_for_planned_move(move)
         source_root_data = self._source_tree_row_payload(source_item) if source_item is not None else {}
         if not source_root_data:
             source_root_data = dict(move.get("source", {}) or {})
             source_root_data.setdefault("item_path", move.get("source_path", ""))
             source_root_data.setdefault("display_path", move.get("source_path", ""))
-        if not source_root_data or not bool(source_root_data.get("is_folder", True)):
-            return 0
-        source_root_path = self._canonical_source_projection_path(self._tree_item_path(source_root_data))
-        descendants = self._sort_descendants_for_allocation_apply(
-            self._collect_source_descendants_for_projection(source_root_data, move)
+        token = self._destination_allocation_projection_resume_token(move, source_root_data)
+        if not token:
+            return
+        desc_idx = int(st.get("desc_index") or 0)
+        total = len(descendants)
+
+        def _mut(p):
+            p["allocation_projection_resume_source_token"] = token
+            p["allocation_projection_resume_desc_index"] = desc_idx
+            p["allocation_projection_resume_descendants_total"] = total
+
+        try:
+            dm.update_payload_for_index(col0, _mut)
+        except Exception:
+            pass
+
+    def _destination_flush_pending_leaf_batches_for_snapshot_capture(self) -> None:
+        """Append batched file leaves to the model before walking the tree for JSON snapshot.
+
+        Non-graph allocation apply batches file descendants in ``pending_leaf_batches`` and flushes on
+        folder boundaries; if capture runs between batches, :meth:`rowCount` can omit those rows even
+        though the UI already painted them from prior appends in the same tick slice.
+        """
+        st = getattr(self, "_destination_descendant_apply_state", None)
+        if not isinstance(st, dict):
+            return
+        model = st.get("model")
+        if model is None:
+            return
+        pending = st.get("pending_leaf_batches") or {}
+        if not pending:
+            return
+        self._allocation_apply_flush_all_pending_model(
+            model, st.get("child_map_cache") or {}, pending
         )
-        count = 0
-        for descendant_data in descendants:
+
+    def _snapshot_capture_shutdown_drain_deadline_s(self) -> float:
+        """Wall-clock budget for draining in-flight descendant apply during shutdown snapshot capture.
+
+        Default 120s — insufficient drain (previously 12s) produced ``deadline_shutdown_cap`` with queue/state
+        still active, so ``DestinationTreeSnapshot`` was serialized mid graph-walk. Override via
+        ``OZLINK_SNAPSHOT_DRAIN_SHUTDOWN_S`` (15–600).
+        """
+        raw = os.environ.get("OZLINK_SNAPSHOT_DRAIN_SHUTDOWN_S", "").strip()
+        if raw:
+            try:
+                v = float(raw)
+                return max(15.0, min(600.0, v))
+            except ValueError:
+                pass
+        return 120.0
+
+    def _destination_finalize_inflight_descendant_apply_for_snapshot_capture(self) -> None:
+        """Bounded synchronous drain so session capture matches visible planning-model rows.
+
+        Timer-sliced descendant injection may leave work in the active state or queue when autosave/close
+        captures; without draining, :meth:`_serialize_source_model_subtree_snapshot` sees fewer children
+        than the view (``rowCount`` includes only rows already linked under each parent node).
+        """
+        if int(getattr(self, "_destination_snapshot_capture_drain_depth", 0) or 0) >= 1:
+            return
+        if getattr(self, "_application_shutting_down", False):
+            try:
+                self._destination_flush_pending_leaf_batches_for_snapshot_capture()
+            except Exception:
+                pass
+            log_info(
+                "shutdown_trace",
+                event="snapshot_descendant_drain_skipped",
+                note="shutdown_gate_materialized_snapshot_only",
+            )
+            return
+        if getattr(self, "_destination_descendant_apply_paused_for_finalize_alloc", False):
+            self._destination_flush_pending_leaf_batches_for_snapshot_capture()
+            return
+        self._destination_snapshot_capture_drain_depth = 1
+        self._destination_snapshot_capture_drain_active = True
+        t0 = time.perf_counter()
+        shutting = bool(getattr(self, "_application_shutting_down", False))
+        shutdown_deadline_s = float(self._snapshot_capture_shutdown_drain_deadline_s()) if shutting else 0.0
+        dq0 = getattr(self, "_destination_descendant_apply_queue", None)
+        q0 = len(dq0) if dq0 else 0
+        st0 = getattr(self, "_destination_descendant_apply_state", None)
+        log_info(
+            "destination_snapshot_capture_drain_begin",
+            shutdown=bool(shutting),
+            queue_len_before=int(q0),
+            descendant_apply_state_active=st0 is not None,
+            graph_walk_active=bool((st0 or {}).get("graph_walk")) if isinstance(st0, dict) else False,
+            shutdown_drain_deadline_s=round(shutdown_deadline_s, 2) if shutting else None,
+        )
+        try:
+            # Autosave: tight wall budget (~200ms). Shutdown: drain until queue/state idle or wall cap —
+            # sibling reconcile during apply is suppressed while :attr:`_destination_snapshot_capture_drain_active`
+            # so ``allocation_apply_model_index_yield`` cannot run unbounded full-tree reconcile passes.
+            deadline_autosave = t0 + 0.2
+            deadline_shutdown = t0 + shutdown_deadline_s
+            max_ticks = 120000 if shutting else 600
+            ticks = 0
+            exit_reason = "idle"
+            self._destination_flush_pending_leaf_batches_for_snapshot_capture()
+            while ticks < max_ticks:
+                dq = getattr(self, "_destination_descendant_apply_queue", None)
+                st = getattr(self, "_destination_descendant_apply_state", None)
+                qlen = len(dq) if dq else 0
+                if qlen == 0 and st is None:
+                    exit_reason = "idle"
+                    break
+                now = time.perf_counter()
+                if shutting:
+                    if now >= deadline_shutdown:
+                        exit_reason = "deadline_shutdown_cap"
+                        break
+                elif now >= deadline_autosave:
+                    exit_reason = "deadline_autosave"
+                    break
+                self._run_destination_descendant_apply_tick()
+                ticks += 1
+            else:
+                exit_reason = "max_ticks"
+            self._destination_flush_pending_leaf_batches_for_snapshot_capture()
+            dq1 = getattr(self, "_destination_descendant_apply_queue", None)
+            q1 = len(dq1) if dq1 else 0
+            st1 = getattr(self, "_destination_descendant_apply_state", None)
+            wall_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+            log_info(
+                "destination_snapshot_capture_descendant_apply_drain",
+                tick_count=int(ticks),
+                wall_ms=wall_ms,
+                shutdown=bool(shutting),
+                queue_len_before=int(q0),
+                queue_len_after=int(q1),
+                descendant_apply_state_after=st1 is not None,
+                exit_reason=str(exit_reason),
+                shutdown_drain_deadline_s=round(shutdown_deadline_s, 2) if shutting else None,
+            )
+            if shutting and exit_reason == "deadline_shutdown_cap" and (q1 > 0 or st1 is not None):
+                log_warn(
+                    "destination_snapshot_capture_drain_incomplete",
+                    queue_len_after=int(q1),
+                    descendant_apply_state_after=st1 is not None,
+                    wall_ms=wall_ms,
+                    shutdown_drain_deadline_s=round(shutdown_deadline_s, 2),
+                    hint="Raise OZLINK_SNAPSHOT_DRAIN_SHUTDOWN_S (15–600) if snapshots miss allocation descendants after close.",
+                )
+        finally:
+            self._destination_snapshot_capture_drain_active = False
+            self._destination_snapshot_capture_drain_depth = 0
+
+    def _build_destination_graph_allocation_descendant_apply_state(
+        self,
+        parent_ix: QModelIndex,
+        move,
+        on_complete,
+        *,
+        enqueue_reason: str = "",
+        collect_reason: str = "",
+    ):
+        """Graph-authority allocation descendant projection: chunked (see :meth:`_decorate_destination_graph_subtree_for_allocation_move`)."""
+        self._alloc_apply_sibling_reconcile_coalesce_key = None
+        model = getattr(self, "destination_planning_model", None)
+        if model is None or not parent_ix.isValid():
+            return None
+        if hasattr(model, "is_index_live") and not model.is_index_live(parent_ix):
+            log_info(
+                "destination_child_lookup_invalid_parent_index",
+                reason="allocation_apply_parent_not_live",
+                parent_path_hint=self._canonical_destination_projection_path(
+                    self._tree_item_path(parent_ix.data(Qt.UserRole) or {})
+                ),
+            )
+            return None
+        if not destination_authority_contract.graph_owns_visible_real_destination_structure(self):
+            return None
+        parent_data = parent_ix.data(Qt.UserRole) or {}
+        tree_or_proj = self._tree_item_path(parent_data) or self._allocation_projection_path(move)
+        allocation_destination_path = self._canonical_destination_path_with_visible_library_anchor(tree_or_proj)
+        if not allocation_destination_path:
+            return None
+        source_item = self._find_source_item_for_planned_move(move)
+        source_root_data = self._source_tree_row_payload(source_item) if source_item is not None else {}
+        if not source_root_data:
+            source_root_data = dict(move.get("source", {}) or {})
+            source_root_data.setdefault("item_path", move.get("source_path", ""))
+            source_root_data.setdefault("display_path", move.get("source_path", ""))
+        expected_is_folder = bool(parent_data.get("is_folder", True))
+        if source_root_data and source_root_data.get("is_folder", None) is None:
+            source_root_data["is_folder"] = expected_is_folder
+        if not source_root_data or not bool(source_root_data.get("is_folder", expected_is_folder)):
+            return None
+        source_root_path = self._canonical_source_projection_path(self._tree_item_path(source_root_data))
+        cr = str(collect_reason or "").strip() or str(enqueue_reason or "").strip() or "graph_allocation_descendant_apply"
+        descendants = self._sort_descendants_for_allocation_apply(
+            self._collect_source_descendants_for_projection(source_root_data, move, collect_reason=cr)
+        )
+        cur_token = self._destination_allocation_projection_resume_token(move, source_root_data)
+        resume_tok = str(parent_data.get("allocation_projection_resume_source_token") or "").strip()
+        try:
+            resume_total = int(parent_data.get("allocation_projection_resume_descendants_total"))
+        except (TypeError, ValueError):
+            resume_total = -1
+        try:
+            resume_idx = int(parent_data.get("allocation_projection_resume_desc_index"))
+        except (TypeError, ValueError):
+            resume_idx = -1
+        seeded_desc_index = 0
+        if (
+            cur_token
+            and resume_tok
+            and resume_tok == cur_token
+            and resume_total == len(descendants)
+            and 0 <= resume_idx <= len(descendants)
+        ):
+            seeded_desc_index = resume_idx
+            log_info(
+                "allocation_projection_resume_desc_index_seeded",
+                desc_index=int(resume_idx),
+                descendants_total=int(len(descendants)),
+                token_suffix=cur_token[-8:],
+            )
+        _gen_snap = None
+        _sg = getattr(model, "structure_generation", None)
+        if callable(_sg):
+            try:
+                _gen_snap = int(_sg())
+            except Exception:
+                _gen_snap = None
+        return {
+            "parent_ix": parent_ix,
+            "move": move,
+            "on_complete": on_complete,
+            "projection_enqueue_reason": str(enqueue_reason or "")[:240],
+            "projection_collect_reason": str(cr)[:240],
+            "model": model,
+            "parent_data": parent_data,
+            "allocation_destination_path": allocation_destination_path,
+            "source_root_path": source_root_path,
+            "descendants": descendants,
+            "desc_index": seeded_desc_index,
+            "graph_walk": True,
+            "graph_auth": True,
+            "child_map_cache": {},
+            "overlay_count": 0,
+            "walk_phase": "next_descendant",
+            "rel_clean": None,
+            "base_canon": "",
+            "base_parts": [],
+            "projection_terminal": None,
+            "descendant_data": None,
+            "descendant_source_path": "",
+            "seg_index": 0,
+            "graph_budget_s": float(getattr(self, "_destination_graph_descendant_apply_budget_s", 0.01) or 0.01),
+            "graph_model_structure_generation_snap": _gen_snap,
+        }
+
+    def _build_destination_descendant_apply_state(
+        self,
+        parent_ix: QModelIndex,
+        move,
+        on_complete,
+        *,
+        enqueue_reason: str = "",
+        collect_reason: str = "",
+    ):
+        self._alloc_apply_sibling_reconcile_coalesce_key = None
+        model = getattr(self, "destination_planning_model", None)
+        if model is None or not parent_ix.isValid():
+            return None
+        if hasattr(model, "is_index_live") and not model.is_index_live(parent_ix):
+            log_info(
+                "destination_child_lookup_invalid_parent_index",
+                reason="allocation_apply_parent_not_live",
+                parent_path_hint=self._canonical_destination_projection_path(
+                    self._tree_item_path(parent_ix.data(Qt.UserRole) or {})
+                ),
+            )
+            return None
+        if destination_authority_contract.graph_owns_visible_real_destination_structure(self):
+            return self._build_destination_graph_allocation_descendant_apply_state(
+                parent_ix,
+                move,
+                on_complete,
+                enqueue_reason=enqueue_reason,
+                collect_reason=collect_reason,
+            )
+        parent_data = parent_ix.data(Qt.UserRole) or {}
+        allocation_destination_path = self._canonical_destination_projection_path(
+            self._tree_item_path(parent_data) or self._allocation_projection_path(move)
+        )
+        if not allocation_destination_path:
+            return None
+        source_item = self._find_source_item_for_planned_move(move)
+        source_root_data = self._source_tree_row_payload(source_item) if source_item is not None else {}
+        if not source_root_data:
+            source_root_data = dict(move.get("source", {}) or {})
+            source_root_data.setdefault("item_path", move.get("source_path", ""))
+            source_root_data.setdefault("display_path", move.get("source_path", ""))
+        expected_is_folder = bool(parent_data.get("is_folder", True))
+        if source_root_data and source_root_data.get("is_folder", None) is None:
+            source_root_data["is_folder"] = expected_is_folder
+        if not source_root_data or not bool(source_root_data.get("is_folder", expected_is_folder)):
+            return None
+        source_root_path = self._canonical_source_projection_path(self._tree_item_path(source_root_data))
+        cr = str(collect_reason or "").strip() or str(enqueue_reason or "").strip() or "destination_descendant_apply_non_graph"
+        descendants = self._collect_source_descendants_for_projection(source_root_data, move, collect_reason=cr)
+        descendants = self._sort_descendants_for_allocation_apply(descendants)
+        return {
+            "parent_ix": parent_ix,
+            "move": move,
+            "on_complete": on_complete,
+            "projection_enqueue_reason": str(enqueue_reason or "")[:240],
+            "projection_collect_reason": str(cr)[:240],
+            "model": model,
+            "parent_data": parent_data,
+            "allocation_destination_path": allocation_destination_path,
+            "source_root_path": source_root_path,
+            "descendants": descendants,
+            "desc_index": 0,
+            "seg_index": 0,
+            "relative_segments": None,
+            "descendant_data": None,
+            "current_parent_ix": parent_ix,
+            "current_parent_data": parent_data,
+            "child_map_cache": {},
+            "pending_leaf_batches": {},
+            "visibility_targets": {},
+            "added_count": 0,
+            "walk_phase": "next_descendant",
+        }
+
+    def _destination_graph_descendant_apply_prepare_next_descendant(self, st) -> str:
+        """Advance graph-authority walk to the next descendant (same filters as sync decorate)."""
+        descendants = st["descendants"]
+        parent_ix = st["parent_ix"]
+        parent_data = st["parent_data"]
+        allocation_destination_path = st["allocation_destination_path"]
+        source_root_path = st["source_root_path"]
+        model = st["model"]
+        graph_auth = bool(st.get("graph_auth"))
+
+        while st["desc_index"] < len(descendants):
+            if st["desc_index"] > 0 and st["desc_index"] % 50 == 0:
+                self._reconcile_destination_sibling_folders_during_allocation_apply("model_index_yield")
+            if not parent_ix.isValid() or (hasattr(model, "is_index_live") and not model.is_index_live(parent_ix)):
+                return "stale"
+            descendant_data = descendants[st["desc_index"]]
             descendant_source_path = self._canonical_source_projection_path(self._tree_item_path(descendant_data))
             if descendant_source_path == source_root_path:
+                st["desc_index"] += 1
                 continue
             relative_segments = self._allocation_projection_relative_source_segments(
                 source_root_path, descendant_source_path
             )
             if not relative_segments:
+                st["desc_index"] += 1
                 continue
             if self._source_tree_payload_implies_file_leaf(descendant_data) and self._is_leaf_path_excluded_for_plan(
                 descendant_source_path
             ):
+                st["desc_index"] += 1
                 continue
             exact_move = self._find_exact_planned_move_for_source_path(descendant_source_path)
             if exact_move is not None:
@@ -30159,12 +33656,14 @@ class MainWindow(QMainWindow):
                     else dest_here_bare
                 )
                 if exact_destination_path and exact_destination_path != dest_here:
+                    st["desc_index"] += 1
                     continue
             base_canon = self._canonical_destination_projection_path(allocation_destination_path) or self.normalize_memory_path(
                 allocation_destination_path
             )
             rel_clean = [str(s or "").strip() for s in relative_segments if str(s or "").strip()]
             if not rel_clean:
+                st["desc_index"] += 1
                 continue
             base_parts = list(self._path_segments(base_canon))
             if not base_parts:
@@ -30173,9 +33672,8 @@ class MainWindow(QMainWindow):
                     allocation_destination_excerpt=str(allocation_destination_path)[:220],
                     descendant_source_excerpt=str(descendant_source_path)[:220],
                 )
+                st["desc_index"] += 1
                 continue
-            cur_ix = alloc_folder_ix.siblingAtColumn(0) if alloc_folder_ix.column() != 0 else alloc_folder_ix
-            dest_full = base_canon
             projection_terminal_bare = self._canonical_destination_projection_path(
                 "\\".join(base_parts + rel_clean)
             ) or self.normalize_memory_path("\\".join(base_parts + rel_clean))
@@ -30187,205 +33685,435 @@ class MainWindow(QMainWindow):
                 if graph_auth
                 else projection_terminal_bare
             ) or None
-            resolved_leaf: QModelIndex | None = None
-            for i, _seg in enumerate(rel_clean):
-                expected_parent_before = (
-                    base_canon
-                    if i == 0
-                    else (
-                        self._canonical_destination_projection_path("\\".join(base_parts + rel_clean[:i]))
-                        or self.normalize_memory_path("\\".join(base_parts + rel_clean[:i]))
-                    )
+            cur_ix = parent_ix.siblingAtColumn(0) if parent_ix.column() != 0 else parent_ix
+            st["rel_clean"] = rel_clean
+            st["base_canon"] = base_canon
+            st["base_parts"] = base_parts
+            st["projection_terminal"] = projection_terminal
+            st["descendant_data"] = descendant_data
+            st["descendant_source_path"] = descendant_source_path
+            st["seg_index"] = 0
+            st["walk_phase"] = "walk"
+            return "walk"
+        return "done"
+
+    def _destination_graph_descendant_stable_path_for_walk_cursor(self, st, seg_index: int) -> str:
+        """Canonical path to the walk cursor row before consuming segment ``seg_index`` (path-only; no QModelIndex)."""
+        base_canon = str(st.get("base_canon") or "").strip()
+        base_parts = st.get("base_parts") or []
+        rel_clean = st.get("rel_clean") or []
+        i = int(seg_index)
+        if i <= 0:
+            return base_canon
+        sub = "\\".join(base_parts + rel_clean[:i])
+        if bool(st.get("graph_auth")):
+            sub_bare = self._canonical_destination_projection_path(sub) or self.normalize_memory_path(sub)
+            return (
+                self._canonical_planned_memory_path_for_graph_match(sub_bare) or sub_bare or ""
+            ).strip()
+        return (
+            self._canonical_destination_projection_path(sub) or self.normalize_memory_path(sub) or ""
+        ).strip()
+
+    def _destination_graph_descendant_stable_path_for_leaf(self, st) -> str:
+        base_parts = st.get("base_parts") or []
+        rel_clean = st.get("rel_clean") or []
+        leaf_sub = "\\".join(base_parts + rel_clean)
+        return (
+            self._canonical_destination_projection_path(leaf_sub) or self.normalize_memory_path(leaf_sub) or ""
+        ).strip()
+
+    def _destination_graph_descendant_model_index_keys_for_lookup(self, path_hint: str) -> list[str]:
+        """Canonical keys that may appear in DestinationPlanningModel path index (Graph hub vs library-relative)."""
+        raw = (path_hint or "").strip()
+        if not raw:
+            return []
+        seen_cf: set[str] = set()
+        out: list[str] = []
+
+        def _add(s: str) -> None:
+            t = (s or "").strip()
+            if not t:
+                return
+            cf = t.casefold()
+            if cf in seen_cf:
+                return
+            seen_cf.add(cf)
+            out.append(t)
+
+        _add(self._canonical_destination_projection_path(raw) or "")
+        _add(self.normalize_memory_path(raw))
+        _add(raw)
+        if destination_authority_contract.graph_owns_visible_real_destination_structure(self):
+            try:
+                nt = self._materialize_cached_destination_lookup_norm(raw)
+            except Exception:
+                nt = ""
+            keys, _ = self._destination_visible_path_lookup_canonical_keys_ex(raw, nt)
+            for k in keys or []:
+                _add(k)
+        return out
+
+    def _destination_graph_descendant_resolve_model_index_for_path(self, dm, canonical_path: str) -> QModelIndex | None:
+        """Fresh QModelIndex for a canonical destination path; never reuse stale indices across ticks."""
+        if dm is None:
+            return None
+        raw = (canonical_path or "").strip()
+        if not raw:
+            return None
+        find_fn = getattr(dm, "find_indices_for_canonical_destination_path", None)
+        if callable(find_fn):
+            try:
+                for c in self._destination_graph_descendant_model_index_keys_for_lookup(raw):
+                    for h in find_fn(c) or []:
+                        if not isinstance(h, QModelIndex) or not h.isValid():
+                            continue
+                        h0 = h.siblingAtColumn(0) if h.column() != 0 else h
+                        if hasattr(dm, "is_index_live") and not dm.is_index_live(h0):
+                            continue
+                        return h0
+            except RuntimeError:
+                return None
+        c0 = (self._canonical_destination_projection_path(raw) or self.normalize_memory_path(raw) or raw).strip()
+        try:
+            vis = self._find_visible_destination_item_by_path(c0)
+        except Exception:
+            vis = None
+        if vis is not None and isinstance(vis, QModelIndex) and vis.isValid():
+            v0 = vis.siblingAtColumn(0) if vis.column() != 0 else vis
+            try:
+                if hasattr(dm, "is_index_live") and not dm.is_index_live(v0):
+                    return None
+            except RuntimeError:
+                return None
+            return v0
+        return None
+
+    def _destination_graph_descendant_resolve_child_under_walk_parent(
+        self, dm, parent_ix: QModelIndex, next_branch: str
+    ) -> QModelIndex | None:
+        """When parent-scoped child map misses, recover a row already indexed under another canonical key."""
+        if dm is None or not parent_ix.isValid() or not next_branch:
+            return None
+        p0 = parent_ix.siblingAtColumn(0) if parent_ix.column() != 0 else parent_ix
+        find_fn = getattr(dm, "find_indices_for_canonical_destination_path", None)
+        if not callable(find_fn):
+            return None
+        try:
+            for c in self._destination_graph_descendant_model_index_keys_for_lookup(next_branch):
+                for h in find_fn(c) or []:
+                    if not isinstance(h, QModelIndex) or not h.isValid():
+                        continue
+                    h0 = h.siblingAtColumn(0) if h.column() != 0 else h
+                    if hasattr(dm, "is_index_live") and not dm.is_index_live(h0):
+                        continue
+                    try:
+                        par = h0.parent()
+                    except RuntimeError:
+                        continue
+                    if not par.isValid():
+                        continue
+                    par0 = par.siblingAtColumn(0) if par.column() != 0 else par
+                    if par0 != p0:
+                        continue
+                    pl = self._destination_model_index_user_role_dict(h0)
+                    vis = self._destination_semantic_path(pl)
+                    if self._destination_parent_match_details(next_branch, vis).get("exact_match"):
+                        return h0
+        except RuntimeError:
+            return None
+        return None
+
+    def _destination_graph_descendant_apply_process_one_segment(self, st) -> str:
+        """One graph-authority segment step: reuse visible/snapshot row or inject a single planned segment."""
+        if int(getattr(self, "_destination_descendant_apply_graph_bind_depth", 0) or 0) > 0:
+            log_info("descendant_apply_reentrant_guard_skip", reason="graph_bind_in_progress")
+            return "stale"
+
+        model = st["model"]
+        rel_clean = st.get("rel_clean") or []
+        descendant_data = st.get("descendant_data")
+        parent_data = st.get("parent_data")
+        base_parts = st.get("base_parts") or []
+        base_canon = st.get("base_canon") or ""
+        projection_terminal = st.get("projection_terminal")
+        graph_auth = bool(st.get("graph_auth"))
+        descendant_source_path = str(st.get("descendant_source_path") or "")
+        allocation_destination_path = st.get("allocation_destination_path") or ""
+
+        gen_fn = getattr(model, "structure_generation", None)
+        if callable(gen_fn):
+            cur_gen = int(gen_fn())
+            snap = st.get("graph_model_structure_generation_snap")
+            if snap is not None and cur_gen != int(snap):
+                log_info(
+                    "descendant_apply_model_mutation_guard_skip",
+                    previous_generation=int(snap),
+                    current_generation=cur_gen,
                 )
-                cur_pl = dict(cur_ix.data(Qt.UserRole) or {})
-                cur_canon = self._canonical_destination_projection_path(self._tree_item_path(cur_pl) or "") or ""
-                walk_md = self._destination_parent_match_details(expected_parent_before, cur_canon)
-                if not walk_md.get("exact_match"):
-                    self._log_restore_phase(
-                        "sharepoint_allocation_descendant_walk_mismatch",
-                        expected_parent_canonical=str(expected_parent_before)[:260],
-                        actual_current_canonical=str(cur_canon)[:260],
-                        descendant_source_excerpt=str(descendant_source_path)[:220],
-                    )
-                    resolved_leaf = None
-                    break
-                next_branch = self._canonical_destination_projection_path("\\".join(base_parts + rel_clean[: i + 1]))
-                if not next_branch:
-                    next_branch = self.normalize_memory_path("\\".join(base_parts + rel_clean[: i + 1]))
-                ch = self._find_destination_child_by_path(cur_ix, next_branch, overlay_path_strict=bool(graph_auth))
-                if ch is None or not isinstance(ch, QModelIndex) or not ch.isValid():
-                    if graph_auth:
-                        _def_ad, _miss_ad, _cc_ad = self._graph_authority_planned_structural_bind_deferred_miss(
-                            next_branch, live_graph_parent_pl=cur_pl
-                        )
-                        if _def_ad:
-                            self._log_restore_phase(
-                                "sharepoint_overlay_planned_chain_suppressed_graph_authority",
-                                normalized_target=str(projection_terminal or "")[:400],
-                                depth=i,
-                                path=next_branch,
-                                miss_reason=_miss_ad,
-                                candidate_count=int(_cc_ad),
-                                bind_context="allocation_descendant_child_missing",
-                            )
-                            log_info(
-                                "destination_planned_chain_bind_suppressed",
-                                intended_path=str(projection_terminal or next_branch)[:400],
-                                reason="graph_authority_allocation_descendant_deferred",
-                                miss_reason=_miss_ad,
-                                path_excerpt=str(next_branch)[:260],
-                                nearest_visible_parent=str(expected_parent_before)[:400],
-                                candidate_count=int(_cc_ad),
-                            )
-                            cur_pl_ld = self._destination_model_index_user_role_dict(cur_ix)
-                            if (
-                                self._destination_row_is_live_graph_structure(cur_pl_ld)
-                                and not cur_pl_ld.get("children_loaded")
-                                and not cur_pl_ld.get("load_failed")
-                            ):
-                                self._request_graph_destination_children_load(
-                                    cur_ix.siblingAtColumn(0) if cur_ix.column() != 0 else cur_ix,
-                                    reason="allocation_descendant_deferred",
-                                )
-                            resolved_leaf = None
-                            break
-                    rem = rel_clean[i:]
-                    bound = self._sharepoint_bind_planned_segment_chain(
-                        cur_ix,
-                        rem,
-                        bind_kind="allocation_descendant",
-                        bind_context_excerpt=str(descendant_source_path)[:220],
-                        expected_parent_canonical=expected_parent_before,
-                        projection_target_canonical=projection_terminal,
-                        terminal_is_file=self._source_tree_payload_implies_file_leaf(descendant_data),
-                    )
-                    if bound is not None and bound.isValid():
-                        resolved_leaf = bound
-                    break
-                ch_pl = self._destination_model_index_user_role_dict(ch)
-                ch_canon = self._canonical_destination_projection_path(self._tree_item_path(ch_pl) or "") or ""
-                ch_md = self._destination_parent_match_details(next_branch, ch_canon)
-                if not ch_md.get("exact_match"):
-                    self._log_restore_phase(
-                        "sharepoint_allocation_descendant_child_mismatch",
-                        expected_child_canonical=str(next_branch)[:260],
-                        actual_child_canonical=str(ch_canon)[:260],
-                        descendant_source_excerpt=str(descendant_source_path)[:220],
-                    )
-                    rem = rel_clean[i:]
-                    bound = self._sharepoint_bind_planned_segment_chain(
-                        cur_ix,
-                        rem,
-                        bind_kind="allocation_descendant",
-                        bind_context_excerpt=str(descendant_source_path)[:220],
-                        expected_parent_canonical=expected_parent_before,
-                        projection_target_canonical=projection_terminal,
-                        terminal_is_file=self._source_tree_payload_implies_file_leaf(descendant_data),
-                    )
-                    if bound is not None and bound.isValid():
-                        resolved_leaf = bound
-                    break
-                cur_ix = ch.siblingAtColumn(0) if ch.column() != 0 else ch
-                dest_full = next_branch
-            else:
-                resolved_leaf = cur_ix
-            if resolved_leaf is None or not resolved_leaf.isValid():
-                continue
-            cur_final = resolved_leaf.siblingAtColumn(0) if resolved_leaf.column() != 0 else resolved_leaf
-            dest_full = (
-                self._tree_item_path(dict(cur_final.data(Qt.UserRole) or {})) or dest_full or allocation_destination_path
+            st["graph_model_structure_generation_snap"] = cur_gen
+
+        st["child_map_cache"] = {}
+        child_map_cache: dict = st["child_map_cache"]
+
+        if not rel_clean or descendant_data is None or parent_data is None:
+            st["desc_index"] += 1
+            st["walk_phase"] = "next_descendant"
+            return "next_descendant"
+
+        i = int(st.get("seg_index") or 0)
+        if i >= len(rel_clean):
+            leaf_path = self._destination_graph_descendant_stable_path_for_leaf(st)
+            cur_final = self._destination_graph_descendant_resolve_model_index_for_path(model, leaf_path)
+            if cur_final is None or not cur_final.isValid():
+                log_info(
+                    "descendant_apply_index_invalid_resolved_by_path",
+                    phase="leaf_overlay",
+                    path_excerpt=str(leaf_path)[:400],
+                )
+                st["desc_index"] += 1
+                st["walk_phase"] = "next_descendant"
+                return "next_descendant"
+            log_info(
+                "descendant_apply_index_revalidated",
+                phase="leaf_overlay",
+                path_excerpt=str(leaf_path)[:400],
             )
-            par_ix = cur_final.parent()
-            pd = dict(par_ix.data(Qt.UserRole) or {}) if par_ix.isValid() else parent_data
+            try:
+                dest_full = self._tree_item_path(self._destination_model_index_user_role_dict(cur_final)) or leaf_path
+            except Exception:
+                dest_full = leaf_path or allocation_destination_path
+            par_ix = QModelIndex()
+            pd = parent_data
+            try:
+                par_ix = cur_final.parent()
+                if par_ix.isValid():
+                    pd = dict(self._destination_model_index_user_role_dict(par_ix))
+            except RuntimeError:
+                par_ix = QModelIndex()
+                pd = parent_data
             self._apply_allocation_descendant_overlay_to_existing_model_index(
                 cur_final, descendant_data, dest_full, pd
             )
-            count += 1
-        return count
+            st["overlay_count"] = int(st.get("overlay_count") or 0) + 1
+            st["desc_index"] += 1
+            st["walk_phase"] = "next_descendant"
+            return "next_descendant"
 
-    def _pause_destination_descendant_apply_for_finalize_alloc(self) -> None:
-        """Stop allocation-descendant apply while merge finalize runs alloc_step (lazy_ap / lazy_df)."""
-        if getattr(self, "_destination_descendant_apply_paused_for_finalize_alloc", False):
-            return
-        self._destination_descendant_apply_paused_for_finalize_alloc = True
-        t = getattr(self, "_destination_descendant_apply_timer", None)
-        if t is not None and t.isActive():
-            t.stop()
-
-    def _resume_destination_descendant_apply_after_finalize_alloc(self) -> None:
-        """Restart descendant apply after finalize alloc_step (or merge cancel)."""
-        if not getattr(self, "_destination_descendant_apply_paused_for_finalize_alloc", False):
-            return
-        self._destination_descendant_apply_paused_for_finalize_alloc = False
-        if self._destination_descendant_apply_state is not None or self._destination_descendant_apply_queue:
-            self._schedule_destination_descendant_apply_tick()
-
-    def _schedule_destination_descendant_apply_tick(self) -> None:
-        if getattr(self, "_destination_descendant_apply_paused_for_finalize_alloc", False):
-            return
-        if not self._destination_descendant_apply_timer.isActive():
-            self._destination_descendant_apply_timer.start(0)
-
-    def _build_destination_descendant_apply_state(self, parent_ix: QModelIndex, move, on_complete):
-        self._alloc_apply_sibling_reconcile_coalesce_key = None
-        model = getattr(self, "destination_planning_model", None)
-        if model is None or not parent_ix.isValid():
-            return None
-        if hasattr(model, "is_index_live") and not model.is_index_live(parent_ix):
+        cursor_path = self._destination_graph_descendant_stable_path_for_walk_cursor(st, i)
+        cur_ix = self._destination_graph_descendant_resolve_model_index_for_path(model, cursor_path)
+        if cur_ix is None or not cur_ix.isValid():
             log_info(
-                "destination_child_lookup_invalid_parent_index",
-                reason="allocation_apply_parent_not_live",
-                parent_path_hint=self._canonical_destination_projection_path(
-                    self._tree_item_path(parent_ix.data(Qt.UserRole) or {})
-                ),
+                "descendant_apply_index_invalid_resolved_by_path",
+                phase="walk_cursor",
+                path_excerpt=str(cursor_path)[:400],
+                segment_index=int(i),
             )
-            return None
-        if destination_authority_contract.graph_owns_visible_real_destination_structure(self):
-            return None
-        parent_data = parent_ix.data(Qt.UserRole) or {}
-        allocation_destination_path = self._canonical_destination_projection_path(
-            self._tree_item_path(parent_data) or self._allocation_projection_path(move)
+            return "stale"
+        log_info(
+            "descendant_apply_index_revalidated",
+            phase="walk_cursor",
+            path_excerpt=str(cursor_path)[:400],
+            segment_index=int(i),
         )
-        if not allocation_destination_path:
-            return None
-        source_item = self._find_source_item_for_planned_move(move)
-        source_root_data = self._source_tree_row_payload(source_item) if source_item is not None else {}
-        if not source_root_data:
-            source_root_data = dict(move.get("source", {}) or {})
-            source_root_data.setdefault("item_path", move.get("source_path", ""))
-            source_root_data.setdefault("display_path", move.get("source_path", ""))
-        expected_is_folder = bool(parent_data.get("is_folder", True))
-        if source_root_data and source_root_data.get("is_folder", None) is None:
-            source_root_data["is_folder"] = expected_is_folder
-        if not source_root_data or not bool(source_root_data.get("is_folder", expected_is_folder)):
-            return None
-        source_root_path = self._canonical_source_projection_path(self._tree_item_path(source_root_data))
-        descendants = self._collect_source_descendants_for_projection(source_root_data, move)
-        descendants = self._sort_descendants_for_allocation_apply(descendants)
-        return {
-            "parent_ix": parent_ix,
-            "move": move,
-            "on_complete": on_complete,
-            "model": model,
-            "parent_data": parent_data,
-            "allocation_destination_path": allocation_destination_path,
-            "source_root_path": source_root_path,
-            "descendants": descendants,
-            "desc_index": 0,
-            "seg_index": 0,
-            "relative_segments": None,
-            "descendant_data": None,
-            "current_parent_ix": parent_ix,
-            "current_parent_data": parent_data,
-            "child_map_cache": {},
-            "pending_leaf_batches": {},
-            "visibility_targets": {},
-            "added_count": 0,
-            "walk_phase": "next_descendant",
-        }
+
+        if i == 0:
+            expected_parent_before = base_canon
+        else:
+            join_p = "\\".join(base_parts + rel_clean[:i])
+            join_p_bare = self._canonical_destination_projection_path(join_p) or self.normalize_memory_path(join_p)
+            if graph_auth:
+                expected_parent_before = (
+                    self._canonical_planned_memory_path_for_graph_match(join_p_bare) or join_p_bare
+                )
+            else:
+                expected_parent_before = join_p_bare
+        cur_pl = self._destination_model_index_user_role_dict(cur_ix)
+        cur_raw = self._tree_item_path(cur_pl) or ""
+        if graph_auth:
+            cur_canon = self._canonical_planned_memory_path_for_graph_match(cur_raw) or ""
+        else:
+            cur_canon = self._canonical_destination_projection_path(cur_raw) or ""
+        walk_md = self._destination_parent_match_details(expected_parent_before, cur_canon)
+        if not walk_md.get("exact_match"):
+            self._log_restore_phase(
+                "sharepoint_allocation_descendant_walk_mismatch",
+                expected_parent_canonical=str(expected_parent_before)[:260],
+                actual_current_canonical=str(cur_canon)[:260],
+                descendant_source_excerpt=str(descendant_source_path)[:220],
+            )
+            st["desc_index"] += 1
+            st["walk_phase"] = "next_descendant"
+            return "next_descendant"
+
+        join_child = "\\".join(base_parts + rel_clean[: i + 1])
+        join_child_bare = (
+            self._canonical_destination_projection_path(join_child) or self.normalize_memory_path(join_child)
+        )
+        if graph_auth:
+            next_branch = self._canonical_planned_memory_path_for_graph_match(join_child_bare) or join_child_bare
+        else:
+            next_branch = join_child_bare
+
+        ch = self._find_destination_child_by_path_index_cached(cur_ix, next_branch, child_map_cache)
+        missing_for_inject = ch is None or not isinstance(ch, QModelIndex) or not ch.isValid()
+
+        if missing_for_inject:
+            ch_rec = self._destination_graph_descendant_resolve_child_under_walk_parent(model, cur_ix, next_branch)
+            if ch_rec is not None and ch_rec.isValid():
+                log_info(
+                    "descendant_apply_child_recovered_parent_scoped_miss",
+                    canonical_path_excerpt=str(next_branch)[:400],
+                    segment_index=int(i),
+                    bind_context_excerpt=str(descendant_source_path)[:220],
+                )
+                ch = ch_rec
+                missing_for_inject = False
+
+        if not missing_for_inject:
+            ch_pl = self._destination_model_index_user_role_dict(ch)
+            ch_raw = self._tree_item_path(ch_pl) or ""
+            if graph_auth:
+                ch_canon = self._canonical_planned_memory_path_for_graph_match(ch_raw) or ""
+            else:
+                ch_canon = self._canonical_destination_projection_path(ch_raw) or ""
+            ch_md = self._destination_parent_match_details(next_branch, ch_canon)
+            if ch_md.get("exact_match"):
+                snap_hint = bool(
+                    ch_pl.get("workspace_row_state")
+                    or ch_pl.get("workspace_planned_row")
+                    or str(ch_pl.get("verification_state") or "") == "planned_only"
+                )
+                log_info(
+                    "startup_lifecycle_temp_snapshot_descendant_reused",
+                    canonical_path_excerpt=str(next_branch)[:400],
+                    segment_index=int(i),
+                    snapshot_row_hint=bool(snap_hint),
+                    bind_context_excerpt=str(descendant_source_path)[:220],
+                )
+                st["seg_index"] = i + 1
+                return "continue"
+
+            self._log_restore_phase(
+                "sharepoint_allocation_descendant_child_mismatch",
+                expected_child_canonical=str(next_branch)[:260],
+                actual_child_canonical=str(ch_canon)[:260],
+                descendant_source_excerpt=str(descendant_source_path)[:220],
+            )
+            rem = rel_clean[i:]
+            self._destination_graph_descendant_apply_bind_one_segment(
+                st, cur_ix, rem, expected_parent_before, descendant_data, descendant_source_path, projection_terminal
+            )
+            return "continue"
+
+        if graph_auth:
+            _def_ad, _miss_ad, _cc_ad = self._graph_authority_planned_structural_bind_deferred_miss(
+                next_branch, live_graph_parent_pl=cur_pl, parent_anchor_index_valid=True
+            )
+            if _def_ad:
+                self._log_restore_phase(
+                    "sharepoint_overlay_planned_chain_suppressed_graph_authority",
+                    normalized_target=str(projection_terminal or "")[:400],
+                    depth=i,
+                    path=next_branch,
+                    miss_reason=_miss_ad,
+                    candidate_count=int(_cc_ad),
+                    bind_context="allocation_descendant_child_missing",
+                )
+                log_info(
+                    "destination_planned_chain_bind_suppressed",
+                    intended_path=str(projection_terminal or next_branch)[:400],
+                    reason="graph_authority_allocation_descendant_deferred",
+                    miss_reason=_miss_ad,
+                    path_excerpt=str(next_branch)[:260],
+                    nearest_visible_parent=str(expected_parent_before)[:400],
+                    candidate_count=int(_cc_ad),
+                )
+                cur_pl_ld = self._destination_model_index_user_role_dict(cur_ix)
+                if (
+                    self._destination_row_is_live_graph_structure(cur_pl_ld)
+                    and not cur_pl_ld.get("children_loaded")
+                    and not cur_pl_ld.get("load_failed")
+                ):
+                    self._request_graph_destination_children_load(
+                        cur_ix.siblingAtColumn(0) if cur_ix.column() != 0 else cur_ix,
+                        reason="allocation_descendant_deferred",
+                    )
+                st["desc_index"] += 1
+                st["walk_phase"] = "next_descendant"
+                return "next_descendant"
+
+        log_info(
+            "startup_lifecycle_temp_live_descendant_missing_from_cache",
+            canonical_path_excerpt=str(next_branch)[:400],
+            segment_index=int(i),
+            bind_context_excerpt=str(descendant_source_path)[:220],
+        )
+        rem = rel_clean[i:]
+        self._destination_graph_descendant_apply_bind_one_segment(
+            st, cur_ix, rem, expected_parent_before, descendant_data, descendant_source_path, projection_terminal
+        )
+        return "continue"
+
+    def _destination_graph_descendant_apply_bind_one_segment(
+        self,
+        st,
+        cur_ix: QModelIndex,
+        rem: list[str],
+        expected_parent_before: str,
+        descendant_data,
+        descendant_source_path: str,
+        projection_terminal,
+    ) -> None:
+        """Bind exactly the first segment of ``rem`` (incremental injection)."""
+        if not rem:
+            return
+        seg0 = rem[0]
+        terminal_one = len(rem) == 1
+        t0 = time.perf_counter()
+        log_info(
+            "startup_lifecycle_temp_live_descendant_injected_chunk_begin",
+            segment_excerpt=str(seg0)[:200],
+            remaining_segments=int(len(rem)),
+            bind_context_excerpt=str(descendant_source_path)[:220],
+        )
+        self._destination_descendant_apply_graph_bind_depth = int(
+            getattr(self, "_destination_descendant_apply_graph_bind_depth", 0) or 0
+        ) + 1
+        bound = None
+        try:
+            bound = self._sharepoint_bind_planned_segment_chain(
+                cur_ix,
+                [seg0],
+                bind_kind="allocation_descendant",
+                bind_context_excerpt=str(descendant_source_path)[:220],
+                expected_parent_canonical=expected_parent_before,
+                projection_target_canonical=projection_terminal,
+                terminal_is_file=bool(terminal_one and self._source_tree_payload_implies_file_leaf(descendant_data)),
+            )
+        finally:
+            self._destination_descendant_apply_graph_bind_depth = max(
+                0,
+                int(getattr(self, "_destination_descendant_apply_graph_bind_depth", 0) or 0) - 1,
+            )
+        wall_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        log_info(
+            "startup_lifecycle_temp_live_descendant_injected_chunk_end",
+            wall_ms=wall_ms,
+            entries_processed=1,
+            segment_excerpt=str(seg0)[:200],
+            bind_context_excerpt=str(descendant_source_path)[:220],
+        )
+        if bound is not None and bound.isValid():
+            st["seg_index"] = int(st.get("seg_index") or 0) + 1
+        else:
+            st["desc_index"] += 1
+            st["walk_phase"] = "next_descendant"
 
     def _destination_descendant_apply_prepare_next_descendant(self, st) -> str:
         """Advance to the next non-skipped descendant. Returns 'walk', 'done', or 'stale'."""
+        if st.get("graph_walk"):
+            return self._destination_graph_descendant_apply_prepare_next_descendant(st)
         descendants = st["descendants"]
         parent_ix = st["parent_ix"]
         parent_data = st["parent_data"]
@@ -30441,6 +34169,8 @@ class MainWindow(QMainWindow):
 
     def _destination_descendant_apply_process_one_segment(self, st) -> str:
         """Process one segment of the current descendant. Returns 'continue', 'next_descendant', 'stale', or 'done'."""
+        if st.get("graph_walk"):
+            return self._destination_graph_descendant_apply_process_one_segment(st)
         model = st["model"]
         relative_segments = st["relative_segments"]
         descendant_data = st["descendant_data"]
@@ -30509,6 +34239,43 @@ class MainWindow(QMainWindow):
         return "continue"
 
     def _destination_descendant_apply_finalize_job(self, st) -> None:
+        if st.get("graph_walk"):
+            move = st["move"]
+            overlay_count = int(st.get("overlay_count") or 0)
+            dm = st.get("model")
+            parent_ix = st.get("parent_ix")
+            ap = str(st.get("allocation_destination_path") or "").strip()
+            if dm is not None and ap:
+                fresh = self._destination_graph_descendant_resolve_model_index_for_path(dm, ap)
+                if fresh is not None and fresh.isValid():
+                    parent_ix = fresh
+                    log_info(
+                        "descendant_apply_index_revalidated",
+                        phase="graph_finalize_parent",
+                        path_excerpt=str(ap)[:400],
+                    )
+            if parent_ix is not None and isinstance(parent_ix, QModelIndex) and parent_ix.isValid():
+                self._mark_allocation_descendants_applied_on_allocation_folder_model_index(parent_ix, move)
+                node_after = self._destination_model_index_user_role_dict(parent_ix)
+                self._stamp_allocation_projection_cache_metadata_index(parent_ix, node_after, move)
+            tree = getattr(self, "destination_tree_widget", None)
+            if tree is not None:
+                try:
+                    tree.viewport().update()
+                except Exception:
+                    pass
+            cb = st.get("on_complete")
+            if cb is not None:
+                try:
+                    cb(overlay_count)
+                except Exception:
+                    log_info(
+                        "destination_descendant_apply_on_complete_failed",
+                        reason="callback_exception_graph_walk",
+                    )
+            self._promote_destination_workspace_snapshot_after_structure_change()
+            return
+
         model = st["model"]
         parent_ix = st["parent_ix"]
         move = st["move"]
@@ -30532,70 +34299,147 @@ class MainWindow(QMainWindow):
                 tree.viewport().update()
             except Exception:
                 pass
+        self._promote_destination_workspace_snapshot_after_structure_change()
 
     def _run_destination_descendant_apply_tick(self) -> None:
+        if _shutdown_mutation_skip_for_host(self, "_run_destination_descendant_apply_tick"):
+            return
         if getattr(self, "_destination_descendant_apply_paused_for_finalize_alloc", False):
             return
+        if getattr(self, "_destination_descendant_apply_tick_running", False):
+            log_info("descendant_apply_reentrant_guard_skip", reason="nested_descendant_apply_tick")
+            self._schedule_destination_descendant_apply_tick()
+            return
+        self._destination_descendant_apply_tick_running = True
+        try:
+            self._run_destination_descendant_apply_tick_body()
+        finally:
+            self._destination_descendant_apply_tick_running = False
+
+    def _run_destination_descendant_apply_tick_body(self) -> None:
+        st_gate = getattr(self, "_destination_descendant_apply_state", None)
+        _scroll_fn = getattr(self, "_destination_user_scroll_interaction_active", None)
+        if (
+            st_gate is not None
+            and st_gate.get("graph_walk")
+            and callable(_scroll_fn)
+            and _scroll_fn()
+        ):
+            log_info(
+                "startup_lifecycle_temp_live_descendant_injected_deferred_due_to_interaction",
+                reason="destination_tree_scroll_active",
+            )
+            self._schedule_destination_descendant_apply_tick()
+            return
+        dm = getattr(self, "destination_planning_model", None)
+        _prof = str(os.environ.get("OZLINK_DEST_INJECT_PROFILE", "") or "").strip().lower() in ("1", "true", "yes")
+        _t0 = time.perf_counter() if _prof else None
         budget_s = float(getattr(self, "_destination_descendant_apply_budget_s", 0.005) or 0.005)
+        if st_gate is not None and st_gate.get("graph_walk"):
+            budget_s = float(
+                st_gate.get("graph_budget_s") or getattr(self, "_destination_graph_descendant_apply_budget_s", 0.01) or 0.01
+            )
         deadline = time.perf_counter() + budget_s
+        max_graph_ops = int(getattr(self, "_destination_graph_descendant_apply_max_ops_per_tick", 8) or 8)
+        graph_ops = 0
+        _coalesced = False
+        if dm is not None:
+            cbs = getattr(dm, "begin_coalesce_destination_structure_signal", None)
+            if callable(cbs):
+                cbs()
+                _coalesced = True
 
         def _budget_left() -> bool:
             return time.perf_counter() < deadline
 
-        while _budget_left():
-            if self._destination_descendant_apply_state is None:
-                if not self._destination_descendant_apply_queue:
-                    return
-                parent_ix, move, on_complete = self._destination_descendant_apply_queue.popleft()
-                st = self._build_destination_descendant_apply_state(parent_ix, move, on_complete)
-                if st is None:
-                    if on_complete is not None:
-                        try:
-                            on_complete(0)
-                        except Exception:
-                            log_info(
-                                "destination_descendant_apply_on_complete_failed",
-                                reason="callback_exception_nil_state",
-                            )
-                    continue
-                self._destination_descendant_apply_state = st
+        try:
+            while _budget_left():
+                st_cur = getattr(self, "_destination_descendant_apply_state", None)
+                if st_cur is not None and st_cur.get("graph_walk") and graph_ops >= max_graph_ops:
+                    break
+                if getattr(self, "_destination_descendant_apply_state", None) is None:
+                    dq = getattr(self, "_destination_descendant_apply_queue", None)
+                    if not dq:
+                        return
+                    ent = dq.popleft()
+                    if len(ent) >= 5:
+                        parent_ix, move, on_complete, enq_r, col_r = ent[0], ent[1], ent[2], ent[3], ent[4]
+                    else:
+                        parent_ix, move, on_complete = ent[0], ent[1], ent[2]
+                        enq_r, col_r = "", ""
+                    st = self._build_destination_descendant_apply_state(
+                        parent_ix,
+                        move,
+                        on_complete,
+                        enqueue_reason=str(enq_r or ""),
+                        collect_reason=str(col_r or ""),
+                    )
+                    if st is None:
+                        if on_complete is not None:
+                            try:
+                                on_complete(0)
+                            except Exception:
+                                log_info(
+                                    "destination_descendant_apply_on_complete_failed",
+                                    reason="callback_exception_nil_state",
+                                )
+                        continue
+                    self._destination_descendant_apply_state = st
 
-            st = self._destination_descendant_apply_state
-            phase = st.get("walk_phase")
-            if phase == "next_descendant":
-                nxt = self._destination_descendant_apply_prepare_next_descendant(st)
-                if nxt == "stale":
-                    self._destination_descendant_apply_abort_stale(st)
-                    self._destination_descendant_apply_state = None
+                st = self._destination_descendant_apply_state
+                phase = st.get("walk_phase")
+                if phase == "next_descendant":
+                    nxt = self._destination_descendant_apply_prepare_next_descendant(st)
+                    if nxt == "stale":
+                        self._destination_descendant_apply_abort_stale(st)
+                        self._destination_descendant_apply_state = None
+                        continue
+                    if nxt == "done":
+                        self._destination_descendant_apply_finalize_job(st)
+                        if not st.get("graph_walk"):
+                            cb = st.get("on_complete")
+                            if cb is not None:
+                                try:
+                                    cb(st["added_count"])
+                                except Exception:
+                                    log_info(
+                                        "destination_descendant_apply_on_complete_failed",
+                                        reason="callback_exception",
+                                    )
+                        self._destination_descendant_apply_state = None
+                        continue
+                    st["walk_phase"] = "walk"
                     continue
-                if nxt == "done":
-                    self._destination_descendant_apply_finalize_job(st)
-                    cb = st.get("on_complete")
-                    if cb is not None:
-                        try:
-                            cb(st["added_count"])
-                        except Exception:
-                            log_info(
-                                "destination_descendant_apply_on_complete_failed",
-                                reason="callback_exception",
-                            )
-                    self._destination_descendant_apply_state = None
+                if phase == "walk":
+                    r = self._destination_descendant_apply_process_one_segment(st)
+                    if st.get("graph_walk"):
+                        graph_ops += 1
+                    if r == "stale":
+                        self._destination_descendant_apply_abort_stale(st)
+                        self._destination_descendant_apply_state = None
+                        continue
+                    if r == "next_descendant":
+                        st["walk_phase"] = "next_descendant"
                     continue
-                st["walk_phase"] = "walk"
-                continue
-            if phase == "walk":
-                r = self._destination_descendant_apply_process_one_segment(st)
-                if r == "stale":
-                    self._destination_descendant_apply_abort_stale(st)
-                    self._destination_descendant_apply_state = None
-                    continue
-                if r == "next_descendant":
-                    st["walk_phase"] = "next_descendant"
-                continue
-            st["walk_phase"] = "next_descendant"
+                st["walk_phase"] = "next_descendant"
 
-        if self._destination_descendant_apply_state is not None or self._destination_descendant_apply_queue:
-            self._schedule_destination_descendant_apply_tick()
+            if getattr(self, "_destination_descendant_apply_inline_drain", False):
+                return
+            dq_tail = getattr(self, "_destination_descendant_apply_queue", None)
+            if getattr(self, "_destination_descendant_apply_state", None) is not None or dq_tail:
+                self._schedule_destination_descendant_apply_tick()
+        finally:
+            if _coalesced and dm is not None:
+                cbe = getattr(dm, "end_coalesce_destination_structure_signal", None)
+                if callable(cbe):
+                    cbe()
+            if _prof and _t0 is not None:
+                log_info(
+                    "destination_inject_tick_profile",
+                    wall_ms=round((time.perf_counter() - _t0) * 1000.0, 3),
+                    graph_ops=int(graph_ops),
+                    max_graph_ops=int(max_graph_ops),
+                )
 
     def _destination_descendant_apply_abort_stale(self, st) -> None:
         try:
@@ -30621,30 +34465,101 @@ class MainWindow(QMainWindow):
                     reason="callback_exception_stale_abort",
                 )
 
-    def _enqueue_destination_descendant_apply_to_model(self, parent_ix: QModelIndex, move, on_complete=None) -> bool:
+    def _destination_descendant_apply_pending_for_parent_index(self, ix: QModelIndex) -> bool:
+        """True while a descendant-apply job is active or queued for this allocation parent index."""
+        if ix is None or not ix.isValid():
+            return False
+        t0 = ix.siblingAtColumn(0) if ix.column() != 0 else ix
+        st = getattr(self, "_destination_descendant_apply_state", None)
+        if isinstance(st, dict):
+            pix = st.get("parent_ix")
+            if isinstance(pix, QModelIndex) and pix.isValid():
+                p0 = pix.siblingAtColumn(0) if pix.column() != 0 else pix
+                if p0 == t0:
+                    return True
+        dq = getattr(self, "_destination_descendant_apply_queue", None)
+        if dq:
+            for ent in dq:
+                if not ent:
+                    continue
+                qix = ent[0]
+                if isinstance(qix, QModelIndex) and qix.isValid():
+                    q0 = qix.siblingAtColumn(0) if qix.column() != 0 else qix
+                    if q0 == t0:
+                        return True
+        return False
+
+    def _enqueue_destination_descendant_apply_to_model(
+        self,
+        parent_ix: QModelIndex,
+        move,
+        on_complete=None,
+        *,
+        enqueue_reason: str = "",
+        collect_reason: str = "",
+    ) -> bool:
         """Queue incremental allocation-descendant application for a QModelIndex. State is built when the job runs."""
-        if destination_authority_contract.graph_owns_visible_real_destination_structure(self):
+        if _shutdown_mutation_skip_for_host(
+            self,
+            "_enqueue_destination_descendant_apply_to_model",
+            enqueue_reason=str(enqueue_reason or "")[:200],
+        ):
             return False
         model = getattr(self, "destination_planning_model", None)
         if model is None or not parent_ix.isValid():
             return False
         if hasattr(model, "is_index_live") and not model.is_index_live(parent_ix):
             return False
-        st = self._destination_descendant_apply_state
+        dq = getattr(self, "_destination_descendant_apply_queue", None)
+        if dq is None:
+            dq = deque()
+            self._destination_descendant_apply_queue = dq
+        st = getattr(self, "_destination_descendant_apply_state", None)
         if st is not None:
             pix = st.get("parent_ix")
             if pix is not None and pix == parent_ix:
+                log_info(
+                    "destination_descendant_apply_enqueue_skipped_duplicate_parent",
+                    enqueue_reason=str(enqueue_reason or "")[:200],
+                    reason="active_job_same_parent_index",
+                )
                 return True
-        for qix, _, _ in self._destination_descendant_apply_queue:
+        for ent in dq:
+            qix = ent[0]
             if qix == parent_ix:
+                log_info(
+                    "destination_descendant_apply_enqueue_skipped_duplicate_parent",
+                    enqueue_reason=str(enqueue_reason or "")[:200],
+                    reason="already_queued_same_parent_index",
+                )
                 return True
-        self._destination_descendant_apply_queue.append((parent_ix, move, on_complete))
+        dq.append((parent_ix, move, on_complete, str(enqueue_reason or ""), str(collect_reason or "")))
+        log_info(
+            "destination_descendant_apply_enqueued",
+            enqueue_reason=str(enqueue_reason or "")[:200],
+            collect_reason=str(collect_reason or "")[:200],
+            queue_len=len(dq),
+        )
         self._schedule_destination_descendant_apply_tick()
         return True
 
-    def _apply_allocation_descendants_to_model_index(self, parent_ix: QModelIndex, move, completion_callback=None) -> int:
+    def _apply_allocation_descendants_to_model_index(
+        self,
+        parent_ix: QModelIndex,
+        move,
+        completion_callback=None,
+        *,
+        enqueue_reason: str = "",
+        collect_reason: str = "",
+    ) -> int:
         """Apply projected allocation descendants under parent_ix. Work is incremental; return value is always 0."""
-        self._enqueue_destination_descendant_apply_to_model(parent_ix, move, completion_callback)
+        self._enqueue_destination_descendant_apply_to_model(
+            parent_ix,
+            move,
+            completion_callback,
+            enqueue_reason=enqueue_reason,
+            collect_reason=collect_reason,
+        )
         return 0
 
     def _allocation_projection_relative_source_segments(self, source_root_path, descendant_source_path):
@@ -30873,7 +34788,12 @@ class MainWindow(QMainWindow):
             else:
                 sem = self._destination_semantic_path(node_data)
                 if self._destination_bind_should_apply_allocation_descendants_now(sem, nt):
-                    applied_count += self._apply_allocation_descendants_to_model_index(ix, move)
+                    applied_count += self._apply_allocation_descendants_to_model_index(
+                        ix,
+                        move,
+                        collect_reason="eager_bind_allocation_descendants",
+                        enqueue_reason="eager_bind_allocation_descendants",
+                    )
             if allocation_pass % 2 == 0:
                 QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
         if applied_count:
@@ -31163,6 +35083,217 @@ class MainWindow(QMainWindow):
             full_tree_entries=len(self._destination_full_tree_snapshot or []),
             visible_gap_fill_entries=visible_filled_gaps,
             reconcile_policy="live_full_tree_wins_path_collision",
+        )
+
+    def _destination_begin_full_tree_idle_snapshot_merge_chunks(
+        self,
+        *,
+        allow_defer: bool,
+        prefer_chunked_projection: bool,
+        narrow_restore_real_snapshot: bool,
+    ) -> None:
+        """Split full-tree / visible digest merge across GUI timer slices (not one blocking wave)."""
+        self._destination_full_tree_idle_merge_chunk_active = True
+        current_drive_id = self._current_selected_destination_drive_id() or self.pending_root_drive_ids.get(
+            "destination", ""
+        )
+        snapshot: list = []
+        tree = getattr(self, "destination_tree_widget", None)
+        if tree is None:
+            self._destination_real_tree_snapshot = []
+            self._destination_real_tree_snapshot_stale = False
+            self._destination_full_tree_idle_merge_chunk_active = False
+            self._destination_full_tree_idle_light_overlay = True
+            QTimer.singleShot(
+                0,
+                lambda: self._safe_invoke(
+                    "destination_full_tree_idle_light_overlay_empty_tree",
+                    lambda: self._apply_destination_planning_overlays(
+                        "destination_full_tree_idle_success",
+                        allow_defer=allow_defer,
+                        prefer_chunked_projection=prefer_chunked_projection,
+                        narrow_restore_real_snapshot=narrow_restore_real_snapshot,
+                    ),
+                ),
+            )
+            return
+        self._collect_real_destination_snapshot_entries_index(snapshot)
+        full_tree_ready = (
+            bool(self._destination_full_tree_snapshot)
+            and self._destination_full_tree_completed_drive_id == current_drive_id
+        )
+        if not full_tree_ready:
+            self._destination_real_tree_snapshot = snapshot
+            self._destination_real_tree_snapshot_stale = False
+            self._destination_full_tree_idle_merge_chunk_active = False
+            self._destination_full_tree_idle_light_overlay = True
+            QTimer.singleShot(
+                0,
+                lambda: self._safe_invoke(
+                    "destination_full_tree_idle_light_overlay_no_full_walk",
+                    lambda: self._apply_destination_planning_overlays(
+                        "destination_full_tree_idle_success",
+                        allow_defer=allow_defer,
+                        prefer_chunked_projection=prefer_chunked_projection,
+                        narrow_restore_real_snapshot=narrow_restore_real_snapshot,
+                    ),
+                ),
+            )
+            return
+
+        self._destination_ft_idle_merge_state = {
+            "phase": "full_tree",
+            "ft_list": list(self._destination_full_tree_snapshot or []),
+            "i": 0,
+            "merged_by_path": {},
+            "visible_list": list(snapshot),
+            "gap_i": 0,
+            "visible_filled_gaps": 0,
+            "saved_allow_defer": bool(allow_defer),
+            "saved_prefer_chunked": bool(prefer_chunked_projection),
+            "saved_narrow_restore": bool(narrow_restore_real_snapshot),
+        }
+        log_info(
+            "startup_lifecycle_temp_full_tree_idle_finalize_bypassed",
+            note="broad_inline_overlay_deferred_to_chunked_digest_merge",
+            full_tree_entry_count=len(self._destination_full_tree_snapshot or []),
+            visible_entry_count=len(snapshot),
+        )
+        QTimer.singleShot(
+            0,
+            lambda: self._safe_invoke(
+                "destination_full_tree_idle_merge_chunk_tick",
+                self._destination_full_tree_idle_merge_chunk_tick,
+            ),
+        )
+
+    def _destination_full_tree_idle_merge_chunk_tick(self) -> None:
+        st = getattr(self, "_destination_ft_idle_merge_state", None)
+        if not isinstance(st, dict):
+            self._destination_full_tree_idle_merge_chunk_active = False
+            return
+        if self._destination_user_scroll_interaction_active():
+            log_info(
+                "startup_lifecycle_temp_full_tree_idle_deferred_due_to_interaction",
+                detail="destination_tree_scroll_window_active",
+            )
+            QTimer.singleShot(
+                120,
+                lambda: self._safe_invoke(
+                    "destination_full_tree_idle_merge_after_scroll",
+                    self._destination_full_tree_idle_merge_chunk_tick,
+                ),
+            )
+            return
+        t0 = time.perf_counter()
+        budget_s = float(getattr(self, "_destination_full_tree_idle_chunk_budget_s", 0.01) or 0.01)
+        cap = int(getattr(self, "_destination_full_tree_idle_chunk_max_entries", 32) or 32)
+        phase = str(st.get("phase") or "")
+        log_info(
+            "startup_lifecycle_temp_full_tree_idle_chunk_begin",
+            phase=phase,
+            budget_ms=round(budget_s * 1000.0, 2),
+            max_entries=int(cap),
+        )
+        entries_processed = 0
+        merged = st["merged_by_path"]
+        try:
+            if phase == "full_tree":
+                ft = st["ft_list"]
+                i = int(st.get("i", 0) or 0)
+                while (
+                    i < len(ft)
+                    and entries_processed < cap
+                    and (time.perf_counter() - t0) < budget_s
+                ):
+                    entry = ft[i]
+                    semantic_path = self.normalize_memory_path(entry.get("semantic_path", ""))
+                    if semantic_path:
+                        merged[semantic_path] = dict(entry)
+                    i += 1
+                    entries_processed += 1
+                st["i"] = i
+                if i >= len(ft):
+                    st["phase"] = "gap_fill"
+            if str(st.get("phase") or "") == "gap_fill":
+                vis = st["visible_list"]
+                j = int(st.get("gap_i", 0) or 0)
+                visible_filled = int(st.get("visible_filled_gaps", 0) or 0)
+                while (
+                    j < len(vis)
+                    and entries_processed < cap
+                    and (time.perf_counter() - t0) < budget_s
+                ):
+                    entry = vis[j]
+                    semantic_path = self.normalize_memory_path(entry.get("semantic_path", ""))
+                    if semantic_path and semantic_path not in merged:
+                        merged[semantic_path] = dict(entry)
+                        visible_filled += 1
+                    j += 1
+                    entries_processed += 1
+                st["gap_i"] = j
+                st["visible_filled_gaps"] = visible_filled
+                if j >= len(vis):
+                    st["phase"] = "commit"
+            if str(st.get("phase") or "") == "commit":
+                merged_snapshot = list(merged.values())
+                merged_snapshot.sort(
+                    key=lambda value: (
+                        [segment.lower() for segment in self._path_segments(value.get("semantic_path", ""))],
+                    ),
+                )
+                self._destination_real_tree_snapshot = merged_snapshot
+                self._destination_real_tree_snapshot_stale = False
+                self._log_restore_phase(
+                    "destination_real_snapshot_merged_full_tree",
+                    merged_total=len(merged_snapshot),
+                    visible_model_entries=len(st.get("visible_list") or []),
+                    full_tree_entries=len(st.get("ft_list") or []),
+                    visible_gap_fill_entries=int(st.get("visible_filled_gaps", 0) or 0),
+                    reconcile_policy="live_full_tree_wins_path_collision",
+                )
+                _ad = bool(st.get("saved_allow_defer", True))
+                _pc = bool(st.get("saved_prefer_chunked", True))
+                _nr = bool(st.get("saved_narrow_restore", False))
+                self._destination_ft_idle_merge_state = None
+                self._destination_full_tree_idle_merge_chunk_active = False
+                self._destination_full_tree_idle_light_overlay = True
+                wall_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+                log_info(
+                    "startup_lifecycle_temp_full_tree_idle_chunk_end",
+                    phase="commit",
+                    wall_ms=wall_ms,
+                    entries_processed=int(entries_processed),
+                )
+
+                def _light():
+                    self._apply_destination_planning_overlays(
+                        "destination_full_tree_idle_success",
+                        allow_defer=_ad,
+                        prefer_chunked_projection=_pc,
+                        narrow_restore_real_snapshot=_nr,
+                    )
+
+                QTimer.singleShot(0, lambda: self._safe_invoke("destination_full_tree_idle_light_overlay", _light))
+                return
+        except Exception as exc:
+            self._log_restore_exception("destination_full_tree_idle_merge_chunk_tick", exc)
+            self._destination_ft_idle_merge_state = None
+            self._destination_full_tree_idle_merge_chunk_active = False
+            return
+        wall_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        log_info(
+            "startup_lifecycle_temp_full_tree_idle_chunk_end",
+            phase=str(st.get("phase") or ""),
+            wall_ms=wall_ms,
+            entries_processed=int(entries_processed),
+        )
+        QTimer.singleShot(
+            0,
+            lambda: self._safe_invoke(
+                "destination_full_tree_idle_merge_chunk_continue",
+                self._destination_full_tree_idle_merge_chunk_tick,
+            ),
         )
 
     def _ensure_visible_destination_root_children_in_model(self, model_nodes, *, planning_relevant_paths: set[str] | None = None):
@@ -35969,13 +40100,54 @@ class MainWindow(QMainWindow):
                 src["item_path"] = out["item_path"]
         return out
 
-    def _clear_source_projection_descendants_cache(self):
+    def _log_source_projection_descendants_cache_event(
+        self,
+        op: str,
+        *,
+        reason: str = "",
+        caller: str = "",
+        stable_key_excerpt: str = "",
+        legacy_key_excerpt: str = "",
+        source_root_excerpt: str = "",
+        destination_root_excerpt: str = "",
+        entry_count_before: int | None = None,
+        entry_count_after: int | None = None,
+        descendant_count: int | None = None,
+        evicted_key_excerpt: str = "",
+        note: str = "",
+    ) -> None:
+        log_info(
+            "source_projection_descendants_cache_event",
+            op=str(op or "")[:80],
+            reason=str(reason or "")[:220],
+            caller=str(caller or "")[:160],
+            stable_key_excerpt=str(stable_key_excerpt)[:220],
+            legacy_key_excerpt=str(legacy_key_excerpt)[:220],
+            source_root_excerpt=str(source_root_excerpt)[:400],
+            destination_root_excerpt=str(destination_root_excerpt)[:400],
+            entry_count_before=entry_count_before,
+            entry_count_after=entry_count_after,
+            descendant_count=descendant_count,
+            evicted_key_excerpt=str(evicted_key_excerpt)[:220],
+            note=str(note or "")[:300],
+        )
+
+    def _clear_source_projection_descendants_cache(self, *, reason: str = "unspecified", caller: str = ""):
         od = getattr(self, "_source_projection_descendants_cache", None)
+        prev_n = len(od) if isinstance(od, OrderedDict) else None
         if isinstance(od, OrderedDict):
             od.clear()
         um = getattr(self, "_source_projection_descendants_unready_empty_until", None)
         if isinstance(um, dict):
             um.clear()
+        self._log_source_projection_descendants_cache_event(
+            "full_clear",
+            reason=str(reason or "unspecified"),
+            caller=str(caller or ""),
+            entry_count_before=prev_n,
+            entry_count_after=0,
+            note="cleared_ordereddict_and_unready_map",
+        )
 
     def _projection_descendants_planned_signature_digest(self) -> str:
         pm = getattr(self, "planned_moves", None) or []
@@ -35996,6 +40168,16 @@ class MainWindow(QMainWindow):
             sp,
         )
 
+    def _source_projection_descendants_cache_key_graph_subtree_stable(self, source_root_data) -> tuple:
+        """Stable key for Graph subtree enumeration: same drive item + source path, independent of other planned moves."""
+        sp = self._canonical_source_projection_path(self._tree_item_path(source_root_data))
+        return (
+            "graph_drive_subtree_v1",
+            str(source_root_data.get("drive_id") or ""),
+            str(source_root_data.get("id") or ""),
+            sp,
+        )
+
     def _source_projection_descendants_cache_get(self, key):
         od = getattr(self, "_source_projection_descendants_cache", None)
         if not isinstance(od, OrderedDict) or not key:
@@ -36005,22 +40187,66 @@ class MainWindow(QMainWindow):
         od.move_to_end(key)
         return copy.deepcopy(od[key])
 
-    def _source_projection_descendants_cache_put(self, key, descendants):
+    def _source_projection_descendants_cache_put(
+        self,
+        key,
+        descendants,
+        *,
+        reason: str = "put",
+        caller: str = "",
+        source_root_excerpt: str = "",
+        destination_root_excerpt: str = "",
+    ):
         if not key:
             return
         od = getattr(self, "_source_projection_descendants_cache", None)
         if not isinstance(od, OrderedDict):
             return
+        prev_n = len(od)
         od[key] = copy.deepcopy(descendants)
         od.move_to_end(key)
         lim = int(getattr(self, "_source_projection_descendants_cache_limit", 96) or 96)
+        evicted_ex = ""
         while len(od) > lim:
-            od.popitem(last=False)
+            k_old, _ = od.popitem(last=False)
+            try:
+                evicted_ex = str(k_old)[:220]
+            except Exception:
+                evicted_ex = ""
+            self._log_source_projection_descendants_cache_event(
+                "lru_evict",
+                reason="cache_size_limit",
+                caller=str(caller or ""),
+                evicted_key_excerpt=evicted_ex,
+                entry_count_after=len(od),
+                note=f"limit={lim}",
+            )
+        dc = len(descendants or []) if isinstance(descendants, list) else None
+        ks = str(key)
+        _is_stable = isinstance(key, tuple) and len(key) > 0 and key[0] == "graph_drive_subtree_v1"
+        self._log_source_projection_descendants_cache_event(
+            "put",
+            reason=str(reason or "put"),
+            caller=str(caller or ""),
+            stable_key_excerpt=ks[:220] if _is_stable else "",
+            legacy_key_excerpt=ks[:220] if not _is_stable else "",
+            source_root_excerpt=str(source_root_excerpt)[:400],
+            destination_root_excerpt=str(destination_root_excerpt)[:400],
+            entry_count_before=prev_n,
+            entry_count_after=len(od),
+            descendant_count=dc,
+            note="write_copy_deepclone",
+        )
 
-    def _collect_source_descendants_for_projection(self, source_root_data, move=None):
-        """
-        Prefer walking the in-memory source tree when the allocation root is visible and fully loaded.
-        Otherwise enumerate via Graph (slow on large folders) or partially-loaded tree as last resort.
+    def _collect_source_descendants_for_projection(self, source_root_data, move=None, *, collect_reason: str = ""):
+        """Enumerate allocation source descendants for destination projection.
+
+        When ``drive_id`` and ``id`` are available on the source root (after enrichment), Microsoft Graph
+        ``list_drive_subtree_items_normalized`` is the **authoritative** enumeration path. The visible source
+        tree may be shallow or partially expanded; projection must not depend on
+        :meth:`_source_subtree_fully_loaded_in_tree` or in-model walks for that case.
+
+        In-model subtree iteration is **fallback only** when Graph ids are missing or Graph enumeration fails.
         """
         if move is None:
             move = {"source": source_root_data, "source_path": self._tree_item_path(source_root_data)}
@@ -36031,59 +40257,73 @@ class MainWindow(QMainWindow):
         source_item = self._find_source_item_for_planned_move(move)
         base_diag = self._destination_projection_diag_payload(source_root_data, move, source_item)
 
-        if source_item is not None and self._source_subtree_fully_loaded_in_tree(source_item):
-            cache_key = self._source_projection_descendants_cache_key_for_root(source_root_data)
-            cached = self._source_projection_descendants_cache_get(cache_key)
+        drive_id = str(source_root_data.get("drive_id", "") or "").strip()
+        item_id = str(source_root_data.get("id", "") or "").strip()
+        item_path = str(source_root_data.get("item_path", "") or "").strip()
+        sp_excerpt = self._canonical_source_projection_path(self._tree_item_path(source_root_data)) or item_path
+        dest_root_excerpt = ""
+        try:
+            dest_root_excerpt = str(self._allocation_projection_path(move) or "")[:400] if move else ""
+        except Exception:
+            dest_root_excerpt = ""
+        digest_prefix = ""
+        try:
+            digest_prefix = str(self._projection_descendants_planned_signature_digest() or "")[:16]
+        except Exception:
+            digest_prefix = ""
+
+        stable_key = self._source_projection_descendants_cache_key_graph_subtree_stable(source_root_data)
+        legacy_key = self._source_projection_descendants_cache_key_for_root(source_root_data)
+        graph_attempted = False
+        graph_error: str | None = None
+
+        if drive_id and item_id:
+            cached = self._source_projection_descendants_cache_get(stable_key)
+            cache_tier = "stable_hit"
+            if cached is None:
+                cached = self._source_projection_descendants_cache_get(legacy_key)
+                cache_tier = "legacy_hit" if cached is not None else "miss_graph_api_next"
+            log_info(
+                "projection_source_descendants_collect",
+                collect_reason=str(collect_reason or "")[:200],
+                source_root_path_excerpt=str(sp_excerpt)[:400],
+                destination_root_excerpt=str(dest_root_excerpt)[:400],
+                subtree_cache_state=str(cache_tier),
+                planned_moves_digest_prefix=str(digest_prefix),
+                stable_cache_key_excerpt=str(stable_key)[:220],
+            )
             if cached is not None:
+                log_info(
+                    "projection_source_descendants_finished",
+                    projection_source_descendants_branch="graph_subtree",
+                    descendant_count=len(cached or []),
+                    cache_hit=True,
+                    cache_tier=str(cache_tier),
+                    subtree_lifecycle_state="completed_cached",
+                    fallback_reason="",
+                )
                 self._log_destination_projection_collect_result(
                     cached,
-                    branch="tree_fully_loaded_cache",
+                    branch="graph_subtree",
                     graph_attempted=False,
                     graph_error=None,
                     **base_diag,
                 )
                 return cached
-            descendants = []
-            for descendant_item in self._iter_source_tree_subtree_rows(source_item):
-                if descendant_item == source_item:
-                    continue
-                descendant_data = self._source_tree_row_payload(descendant_item)
-                if descendant_data.get("placeholder"):
-                    continue
-                descendants.append(dict(descendant_data))
-            self._source_projection_descendants_cache_put(cache_key, descendants)
-            self._log_destination_projection_collect_result(
-                descendants,
-                branch="tree_fully_loaded",
-                graph_attempted=False,
-                graph_error=None,
-                **base_diag,
+            log_info(
+                "projection_source_descendants_started",
+                source_root_path_excerpt=str(sp_excerpt)[:400],
+                destination_root_excerpt=str(dest_root_excerpt)[:400],
+                collect_reason=str(collect_reason or "")[:200],
+                subtree_lifecycle_state="miss_graph_api_next",
+                replay_reason="graph_subtree_cache_miss",
+                stable_cache_key_excerpt=str(stable_key)[:220],
+                legacy_cache_key_excerpt=str(legacy_key)[:220],
+                has_drive_id=bool(drive_id),
+                has_item_id=bool(item_id),
+                source_item_found=bool(source_item is not None),
+                note="graph_api_list_drive_subtree_imminent",
             )
-            return descendants
-
-        defer_graph_until_subtree_ready = source_item is not None and not self._source_subtree_fully_loaded_in_tree(
-            source_item
-        )
-        if defer_graph_until_subtree_ready:
-            uk = self._source_projection_descendants_cache_key_for_root(source_root_data)
-            unready_map = getattr(self, "_source_projection_descendants_unready_empty_until", None)
-            if isinstance(unready_map, dict):
-                deadline = unready_map.get(uk)
-                if deadline is not None and time.monotonic() < float(deadline):
-                    # With drive_id + item_id we can still fall back to Graph after an empty partial
-                    # walk; do not short-circuit to silent [].
-                    if not (str(source_root_data.get("drive_id") or "").strip() and str(source_root_data.get("id") or "").strip()):
-                        return []
-
-        drive_id = source_root_data.get("drive_id", "")
-        item_id = source_root_data.get("id", "")
-        item_path = source_root_data.get("item_path", "")
-        graph_attempted = False
-        graph_error = None
-        # Some saved move payloads omit item_path. Graph subtree enumeration
-        # only needs drive_id + item_id; use a safe default when item_path
-        # is missing so projected descendant expansion can resolve.
-        if drive_id and item_id and not defer_graph_until_subtree_ready:
             graph_attempted = True
             try:
                 descendants = self.graph.list_drive_subtree_items_normalized(
@@ -36096,9 +40336,26 @@ class MainWindow(QMainWindow):
                     tree_role="source",
                     parent_item_path=item_path or "/",
                 )
+                _put_kw = dict(
+                    reason=str(collect_reason or "graph_subtree_fill"),
+                    caller="_collect_source_descendants_for_projection",
+                    source_root_excerpt=str(sp_excerpt)[:400],
+                    destination_root_excerpt=str(dest_root_excerpt)[:400],
+                )
+                self._source_projection_descendants_cache_put(stable_key, descendants, **_put_kw)
+                self._source_projection_descendants_cache_put(legacy_key, descendants, **_put_kw)
+                log_info(
+                    "projection_source_descendants_finished",
+                    projection_source_descendants_branch="graph_subtree",
+                    descendant_count=len(descendants or []),
+                    cache_hit=False,
+                    cache_tier="filled_stable_and_legacy",
+                    subtree_lifecycle_state="filled_new",
+                    fallback_reason="",
+                )
                 self._log_destination_projection_collect_result(
                     descendants,
-                    branch="graph",
+                    branch="graph_subtree",
                     graph_attempted=True,
                     graph_error=None,
                     **base_diag,
@@ -36113,6 +40370,16 @@ class MainWindow(QMainWindow):
                     graph_attempted=True,
                     **base_diag,
                 )
+        else:
+            log_info(
+                "projection_source_descendants_collect",
+                collect_reason=str(collect_reason or "")[:200],
+                source_root_path_excerpt=str(sp_excerpt)[:400],
+                destination_root_excerpt=str(dest_root_excerpt)[:400],
+                subtree_cache_state="skipped_no_graph_ids",
+                planned_moves_digest_prefix=str(digest_prefix),
+                stable_cache_key_excerpt=str(stable_key)[:220],
+            )
 
         if source_item is None:
             source_item = self._find_source_item_for_planned_move(
@@ -36121,9 +40388,16 @@ class MainWindow(QMainWindow):
             base_diag = self._destination_projection_diag_payload(source_root_data, move, source_item)
 
         if source_item is None:
-            extra = {}
-            if not graph_attempted and (not drive_id or not item_id):
+            extra: dict[str, Any] = {}
+            if not drive_id or not item_id:
                 extra["graph_skip_reason"] = "missing_drive_id_or_item_id"
+            log_info(
+                "projection_source_descendants_finished",
+                projection_source_descendants_branch="empty_return",
+                descendant_count=0,
+                fallback_reason=str(extra.get("graph_skip_reason") or "no_source_item"),
+                graph_error_excerpt=str(graph_error or "")[:80],
+            )
             self._log_destination_projection_collect_result(
                 [],
                 branch="no_source_item",
@@ -36142,52 +40416,24 @@ class MainWindow(QMainWindow):
             if descendant_data.get("placeholder"):
                 continue
             descendants.append(dict(descendant_data))
-        if defer_graph_until_subtree_ready and not descendants and drive_id and item_id:
-            graph_attempted = True
-            try:
-                descendants = self.graph.list_drive_subtree_items_normalized(
-                    drive_id,
-                    item_id,
-                    site_id=source_root_data.get("site_id", ""),
-                    site_name=source_root_data.get("site_name", ""),
-                    library_id=source_root_data.get("library_id", drive_id),
-                    library_name=source_root_data.get("library_name", ""),
-                    tree_role="source",
-                    parent_item_path=item_path or "/",
-                )
-                self._log_destination_projection_collect_result(
-                    descendants,
-                    branch="graph_fallback_empty_partial_walk",
-                    graph_attempted=True,
-                    graph_error=None,
-                    **base_diag,
-                )
-                um = getattr(self, "_source_projection_descendants_unready_empty_until", None)
-                if isinstance(um, dict):
-                    um.pop(self._source_projection_descendants_cache_key_for_root(source_root_data), None)
-                return descendants
-            except Exception as exc:
-                graph_error = type(exc).__name__
-                self._log_restore_exception("collect_source_descendants_for_projection_graph_fallback", exc)
-                self._log_restore_phase(
-                    "destination_projection_graph_failed",
-                    graph_error=graph_error,
-                    graph_attempted=True,
-                    **base_diag,
-                )
-        if defer_graph_until_subtree_ready and not descendants:
-            uk = self._source_projection_descendants_cache_key_for_root(source_root_data)
-            unready_map = getattr(self, "_source_projection_descendants_unready_empty_until", None)
-            if isinstance(unready_map, dict):
-                ttl = float(getattr(self, "_source_projection_unready_empty_ttl_s", 2.0) or 2.0)
-                unready_map[uk] = time.monotonic() + max(0.25, ttl)
-        elif defer_graph_until_subtree_ready and descendants:
-            unready_map = getattr(self, "_source_projection_descendants_unready_empty_until", None)
-            if isinstance(unready_map, dict):
-                unready_map.pop(self._source_projection_descendants_cache_key_for_root(source_root_data), None)
+
+        if graph_attempted and graph_error:
+            branch = "graph_failed_fallback_partial"
+            fb = f"graph_error={graph_error}"
+        else:
+            branch = "partial_tree"
+            fb = "missing_drive_id_or_item_id"
+
+        log_info(
+            "projection_source_descendants_finished",
+            projection_source_descendants_branch=branch,
+            descendant_count=len(descendants or []),
+            fallback_reason=fb,
+            graph_error_excerpt=str(graph_error or "")[:80],
+        )
         self._log_destination_projection_collect_result(
             descendants,
-            branch="partial_tree_walk",
+            branch=branch,
             graph_attempted=graph_attempted,
             graph_error=graph_error,
             **base_diag,
@@ -36409,7 +40655,11 @@ class MainWindow(QMainWindow):
         source_root_path = self._canonical_source_projection_path(self._tree_item_path(source_root_data))
         source_root_segments = self._path_segments(source_root_path)
         added_count = 0
-        descendants_full = self._collect_source_descendants_for_projection(source_root_data, move)
+        descendants_full = self._collect_source_descendants_for_projection(
+            source_root_data,
+            move,
+            collect_reason="future_model_project_source_descendants",
+        )
         eager, defer_mode, deferred_file_n, total_n = self._destination_partition_descendants_for_projection_files(
             descendants_full
         )
@@ -36514,7 +40764,11 @@ class MainWindow(QMainWindow):
         allocation_destination_path = self._canonical_destination_projection_path(allocation_path)
         source_root_path = self._canonical_source_projection_path(self._tree_item_path(source_root_data))
         source_root_segments = self._path_segments(source_root_path)
-        descendants_full = self._collect_source_descendants_for_projection(source_root_data, move)
+        descendants_full = self._collect_source_descendants_for_projection(
+            source_root_data,
+            move,
+            collect_reason="future_model_allocation_descendant_projection_chunk",
+        )
         eager, defer_mode, deferred_file_n, total_n = self._destination_partition_descendants_for_projection_files(
             descendants_full
         )
@@ -36988,6 +41242,29 @@ class MainWindow(QMainWindow):
         finally:
             self._destination_idle_materialize_reentrancy_block -= 1
 
+    def _destination_expand_tree_index_chain(self, tree, index: QModelIndex) -> None:
+        """Expand ancestors then ``index`` so deep rows become visible (matches source panel restore)."""
+        if tree is None or not isinstance(index, QModelIndex) or not index.isValid():
+            return
+        col0 = index.siblingAtColumn(0) if index.column() != 0 else index
+        if not col0.isValid():
+            return
+        chain: list[QModelIndex] = []
+        par = col0.parent()
+        while par.isValid():
+            p0 = par.siblingAtColumn(0) if par.column() != 0 else par
+            chain.append(p0)
+            par = par.parent()
+        for p in reversed(chain):
+            try:
+                tree.expand(p)
+            except Exception:
+                pass
+        try:
+            tree.expand(col0)
+        except Exception:
+            pass
+
     def _restore_expanded_destination_paths_body(self, expanded_paths):
         tree = getattr(self, "destination_tree_widget", None)
         if tree is None:
@@ -37027,12 +41304,12 @@ class MainWindow(QMainWindow):
                     continue
                 for ix in model.find_indices_for_canonical_destination_path(ck):
                     if ix.isValid():
-                        tree.expand(ix)
+                        self._destination_expand_tree_index_chain(tree, ix)
                         expanded = True
             if not expanded:
                 item = self._find_visible_destination_item_by_path(target_path)
                 if item is not None and isinstance(item, QModelIndex) and item.isValid():
-                    tree.expand(item)
+                    self._destination_expand_tree_index_chain(tree, item)
 
     def _restore_expanded_tree_paths(self, panel_key, expanded_paths):
         if panel_key == "destination":
@@ -37658,11 +41935,34 @@ class MainWindow(QMainWindow):
     def _apply_destination_planning_overlays(
         self, reason, *, allow_defer=True, prefer_chunked_projection=False, narrow_restore_real_snapshot=False
     ):
+        if _shutdown_mutation_skip_for_host(self, "_apply_destination_planning_overlays", reason=str(reason or "")[:200]):
+            return 0
         perf = QElapsedTimer()
         dev = is_dev_mode()
         if dev:
             perf.start()
         r = str(reason or "")
+        if not (r.startswith("deferred_graph_ids_resolved") or "deferred_graph_ids_resolved" in r):
+            self._destination_chunk_planned_workspace_fixpoint = False
+        else:
+            self._destination_fixpoint_slice_continuations = 0
+        if getattr(self, "_destination_quiet_startup_overlay_structural_suppress", False):
+            rr = str(r or "")
+            _quiet_overlay_block = (
+                rr.startswith("deferred_")
+                or rr.startswith("incremental_destination_cache_refresh")
+                or rr.startswith("cache_refresh")
+                or rr == "destination_full_tree_idle_success"
+                or rr == "destination_expand_all_full_tree"
+                or rr == "destination_authority_shell_hard_flush"
+                or rr == "destination_full_tree_after_non_auth_shell"
+                or rr == "destination_authority_shell_force_cleared_after_authoritative_bind"
+            )
+            if _quiet_overlay_block:
+                log_info("destination_planning_overlay_suppressed_quiet_startup", reason=rr[:220])
+                return 0
+            self._destination_quiet_startup_overlay_structural_suppress = False
+            log_info("destination_quiet_startup_overlay_structural_suppress_off", entry_reason=rr[:220])
         self._destination_overlay_terminal_reconcile_done = False
         _force_auth_flush = MainWindow._destination_materialize_requires_authoritative_hard_flush(self, r)
         if _force_auth_flush:
@@ -37719,6 +42019,19 @@ class MainWindow(QMainWindow):
             return 0
         _scroll_idle_fn = getattr(self, "_destination_user_scroll_interaction_active", None)
         if not _force_auth_flush and callable(_scroll_idle_fn) and _scroll_idle_fn():
+            if r == "destination_full_tree_idle_success":
+                log_info(
+                    "startup_lifecycle_temp_full_tree_idle_deferred_due_to_interaction",
+                    reason=r[:220],
+                    detail="destination_tree_scroll_window_active",
+                )
+            elif "deferred_graph_ids_resolved" in r:
+                log_info(
+                    "startup_lifecycle_temp_interaction_deferral",
+                    work_kind="destination_planning_overlay",
+                    reason=r[:220],
+                    detail="destination_tree_scroll_window_active",
+                )
             self._destination_materialize_pended_for_scroll_reason = r
             self._destination_materialize_pended_for_scroll_kwargs = {
                 "allow_defer": allow_defer,
@@ -37731,6 +42044,56 @@ class MainWindow(QMainWindow):
                 t_idle.start(idle_ms)
             self._on_destination_state_mutation(r, None)
             return 0
+        if (
+            not _force_auth_flush
+            and not getattr(self, "_destination_mz_coalesce_drain_invocation", False)
+            and ("deferred_graph_ids_resolved" in r or r.startswith("deferred_graph_ids_resolved"))
+            and getattr(self, "_destination_startup_snapshot_mount_seen", False)
+            and not getattr(self, "_destination_graph_overlay_deferred_frame_kick", False)
+        ):
+            self._destination_graph_overlay_deferred_frame_kick = True
+            _ad, _pc, _nr = bool(allow_defer), bool(prefer_chunked_projection), bool(narrow_restore_real_snapshot)
+            _rr = str(r)
+
+            def _kick_graph_overlay_frame():
+                self._destination_graph_overlay_deferred_frame_kick = False
+                self._apply_destination_planning_overlays(
+                    _rr,
+                    allow_defer=_ad,
+                    prefer_chunked_projection=True,
+                    narrow_restore_real_snapshot=_nr,
+                )
+
+            _t_chunk0 = time.perf_counter()
+            log_info(
+                "startup_lifecycle_temp_materialize_chunk_begin",
+                phase="graph_resolve_overlay_yield_frame",
+                defer_ms=16,
+                reason_excerpt=_rr[:200],
+                schedule_wall_ms=round((time.perf_counter() - _t_chunk0) * 1000.0, 2),
+            )
+            QTimer.singleShot(
+                16,
+                lambda: self._safe_invoke(
+                    "destination_overlay_graph_resolve_frame_defer",
+                    _kick_graph_overlay_frame,
+                ),
+            )
+            self._on_destination_state_mutation(r, None)
+            return 0
+        if (
+            r == "destination_full_tree_idle_success"
+            and not _force_auth_flush
+            and not getattr(self, "_destination_full_tree_idle_light_overlay", False)
+        ):
+            if not self._destination_should_block_idle_full_tree_materialize():
+                self._destination_begin_full_tree_idle_snapshot_merge_chunks(
+                    allow_defer=bool(allow_defer),
+                    prefer_chunked_projection=bool(prefer_chunked_projection),
+                    narrow_restore_real_snapshot=bool(narrow_restore_real_snapshot),
+                )
+                self._on_destination_state_mutation(r, None)
+                return 0
         _timing_probe = (
             r.startswith("draft_reset")
             or "destination_reconcile" in r
@@ -37819,18 +42182,30 @@ class MainWindow(QMainWindow):
                         ),
                         reason=str(r)[:220],
                     )
+                    self._startup_post_snapshot_trace_event(
+                        "destination_materialize_coalesce_requested",
+                        reason_excerpt=str(r)[:160],
+                    )
                 self._destination_mz_coalesce_top_level_active = True
                 self._destination_mz_coalesce_last_allow_defer = bool(allow_defer)
                 self._destination_mz_coalesce_last_prefer_chunked = bool(prefer_chunked_projection)
                 self._destination_mz_coalesce_last_narrow_restore = bool(narrow_restore_real_snapshot)
             try:
-                return self._apply_destination_planning_overlays_body(
-                    reason,
-                    allow_defer=allow_defer,
-                    prefer_chunked_projection=prefer_chunked_projection,
-                    narrow_restore_real_snapshot=narrow_restore_real_snapshot,
-                    force_authoritative_bind=_force_auth_flush,
+                _prev_omat = getattr(self, "_destination_overlay_active_materialize_reason", "")
+                self._destination_overlay_active_materialize_reason = str(reason or "")
+                self._destination_chunk_planned_workspace_fixpoint = "deferred_graph_ids_resolved" in str(
+                    reason or ""
                 )
+                try:
+                    return self._apply_destination_planning_overlays_body(
+                        reason,
+                        allow_defer=allow_defer,
+                        prefer_chunked_projection=prefer_chunked_projection,
+                        narrow_restore_real_snapshot=narrow_restore_real_snapshot,
+                        force_authoritative_bind=_force_auth_flush,
+                    )
+                finally:
+                    self._destination_overlay_active_materialize_reason = _prev_omat
             finally:
                 d = int(getattr(self, "_destination_overlay_batch_structure_depth", 0) or 0) - 1
                 self._destination_overlay_batch_structure_depth = max(0, d)
@@ -38097,10 +42472,41 @@ class MainWindow(QMainWindow):
             "destination_planning_overlay_pass",
             reason=str(reason or ""),
         )
+        self._startup_post_snapshot_trace_event(
+            "destination_planning_overlay_pass",
+            reason_excerpt=str(reason or "")[:160],
+        )
         self._destination_materialize_profile_start_cycle()
         exp_paths = self._destination_expanded_paths_for_planning_bind()
         sel_path = self._destination_selected_path_for_planning_bind()
         ctx = str(reason or "overlay_pass")
+        _light_idle_overlay = bool(getattr(self, "_destination_full_tree_idle_light_overlay", False))
+        _finalize_log = (
+            destination_authority_contract.graph_owns_visible_real_destination_structure(self)
+            and self._destination_finalize_pass_log_reason(ctx)
+            and not _light_idle_overlay
+        )
+        _vp0n = _av0n = 0
+        _mod_nodes_before = -1
+        _term_done_before = bool(getattr(self, "_destination_overlay_terminal_reconcile_done", False))
+        if _finalize_log:
+            _vpb, _avb = self._destination_enumerate_visible_planned_paths_and_all_visible()
+            _vp0n, _av0n = len(_vpb), len(_avb)
+            dm_log = getattr(self, "destination_planning_model", None)
+            if dm_log is not None and hasattr(dm_log, "iter_depth_first"):
+                try:
+                    _mod_nodes_before = sum(1 for _ in dm_log.iter_depth_first())
+                except Exception:
+                    _mod_nodes_before = -1
+            log_info(
+                "destination_finalize_started",
+                reason=str(ctx)[:200],
+                mode="planning_overlay_pass",
+                visible_planned_workspace_rows=int(_vp0n),
+                all_visible_rows=int(_av0n),
+                model_node_count=int(_mod_nodes_before),
+                overlay_terminal_reconcile_done_before=bool(_term_done_before),
+            )
         with self._destination_materialize_profile_span("replay_unresolved_proposed_overlay"):
             n_prop = self._replay_unresolved_proposed_overlay(ctx, "")
         with self._destination_materialize_profile_span("replay_unresolved_allocation_overlay"):
@@ -38122,7 +42528,9 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._log_restore_exception("destination_planning_overlay_pass_reconcile", exc)
         try:
-            self._destination_last_materialized_overlay_fp = self._current_destination_full_overlay_fingerprint()
+            self._destination_last_materialized_overlay_fp = self._current_destination_full_overlay_fingerprint(
+                force_refresh_snapshot=not bool(_light_idle_overlay)
+            )
         except Exception:
             self._destination_last_materialized_overlay_fp = ""
         self._bump_destination_materialized_overlay_fingerprint(
@@ -38143,15 +42551,91 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._log_restore_exception("destination_overlay_placement_audit", exc)
         if not bool(getattr(self, "_destination_overlay_terminal_reconcile_done", False)):
-            try:
-                with self._destination_materialize_profile_span(
-                    "destination_reconcile_all_planned_parents_after_graph_update"
-                ):
-                    self._destination_reconcile_all_planned_parents_after_graph_update()
-            except Exception as exc:
-                self._log_restore_exception("destination_planning_overlay_pass_global_planned_reconcile", exc)
+            _defer_global = bool(getattr(self, "_destination_defer_first_terminal_planned_reconcile_pending", False))
+            if _defer_global:
+                self._destination_defer_first_terminal_planned_reconcile_pending = False
+                log_info(
+                    "startup_lifecycle_temp_global_planned_reconcile_deferred",
+                    overlay_reason=str(reason or "")[:160],
+                    defer_ms=0,
+                )
+                _ctx_reason = str(reason or "")
+
+                def _global_rec():
+                    t0 = time.perf_counter()
+                    _saved_om = getattr(self, "_destination_overlay_active_materialize_reason", "")
+                    self._destination_overlay_active_materialize_reason = _ctx_reason
+                    try:
+                        with self._destination_materialize_profile_span(
+                            "destination_reconcile_all_planned_parents_after_graph_update"
+                        ):
+                            self._destination_reconcile_all_planned_parents_after_graph_update()
+                    except Exception as exc:
+                        self._log_restore_exception("destination_planning_overlay_pass_global_planned_reconcile", exc)
+                    else:
+                        self._destination_overlay_terminal_reconcile_done = True
+                    finally:
+                        self._destination_overlay_active_materialize_reason = _saved_om
+                    log_info(
+                        "startup_lifecycle_temp_deferred_global_planned_reconcile_chunk",
+                        wall_ms=round((time.perf_counter() - t0) * 1000.0, 2),
+                        overlay_reason_excerpt=_ctx_reason[:160],
+                    )
+
+                QTimer.singleShot(
+                    0,
+                    lambda: self._safe_invoke(
+                        "destination_terminal_planned_reconcile_idle",
+                        _global_rec,
+                    ),
+                )
             else:
-                self._destination_overlay_terminal_reconcile_done = True
+                _ctx_reason2 = str(reason or "")
+                _saved_om2 = getattr(self, "_destination_overlay_active_materialize_reason", "")
+                self._destination_overlay_active_materialize_reason = _ctx_reason2
+                try:
+                    try:
+                        with self._destination_materialize_profile_span(
+                            "destination_reconcile_all_planned_parents_after_graph_update"
+                        ):
+                            self._destination_reconcile_all_planned_parents_after_graph_update()
+                    except Exception as exc:
+                        self._log_restore_exception("destination_planning_overlay_pass_global_planned_reconcile", exc)
+                    else:
+                        self._destination_overlay_terminal_reconcile_done = True
+                finally:
+                    self._destination_overlay_active_materialize_reason = _saved_om2
+        if _finalize_log:
+            _vpa, _ava = self._destination_enumerate_visible_planned_paths_and_all_visible()
+            dm_log2 = getattr(self, "destination_planning_model", None)
+            _mod_after = -1
+            if dm_log2 is not None and hasattr(dm_log2, "iter_depth_first"):
+                try:
+                    _mod_after = sum(1 for _ in dm_log2.iter_depth_first())
+                except Exception:
+                    _mod_after = -1
+            _vp_lost = max(0, _vp0n - len(_vpa))
+            log_info(
+                "destination_finalize_finished",
+                reason=str(ctx)[:200],
+                mode="planning_overlay_pass",
+                visible_planned_workspace_rows_before=int(_vp0n),
+                visible_planned_workspace_rows_after=len(_vpa),
+                all_visible_rows_before=int(_av0n),
+                all_visible_rows_after=len(_ava),
+                model_node_count_before=int(_mod_nodes_before),
+                model_node_count_after=int(_mod_after),
+                visible_planned_shrink=int(_vp_lost),
+                overlay_terminal_reconcile_done_after=bool(
+                    getattr(self, "_destination_overlay_terminal_reconcile_done", False)
+                ),
+                global_planned_reconcile_ran_this_pass=bool(
+                    not _term_done_before
+                    and bool(getattr(self, "_destination_overlay_terminal_reconcile_done", False))
+                ),
+            )
+        if getattr(self, "_destination_full_tree_idle_light_overlay", False):
+            self._destination_full_tree_idle_light_overlay = False
         return int(n_prop + n_alloc)
 
     def _destination_is_future_state_node(self, node_data):
@@ -39377,6 +43861,19 @@ class MainWindow(QMainWindow):
 
         total_moved = 0
         merged_groups = 0
+        mat_ctx = getattr(self, "_destination_overlay_active_materialize_reason", "") or ""
+        chunk_merge_cap = (
+            3
+            if ("deferred_graph_ids_resolved" in mat_ctx and str(reason) == "destination_planning_overlay_pass")
+            else None
+        )
+        _t_sem_chunk = time.perf_counter()
+        if chunk_merge_cap is not None:
+            log_info(
+                "startup_lifecycle_temp_reconcile_chunk_begin",
+                phase="semantic_duplicates",
+                merge_groups_budget=int(chunk_merge_cap),
+            )
         snapshot_probe = list(dmodel.iter_depth_first())
         self._log_restore_phase(
             "reconcile_start",
@@ -39508,6 +44005,38 @@ class MainWindow(QMainWindow):
                 node_origin_before=duplicate_data.get("node_origin", ""),
                 node_origin_after=canonical_data.get("node_origin", ""),
             )
+            if chunk_merge_cap is not None and merged_groups >= chunk_merge_cap:
+                log_info(
+                    "startup_lifecycle_temp_reconcile_chunk_end",
+                    phase="semantic_duplicates",
+                    wall_ms=round((time.perf_counter() - _t_sem_chunk) * 1000.0, 2),
+                    parent_count_processed=int(chunk_merge_cap),
+                    note="merge_group_cap_reschedule",
+                )
+                _saved_ctx = mat_ctx
+
+                def _more():
+                    _p = getattr(self, "_destination_overlay_active_materialize_reason", "")
+                    self._destination_overlay_active_materialize_reason = _saved_ctx
+                    try:
+                        self._reconcile_destination_semantic_duplicates(reason)
+                    finally:
+                        self._destination_overlay_active_materialize_reason = _p
+
+                QTimer.singleShot(
+                    0,
+                    lambda: self._safe_invoke("destination_semantic_dup_graph_resolve_chunk", _more),
+                )
+                return total_moved
+
+        if chunk_merge_cap is not None:
+            log_info(
+                "startup_lifecycle_temp_reconcile_chunk_end",
+                phase="semantic_duplicates",
+                wall_ms=round((time.perf_counter() - _t_sem_chunk) * 1000.0, 2),
+                parent_count_processed=int(merged_groups),
+                note="semantic_dup_pass_before_sibling_collisions",
+            )
 
         sm, sg = self._reconcile_destination_sibling_folder_name_collisions_index(reason)
         total_moved += sm
@@ -39618,6 +44147,8 @@ class MainWindow(QMainWindow):
     def _reconcile_destination_sibling_folders_during_allocation_apply(self, phase: str) -> None:
         """Merge same-named folder siblings before UI repaints (allocation apply yields, fast first paint, etc.)."""
         try:
+            if getattr(self, "_destination_snapshot_capture_drain_active", False):
+                return
             if str(phase or "") == "fast_paint_pre_projection" and self._destination_bind_reconcile_suppressed_for_active_workers():
                 self._destination_bind_reconcile_defer_sibling_fast_paint_pending = True
                 self._log_restore_phase("destination_sibling_fast_paint_deferred_while_workers_active")
@@ -39689,6 +44220,8 @@ class MainWindow(QMainWindow):
             pass
 
     def _flush_destination_bind_reconcile_deferred_after_workers(self) -> None:
+        if _shutdown_mutation_skip_for_host(self, "_flush_destination_bind_reconcile_deferred_after_workers"):
+            return
         reasons = set(getattr(self, "_destination_bind_reconcile_deferred_reasons", None) or set())
         defer_semantic = bool(reasons)
         sibling_pending = bool(getattr(self, "_destination_bind_reconcile_defer_sibling_fast_paint_pending", False))
@@ -40029,12 +44562,28 @@ class MainWindow(QMainWindow):
             child_data = ix.data(Qt.UserRole) or {}
             if child_data.get("placeholder"):
                 continue
-            if self._destination_semantic_path(child_data) == semantic_path:
+            row_sem = self._destination_row_semantic_path(child_data)
+            leg_sem = self._destination_semantic_path(child_data)
+            idx_key = ""
+            if destination_authority_contract.graph_owns_visible_real_destination_structure(self):
+                idx_key = self._destination_payload_index_key(child_data)
+            if semantic_path == row_sem or semantic_path == leg_sem or (idx_key and semantic_path == idx_key):
                 matches.append(ix)
         return self._select_canonical_destination_item(matches)
 
     def _destination_children_semantic_map_index(self, parent_ix: QModelIndex) -> dict:
-        """Direct child semantic_path -> QModelIndex for one parent (one O(rows) scan)."""
+        """Direct child canonical path -> QModelIndex for one parent (one O(rows) scan).
+
+        Live Graph rows must use the same path basis as :meth:`_destination_row_raw_path_for_path_lookup_match`
+        / :meth:`_destination_row_semantic_path` so allocation-descendant walks (``next_branch``) hit
+        restored file leaves. Legacy :meth:`_destination_semantic_path` prefers ``display_path``, which
+        often disagrees with ``item_path`` on ``live_confirmed`` files and caused cache misses plus
+        unnecessary reinjection under restored snapshot subtrees.
+
+        Under Graph authority, also register :meth:`_destination_payload_index_key` so parent-scoped
+        lookups align with :class:`DestinationPlanningTreeModel` path buckets (explicit graph-relative
+        segments), which can differ from context-projection canonical strings used in the graph walk.
+        """
         model = getattr(self, "destination_planning_model", None)
         if model is None:
             return {}
@@ -40042,14 +44591,26 @@ class MainWindow(QMainWindow):
             return {}
         parent = parent_ix if parent_ix.isValid() else QModelIndex()
         out = {}
+        seen_cf: set[str] = set()
+
+        def _register(sem: str, idx) -> None:
+            if not sem:
+                return
+            cf = sem.casefold()
+            if cf in seen_cf:
+                return
+            seen_cf.add(cf)
+            out[sem] = idx
+
         for r in range(model.rowCount(parent)):
             ix = model.index(r, 0, parent)
             child_data = ix.data(Qt.UserRole) or {}
             if child_data.get("placeholder"):
                 continue
-            sem = self._destination_semantic_path(child_data)
-            if sem:
-                out[sem] = ix
+            _register(self._destination_row_semantic_path(child_data), ix)
+            _register(self._destination_semantic_path(child_data), ix)
+            if destination_authority_contract.graph_owns_visible_real_destination_structure(self):
+                _register(self._destination_payload_index_key(child_data), ix)
         return out
 
     def _sort_descendants_for_allocation_apply(self, descendants):
@@ -40105,13 +44666,19 @@ class MainWindow(QMainWindow):
                     child_data = ix.data(Qt.UserRole) or {}
                 except Exception:
                     continue
-                sem = self._destination_semantic_path(child_data)
-                if sem:
-                    try:
-                        if ix.isValid():
-                            sub[sem] = QPersistentModelIndex(ix)
-                    except RuntimeError:
-                        continue
+                keys = [
+                    self._destination_row_semantic_path(child_data),
+                    self._destination_semantic_path(child_data),
+                ]
+                if destination_authority_contract.graph_owns_visible_real_destination_structure(self):
+                    keys.append(self._destination_payload_index_key(child_data))
+                for sem in keys:
+                    if sem:
+                        try:
+                            if ix.isValid():
+                                sub[sem] = QPersistentModelIndex(ix)
+                        except RuntimeError:
+                            continue
         # Cold cache (sub missing): leave absent; next lookup rebuilds full map.
 
     def _allocation_apply_flush_pending_model(self, model, child_map_cache: dict, pending_batches: dict, parent_ix: QModelIndex) -> None:
@@ -40652,7 +45219,7 @@ class MainWindow(QMainWindow):
                 if rel:
                     _ppl_al = self._destination_model_index_user_role_dict(col0)
                     _def_al, _miss_al, _cc_al = self._graph_authority_planned_structural_bind_deferred_miss(
-                        acanon, live_graph_parent_pl=_ppl_al
+                        acanon, live_graph_parent_pl=_ppl_al, parent_anchor_index_valid=True
                     )
                     if _def_al:
                         log_info(
@@ -40977,17 +45544,32 @@ class MainWindow(QMainWindow):
         *,
         normalized_target: str | None = None,
         live_graph_parent_pl: dict | None = None,
+        parent_anchor_index_valid: bool = False,
     ) -> tuple[bool, str, int]:
         """Graph authority: when must we defer planned *structural* chains for *path*?
 
-        ``empty_model`` always defers. For ``not_loaded``, the global index scan cannot distinguish "not in the
-        model yet" from "enumerated under parent but absent"; we defer only when the immediate parent row is live
-        Graph structure and its children have **not** finished loading, so the miss is plausibly lazy hydration.
-        When the parent is not live Graph (e.g. planned workspace) or ``children_loaded`` is true, ``not_loaded`` is
-        treated as a concrete miss for bind purposes and structural planned rows may be created.
+        Option 3: only an **empty** planning model defers (nothing to attach under). When the caller already
+        holds a **valid parent QModelIndex** (``parent_anchor_index_valid``), do **not** consult visible lookup
+        for the *target* path: that path is often absent by design until the planned chain is bound; probing it
+        yields ``not_loaded`` / ``candidate_count=0`` and must **not** suppress bind.
+
+        If ``parent_anchor_index_valid`` is false, a target-path probe still informs ``miss_reason`` / counts for
+        diagnostics only; only ``empty_model`` defers.
         """
+        _ = live_graph_parent_pl
         if not destination_authority_contract.graph_owns_visible_real_destination_structure(self):
             return (False, "", 0)
+        model = getattr(self, "destination_planning_model", None)
+        if model is None:
+            return (True, "empty_model", 0)
+        try:
+            root_rc = int(model.rowCount(QModelIndex()))
+        except Exception:
+            root_rc = -1
+        if root_rc == 0:
+            return (True, "empty_model", 0)
+        if parent_anchor_index_valid:
+            return (False, "not_loaded", 0)
         nt = (
             normalized_target
             if normalized_target is not None
@@ -40997,13 +45579,6 @@ class MainWindow(QMainWindow):
         miss = str(_probe[1] or "").strip()
         cc = int(_probe[3])
         if miss == "empty_model":
-            return (True, miss, cc)
-        if miss == "not_loaded":
-            pl = live_graph_parent_pl
-            if pl is None:
-                return (True, miss, cc)
-            if not self._destination_row_may_lazy_enumerate_graph_children(pl):
-                return (False, miss, cc)
             return (True, miss, cc)
         return (False, miss, cc)
 
@@ -43503,10 +48078,20 @@ class MainWindow(QMainWindow):
             source_item = self._find_source_item_for_planned_move(move)
             if source_item is not None:
                 src_data = self._source_tree_row_payload(source_item)
-                ck = self._source_projection_descendants_cache_key_for_root(src_data)
-                od = getattr(self, "_source_projection_descendants_cache", None)
-                if isinstance(od, OrderedDict) and ck in od:
-                    od.pop(ck, None)
+                sk_ex = str(self._source_projection_descendants_cache_key_graph_subtree_stable(src_data))[:220]
+                lk_ex = str(self._source_projection_descendants_cache_key_for_root(src_data))[:220]
+            else:
+                sk_ex = lk_ex = ""
+            self._log_source_projection_descendants_cache_event(
+                "invalidate_skipped",
+                reason="destination_refresh_after_source_paths_loaded",
+                caller="_destination_refresh_folder_move_projection_after_source_paths_loaded",
+                stable_key_excerpt=sk_ex,
+                legacy_key_excerpt=lk_ex,
+                source_root_excerpt=str(self._canonical_source_projection_path(str(move.get("source_path") or "")))[:400],
+                destination_root_excerpt=str(self._allocation_projection_path(move) or "")[:400],
+                note="graph_source_subtree_cache_preserved",
+            )
 
             def _mut_retry(p):
                 p.pop("allocation_descendants_applied", None)
@@ -43533,10 +48118,20 @@ class MainWindow(QMainWindow):
         source_item = self._find_source_item_for_planned_move(move)
         if source_item is not None:
             src_data = self._source_tree_row_payload(source_item)
-            ck = self._source_projection_descendants_cache_key_for_root(src_data)
-            od = getattr(self, "_source_projection_descendants_cache", None)
-            if isinstance(od, OrderedDict) and ck in od:
-                od.pop(ck, None)
+            sk_ex = str(self._source_projection_descendants_cache_key_graph_subtree_stable(src_data))[:220]
+            lk_ex = str(self._source_projection_descendants_cache_key_for_root(src_data))[:220]
+        else:
+            sk_ex = lk_ex = ""
+        self._log_source_projection_descendants_cache_event(
+            "invalidate_skipped",
+            reason="overlay_projection_invariant_repair",
+            caller="_apply_overlay_projection_invariant_repair_to_index",
+            stable_key_excerpt=sk_ex,
+            legacy_key_excerpt=lk_ex,
+            source_root_excerpt=str(self._canonical_source_projection_path(str(move.get("source_path") or "")))[:400],
+            destination_root_excerpt=str(self._allocation_projection_path(move) or "")[:400],
+            note="graph_source_subtree_cache_preserved_destination_only_resync",
+        )
 
         def _mut_retry(p):
             p.pop("allocation_descendants_applied", None)
@@ -43548,14 +48143,20 @@ class MainWindow(QMainWindow):
         self._destination_remove_deferred_file_summary_children_index(col0)
         if hasattr(dm, "is_index_live") and not dm.is_index_live(col0):
             return
-        self._decorate_destination_graph_subtree_for_allocation_move(col0, move)
-        self._mark_allocation_descendants_applied_on_allocation_folder_model_index(col0, move)
-        node_after = dict(col0.data(Qt.UserRole) or {})
-        self._stamp_allocation_projection_cache_metadata_index(col0, node_after, move)
-        self._refresh_destination_item_visibility_index(col0)
-        self._apply_tree_item_visual_state(None, col0.data(Qt.UserRole) or {})
-        if tree is not None:
-            tree.viewport().update()
+
+        def _after_invariant_repair(_count: int, *, _c0=col0) -> None:
+            self._refresh_destination_item_visibility_index(_c0)
+            self._apply_tree_item_visual_state(None, _c0.data(Qt.UserRole) or {})
+            if tree is not None:
+                tree.viewport().update()
+
+        self._decorate_destination_graph_subtree_for_allocation_move(
+            col0,
+            move,
+            on_complete=_after_invariant_repair,
+            enqueue_reason="overlay_projection_invariant_repair",
+            collect_reason="overlay_projection_invariant_repair",
+        )
 
     def _destination_index_has_overlay_backed_non_graph_children(self, dm, parent_ix: QModelIndex) -> bool:
         """True when the row has any direct child that is not a live Graph row (overlay / projection rows)."""
@@ -43704,6 +48305,19 @@ class MainWindow(QMainWindow):
         """True when the in-memory source subtree is ready but destination direct children do not match."""
         if not isinstance(pl, dict):
             return False
+        if destination_authority_contract.graph_owns_visible_real_destination_structure(self):
+            if bool(pl.get("allocation_descendants_applied")) and bool(pl.get("children_loaded")):
+                sig = str(pl.get("allocation_projection_children_signature") or "").strip()
+                if sig:
+                    col0 = ix.siblingAtColumn(0) if ix.column() != 0 else ix
+                    cur_sig = self._allocation_projection_children_signature_from_index(col0)
+                    if cur_sig and cur_sig == sig:
+                        log_info(
+                            "destination_overlay_reproject_skipped_stamped_projection_fresh",
+                            destination_path_excerpt=str(self._tree_item_path(pl) or "")[:400],
+                            signature_excerpt=str(sig)[:40],
+                        )
+                        return False
         src_item = self._find_source_item_for_planned_move(move)
         if src_item is None or not self._source_subtree_fully_loaded_in_tree(src_item):
             return False
@@ -43745,10 +48359,20 @@ class MainWindow(QMainWindow):
         source_item = self._find_source_item_for_planned_move(move)
         if source_item is not None:
             src_data = self._source_tree_row_payload(source_item)
-            ck = self._source_projection_descendants_cache_key_for_root(src_data)
-            od = getattr(self, "_source_projection_descendants_cache", None)
-            if isinstance(od, OrderedDict) and ck in od:
-                od.pop(ck, None)
+            sk_ex = str(self._source_projection_descendants_cache_key_graph_subtree_stable(src_data))[:220]
+            lk_ex = str(self._source_projection_descendants_cache_key_for_root(src_data))[:220]
+        else:
+            sk_ex = lk_ex = ""
+        self._log_source_projection_descendants_cache_event(
+            "invalidate_skipped",
+            reason="prepare_and_reload_overlay_folder_source_projection",
+            caller="_prepare_and_reload_overlay_folder_source_projection_index",
+            stable_key_excerpt=sk_ex,
+            legacy_key_excerpt=lk_ex,
+            source_root_excerpt=str(self._canonical_source_projection_path(str(move.get("source_path") or "")))[:400],
+            destination_root_excerpt=str(self._allocation_projection_path(move) or "")[:400],
+            note="graph_source_subtree_cache_preserved",
+        )
 
         def _mut_retry(p):
             p.pop("allocation_descendants_applied", None)
@@ -43801,6 +48425,68 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(0, _flush)
 
+    def _destination_session_snapshot_canonical_path_cf_set(self) -> set:
+        """Casefolded canonical paths from persisted destination tree snapshot (all nodes with paths)."""
+        cached = getattr(self, "_destination_session_snapshot_path_cf_set_cache", None)
+        if isinstance(cached, set):
+            return cached
+        out: set[str] = set()
+        snaps = list(
+            (getattr(self, "_pending_session_tree_snapshots", {}) or {}).get("destination")
+            or (getattr(self, "_runtime_session_tree_snapshots", {}) or {}).get("destination")
+            or []
+        )
+
+        def walk(node: dict) -> None:
+            if not isinstance(node, dict):
+                return
+            data = dict(node.get("data") or {})
+            item_path = str(
+                data.get("item_path")
+                or data.get("display_path")
+                or data.get("semantic_path")
+                or ""
+            ).strip()
+            if item_path:
+                dp = self._canonical_destination_projection_path(item_path)
+                c = self._canonical_planned_memory_path_for_graph_match(dp or item_path)
+                if not c:
+                    c = (dp or "").strip()
+                if c:
+                    out.add(c.casefold())
+            for ch in list(node.get("children") or []):
+                walk(ch)
+
+        for snap in snaps:
+            walk(snap)
+        self._destination_session_snapshot_path_cf_set_cache = out
+        return out
+
+    def _destination_overlay_startup_skip_teardown_for_snapshot_path(self, dest_lookup: str) -> bool:
+        """Before first Graph root preservation merge, do not tear down rows present in the session snapshot."""
+        if getattr(self, "_destination_startup_snapshot_preservation_applied", False):
+            return False
+        if not getattr(self, "_destination_startup_snapshot_mount_seen", False):
+            return False
+        canon = str(dest_lookup or "").strip()
+        if not canon:
+            return False
+        return canon.casefold() in self._destination_session_snapshot_canonical_path_cf_set()
+
+    def _overlay_projection_invariant_teardown_reason_code(self, dm, ix: QModelIndex, pl: dict) -> str:
+        """Diagnostic reason when :meth:`_overlay_projection_invariant_teardown_needed_at_index` is true."""
+        if not isinstance(pl, dict) or not pl:
+            return "invalid_payload"
+        move = self._find_exact_planned_move_for_destination_projection_path(pl)
+        if move is None:
+            return "no_move_match_projection_mark_or_children"
+        src = move.get("source") if isinstance(move.get("source"), dict) else {}
+        if not bool(src.get("is_folder", True)):
+            return "move_source_not_folder"
+        if self._find_source_item_for_planned_move(move) is None:
+            return "source_item_not_in_source_tree"
+        return "unknown_should_not_teardown"
+
     def _on_destination_state_mutation(self, reason: str = "", payload: dict | None = None) -> None:
         """Reactive dispatch: run overlay projection invariant immediately after relevant state changes.
 
@@ -43829,6 +48515,10 @@ class MainWindow(QMainWindow):
         descendants immediately. Uses :meth:`_tear_down_unjustified_overlay_projection_at_index` and
         :meth:`_apply_overlay_projection_invariant_repair_to_index` only — no separate projection pipeline.
         """
+        if getattr(self, "_destination_quiet_startup_overlay_structural_suppress", False):
+            return 0
+        if getattr(self, "_application_shutting_down", False):
+            return 0
         if not destination_authority_contract.graph_owns_visible_real_destination_structure(self):
             return 0
         dm = getattr(self, "destination_planning_model", None)
@@ -43836,9 +48526,11 @@ class MainWindow(QMainWindow):
             return 0
         try:
             stack: list = [[QModelIndex(), 0]]
-            teardown_lookups: list[str] = []
+            teardown_plan: list[tuple[str, str]] = []
             seen_teardown: set[str] = set()
             while True:
+                if getattr(self, "_application_shutting_down", False):
+                    return 0
                 ix = self._destination_planning_dfs_next_preorder_index(dm, stack)
                 if ix is None:
                     break
@@ -43855,20 +48547,70 @@ class MainWindow(QMainWindow):
                 if not dest_lookup or dest_lookup.casefold() in seen_teardown:
                     continue
                 seen_teardown.add(dest_lookup.casefold())
-                teardown_lookups.append(dest_lookup)
+                rcode = self._overlay_projection_invariant_teardown_reason_code(dm, ix, pl)
+                teardown_plan.append((dest_lookup, rcode))
             torn = 0
-            for dest_lookup in teardown_lookups:
+            teardown_details: list[dict] = []
+            nodes_before_teardown_pass = self._count_destination_model_non_placeholder_nodes()
+            fc_before_pass = self._destination_forensic_destination_model_counts()
+            for dest_lookup, rcode in teardown_plan:
                 ix = self._find_visible_destination_item_by_path(dest_lookup)
                 if ix is None or not isinstance(ix, QModelIndex) or not ix.isValid():
                     continue
                 if hasattr(dm, "is_index_live") and not dm.is_index_live(ix):
                     continue
+                if self._destination_descendant_apply_pending_for_parent_index(ix):
+                    log_info(
+                        "destination_overlay_projection_invariant_teardown_skipped_descendant_apply_in_flight",
+                        destination_path_excerpt=str(dest_lookup)[:400],
+                        teardown_reason=str(rcode)[:120],
+                    )
+                    continue
+                if self._destination_overlay_startup_skip_teardown_for_snapshot_path(dest_lookup):
+                    log_info(
+                        "destination_overlay_projection_invariant_teardown_skipped_startup_snapshot",
+                        destination_path_excerpt=str(dest_lookup)[:400],
+                        teardown_reason=str(rcode)[:120],
+                        snapshot_path_in_session=bool(
+                            str(dest_lookup).strip().casefold()
+                            in self._destination_session_snapshot_canonical_path_cf_set()
+                        ),
+                    )
+                    continue
+                np_before = self._count_destination_model_non_placeholder_nodes()
+                fc_before = self._destination_forensic_destination_model_counts()
                 self._tear_down_unjustified_overlay_projection_at_index(ix)
+                np_after = self._count_destination_model_non_placeholder_nodes()
+                fc_after = self._destination_forensic_destination_model_counts()
+                teardown_details.append(
+                    {
+                        "path": str(dest_lookup)[:400],
+                        "reason": str(rcode)[:120],
+                        "delta_non_placeholder": int(np_after - np_before),
+                        "delta_iter_depth_first": int(
+                            int(fc_after.get("model_nodes_iter_depth_first") or 0)
+                            - int(fc_before.get("model_nodes_iter_depth_first") or 0)
+                        ),
+                    }
+                )
                 torn += 1
+            nodes_after_teardown_pass = self._count_destination_model_non_placeholder_nodes()
+            fc_after_pass = self._destination_forensic_destination_model_counts()
+            if teardown_plan and torn == 0 and reason:
+                log_info(
+                    "destination_overlay_projection_invariant_teardown_all_skipped",
+                    planned_teardown=len(teardown_plan),
+                    reason_excerpt=str(reason)[:120],
+                    startup_snapshot_preservation_applied=bool(
+                        getattr(self, "_destination_startup_snapshot_preservation_applied", False)
+                    ),
+                )
             stack = [[QModelIndex(), 0]]
             pending: list[tuple[str, dict]] = []
             seen_lookup: set[str] = set()
             while True:
+                if getattr(self, "_application_shutting_down", False):
+                    return 0
                 ix = self._destination_planning_dfs_next_preorder_index(dm, stack)
                 if ix is None:
                     break
@@ -43884,6 +48626,12 @@ class MainWindow(QMainWindow):
                     continue
                 src = move.get("source") if isinstance(move.get("source"), dict) else {}
                 if not bool(src.get("is_folder", True)):
+                    continue
+                if self._destination_descendant_apply_pending_for_parent_index(ix):
+                    log_info(
+                        "destination_overlay_projection_repair_skipped_descendant_apply_in_flight",
+                        destination_path_excerpt=str(self._tree_item_path(pl) or "")[:400],
+                    )
                     continue
                 if not self._destination_overlay_folder_row_needs_source_descendant_reproject(ix, pl, move):
                     continue
@@ -43907,6 +48655,16 @@ class MainWindow(QMainWindow):
                     "destination_overlay_projection_invariant_teardown",
                     teardown_count=int(torn),
                     reason_excerpt=str(reason)[:120],
+                    model_nodes_non_placeholder_before_teardown_pass=int(nodes_before_teardown_pass),
+                    model_nodes_non_placeholder_after_teardown_pass=int(nodes_after_teardown_pass),
+                    model_nodes_iter_depth_first_before_teardown_pass=int(
+                        fc_before_pass.get("model_nodes_iter_depth_first") or 0
+                    ),
+                    model_nodes_iter_depth_first_after_teardown_pass=int(
+                        fc_after_pass.get("model_nodes_iter_depth_first") or 0
+                    ),
+                    delta_non_placeholder_pass=int(nodes_after_teardown_pass - nodes_before_teardown_pass),
+                    teardown_paths_and_reasons=teardown_details[:24],
                 )
             if repaired and reason:
                 log_info(
@@ -43915,6 +48673,9 @@ class MainWindow(QMainWindow):
                     reason_excerpt=str(reason)[:120],
                 )
             return int(torn + repaired)
+        except KeyboardInterrupt:
+            log_info("shutdown_trace", event="overlay_projection_invariant_pass_keyboard_interrupt")
+            return 0
         except Exception as exc:
             self._log_restore_exception("run_overlay_projection_invariant_pass", exc)
             return 0
@@ -43929,6 +48690,8 @@ class MainWindow(QMainWindow):
 
     def _schedule_destination_overlay_source_projection_invariant(self, reason: str = "") -> None:
         if getattr(self, "_disable_overlay_invariant_timer_for_test", False):
+            return
+        if getattr(self, "_destination_quiet_startup_overlay_structural_suppress", False):
             return
         if not getattr(self, "_main_window_qobject_ready", False):
             return
@@ -43946,6 +48709,8 @@ class MainWindow(QMainWindow):
         t.start(0)
 
     def _flush_destination_overlay_source_projection_invariant(self) -> None:
+        if getattr(self, "_application_shutting_down", False):
+            return
         reason = str(getattr(self, "_destination_overlay_source_invariant_pending_reason", "") or "")
         self._run_overlay_projection_invariant_pass(reason or "debounced_overlay_projection_invariant")
 
@@ -44140,18 +48905,59 @@ class MainWindow(QMainWindow):
                 return
             nd_graph = dict(ix.data(Qt.UserRole) or {})
             if not bool(nd_graph.get("children_loaded")):
-                if self._destination_row_allows_structural_folder_child_load(nd_graph):
-                    if fen_ld:
-                        log_info(
-                            "destination_forensic_load_projected_descendants_defer",
-                            folder_path_excerpt=row_path_ex,
-                            branch="allocation_with_graph_auth",
-                            reason="live_graph_folder_awaiting_children_before_allocation_projection",
-                            planned_file_hydration_deferred_until_graph_children=True,
+                _bypass_graph = bool(getattr(self, "_destination_startup_projection_visibility_pass_active", False))
+                _src_move_nd = move.get("source") if isinstance(move.get("source"), dict) else {}
+                _folder_alloc = bool(_src_move_nd.get("is_folder", True))
+                if self._destination_row_allows_structural_folder_child_load(nd_graph) and not _bypass_graph:
+                    # Folder allocations: source-driven overlay projection must not wait for Graph child
+                    # enumeration on the destination shell (children_loaded may stay false until List children return).
+                    if _folder_alloc:
+                        if fen_ld:
+                            log_info(
+                                "destination_forensic_load_projected_descendants_source_subtree",
+                                folder_path_excerpt=row_path_ex,
+                                branch="allocation_with_graph_auth",
+                                reason="folder_projection_while_graph_shell_pending_then_queue_children",
+                            )
+
+                        def _after_graph_proj_shell_pending(count: int, *, _ix=ix, _fen=fen_ld, _ex=row_path_ex) -> None:
+                            if _fen:
+                                log_info(
+                                    "destination_forensic_source_descendant_projection_under_target",
+                                    folder_path_excerpt=_ex,
+                                    descendant_rows_added=int(count),
+                                )
+                            self._request_graph_destination_children_load(_ix, reason="allocation_projection_descendants")
+                            self._refresh_destination_item_visibility_index(_ix)
+                            self._apply_tree_item_visual_state(None, _ix.data(Qt.UserRole) or {})
+                            if tree is not None:
+                                tree.viewport().update()
+
+                        self._decorate_destination_graph_subtree_for_allocation_move(
+                            ix,
+                            move,
+                            on_complete=_after_graph_proj_shell_pending,
+                            enqueue_reason="load_projected_descendants_graph_shell_pending_folder_alloc",
+                            collect_reason="load_projected_descendants_graph_shell_pending_folder_alloc",
                         )
-                    self._request_graph_destination_children_load(ix, reason="allocation_projection_descendants")
-                    self._refresh_destination_item_visibility_index(ix)
+                    else:
+                        if fen_ld:
+                            log_info(
+                                "destination_forensic_load_projected_descendants_defer",
+                                folder_path_excerpt=row_path_ex,
+                                branch="allocation_with_graph_auth",
+                                reason="live_graph_folder_awaiting_children_before_allocation_projection",
+                                planned_file_hydration_deferred_until_graph_children=True,
+                            )
+                        self._request_graph_destination_children_load(ix, reason="allocation_projection_descendants")
+                        self._refresh_destination_item_visibility_index(ix)
                     return
+                if self._destination_row_allows_structural_folder_child_load(nd_graph) and _bypass_graph:
+                    log_info(
+                        "destination_startup_projection_bypassed_graph_child_load_gate",
+                        folder_path_excerpt=row_path_ex[:400],
+                        reason="startup_visibility_pass_uses_source_subtree_projection",
+                    )
                 src_move = move.get("source") if isinstance(move.get("source"), dict) else {}
                 if bool(src_move.get("is_folder", True)):
                     if fen_ld:
@@ -44161,20 +48967,26 @@ class MainWindow(QMainWindow):
                             branch="allocation_with_graph_auth",
                             reason="overlay_planned_target_project_loaded_source_descendants_not_graph_children",
                         )
-                    dec_n = self._decorate_destination_graph_subtree_for_allocation_move(ix, move)
-                    if fen_ld:
-                        log_info(
-                            "destination_forensic_source_descendant_projection_under_target",
-                            folder_path_excerpt=row_path_ex,
-                            descendant_rows_added=int(dec_n),
-                        )
-                    self._mark_allocation_descendants_applied_on_allocation_folder_model_index(ix, move)
-                    node_after = dict(ix.data(Qt.UserRole) or {})
-                    self._stamp_allocation_projection_cache_metadata_index(ix, node_after, move)
-                    self._refresh_destination_item_visibility_index(ix)
-                    self._apply_tree_item_visual_state(None, ix.data(Qt.UserRole) or {})
-                    if tree is not None:
-                        tree.viewport().update()
+
+                    def _after_graph_proj_bypass(count: int, *, _ix=ix, _fen=fen_ld, _ex=row_path_ex) -> None:
+                        if _fen:
+                            log_info(
+                                "destination_forensic_source_descendant_projection_under_target",
+                                folder_path_excerpt=_ex,
+                                descendant_rows_added=int(count),
+                            )
+                        self._refresh_destination_item_visibility_index(_ix)
+                        self._apply_tree_item_visual_state(None, _ix.data(Qt.UserRole) or {})
+                        if tree is not None:
+                            tree.viewport().update()
+
+                    self._decorate_destination_graph_subtree_for_allocation_move(
+                        ix,
+                        move,
+                        on_complete=_after_graph_proj_bypass,
+                        enqueue_reason="load_projected_descendants_startup_visibility_bypass",
+                        collect_reason="load_projected_descendants_startup_visibility_bypass",
+                    )
                     return
                 if fen_ld:
                     log_info(
@@ -44184,17 +48996,30 @@ class MainWindow(QMainWindow):
                         reason="leaf_move_non_structural_row_request_graph_probe",
                         planned_file_hydration_deferred_until_graph_children=True,
                     )
-                self._request_graph_destination_children_load(ix, reason="allocation_projection_descendants")
+                if not bool(getattr(self, "_destination_startup_projection_visibility_pass_active", False)):
+                    self._request_graph_destination_children_load(ix, reason="allocation_projection_descendants")
+                else:
+                    log_info(
+                        "destination_startup_projection_bypassed_graph_child_load_gate",
+                        folder_path_excerpt=row_path_ex[:400],
+                        reason="leaf_allocation_skipped_graph_probe_during_startup_visibility",
+                    )
                 self._refresh_destination_item_visibility_index(ix)
                 return
-            self._decorate_destination_graph_subtree_for_allocation_move(ix, move)
-            self._mark_allocation_descendants_applied_on_allocation_folder_model_index(ix, move)
-            node_after = dict(ix.data(Qt.UserRole) or {})
-            self._stamp_allocation_projection_cache_metadata_index(ix, node_after, move)
-            self._refresh_destination_item_visibility_index(ix)
-            self._apply_tree_item_visual_state(None, ix.data(Qt.UserRole) or {})
-            if tree is not None:
-                tree.viewport().update()
+
+            def _after_graph_proj_children_loaded(_count: int, *, _ix=ix) -> None:
+                self._refresh_destination_item_visibility_index(_ix)
+                self._apply_tree_item_visual_state(None, _ix.data(Qt.UserRole) or {})
+                if tree is not None:
+                    tree.viewport().update()
+
+            self._decorate_destination_graph_subtree_for_allocation_move(
+                ix,
+                move,
+                on_complete=_after_graph_proj_children_loaded,
+                enqueue_reason="load_projected_descendants_children_loaded_graph_auth",
+                collect_reason="load_projected_descendants_children_loaded_graph_auth",
+            )
             return
         self._remove_placeholder_children(ix)
         self._destination_remove_deferred_file_summary_children_index(ix)
@@ -44269,8 +49094,16 @@ class MainWindow(QMainWindow):
                     applied_descendant_rows=int(applied_count),
                     deferred_file_count_expected=_def_fc,
                 )
+            if applied_count > 0:
+                self._promote_destination_workspace_snapshot_after_structure_change()
 
-        if not self._enqueue_destination_descendant_apply_to_model(ix, move, _on_projected_descendants_applied):
+        if not self._enqueue_destination_descendant_apply_to_model(
+            ix,
+            move,
+            _on_projected_descendants_applied,
+            enqueue_reason="deferred_projected_descendants_after_placeholder_strip",
+            collect_reason="deferred_projected_descendants_after_placeholder_strip",
+        ):
             move_src = move.get("source", {}) or {}
             if bool(move_src.get("is_folder", True)):
 
@@ -44760,28 +49593,15 @@ class MainWindow(QMainWindow):
                     model.update_payload_for_index(parent_index, _mut_ok)
                     if destination_authority_contract.graph_owns_visible_real_destination_structure(self):
                         self._destination_graph_subtree_schedule_new_folders_after_bind(parent_index)
-                    pmi_planned = (
-                        QPersistentModelIndex(parent_index)
-                        if parent_index.isValid()
-                        else QPersistentModelIndex()
+                    col0_planned = (
+                        parent_index.siblingAtColumn(0) if parent_index.column() != 0 else parent_index
                     )
-                    _snap_planned = list(planned_workspace_presnapshot)
-
-                    def _deferred_planned_invoke_true() -> None:
-                        pix = QModelIndex(pmi_planned) if pmi_planned.isValid() else QModelIndex()
-                        if not pix.isValid():
-                            return
+                    if col0_planned.isValid() and planned_workspace_presnapshot:
                         self._destination_invoke_planned_workspace_reconcile_after_graph_folder_load(
-                            pix, _snap_planned, allow_reappend=True
+                            col0_planned,
+                            list(planned_workspace_presnapshot),
+                            allow_reappend=True,
                         )
-
-                    QTimer.singleShot(
-                        0,
-                        lambda: self._safe_invoke(
-                            "on_folder_load_success_planned_invoke_deferred",
-                            _deferred_planned_invoke_true,
-                        ),
-                    )
                 else:
                     model.remove_placeholder_children(parent_index)
 
@@ -44790,28 +49610,15 @@ class MainWindow(QMainWindow):
                         p["load_failed"] = False
 
                     model.update_payload_for_index(parent_index, _mut_partial)
-                    pmi_planned_f = (
-                        QPersistentModelIndex(parent_index)
-                        if parent_index.isValid()
-                        else QPersistentModelIndex()
+                    col0_planned = (
+                        parent_index.siblingAtColumn(0) if parent_index.column() != 0 else parent_index
                     )
-                    _snap_planned_f = list(planned_workspace_presnapshot)
-
-                    def _deferred_planned_invoke_false() -> None:
-                        pix = QModelIndex(pmi_planned_f) if pmi_planned_f.isValid() else QModelIndex()
-                        if not pix.isValid():
-                            return
+                    if col0_planned.isValid() and planned_workspace_presnapshot:
                         self._destination_invoke_planned_workspace_reconcile_after_graph_folder_load(
-                            pix, _snap_planned_f, allow_reappend=False
+                            col0_planned,
+                            list(planned_workspace_presnapshot),
+                            allow_reappend=False,
                         )
-
-                    QTimer.singleShot(
-                        0,
-                        lambda: self._safe_invoke(
-                            "on_folder_load_success_planned_invoke_deferred",
-                            _deferred_planned_invoke_false,
-                        ),
-                    )
                 local_bind_ms = int((time.perf_counter() - t_fw_bundle_0) * 1000)
                 _t_reconcile_enq = time.perf_counter()
                 if destination_authority_contract.graph_owns_visible_real_destination_structure(self):
@@ -48792,6 +53599,9 @@ class MainWindow(QMainWindow):
 
     def _schedule_post_import_graph_enrichment(self, *, source_description: str) -> None:
         """Run the same Graph enrichment as ``ensure_planned_moves_resolved_via_graph`` across event-loop ticks."""
+        if getattr(self, "_application_shutting_down", False):
+            log_info("shutdown_trace", event="post_import_graph_enrich_schedule_skipped", reason="application_shutting_down")
+            return
         self._close_post_import_graph_enrichment_generator()
         self._post_import_graph_enrich_run_id += 1
         run_id = int(self._post_import_graph_enrich_run_id)
@@ -48812,6 +53622,13 @@ class MainWindow(QMainWindow):
 
     def _advance_post_import_graph_enrichment_tick(self, run_id: int) -> None:
         if run_id != int(self._post_import_graph_enrich_run_id):
+            return
+        if getattr(self, "_application_shutting_down", False):
+            try:
+                self._close_post_import_graph_enrichment_generator()
+            except Exception:
+                pass
+            log_info("shutdown_trace", event="post_import_graph_enrich_tick_skipped", reason="application_shutting_down")
             return
         if self._import_ok_trace_enabled() and not getattr(self, "_import_ok_trace_graph_tick_logged", False):
             self._import_ok_trace_graph_tick_logged = True
@@ -50462,7 +55279,9 @@ class MainWindow(QMainWindow):
             if not source_root_path:
                 continue
             try:
-                descendants = self._collect_source_descendants_for_projection(src, move)
+                descendants = self._collect_source_descendants_for_projection(
+                    src, move, collect_reason="pilot_transfer_picker_folder_descendants"
+                )
             except Exception:
                 descendants = []
             for descendant_data in descendants:
@@ -53692,7 +58511,14 @@ class MainWindow(QMainWindow):
         table.clearSelection()
 
     def refresh_planned_moves_table(self):
+        self._startup_post_snapshot_trace_event("refresh_planned_moves_table_enter")
+        _t_rc = time.perf_counter()
         self._rebuild_submission_visual_cache()
+        self._startup_post_snapshot_trace_event(
+            "refresh_planned_moves_table_after_submission_cache",
+            submission_cache_ms=round((time.perf_counter() - _t_rc) * 1000.0, 2),
+            planned_moves_count=len(self.planned_moves or []),
+        )
         loading_message = self._planning_workspace_loading_message()
         loading_banner = getattr(self, "planned_moves_loading_banner", None)
         if loading_banner is not None:

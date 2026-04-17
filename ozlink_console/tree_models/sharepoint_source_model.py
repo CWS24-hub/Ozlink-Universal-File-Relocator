@@ -8,7 +8,7 @@ expand affordance without materializing child rows.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QAbstractItemModel, QModelIndex, Qt
 from PySide6.QtGui import QBrush
@@ -527,3 +527,213 @@ class SharePointSourceTreeModel(QAbstractItemModel):
 
         walk(QModelIndex())
         return out
+
+    def count_snapshot_shell_nodes_depth_first(self) -> int:
+        """All visible rows including placeholders (forensic shell size)."""
+        return len(self.iter_depth_first())
+
+    @staticmethod
+    def _merge_root_row_path_key(pl: Dict[str, Any]) -> str:
+        raw = str(pl.get("item_path") or pl.get("semantic_path") or pl.get("display_path") or "").strip()
+        return raw.replace("/", "\\").casefold()
+
+    def _remove_root_row(self, row: int) -> None:
+        parent_node = self._invisible
+        ch = parent_node._children or []
+        if row < 0 or row >= len(ch):
+            return
+        old = ch[row]
+        self._unregister_subtree_paths(old)
+        inv = QModelIndex()
+        self.beginRemoveRows(inv, row, row)
+        ch.pop(row)
+        parent_node._children = ch
+        self.endRemoveRows()
+        self._reindex(parent_node)
+        self._bump_structure_generation()
+
+    def _insert_root_child_at(self, row: int, pl: Dict[str, Any]) -> None:
+        parent_node = self._invisible
+        ch = list(parent_node._children or [])
+        row = max(0, min(int(row), len(ch)))
+        child_list: Optional[List[_Node]] = None if pl.get("is_folder") else []
+        inv = QModelIndex()
+        self.beginInsertRows(inv, row, row)
+        node = _Node(parent_node, row, dict(pl), child_list)
+        ch.insert(row, node)
+        parent_node._children = ch
+        self._reindex(parent_node)
+        self.endInsertRows()
+        self._register_subtree_paths(node)
+        self._bump_structure_generation()
+
+    @staticmethod
+    def _root_graph_sort_key(pl: Dict[str, Any]) -> Tuple[bool, str]:
+        return (not bool(pl.get("is_folder")), str(pl.get("name") or "").lower())
+
+    def _root_graph_insertion_row(self, incoming_pl: Dict[str, Any]) -> int:
+        inv = QModelIndex()
+        sk = self._root_graph_sort_key(incoming_pl)
+        n = self.rowCount(inv)
+        for r in range(n):
+            pl = self.index(r, 0, inv).data(Qt.UserRole) or {}
+            if not isinstance(pl, dict) or pl.get("placeholder"):
+                continue
+            if self._root_graph_sort_key(pl) > sk:
+                return r
+        return n
+
+    def mount_from_session_snapshot_roots(self, snapshot_roots: List[Dict[str, Any]]) -> int:
+        """Replace the model with a recursive snapshot shell (Phase 1 metadata cache).
+
+        Serialized folder rows with no ``children`` use ``_children is None`` unless
+        ``children_loaded`` is true (materialized empty).
+        """
+        roots: List[_Node] = []
+        total = 0
+        for i, snap in enumerate(snapshot_roots or []):
+            node = self._node_from_snapshot_branch(snap if isinstance(snap, dict) else {}, self._invisible, i)
+            if node is not None:
+                roots.append(node)
+                total += self._count_subtree_nodes(node)
+        self.beginResetModel()
+        self._invisible._children = roots
+        self._reindex(self._invisible)
+        self.endResetModel()
+        self._rebuild_path_index()
+        self._bump_structure_generation()
+        return total
+
+    def _count_subtree_nodes(self, node: _Node) -> int:
+        n = 1
+        ch = node._children
+        if not ch:
+            return n
+        for c in ch:
+            n += self._count_subtree_nodes(c)
+        return n
+
+    def _node_from_snapshot_branch(self, snap: Dict[str, Any], parent: _Node, row: int) -> Optional[_Node]:
+        data = dict((snap or {}).get("data") or {})
+        if not data:
+            return None
+        is_ph = bool(data.get("placeholder"))
+        if not is_ph:
+            data["source_shell_provisional"] = True
+        ch_snaps = list((snap or {}).get("children") or [])
+        is_folder = bool(data.get("is_folder")) and not is_ph
+        if not is_folder:
+            return _Node(parent, row, data, [])
+        if not ch_snaps:
+            cl = bool(data.get("children_loaded"))
+            inner: Optional[List[_Node]] = [] if cl else None
+            return _Node(parent, row, data, inner)
+        pl = dict(data)
+        pl["children_loaded"] = True
+        folder_node = _Node(parent, row, pl, [])
+        children: List[_Node] = []
+        for j, c_snap in enumerate(ch_snaps):
+            cn = self._node_from_snapshot_branch(c_snap if isinstance(c_snap, dict) else {}, folder_node, j)
+            if cn is not None:
+                children.append(cn)
+        folder_node._children = children
+        return folder_node
+
+    def merge_sharepoint_source_root_graph_children(
+        self,
+        graph_payloads: List[Dict[str, Any]],
+        *,
+        enrich_only: bool = False,
+    ) -> Dict[str, int]:
+        """Merge live Graph root children into the tree without resetting the model (startup shell)."""
+        inv = QModelIndex()
+        stats = {"updated": 0, "inserted": 0, "removed": 0, "enrich_only": int(bool(enrich_only))}
+        incoming: List[Dict[str, Any]] = [
+            dict(p) for p in (graph_payloads or []) if isinstance(p, dict) and str(p.get("id") or "").strip()
+        ]
+        incoming.sort(key=self._root_graph_sort_key)
+        incoming_by_id = {str(p["id"]).strip(): p for p in incoming}
+        incoming_by_path: Dict[str, Dict[str, Any]] = {}
+        for p in incoming:
+            pk = self._merge_root_row_path_key(p)
+            if pk and pk not in incoming_by_path:
+                incoming_by_path[pk] = p
+
+        used: set[str] = set()
+        for r in range(self.rowCount(inv)):
+            ix = self.index(r, 0, inv)
+            pl = ix.data(Qt.UserRole) or {}
+            if not isinstance(pl, dict) or pl.get("placeholder"):
+                continue
+            gid = str(pl.get("id") or "").strip()
+            if not gid:
+                continue
+            inc = incoming_by_id.get(gid)
+            if inc is None:
+                continue
+            used.add(gid)
+            prev_children_loaded = bool(pl.get("children_loaded")) if pl.get("is_folder") else False
+            inc_copy = dict(inc)
+
+            def mutator(payload: Dict[str, Any], _prev=prev_children_loaded, _inc=inc_copy) -> None:
+                payload.update(_inc)
+                payload.pop("source_shell_provisional", None)
+                if payload.get("is_folder") and _prev:
+                    payload["children_loaded"] = True
+
+            self.update_payload_for_index(ix, mutator)
+            stats["updated"] += 1
+
+        for r in range(self.rowCount(inv) - 1, -1, -1):
+            pl = self.index(r, 0, inv).data(Qt.UserRole) or {}
+            if not isinstance(pl, dict):
+                continue
+            if pl.get("placeholder"):
+                role = str(pl.get("placeholder_role") or "")
+                if incoming_by_id and role in ("empty_library_message", "loading_in_progress", "terminal_empty"):
+                    self._remove_root_row(r)
+                    stats["removed"] += 1
+                continue
+            gid = str(pl.get("id") or "").strip()
+            if not gid:
+                if incoming_by_id and not enrich_only:
+                    self._remove_root_row(r)
+                    stats["removed"] += 1
+                continue
+            if gid not in incoming_by_id:
+                pk = self._merge_root_row_path_key(pl)
+                inc_path = incoming_by_path.get(pk) if pk else None
+                if inc_path is not None:
+                    inc_gid = str(inc_path.get("id") or "").strip()
+                    if inc_gid and inc_gid not in used:
+                        ix = self.index(r, 0, inv)
+                        prev_children_loaded = bool(pl.get("children_loaded")) if pl.get("is_folder") else False
+                        inc_copy = dict(inc_path)
+
+                        def mutator_path(
+                            payload: Dict[str, Any], _prev=prev_children_loaded, _inc=inc_copy
+                        ) -> None:
+                            payload.update(_inc)
+                            payload.pop("source_shell_provisional", None)
+                            if payload.get("is_folder") and _prev:
+                                payload["children_loaded"] = True
+
+                        self.update_payload_for_index(ix, mutator_path)
+                        used.add(inc_gid)
+                        stats["updated"] += 1
+                        continue
+                if not enrich_only:
+                    self._remove_root_row(r)
+                    stats["removed"] += 1
+
+        for inc in incoming:
+            gid = str(inc.get("id") or "").strip()
+            if not gid or gid in used:
+                continue
+            row_ins = self._root_graph_insertion_row(inc)
+            self._insert_root_child_at(row_ins, inc)
+            used.add(gid)
+            stats["inserted"] += 1
+
+        self._rebuild_path_index()
+        return stats
