@@ -10882,12 +10882,15 @@ class MainWindow(QMainWindow):
                     worker_id=worker_id,
                 )
                 try:
-                    worker.finished.connect(worker.deleteLater, Qt.ConnectionType.UniqueConnection)
-                except TypeError:
-                    try:
-                        worker.finished.connect(worker.deleteLater)
-                    except Exception:
-                        pass
+                    fin = getattr(worker, "finished", None)
+                    if fin is not None:
+                        fin.disconnect()
+                except Exception:
+                    pass
+                try:
+                    worker.finished.connect(worker.deleteLater)
+                except Exception:
+                    pass
                 return
             try:
                 if _shiboken_is_valid(worker):
@@ -10949,12 +10952,15 @@ class MainWindow(QMainWindow):
                     worker_id=worker_id,
                 )
                 try:
-                    worker.finished.connect(worker.deleteLater, Qt.ConnectionType.UniqueConnection)
-                except TypeError:
-                    try:
-                        worker.finished.connect(worker.deleteLater)
-                    except Exception:
-                        pass
+                    fin = getattr(worker, "finished", None)
+                    if fin is not None:
+                        fin.disconnect()
+                except Exception:
+                    pass
+                try:
+                    worker.finished.connect(worker.deleteLater)
+                except Exception:
+                    pass
                 return
             try:
                 if _shiboken_is_valid(worker):

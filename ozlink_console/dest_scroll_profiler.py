@@ -172,9 +172,8 @@ class DestScrollProfiler:
         )
 
     def record(self, category: str, name: str, elapsed_sec: float) -> None:
-        if not self._active():
-            return
-        if not self._capturing:
+        # Same gate as model fine-grained hooks (single source of truth).
+        if not self.should_record_fine_grained():
             return
         ms = float(elapsed_sec) * 1000.0
         key = (category, name)
@@ -245,7 +244,7 @@ class DestScrollProfiler:
             "pct_of_wall_ms_overlap_note": pct_note,
             "sum_tracked_ms": round(sum_tracked, 3),
             "overlap_warning": "Percents sum nested/overlapping work; can exceed 100% of wall_ms.",
-            "top_hotspots": top_hotspots[:8],
+            "top_hotspots": top_hotspots[:16],
             "timeline_sample_json": json.dumps(timeline_trim, separators=(",", ":")),
         }
         log_info("dest_scroll_profile_window", **payload)
