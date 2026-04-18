@@ -46117,7 +46117,11 @@ class MainWindow(QMainWindow):
                 self._destination_graph_overlay_deferred_frame_kick = False
                 # Timer may fire while the user is scrolling again; mirror destination_scroll_overlay_blocked
                 # so graph_resolve_overlay_yield_frame work runs after scroll idle (same pending flush path).
-                if self._destination_user_scroll_interaction_active():
+                if (
+                    not bool(force_authoritative_bind)
+                    and not bool(_shutdown_pre_save)
+                    and self._destination_user_scroll_interaction_active()
+                ):
                     _prior = str(getattr(self, "_destination_materialize_pended_for_scroll_reason", "") or "")
                     self._destination_materialize_pended_for_scroll_reason = _rr
                     self._destination_materialize_pended_for_scroll_kwargs = {
@@ -46127,6 +46131,7 @@ class MainWindow(QMainWindow):
                     }
                     log_info(
                         "destination_scroll_graph_resolve_yield_deferred",
+                        reason=str(_rr)[:220],
                         reason_excerpt=str(_rr)[:220],
                         coalesced_with_prior=bool(_prior),
                         prior_reason_excerpt=str(_prior)[:120],
