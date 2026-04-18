@@ -76,8 +76,14 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         self._invalid_internal_pointer_logged_gen: int = -1
         self._coalesce_dest_structure_signal_depth: int = 0
         self._pending_dest_structure_signal: bool = False
+        # (structure_generation, internalPointer _Node ref, payload dict) — hot-path for Qt.UserRole col 0 only.
+        self._ur0_return_cache: Optional[Tuple[int, Any, Any]] = None
         # Set by MainWindow to :class:`ozlink_console.dest_scroll_profiler.DestScrollProfiler` when enabled.
         self._dest_scroll_profiler_ref: Any = None
+
+    def beginResetModel(self) -> None:
+        self._ur0_return_cache = None
+        super().beginResetModel()
 
     def begin_coalesce_destination_structure_signal(self) -> None:
         """Batch multiple structural mutations; emit :attr:`destination_structure_changed` once on end."""
@@ -92,6 +98,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
 
     def _notify_structure_changed(self) -> None:
         self._structure_generation += 1
+        self._ur0_return_cache = None
         if int(getattr(self, "_coalesce_dest_structure_signal_depth", 0) or 0) > 0:
             self._pending_dest_structure_signal = True
             return
@@ -218,6 +225,36 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
                 return None
             col = index.column()
             _prof_detail = f"DestinationPlanningTreeModel.data:r{int(role)}:c{col}"
+            # Qt.UserRole (=256) col 0: row payload dict; delegate + views query often — cache last resolve.
+            if role == Qt.UserRole:
+                if col != 0:
+                    return None
+                gen = int(self._structure_generation)
+                c = getattr(self, "_ur0_return_cache", None)
+                try:
+                    ptr = index.internalPointer()
+                except RuntimeError:
+                    ptr = None
+                if (
+                    c
+                    and c[0] == gen
+                    and ptr is not None
+                    and ptr is c[1]
+                    and isinstance(ptr, _Node)
+                ):
+                    pl_hit = getattr(ptr, "payload", None)
+                    if isinstance(pl_hit, dict) and pl_hit is c[2]:
+                        return pl_hit
+                node = self._node(index)
+                if node is None or not isinstance(node, _Node):
+                    _prof_detail = f"DestinationPlanningTreeModel.data:r{int(role)}:c{col}:no_node"
+                    return None
+                p = getattr(node, "payload", None)
+                if not isinstance(p, dict):
+                    _prof_detail = f"DestinationPlanningTreeModel.data:r{int(role)}:c{col}:no_payload"
+                    return None
+                self._ur0_return_cache = (gen, ptr if isinstance(ptr, _Node) else node, p)
+                return p
             node = self._node(index)
             if node is None or not isinstance(node, _Node):
                 _prof_detail = f"DestinationPlanningTreeModel.data:r{int(role)}:c{col}:no_node"
@@ -236,8 +273,6 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
                 if col == 3:
                     return explorer_date_label(p)
                 return None
-            if role == Qt.UserRole:
-                return p if col == 0 else None
             if role == Qt.ForegroundRole:
                 c = p.get("_model_foreground")
                 if c is not None:
