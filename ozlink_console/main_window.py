@@ -3045,6 +3045,7 @@ class MainWindow(QMainWindow):
         self._legacy_identity_inference_retry_site_key: str | None = None
         self._legacy_identity_inference_retry_timer_pending: bool = False
         self._legacy_identity_inference_retry_trigger: str = ""
+        self._legacy_identity_inference_authoritative_rebind_done: bool = False
         self._destination_startup_descendant_injection_active: bool = False
         self._destination_startup_descendant_queue_completed_logged: bool = False
         self._destination_startup_descendant_queue_paused_for_authority: bool = False
@@ -8113,6 +8114,7 @@ class MainWindow(QMainWindow):
         prev = getattr(self, "_legacy_identity_inference_retry_site_key", None)
         if prev != key:
             self._legacy_identity_inference_retry_attempt_count = 0
+            self._legacy_identity_inference_authoritative_rebind_done = False
             self._legacy_identity_inference_retry_site_key = key
         if self._legacy_identity_inference_retry_attempt_count >= 2:
             return
@@ -8133,6 +8135,61 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(0, _run)
 
+    def _legacy_identity_inference_authoritative_rebind_after_retry(
+        self,
+        *,
+        dest_snaps: list,
+        trigger: str,
+        sel_src: str,
+    ) -> None:
+        """After legacy identity inference succeeds, mirror startup: stamp, provisional snapshot paint, overlay materialize."""
+        if getattr(self, "_legacy_identity_inference_authoritative_rebind_done", False):
+            return
+        t = str(trigger or "")[:120]
+        log_info(
+            "destination_legacy_inference_authoritative_rebind_started",
+            trigger=t,
+            sel_src_excerpt=str(sel_src or "")[:120],
+            top_level_roots=len(dest_snaps) if isinstance(dest_snaps, list) else -1,
+        )
+        prov = False
+        overlay_ret = 0
+        try:
+            destination_stamp_snapshot_tree_workspace_state(dest_snaps)
+            if self._planning_browse_mode("destination") != "local":
+                prov = bool(
+                    self._destination_apply_provisional_session_snapshot_if_eligible(
+                        phase="legacy_identity_inference_retry"
+                    )
+                )
+            overlay_ret = int(
+                self._apply_destination_planning_overlays(
+                    "legacy_identity_inference_retry",
+                    allow_defer=False,
+                    prefer_chunked_projection=False,
+                    narrow_restore_real_snapshot=False,
+                    force_authoritative_bind=True,
+                )
+                or 0
+            )
+            self._legacy_identity_inference_authoritative_rebind_done = True
+            log_info(
+                "destination_legacy_inference_authoritative_rebind_completed",
+                trigger=t,
+                ok=True,
+                provisional_applied=bool(prov),
+                overlay_applied_count=int(overlay_ret),
+                sel_src_excerpt=str(sel_src or "")[:120],
+            )
+        except Exception as exc:
+            self._log_restore_exception("legacy_identity_inference_authoritative_rebind", exc)
+            log_info(
+                "destination_legacy_inference_authoritative_rebind_completed",
+                trigger=t,
+                ok=False,
+                error=str(exc)[:500],
+            )
+
     def _retry_legacy_snapshot_identity_inference(self, win=None) -> None:
         if self._legacy_identity_inference_retry_attempt_count >= 2:
             return
@@ -8150,7 +8207,7 @@ class MainWindow(QMainWindow):
             dest_snaps_session = list(tree_snapshots.get("destination", []) or [])
             mm = getattr(self, "memory_manager", None)
             sidecar = mm.read_workspace_snapshot_optional() if mm is not None else None
-            dest_snaps, _sel_src, _n_sess, _n_side, meta = self._select_destination_tree_snapshot_for_startup(
+            dest_snaps, sel_src, _n_sess, _n_side, meta = self._select_destination_tree_snapshot_for_startup(
                 dest_snaps_session,
                 workspace_sidecar=sidecar,
             )
@@ -8160,6 +8217,8 @@ class MainWindow(QMainWindow):
             rs = getattr(self, "_runtime_session_tree_snapshots", None)
             if isinstance(rs, dict):
                 rs["destination"] = list(dest_snaps)
+            if isinstance(sel_src, str) and sel_src.startswith("Workspace") and isinstance(self._draft_shell_state, SessionState):
+                self._draft_shell_state.DestinationTreeSnapshot = list(dest_snaps)
             try:
                 self._destination_startup_allowed_semantic_root_segments_cf = allowed_semantic_root_segments_cf_from_snapshot(
                     dest_snaps
@@ -8169,6 +8228,10 @@ class MainWindow(QMainWindow):
             after_inferred = bool(state and getattr(state, "DestinationTreeSnapshotIdentityInferredFromLegacy", False))
             stamp_ok = self._meta_legacy_inference_resolved_with_stamp(meta)
             still_blocked = bool(meta.get("legacy_inference_retry_recommended"))
+            tree_materialized = bool(
+                getattr(self, "_destination_provisional_startup_applied", False)
+                or getattr(self, "_destination_startup_snapshot_mount_seen", False)
+            )
             if still_blocked:
                 log_info(
                     "destination_legacy_inference_retry_failed",
@@ -8184,8 +8247,23 @@ class MainWindow(QMainWindow):
                     stamp_applied=bool(stamp_ok),
                     identity_inferred_from_legacy=after_inferred,
                 )
-            if stamp_ok and after_inferred and not before_inferred:
-                self._schedule_destination_bind_reconcile_after_workers(delay_ms=180)
+            identity_ok = bool(stamp_ok or after_inferred or before_inferred)
+            needs_authoritative_rebind = (
+                not still_blocked
+                and identity_ok
+                and not getattr(self, "_legacy_identity_inference_authoritative_rebind_done", False)
+                and (
+                    not before_inferred
+                    or not tree_materialized
+                    or bool(dest_snaps)
+                )
+            )
+            if needs_authoritative_rebind:
+                self._legacy_identity_inference_authoritative_rebind_after_retry(
+                    dest_snaps=list(dest_snaps),
+                    trigger=trigger,
+                    sel_src=str(sel_src or ""),
+                )
         except Exception as exc:
             log_info(
                 "destination_legacy_inference_retry_failed",
@@ -45743,7 +45821,13 @@ class MainWindow(QMainWindow):
             self._destination_planning_overlay_gui_chunk_state = None
 
     def _apply_destination_planning_overlays(
-        self, reason, *, allow_defer=True, prefer_chunked_projection=False, narrow_restore_real_snapshot=False
+        self,
+        reason,
+        *,
+        allow_defer=True,
+        prefer_chunked_projection=False,
+        narrow_restore_real_snapshot=False,
+        force_authoritative_bind=False,
     ):
         if _shutdown_mutation_skip_for_host(self, "_apply_destination_planning_overlays", reason=str(reason or "")[:200]):
             return 0
@@ -45777,8 +45861,10 @@ class MainWindow(QMainWindow):
             self._destination_quiet_startup_overlay_structural_suppress = False
             log_info("destination_quiet_startup_overlay_structural_suppress_off", entry_reason=rr[:220])
         self._destination_overlay_terminal_reconcile_done = False
-        _force_auth_flush = bool(_shutdown_pre_save) or MainWindow._destination_materialize_requires_authoritative_hard_flush(
-            self, r
+        _force_auth_flush = (
+            bool(_shutdown_pre_save)
+            or MainWindow._destination_materialize_requires_authoritative_hard_flush(self, r)
+            or bool(force_authoritative_bind)
         )
         if _force_auth_flush:
             allow_defer = False
