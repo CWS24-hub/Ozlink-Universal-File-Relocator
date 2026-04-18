@@ -1830,10 +1830,7 @@ class DestinationPlanningTreeDelegate(QStyledItemDelegate):
         if prof is not None and prof.should_record_fine_grained():
             _t0 = time.perf_counter()
         try:
-            # Skip Qt.UserRole unless plan-leaf exclusion styling may apply (only column 0; needs exclusions set).
-            if index.column() != 0:
-                super().paint(painter, option, index)
-                return
+            # Delegate is installed for column 0 only; keep exclusion fast-path when no plan-leaf exclusions.
             if not (getattr(self.window, "_plan_leaf_exclusions", None) or set()):
                 super().paint(painter, option, index)
                 return
@@ -5772,8 +5769,11 @@ class MainWindow(QMainWindow):
         self.destination_tree_widget.selectionModel().selectionChanged.connect(
             lambda *_args: self.on_tree_selection_changed("destination")
         )
-        self.destination_tree_widget.setItemDelegate(
-            DestinationPlanningTreeDelegate(self, self.destination_tree_widget)
+        # Column 0 only: name + plan-leaf exclusion styling. Other explorer columns use the default delegate
+        # so scroll paint profiling is not charged to DestinationPlanningTreeDelegate for size/type/date cells.
+        self.destination_tree_widget.setItemDelegateForColumn(
+            0,
+            DestinationPlanningTreeDelegate(self, self.destination_tree_widget),
         )
         self.source_tree_widget.setContextMenuPolicy(Qt.CustomContextMenu)
         self.source_tree_widget.customContextMenuRequested.connect(self.show_source_context_menu)
@@ -24984,6 +24984,7 @@ class MainWindow(QMainWindow):
         """
         _dsp_s = getattr(self, "_dest_scroll_profiler", None)
         _t0_s = time.perf_counter() if _dsp_s else None
+        _skip_dsp_record = False
         try:
             perf = QElapsedTimer()
             dev = is_dev_mode()
@@ -25031,6 +25032,7 @@ class MainWindow(QMainWindow):
                 return None
             _scroll_idle_fn = getattr(self, "_destination_user_scroll_interaction_active", None)
             if callable(_scroll_idle_fn) and _scroll_idle_fn():
+                _skip_dsp_record = True
                 if dev:
                     _perf_explorer_log(
                         "find_visible_source_item_by_path",
@@ -25095,7 +25097,7 @@ class MainWindow(QMainWindow):
             return None
 
         finally:
-            if _dsp_s is not None and _t0_s is not None:
+            if _dsp_s is not None and _t0_s is not None and not _skip_dsp_record:
                 _dsp_s.record(
                     "source_lookup",
                     "_find_visible_source_item_by_path",
@@ -50833,7 +50835,11 @@ class MainWindow(QMainWindow):
                             source_path_excerpt=str(source_path or "")[:220],
                         )
                     return dict(ent[1])
-                source_item = self._find_visible_source_item_by_path(source_path)
+                # Avoid find_visible while destination scroll is active (cache miss): linkage refreshes on idle.
+                if _scr:
+                    source_item = None
+                else:
+                    source_item = self._find_visible_source_item_by_path(source_path)
                 if is_dev_mode() and source_item is None:
                     log_info(
                         "visible_source_lookup_cache_miss",
