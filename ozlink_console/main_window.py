@@ -3192,6 +3192,9 @@ class MainWindow(QMainWindow):
         self._destination_chunk_planned_workspace_fixpoint: bool = False
         self._destination_fixpoint_slice_incomplete: bool = False
         self._destination_fixpoint_slice_continuations: int = 0
+        self._destination_fixpoint_resume_mark_loaded_stack: list | None = None
+        self._destination_fixpoint_resume_seen_mark: set | None = None
+        self._destination_fixpoint_resume: dict | None = None
         self._destination_global_reconcile_chunk_state: dict | None = None
         self._destination_global_reconcile_overlay_deferred: dict | None = None
         self._destination_graph_canon_norm_cache: dict[tuple[int, str, str], str] = {}
@@ -3199,7 +3202,7 @@ class MainWindow(QMainWindow):
         self._destination_reconcile_in_progress: bool = False
         self._destination_reconcile_last_completed_plan_gen: int = -1
         self._destination_startup_global_reconcile_chunk_ms: float = 18.0
-        self._destination_startup_fixpoint_slice_s: float = 0.012
+        self._destination_startup_fixpoint_slice_s: float = 0.006
         # Late full-tree idle success: merge + overlay without one GUI-thread mega-pass.
         self._destination_full_tree_idle_light_overlay: bool = False
         self._destination_full_tree_idle_merge_chunk_active: bool = False
@@ -25332,7 +25335,8 @@ class MainWindow(QMainWindow):
                 deb = int(getattr(self, "_destination_structure_reactive_debounce_ms", 32) or 32)
                 _sfn = getattr(self, "_destination_user_scroll_interaction_active", None)
                 if callable(_sfn) and _sfn():
-                    deb = max(deb, 56)
+                    _idle_ms = int(getattr(self, "_destination_tree_scroll_idle_ms", 280) or 280)
+                    deb = max(deb, 56, min(320, max(_idle_ms // 2, 120)))
                 t_sr.start(max(0, deb))
             else:
                 self._on_destination_state_mutation("destination_model_structure_changed", None)
@@ -35596,6 +35600,24 @@ class MainWindow(QMainWindow):
             attached += 1
         return attached
 
+    def _destination_fixpoint_compute_deadline(self, t0: float) -> tuple[float | None, float | None]:
+        """Return (deadline_perf, budget_ms_for_log) for chunked planned-workspace fixpoint.
+
+        Target slice is 4–8 ms; wall time must never exceed 10 ms per timer invocation.
+        """
+        if not getattr(self, "_destination_chunk_planned_workspace_fixpoint", False):
+            return None, None
+        _slice_s = float(getattr(self, "_destination_startup_fixpoint_slice_s", 0.006) or 0.006)
+        try:
+            if self._destination_user_scroll_interaction_active():
+                _slice_s = min(_slice_s, 0.004)
+        except Exception:
+            pass
+        _slice_s = min(float(_slice_s), 0.008)
+        deadline = min(t0 + _slice_s, t0 + 0.010)
+        budget_ms = round((deadline - t0) * 1000.0, 3)
+        return deadline, budget_ms
+
     def _materialize_planned_workspace_proposed_descendants_fixpoint(
         self, subtree_root_ix: QModelIndex, *, max_rounds: int = 48
     ) -> int:
@@ -35664,6 +35686,89 @@ class MainWindow(QMainWindow):
         if dmodel is None:
             return 0
         fen = self._destination_forensic_planned_item_materialization_logging_enabled()
+        _ml_resume = getattr(self, "_destination_fixpoint_resume_mark_loaded_stack", None)
+        if _ml_resume is not None:
+            self._destination_fixpoint_resume_mark_loaded_stack = None
+            _ml_seen = getattr(self, "_destination_fixpoint_resume_seen_mark", None)
+            self._destination_fixpoint_resume_seen_mark = None
+            _fix_slice_t0 = time.perf_counter()
+            deadline_perf, budget_ms_log = self._destination_fixpoint_compute_deadline(_fix_slice_t0)
+            if deadline_perf is not None:
+                log_info(
+                    "startup_lifecycle_temp_materialize_chunk_begin",
+                    phase="planned_workspace_fixpoint",
+                    subphase="mark_loaded_stack",
+                    budget_ms=budget_ms_log,
+                    budget_wall_cap_ms=10.0,
+                    note="resume",
+                )
+            stack_ml: list[QModelIndex] = list(_ml_resume)
+            seen_ml: set[int] = set(_ml_seen or [])
+            self._destination_fixpoint_slice_incomplete = False
+            while stack_ml:
+                if deadline_perf is not None and time.perf_counter() >= deadline_perf:
+                    self._destination_fixpoint_slice_incomplete = True
+                    self._destination_fixpoint_resume_mark_loaded_stack = list(stack_ml)
+                    self._destination_fixpoint_resume_seen_mark = set(seen_ml)
+                    log_info(
+                        "startup_lifecycle_temp_materialize_chunk_end",
+                        phase="planned_workspace_fixpoint",
+                        subphase="mark_loaded_stack",
+                        wall_ms=round((time.perf_counter() - _fix_slice_t0) * 1000.0, 2),
+                        budget_ms=budget_ms_log,
+                        note="fixpoint_budget_yield_mark_loaded_stack",
+                        planned_workspace_fixpoint_budget_enforced=True,
+                    )
+                    return 0
+                _ix_ml = stack_ml.pop()
+                if not _ix_ml.isValid():
+                    continue
+                _ptr_ml = _ix_ml.internalPointer()
+                _pid_ml = id(_ptr_ml) if _ptr_ml is not None else None
+                if _pid_ml is not None:
+                    if _pid_ml in seen_ml:
+                        continue
+                    seen_ml.add(_pid_ml)
+                _plm_ml = self._destination_model_index_user_role_dict(_ix_ml)
+                if destination_payload_is_planned_workspace_row(_plm_ml) and bool(_plm_ml.get("is_folder", True)):
+
+                    def _mut_loaded_ml(p: dict[str, Any]) -> None:
+                        if destination_payload_is_planned_workspace_row(dict(p)) and p.get("is_folder", True):
+                            p["children_loaded"] = True
+
+                    dmodel.update_payload_for_index(_ix_ml, _mut_loaded_ml)
+                _nrc_ml = int(dmodel.rowCount(_ix_ml))
+                for _r_ml in range(_nrc_ml):
+                    if deadline_perf is not None and time.perf_counter() >= deadline_perf:
+                        for _r2 in range(_r_ml, _nrc_ml):
+                            stack_ml.append(dmodel.index(_r2, 0, _ix_ml))
+                        self._destination_fixpoint_resume_mark_loaded_stack = list(stack_ml)
+                        self._destination_fixpoint_resume_seen_mark = set(seen_ml)
+                        self._destination_fixpoint_slice_incomplete = True
+                        log_info(
+                            "startup_lifecycle_temp_materialize_chunk_end",
+                            phase="planned_workspace_fixpoint",
+                            subphase="mark_loaded_stack",
+                            wall_ms=round((time.perf_counter() - _fix_slice_t0) * 1000.0, 2),
+                            budget_ms=budget_ms_log,
+                            note="fixpoint_budget_yield_mark_loaded_stack_mid_children",
+                            row_index=int(_r_ml),
+                            row_count=int(_nrc_ml),
+                            planned_workspace_fixpoint_budget_enforced=True,
+                        )
+                        return 0
+                    stack_ml.append(dmodel.index(_r_ml, 0, _ix_ml))
+            if deadline_perf is not None:
+                log_info(
+                    "startup_lifecycle_temp_materialize_chunk_end",
+                    phase="planned_workspace_fixpoint",
+                    subphase="mark_loaded_stack",
+                    wall_ms=round((time.perf_counter() - _fix_slice_t0) * 1000.0, 2),
+                    budget_ms=budget_ms_log,
+                    note="mark_loaded_stack_complete",
+                    planned_workspace_fixpoint_budget_enforced=True,
+                )
+            return 0
         if fen:
             root_pl = self._destination_model_index_user_role_dict(col0)
             log_info(
@@ -35692,20 +35797,15 @@ class MainWindow(QMainWindow):
         planned_parents_visited = 0
         worklist_steps = 0
         self._destination_fixpoint_slice_incomplete = False
-        deadline_perf = None
         _fix_slice_t0 = time.perf_counter()
-        if getattr(self, "_destination_chunk_planned_workspace_fixpoint", False):
-            _slice_s = float(getattr(self, "_destination_startup_fixpoint_slice_s", 0.012) or 0.012)
-            try:
-                if self._destination_user_scroll_interaction_active():
-                    _slice_s = min(_slice_s, 0.004)
-            except Exception:
-                pass
-            deadline_perf = _fix_slice_t0 + _slice_s
+        deadline_perf, budget_ms_log = self._destination_fixpoint_compute_deadline(_fix_slice_t0)
+        if deadline_perf is not None:
             log_info(
                 "startup_lifecycle_temp_materialize_chunk_begin",
                 phase="planned_workspace_fixpoint",
-                budget_ms=round(_slice_s * 1000.0, 2),
+                subphase="worklist",
+                budget_ms=budget_ms_log,
+                budget_wall_cap_ms=10.0,
             )
         if fen:
             log_info(
@@ -35722,9 +35822,13 @@ class MainWindow(QMainWindow):
                     log_info(
                         "startup_lifecycle_temp_materialize_chunk_end",
                         phase="planned_workspace_fixpoint",
+                        subphase="worklist",
                         wall_ms=round((time.perf_counter() - _fix_slice_t0) * 1000.0, 2),
+                        budget_ms=budget_ms_log,
                         parent_count_processed=int(planned_parents_visited),
+                        worklist_steps=int(worklist_steps),
                         note="time_slice_yield_with_pending_worklist",
+                        planned_workspace_fixpoint_budget_enforced=True,
                     )
                 break
             worklist_steps += 1
@@ -35734,16 +35838,44 @@ class MainWindow(QMainWindow):
             node_applied = 0
             ptr = ix.internalPointer()
             pid = id(ptr) if ptr is not None else None
-            if pid is not None:
+            _res = getattr(self, "_destination_fixpoint_resume", None)
+            skip_visit_count = False
+            skip_main_materialize = False
+            pw_step_local = 0
+            child_r0 = 0
+            if isinstance(_res, dict):
+                _rix = _res.get("ix")
+                if isinstance(_rix, QModelIndex) and _rix.isValid() and _rix == ix:
+                    _k = str(_res.get("kind") or "")
+                    if _k == "pw":
+                        pw_step_local = int(_res.get("step", 0) or 0)
+                        skip_visit_count = True
+                        if pw_step_local >= 3:
+                            skip_main_materialize = True
+                        self._destination_fixpoint_resume = None
+                    elif _k == "child":
+                        child_r0 = int(_res.get("r", 0) or 0)
+                        skip_visit_count = True
+                        skip_main_materialize = True
+                        self._destination_fixpoint_resume = None
+                    elif _k == "after_apply":
+                        skip_visit_count = True
+                        skip_main_materialize = True
+                        self._destination_fixpoint_resume = None
+            if not skip_visit_count and pid is not None:
                 n_vis = visit_counts.get(pid, 0) + 1
                 visit_counts[pid] = n_vis
                 if n_vis > max_revisits_per_node:
                     continue
             pl = self._destination_model_index_user_role_dict(ix)
-            if destination_payload_is_planned_workspace_row(pl) and bool(pl.get("is_folder", True)):
+            _break_while = False
+            if not skip_main_materialize and destination_payload_is_planned_workspace_row(pl) and bool(
+                pl.get("is_folder", True)
+            ):
                 if pid is not None:
                     unique_planned_ws_parent_ptrs.add(pid)
-                planned_parents_visited += 1
+                if pw_step_local == 0:
+                    planned_parents_visited += 1
                 ppath = str(self._tree_item_path(pl) or "")[:400]
                 br_vis = self._destination_forensic_canon_diff_branch_hit(ppath)
                 un_before = self._forensic_count_unresolved_proposed_for_parent(ppath)
@@ -35753,7 +35885,7 @@ class MainWindow(QMainWindow):
                 )
                 kinds_before = self._forensic_destination_immediate_child_row_kinds(ix)
                 row_count_before = int(dmodel.rowCount(ix))
-                if fen:
+                if fen and pw_step_local == 0:
                     log_info(
                         "destination_forensic_fixpoint_visit_planned_workspace_parent",
                         round_index=int(round_idx),
@@ -35769,7 +35901,7 @@ class MainWindow(QMainWindow):
                         planned_move_folder_move_destinations_sample=" | ".join(folders_planning[:6])[:400],
                         immediate_children_before=dict(kinds_before),
                     )
-                if fen and br_vis:
+                if fen and br_vis and pw_step_local == 0:
                     p_graph = self._canonical_planned_memory_path_for_graph_match(
                         str(self._tree_item_path(pl) or "").strip()
                     )
@@ -35789,38 +35921,96 @@ class MainWindow(QMainWindow):
                         unresolved_proposed_queue_hits=" || ".join(qh[:10])[:2000],
                         detail="compare_raw_model_path_proposed_queue_keys_and_graph_canon",
                     )
-                delta = self._apply_proposed_children_to_model_index(ix, _materialize_recursive_pass=True)
-                kinds_mid = self._forensic_destination_immediate_child_row_kinds(ix)
-                folder_n = self._materialize_planned_move_folder_rows_under_parent(ix)
-                file_n = self._materialize_planned_move_file_rows_under_parent(ix)
-                contrib_pf = int(delta) + int(folder_n) + int(file_n)
-                round_applied += contrib_pf
-                kinds_after = self._forensic_destination_immediate_child_row_kinds(ix)
-                un_after = self._forensic_count_unresolved_proposed_for_parent(ppath)
-                row_count_after = int(dmodel.rowCount(ix))
-                if contrib_pf > 0 and (
-                    row_count_after > row_count_before or int(un_after) < int(un_before)
-                ):
-                    par = ix.parent()
-                    if par.isValid():
-                        queue.appendleft(par)
-                    queue.append(ix)
-                if fen:
-                    log_info(
-                        "destination_forensic_fixpoint_visit_planned_workspace_parent_done",
-                        round_index=int(round_idx),
-                        parent_canonical_path_excerpt=ppath,
-                        proposed_folder_records_applied=int(delta),
-                        planned_move_folder_rows_attached=int(folder_n),
-                        planned_move_file_rows_attached=int(file_n),
-                        immediate_children_after_proposed_pass=dict(kinds_mid),
-                        immediate_children_after=dict(kinds_after),
-                        unresolved_proposed_count_for_parent_after=int(un_after),
-                        planned_file_children_added=int(
-                            kinds_after.get("planned_file", 0) - kinds_before.get("planned_file", 0)
-                        ),
-                    )
-            elif (
+                delta = 0
+                kinds_mid: dict[str, int] = {}
+                folder_n = 0
+                file_n = 0
+                if pw_step_local <= 0:
+                    delta = self._apply_proposed_children_to_model_index(ix, _materialize_recursive_pass=True)
+                    if deadline_perf is not None and time.perf_counter() >= deadline_perf:
+                        self._destination_fixpoint_resume = {"kind": "pw", "ix": ix, "step": 1}
+                        queue.appendleft(ix)
+                        self._destination_fixpoint_slice_incomplete = True
+                        log_info(
+                            "startup_lifecycle_temp_materialize_chunk_end",
+                            phase="planned_workspace_fixpoint",
+                            subphase="worklist",
+                            wall_ms=round((time.perf_counter() - _fix_slice_t0) * 1000.0, 2),
+                            budget_ms=budget_ms_log,
+                            yield_phase="pw_after_apply_proposed",
+                            note="fixpoint_budget_yield_after_apply_proposed",
+                            planned_workspace_fixpoint_budget_enforced=True,
+                        )
+                        _break_while = True
+                    if not _break_while:
+                        kinds_mid = self._forensic_destination_immediate_child_row_kinds(ix)
+                elif pw_step_local == 1:
+                    kinds_mid = self._forensic_destination_immediate_child_row_kinds(ix)
+                else:
+                    kinds_mid = self._forensic_destination_immediate_child_row_kinds(ix)
+                if not _break_while and pw_step_local <= 1:
+                    folder_n = self._materialize_planned_move_folder_rows_under_parent(ix)
+                    if deadline_perf is not None and time.perf_counter() >= deadline_perf:
+                        self._destination_fixpoint_resume = {"kind": "pw", "ix": ix, "step": 2}
+                        queue.appendleft(ix)
+                        self._destination_fixpoint_slice_incomplete = True
+                        log_info(
+                            "startup_lifecycle_temp_materialize_chunk_end",
+                            phase="planned_workspace_fixpoint",
+                            subphase="worklist",
+                            wall_ms=round((time.perf_counter() - _fix_slice_t0) * 1000.0, 2),
+                            budget_ms=budget_ms_log,
+                            yield_phase="pw_after_planned_move_folder",
+                            note="fixpoint_budget_yield_after_planned_move_folder",
+                            planned_workspace_fixpoint_budget_enforced=True,
+                        )
+                        _break_while = True
+                if not _break_while and pw_step_local <= 2:
+                    file_n = self._materialize_planned_move_file_rows_under_parent(ix)
+                    if deadline_perf is not None and time.perf_counter() >= deadline_perf:
+                        self._destination_fixpoint_resume = {"kind": "pw", "ix": ix, "step": 3}
+                        queue.appendleft(ix)
+                        self._destination_fixpoint_slice_incomplete = True
+                        log_info(
+                            "startup_lifecycle_temp_materialize_chunk_end",
+                            phase="planned_workspace_fixpoint",
+                            subphase="worklist",
+                            wall_ms=round((time.perf_counter() - _fix_slice_t0) * 1000.0, 2),
+                            budget_ms=budget_ms_log,
+                            yield_phase="pw_after_planned_move_file",
+                            note="fixpoint_budget_yield_after_planned_move_file",
+                            planned_workspace_fixpoint_budget_enforced=True,
+                        )
+                        _break_while = True
+                if not _break_while:
+                    contrib_pf = int(delta) + int(folder_n) + int(file_n)
+                    round_applied += contrib_pf
+                    kinds_after = self._forensic_destination_immediate_child_row_kinds(ix)
+                    un_after = self._forensic_count_unresolved_proposed_for_parent(ppath)
+                    row_count_after = int(dmodel.rowCount(ix))
+                    if contrib_pf > 0 and (
+                        row_count_after > row_count_before or int(un_after) < int(un_before)
+                    ):
+                        par = ix.parent()
+                        if par.isValid():
+                            queue.appendleft(par)
+                        queue.append(ix)
+                    if fen:
+                        log_info(
+                            "destination_forensic_fixpoint_visit_planned_workspace_parent_done",
+                            round_index=int(round_idx),
+                            parent_canonical_path_excerpt=ppath,
+                            proposed_folder_records_applied=int(delta),
+                            planned_move_folder_rows_attached=int(folder_n),
+                            planned_move_file_rows_attached=int(file_n),
+                            immediate_children_after_proposed_pass=dict(kinds_mid),
+                            immediate_children_after=dict(kinds_after),
+                            unresolved_proposed_count_for_parent_after=int(un_after),
+                            planned_file_children_added=int(
+                                kinds_after.get("planned_file", 0) - kinds_before.get("planned_file", 0)
+                            ),
+                        )
+            elif not skip_main_materialize and (
                 bool(pl.get("is_folder", True))
                 and not destination_payload_is_live_graph_row(pl)
                 and self.node_is_planned_allocation(pl)
@@ -35835,7 +36025,22 @@ class MainWindow(QMainWindow):
                         parent_path_excerpt=str(self._tree_item_path(pl) or "")[:400],
                         allocation_children_applied=int(alloc_n),
                     )
-            elif bool(pl.get("is_folder", True)) and self.node_is_proposed(pl):
+                if deadline_perf is not None and time.perf_counter() >= deadline_perf:
+                    self._destination_fixpoint_resume = {"kind": "after_apply", "ix": ix}
+                    queue.appendleft(ix)
+                    self._destination_fixpoint_slice_incomplete = True
+                    log_info(
+                        "startup_lifecycle_temp_materialize_chunk_end",
+                        phase="planned_workspace_fixpoint",
+                        subphase="worklist",
+                        wall_ms=round((time.perf_counter() - _fix_slice_t0) * 1000.0, 2),
+                        budget_ms=budget_ms_log,
+                        yield_phase="after_allocation_apply",
+                        note="fixpoint_budget_yield_after_allocation_apply",
+                        planned_workspace_fixpoint_budget_enforced=True,
+                    )
+                    _break_while = True
+            elif not skip_main_materialize and bool(pl.get("is_folder", True)) and self.node_is_proposed(pl):
                 prop_n = self._apply_proposed_children_to_model_index(ix, _materialize_recursive_pass=True)
                 node_applied += int(prop_n)
                 round_applied += int(prop_n)
@@ -35846,12 +36051,50 @@ class MainWindow(QMainWindow):
                         parent_path_excerpt=str(self._tree_item_path(pl) or "")[:400],
                         proposed_folder_records_applied=int(prop_n),
                     )
-            for r in range(dmodel.rowCount(ix)):
+                if deadline_perf is not None and time.perf_counter() >= deadline_perf:
+                    self._destination_fixpoint_resume = {"kind": "after_apply", "ix": ix}
+                    queue.appendleft(ix)
+                    self._destination_fixpoint_slice_incomplete = True
+                    log_info(
+                        "startup_lifecycle_temp_materialize_chunk_end",
+                        phase="planned_workspace_fixpoint",
+                        subphase="worklist",
+                        wall_ms=round((time.perf_counter() - _fix_slice_t0) * 1000.0, 2),
+                        budget_ms=budget_ms_log,
+                        yield_phase="after_proposed_folder_apply",
+                        note="fixpoint_budget_yield_after_proposed_folder_apply",
+                        planned_workspace_fixpoint_budget_enforced=True,
+                    )
+                    _break_while = True
+            if _break_while:
+                break
+            rc = int(dmodel.rowCount(ix))
+            for r in range(child_r0, rc):
+                if deadline_perf is not None and time.perf_counter() >= deadline_perf:
+                    self._destination_fixpoint_resume = {"kind": "child", "ix": ix, "r": r}
+                    queue.appendleft(ix)
+                    self._destination_fixpoint_slice_incomplete = True
+                    log_info(
+                        "startup_lifecycle_temp_materialize_chunk_end",
+                        phase="planned_workspace_fixpoint",
+                        subphase="worklist",
+                        wall_ms=round((time.perf_counter() - _fix_slice_t0) * 1000.0, 2),
+                        budget_ms=budget_ms_log,
+                        yield_phase="child_enqueue",
+                        child_r=int(r),
+                        row_count=int(rc),
+                        note="fixpoint_budget_yield_mid_child_enqueue",
+                        planned_workspace_fixpoint_budget_enforced=True,
+                    )
+                    _break_while = True
+                    break
                 ch = dmodel.index(r, 0, ix)
                 ch_pl = self._destination_model_index_user_role_dict(ch)
                 if ch_pl.get("placeholder"):
                     continue
                 queue.append(ch)
+            if _break_while:
+                break
             if node_applied > 0:
                 par = ix.parent()
                 if par.isValid():
@@ -35884,9 +36127,38 @@ class MainWindow(QMainWindow):
         if getattr(self, "_destination_fixpoint_slice_incomplete", False):
             return int(total_applied)
 
+        if deadline_perf is not None and time.perf_counter() >= deadline_perf:
+            self._destination_fixpoint_resume_mark_loaded_stack = [col0]
+            self._destination_fixpoint_resume_seen_mark = set()
+            self._destination_fixpoint_slice_incomplete = True
+            log_info(
+                "startup_lifecycle_temp_materialize_chunk_end",
+                phase="planned_workspace_fixpoint",
+                subphase="mark_loaded_stack",
+                wall_ms=round((time.perf_counter() - _fix_slice_t0) * 1000.0, 2),
+                budget_ms=budget_ms_log,
+                note="fixpoint_defer_mark_loaded_stack_after_worklist",
+                planned_workspace_fixpoint_budget_enforced=True,
+            )
+            return int(total_applied)
+
         stack: list[QModelIndex] = [col0]
         seen_mark: set[int] = set()
         while stack:
+            if deadline_perf is not None and time.perf_counter() >= deadline_perf:
+                self._destination_fixpoint_resume_mark_loaded_stack = list(stack)
+                self._destination_fixpoint_resume_seen_mark = set(seen_mark)
+                self._destination_fixpoint_slice_incomplete = True
+                log_info(
+                    "startup_lifecycle_temp_materialize_chunk_end",
+                    phase="planned_workspace_fixpoint",
+                    subphase="mark_loaded_stack",
+                    wall_ms=round((time.perf_counter() - _fix_slice_t0) * 1000.0, 2),
+                    budget_ms=budget_ms_log,
+                    note="fixpoint_budget_yield_mark_loaded_stack",
+                    planned_workspace_fixpoint_budget_enforced=True,
+                )
+                return int(total_applied)
             ix = stack.pop()
             if not ix.isValid():
                 continue
@@ -35904,8 +36176,37 @@ class MainWindow(QMainWindow):
                         p["children_loaded"] = True
 
                 dmodel.update_payload_for_index(ix, _mut_loaded)
-            for r in range(dmodel.rowCount(ix)):
+            _rc_ml = int(dmodel.rowCount(ix))
+            for r in range(_rc_ml):
+                if deadline_perf is not None and time.perf_counter() >= deadline_perf:
+                    for _r2 in range(r, _rc_ml):
+                        stack.append(dmodel.index(_r2, 0, ix))
+                    self._destination_fixpoint_resume_mark_loaded_stack = list(stack)
+                    self._destination_fixpoint_resume_seen_mark = set(seen_mark)
+                    self._destination_fixpoint_slice_incomplete = True
+                    log_info(
+                        "startup_lifecycle_temp_materialize_chunk_end",
+                        phase="planned_workspace_fixpoint",
+                        subphase="mark_loaded_stack",
+                        wall_ms=round((time.perf_counter() - _fix_slice_t0) * 1000.0, 2),
+                        budget_ms=budget_ms_log,
+                        note="fixpoint_budget_yield_mark_loaded_stack_mid_children",
+                        row_index=int(r),
+                        row_count=int(_rc_ml),
+                        planned_workspace_fixpoint_budget_enforced=True,
+                    )
+                    return int(total_applied)
                 stack.append(dmodel.index(r, 0, ix))
+        if deadline_perf is not None:
+            log_info(
+                "startup_lifecycle_temp_materialize_chunk_end",
+                phase="planned_workspace_fixpoint",
+                subphase="mark_loaded_stack",
+                wall_ms=round((time.perf_counter() - _fix_slice_t0) * 1000.0, 2),
+                budget_ms=budget_ms_log,
+                note="mark_loaded_stack_complete",
+                planned_workspace_fixpoint_budget_enforced=True,
+            )
         return total_applied
 
     def _apply_proposed_children_to_model_index(
@@ -46366,7 +46667,9 @@ class MainWindow(QMainWindow):
             elif phase == 5:
                 try:
                     with self._destination_materialize_profile_span("reconcile_destination_semantic_duplicates"):
-                        self._reconcile_destination_semantic_duplicates("destination_planning_overlay_pass")
+                        self._reconcile_destination_semantic_duplicates_maybe_deferred(
+                            "destination_planning_overlay_pass"
+                        )
                 except Exception as exc:
                     self._log_restore_exception("destination_planning_overlay_pass_reconcile", exc)
             elif phase == 6:
@@ -47128,7 +47431,7 @@ class MainWindow(QMainWindow):
             self._refresh_expand_all_button_for_panel("destination")
         try:
             with self._destination_materialize_profile_span("reconcile_destination_semantic_duplicates"):
-                self._reconcile_destination_semantic_duplicates("destination_planning_overlay_pass")
+                self._reconcile_destination_semantic_duplicates_maybe_deferred("destination_planning_overlay_pass")
         except Exception as exc:
             self._log_restore_exception("destination_planning_overlay_pass_reconcile", exc)
         try:
