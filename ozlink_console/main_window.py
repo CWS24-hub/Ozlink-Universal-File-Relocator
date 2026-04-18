@@ -3696,7 +3696,7 @@ class MainWindow(QMainWindow):
             subtree_item_id=cfg.get("subtree_item_id") or "",
             subtree_parent_item_path=cfg.get("subtree_parent_item_path") or "",
             context=cfg.get("context") or {},
-            parent=self,
+            parent=None,
         )
         self._graph_truth_worker = worker
         worker.finished_ok.connect(self._dev_on_graph_truth_live_enumeration_done)
@@ -3808,7 +3808,7 @@ class MainWindow(QMainWindow):
             subtree_item_id=cfg.get("subtree_item_id") or "",
             subtree_parent_item_path=cfg.get("subtree_parent_item_path") or "",
             context=cfg.get("context") or {},
-            parent=self,
+            parent=None,
         )
         self._graph_truth_worker = worker
         worker.finished_ok.connect(self._dev_on_graph_truth_live_enumeration_done)
@@ -7464,6 +7464,28 @@ class MainWindow(QMainWindow):
         reasons = list(getattr(self, "_deferred_planning_refresh_reasons", []))
         combined_reason = "__".join(reasons) if reasons else "deferred_planning_refresh"
         source_projection_paths = set(getattr(self, "_deferred_source_projection_paths", set()))
+
+        # Graph-ID refresh walks overlays / projection caches on the GUI thread (~seconds). If the user is
+        # actively scrolling the destination tree, postpone until scroll idle (same window as indicator defer).
+        if "graph_ids_resolved_from_sharepoint_paths" in reasons:
+            _scroll_fn = getattr(self, "_destination_user_scroll_interaction_active", None)
+            try:
+                _scrolling = bool(callable(_scroll_fn) and _scroll_fn())
+            except Exception:
+                _scrolling = False
+            if _scrolling:
+                _defer_ms = max(120, int(getattr(self, "_destination_tree_scroll_idle_ms", 280) or 280))
+                _tmr = getattr(self, "_deferred_planning_refresh_timer", None)
+                if _tmr is not None:
+                    _tmr.stop()
+                    _tmr.start(_defer_ms)
+                log_info(
+                    "graph_ids_deferred_planning_refresh_deferred_for_destination_scroll",
+                    defer_ms=int(_defer_ms),
+                    source_projection_path_count=int(len(source_projection_paths)),
+                    combined_reason=str(combined_reason)[:220],
+                )
+                return
 
         self._deferred_planning_refresh_pending = False
         self._deferred_planning_refresh_reasons = []

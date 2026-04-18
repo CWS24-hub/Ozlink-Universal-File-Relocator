@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 import unittest
 from types import MethodType
 from unittest.mock import MagicMock, patch
@@ -68,6 +69,33 @@ class DeferredPlanningRefreshGraphIdsTests(unittest.TestCase):
                 MainWindow._run_deferred_planning_refresh(w)
 
         self.assertEqual(len(enum_calls), 2)
+
+    def test_graph_ids_refresh_deferred_while_destination_scroll_active(self):
+        """Do not run graph_ids deferred planning refresh on the GUI thread while the user scrolls."""
+        w = self._bare_window_for_deferred_refresh()
+        w._deferred_source_projection_paths = {"a\\b"}
+        w._destination_tree_scroll_idle_ms = 280
+        w._destination_tree_scroll_activity_until = time.monotonic() + 3600.0
+        inner_calls: list[int] = []
+
+        def _no_inner(_self, *_a, **_k):
+            inner_calls.append(1)
+
+        w._run_deferred_planning_refresh_inner = MethodType(_no_inner, w)
+        tmr = MagicMock()
+        w._deferred_planning_refresh_timer = tmr
+
+        with patch("ozlink_console.main_window.is_dev_mode", return_value=False):
+            with patch("ozlink_console.main_window.log_info"):
+                MainWindow._run_deferred_planning_refresh(w)
+
+        self.assertEqual(inner_calls, [], "inner refresh must not run while scroll interaction active")
+        self.assertTrue(w._deferred_planning_refresh_pending)
+        self.assertEqual(w._deferred_planning_refresh_reasons, ["graph_ids_resolved_from_sharepoint_paths"])
+        self.assertEqual(w._deferred_source_projection_paths, {"a\\b"})
+        tmr.stop.assert_called()
+        tmr.start.assert_called_once()
+        self.assertGreaterEqual(tmr.start.call_args[0][0], 120)
 
 
 if __name__ == "__main__":
