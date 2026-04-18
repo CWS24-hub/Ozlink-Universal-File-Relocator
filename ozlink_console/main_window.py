@@ -96,6 +96,7 @@ from ozlink_console.tree_models.explorer_columns import (
 )
 from ozlink_console.tree_models.sharepoint_source_model import SharePointSourceTreeModel
 from ozlink_console.tree_models.destination_planning_model import DestinationPlanningTreeModel, NestedSpec
+from ozlink_console.destination_legacy_snapshot_identity import DestinationLibraryCandidate
 from ozlink_console.destination_startup_snapshot_roots import (
     DestinationStartupSnapshotRootContext,
     allowed_semantic_root_segments_cf_from_snapshot,
@@ -7983,6 +7984,7 @@ class MainWindow(QMainWindow):
         if isinstance(destination_site, dict):
             site_id = str(destination_site.get("id", "") or "").strip()
         state.DestinationTreeSnapshotIdentitySiteId = site_id
+        state.DestinationTreeSnapshotIdentityInferredFromLegacy = False
         if did or state.DestinationTreeSnapshotIdentityLibraryName:
             log_info(
                 "destination_snapshot_identity_persisted",
@@ -7992,6 +7994,82 @@ class MainWindow(QMainWindow):
                 library_name_excerpt=str(state.DestinationTreeSnapshotIdentityLibraryName or "")[:120],
                 site_id_suffix=site_id[-16:] if len(site_id) > 16 else site_id,
             )
+
+    def _destination_legacy_snapshot_library_candidates(self) -> list[DestinationLibraryCandidate]:
+        """Destination document libraries in the current site selector (for legacy snapshot inference only)."""
+        out: list[DestinationLibraryCandidate] = []
+        if not getattr(self, "planning_inputs", None):
+            return out
+        lib_sel = self.planning_inputs.get("Destination Library")
+        site_sel = self.planning_inputs.get("Destination Site")
+        site = site_sel.currentData() if site_sel is not None else None
+        site_id = ""
+        if isinstance(site, dict):
+            site_id = str(site.get("id") or "").strip()
+        gnames = getattr(self, "_destination_graph_shallow_destination_root_names_cf", None)
+        gfrozen: frozenset[str] | None
+        if isinstance(gnames, frozenset):
+            gfrozen = gnames
+        elif isinstance(gnames, (set, list, tuple)) and gnames:
+            gfrozen = frozenset(str(x).casefold() for x in gnames)
+        else:
+            gfrozen = None
+        active = str(self._current_selected_destination_drive_id() or "").strip()
+        if lib_sel is None:
+            return out
+        for i in range(lib_sel.count()):
+            data = lib_sel.itemData(i)
+            if not isinstance(data, dict):
+                continue
+            did = str(data.get("id") or "").strip()
+            if not did:
+                continue
+            roots = gfrozen if active and did.casefold() == active.casefold() else None
+            out.append(
+                DestinationLibraryCandidate(
+                    drive_id=did,
+                    library_id=did,
+                    display_name=str(data.get("name") or "").strip(),
+                    site_id=site_id,
+                    graph_shallow_root_names_cf=roots,
+                )
+            )
+        return out
+
+    def _apply_destination_snapshot_legacy_identity_stamp(self, meta: dict | None) -> None:
+        """After startup snapshot selection, persist inferred legacy identity onto SessionState for next save."""
+        if not isinstance(meta, dict):
+            return
+        label = str(meta.get("chosen_label") or "")
+        stamp = None
+        if "WorkspaceSnapshot.destination_tree_snapshot" in label and "fallback" not in label:
+            stamp = meta.get("sidecar_legacy_identity_stamp")
+        elif "SessionState.DestinationTreeSnapshot" in label:
+            stamp = meta.get("session_legacy_identity_stamp")
+        else:
+            stamp = meta.get("session_legacy_identity_stamp") or meta.get("sidecar_legacy_identity_stamp")
+        if not isinstance(stamp, dict) or not stamp.get("destination_snapshot_identity_inferred_from_legacy"):
+            return
+        state = self._draft_shell_state if isinstance(self._draft_shell_state, SessionState) else None
+        if state is None:
+            return
+        state.DestinationTreeSnapshotIdentityDriveId = str(stamp.get("matched_drive_id") or "").strip()
+        state.DestinationTreeSnapshotIdentityLibraryId = str(stamp.get("matched_library_id") or "").strip()
+        state.DestinationTreeSnapshotIdentityLibraryName = str(stamp.get("matched_library_name") or "").strip()
+        state.DestinationTreeSnapshotIdentitySiteId = str(stamp.get("matched_site_id") or "").strip()
+        state.DestinationTreeSnapshotIdentityInferredFromLegacy = True
+        self._destination_tree_snapshot_dirty_for_persist = True
+        try:
+            self._workspace_ui_snapshot_dirty_panels.add("destination")
+        except Exception:
+            pass
+        log_info(
+            "destination_snapshot_identity_inferred_from_legacy_applied",
+            drive_id_suffix=str(state.DestinationTreeSnapshotIdentityDriveId)[-16:]
+            if len(str(state.DestinationTreeSnapshotIdentityDriveId)) > 16
+            else str(state.DestinationTreeSnapshotIdentityDriveId),
+            library_name_excerpt=str(state.DestinationTreeSnapshotIdentityLibraryName or "")[:120],
+        )
 
     def _intended_destination_drive_id_for_snapshot_validation(self) -> str:
         """Prefer persisted session/snapshot envelope over combo (combo may be wrong before selector restore)."""
@@ -10905,6 +10983,9 @@ class MainWindow(QMainWindow):
                 "library_id": str(getattr(state, "DestinationTreeSnapshotIdentityLibraryId", "") or ""),
                 "library_name": str(getattr(state, "DestinationTreeSnapshotIdentityLibraryName", "") or ""),
                 "site_id": str(getattr(state, "DestinationTreeSnapshotIdentitySiteId", "") or ""),
+                "destination_snapshot_identity_inferred_from_legacy": bool(
+                    getattr(state, "DestinationTreeSnapshotIdentityInferredFromLegacy", False)
+                ),
             },
         }
 
@@ -20538,6 +20619,7 @@ class MainWindow(QMainWindow):
             if isinstance(raw, list):
                 side_list = list(raw)
         ctx = self._destination_startup_snapshot_root_context()
+        legacy_cands = self._destination_legacy_snapshot_library_candidates()
         chosen, label, _n_sess_san, _n_side_san, meta = select_validated_destination_startup_snapshot(
             list(session_destination_snaps or []),
             side_list,
@@ -20547,10 +20629,12 @@ class MainWindow(QMainWindow):
             sidecar_envelope_drive_id=sidecar_d,
             sidecar_envelope_library_id=sidecar_lib,
             intended_drive_id=intended,
+            legacy_library_candidates=legacy_cands or None,
         )
+        self._apply_destination_snapshot_legacy_identity_stamp(meta)
         n_sess = int(meta.get("session_raw_nodes", 0) or 0)
         n_side = int(meta.get("sidecar_raw_nodes", 0) or 0)
-        return chosen, str(label), n_sess, n_side
+        return chosen, str(label), n_sess, n_side, meta
 
     def _refresh_pending_destination_snapshot_after_selector_identity(self) -> None:
         """Re-select destination snapshot using authoritative selector drive id (post phase2 selectors)."""
@@ -20559,7 +20643,7 @@ class MainWindow(QMainWindow):
             dest_snaps_session = list(tree_snapshots.get("destination", []) or [])
             mm = getattr(self, "memory_manager", None)
             sidecar = mm.read_workspace_snapshot_optional() if mm is not None else None
-            dest_snaps, sel_src, _, _ = self._select_destination_tree_snapshot_for_startup(
+            dest_snaps, sel_src, _, _, _meta = self._select_destination_tree_snapshot_for_startup(
                 dest_snaps_session,
                 workspace_sidecar=sidecar,
             )
@@ -21170,7 +21254,7 @@ class MainWindow(QMainWindow):
         dest_snaps_session = list(tree_snapshots.get("destination", []) or [])
         mm = getattr(self, "memory_manager", None)
         sidecar = mm.read_workspace_snapshot_optional() if mm is not None else None
-        dest_snaps, sel_src, n_sess_nodes, n_side_nodes = self._select_destination_tree_snapshot_for_startup(
+        dest_snaps, sel_src, n_sess_nodes, n_side_nodes, _meta = self._select_destination_tree_snapshot_for_startup(
             dest_snaps_session,
             workspace_sidecar=sidecar,
         )

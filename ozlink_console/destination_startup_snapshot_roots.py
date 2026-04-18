@@ -12,6 +12,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from ozlink_console.destination_legacy_snapshot_identity import (
+    DestinationLibraryCandidate,
+    InferenceConfidence,
+    infer_destination_snapshot_identity_from_legacy_snapshot,
+)
 from ozlink_console.logger import log_info
 from ozlink_console.paths import normalize_manifest_path
 from ozlink_console.sharepoint_destination_overlay_attach import (
@@ -240,6 +245,139 @@ def filter_promoted_semantic_paths_for_destination_roots(
     return filtered
 
 
+def apply_destination_snapshot_identity_gate_with_legacy(
+    snapshots: list,
+    *,
+    intended_drive_id: str,
+    snapshot_stored_drive_id: str,
+    snapshot_stored_library_id: str,
+    source: str,
+    legacy_library_candidates: list[DestinationLibraryCandidate] | None,
+) -> tuple[list, str, dict[str, Any] | None]:
+    """Like :func:`apply_destination_snapshot_identity_gate` but infers missing envelope when safe.
+
+    Explicit envelope identity always uses the strict gate (unchanged). When the envelope is empty,
+    candidates must be supplied for inference; otherwise the snapshot stays unresolved.
+    """
+
+    intended = str(intended_drive_id or "").strip()
+    if not intended:
+        log_info(
+            "destination_startup_snapshot_blocked_unresolved_identity",
+            source=str(source)[:40],
+            reason="intended_destination_drive_unknown",
+        )
+        return [], "blocked_intended_unknown", None
+
+    stored_d = str(snapshot_stored_drive_id or "").strip()
+    stored_lib = str(snapshot_stored_library_id or "").strip()
+    eff = stored_d or stored_lib
+    if eff:
+        gated, tag = apply_destination_snapshot_identity_gate(
+            snapshots,
+            intended_drive_id=intended_drive_id,
+            snapshot_stored_drive_id=stored_d,
+            snapshot_stored_library_id=stored_lib,
+            source=source,
+        )
+        return gated, tag, None
+
+    if not list(snapshots or []):
+        log_info(
+            "destination_startup_snapshot_blocked_unresolved_identity",
+            source=str(source)[:40],
+            reason="snapshot_envelope_missing_drive",
+        )
+        return [], "blocked_no_snapshot_envelope", None
+
+    cands = list(legacy_library_candidates or [])
+    if not cands:
+        log_info(
+            "destination_snapshot_legacy_identity_unresolved",
+            source=str(source)[:40],
+            reason="candidates_not_ready",
+            detail="destination_site_libraries_unavailable",
+        )
+        return [], "blocked_legacy_no_candidates", None
+
+    log_info(
+        "destination_snapshot_legacy_identity_inference_begin",
+        source=str(source)[:40],
+        candidate_library_count=len(cands),
+        snapshot_top_level=len(list(snapshots or [])),
+    )
+    inf = infer_destination_snapshot_identity_from_legacy_snapshot(snapshots, cands)
+    meta = {"inference": inf.to_meta_dict()}
+
+    if inf.confidence == InferenceConfidence.LOW or (
+        inf.confidence == InferenceConfidence.MEDIUM
+    ):
+        log_info(
+            "destination_snapshot_legacy_identity_unresolved",
+            source=str(source)[:40],
+            confidence=str(inf.confidence.value),
+            score=float(inf.score),
+            auto_apply_safe=False,
+            reason="confidence_below_high",
+        )
+        tag = (
+            "legacy_identity_medium_unresolved"
+            if inf.confidence == InferenceConfidence.MEDIUM
+            else "legacy_identity_low_unresolved"
+        )
+        return [], tag, meta
+
+    # HIGH path — still require margin / auto_apply policy
+    if not inf.auto_apply_safe or not inf.matched_drive_id:
+        log_info(
+            "destination_snapshot_legacy_identity_unresolved",
+            source=str(source)[:40],
+            confidence=str(inf.confidence.value),
+            score=float(inf.score),
+            auto_apply_safe=bool(inf.auto_apply_safe),
+            reason="high_confidence_but_ambiguous_margin",
+        )
+        return [], "legacy_identity_high_ambiguous", meta
+
+    if inf.matched_drive_id.casefold() != intended.casefold():
+        log_info(
+            "destination_snapshot_legacy_identity_unresolved",
+            source=str(source)[:40],
+            reason="inferred_library_not_intended_combo",
+            inferred_suffix=str(inf.matched_drive_id)[-16:]
+            if len(str(inf.matched_drive_id)) > 16
+            else str(inf.matched_drive_id),
+            intended_suffix=str(intended)[-16:] if len(intended) > 16 else intended,
+        )
+        return [], "legacy_identity_high_intended_mismatch", meta
+
+    gated, strict_tag = apply_destination_snapshot_identity_gate(
+        snapshots,
+        intended_drive_id=intended,
+        snapshot_stored_drive_id=inf.matched_drive_id,
+        snapshot_stored_library_id=inf.matched_library_id or inf.matched_drive_id,
+        source=source,
+    )
+    stamp = {
+        "destination_snapshot_identity_inferred_from_legacy": True,
+        "matched_drive_id": inf.matched_drive_id,
+        "matched_library_id": inf.matched_library_id or inf.matched_drive_id,
+        "matched_library_name": inf.matched_library_name,
+        "matched_site_id": inf.matched_site_id,
+        "inference": inf.to_meta_dict(),
+    }
+    log_info(
+        "destination_snapshot_identity_inferred_from_legacy",
+        source=str(source)[:40],
+        drive_id_suffix=str(inf.matched_drive_id)[-16:]
+        if len(str(inf.matched_drive_id)) > 16
+        else str(inf.matched_drive_id),
+        confidence=str(inf.confidence.value),
+        score=float(inf.score),
+    )
+    return gated, strict_tag, stamp
+
+
 def apply_destination_snapshot_identity_gate(
     snapshots: list,
     *,
@@ -355,6 +493,7 @@ def select_validated_destination_startup_snapshot(
     sidecar_envelope_drive_id: str = "",
     sidecar_envelope_library_id: str = "",
     intended_drive_id: str = "",
+    legacy_library_candidates: list[DestinationLibraryCandidate] | None = None,
 ) -> tuple[list, str, int, int, dict[str, Any]]:
     """Choose session vs sidecar after identity gate + sanitization; validity outranks raw node count.
 
@@ -364,19 +503,21 @@ def select_validated_destination_startup_snapshot(
     session_list = list(session_destination_snaps or [])
     side_list = list(workspace_sidecar_destination_snaps or [])
 
-    sess_gated, sess_gate_tag = apply_destination_snapshot_identity_gate(
+    sess_gated, sess_gate_tag, sess_legacy_stamp = apply_destination_snapshot_identity_gate_with_legacy(
         session_list,
         intended_drive_id=intended_drive_id,
         snapshot_stored_drive_id=session_envelope_drive_id,
         snapshot_stored_library_id=session_envelope_library_id or session_envelope_drive_id,
         source="session",
+        legacy_library_candidates=legacy_library_candidates,
     )
-    side_gated, side_gate_tag = apply_destination_snapshot_identity_gate(
+    side_gated, side_gate_tag, side_legacy_stamp = apply_destination_snapshot_identity_gate_with_legacy(
         side_list,
         intended_drive_id=intended_drive_id,
         snapshot_stored_drive_id=sidecar_envelope_drive_id,
         snapshot_stored_library_id=sidecar_envelope_library_id or sidecar_envelope_drive_id,
         source="sidecar",
+        legacy_library_candidates=legacy_library_candidates,
     )
 
     sess_gated, _npr_s = prune_nested_snapshot_nodes_for_wrong_drive(
@@ -450,6 +591,8 @@ def select_validated_destination_startup_snapshot(
         "chosen_label": label,
         "session_identity_gate": str(sess_gate_tag),
         "sidecar_identity_gate": str(side_gate_tag),
+        "session_legacy_identity_stamp": sess_legacy_stamp,
+        "sidecar_legacy_identity_stamp": side_legacy_stamp,
     }
     log_info(
         "destination_startup_snapshot_selection_after_validation",

@@ -118,6 +118,8 @@ class SessionState:
     DestinationTreeSnapshotIdentityLibraryId: str = ""
     DestinationTreeSnapshotIdentityLibraryName: str = ""
     DestinationTreeSnapshotIdentitySiteId: str = ""
+    # True when DestinationTreeSnapshot* identity fields were backfilled by legacy startup inference (migration).
+    DestinationTreeSnapshotIdentityInferredFromLegacy: bool = False
     # Canonical source paths (files) excluded from inherited folder allocations; persisted with draft session.
     PlanLeafExclusions: list[str] = field(default_factory=list)
     # Source paths for inherited_mapping rows the user dismissed in Needs Review (UI only; does not change the plan).
