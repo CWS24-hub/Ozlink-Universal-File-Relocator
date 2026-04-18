@@ -1825,35 +1825,47 @@ class DestinationPlanningTreeDelegate(QStyledItemDelegate):
         self.window = window
 
     def paint(self, painter, option, index):
-        node_data = index.data(Qt.UserRole) or {}
-        if not self.window._plan_leaf_exclusion_display_active("destination", node_data):
-            super().paint(painter, option, index)
-            return
+        prof = getattr(self.window, "_dest_scroll_profiler", None)
+        _t0 = None
+        if prof is not None and prof.should_record_fine_grained():
+            _t0 = time.perf_counter()
+        try:
+            node_data = index.data(Qt.UserRole) or {}
+            if not self.window._plan_leaf_exclusion_display_active("destination", node_data):
+                super().paint(painter, option, index)
+                return
 
-        custom_option = QStyleOptionViewItem(option)
-        self.initStyleOption(custom_option, index)
-        base_text = self.window.get_source_item_display_name(node_data, custom_option.text)
-        display = f"\u2298 {base_text}"
-        custom_option.text = ""
+            custom_option = QStyleOptionViewItem(option)
+            self.initStyleOption(custom_option, index)
+            base_text = self.window.get_source_item_display_name(node_data, custom_option.text)
+            display = f"\u2298 {base_text}"
+            custom_option.text = ""
 
-        style = custom_option.widget.style() if custom_option.widget else QApplication.style()
-        style.drawControl(QStyle.CE_ItemViewItem, custom_option, painter, custom_option.widget)
+            style = custom_option.widget.style() if custom_option.widget else QApplication.style()
+            style.drawControl(QStyle.CE_ItemViewItem, custom_option, painter, custom_option.widget)
 
-        text_rect = style.subElementRect(QStyle.SE_ItemViewItemText, custom_option, custom_option.widget)
-        if not text_rect.isValid():
-            text_rect = custom_option.rect.adjusted(4, 0, -4, 0)
+            text_rect = style.subElementRect(QStyle.SE_ItemViewItemText, custom_option, custom_option.widget)
+            if not text_rect.isValid():
+                text_rect = custom_option.rect.adjusted(4, 0, -4, 0)
 
-        painter.save()
-        painter.setClipRect(text_rect)
-        font = QFont(custom_option.font)
-        font.setStrikeOut(True)
-        painter.setFont(font)
-        base_color = QColor("#9AA0A6")
-        if custom_option.state & QStyle.State_Selected:
-            base_color = QColor("#C8CED4")
-        painter.setPen(base_color)
-        painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, display)
-        painter.restore()
+            painter.save()
+            painter.setClipRect(text_rect)
+            font = QFont(custom_option.font)
+            font.setStrikeOut(True)
+            painter.setFont(font)
+            base_color = QColor("#9AA0A6")
+            if custom_option.state & QStyle.State_Selected:
+                base_color = QColor("#C8CED4")
+            painter.setPen(base_color)
+            painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, display)
+            painter.restore()
+        finally:
+            if _t0 is not None:
+                prof.record(
+                    "paint",
+                    "DestinationPlanningTreeDelegate.paint",
+                    time.perf_counter() - _t0,
+                )
 
     def setModelData(self, editor, model, index):
         from ozlink_console.tree_models.destination_planning_model import DestinationPlanningTreeModel
@@ -6692,6 +6704,9 @@ class MainWindow(QMainWindow):
             tree.setModel(self.destination_planning_model)
             if getattr(self, "_dest_scroll_profiler", None) is not None:
                 self._dest_scroll_profiler.install_on_destination_tree(tree, self.destination_planning_model)
+                self.destination_planning_model._dest_scroll_profiler_ref = self._dest_scroll_profiler
+            else:
+                self.destination_planning_model._dest_scroll_profiler_ref = None
             sharepoint_model_view = True
         else:
             raise RuntimeError(f"build_tree_panel: unexpected panel_key {panel_key!r}")
@@ -46030,6 +46045,9 @@ class MainWindow(QMainWindow):
                 "prefer_chunked_projection": prefer_chunked_projection,
                 "narrow_restore_real_snapshot": narrow_restore_real_snapshot,
             }
+            _dsp_ov = getattr(self, "_dest_scroll_profiler", None)
+            if _dsp_ov is not None:
+                _dsp_ov.note_heavy_work_deferred(f"overlay_materialize:{str(r)[:80]}")
             t_idle = getattr(self, "_destination_tree_scroll_idle_timer", None)
             if t_idle is not None:
                 idle_ms = max(120, int(getattr(self, "_destination_tree_scroll_idle_ms", 280) or 280))

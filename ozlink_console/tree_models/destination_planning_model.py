@@ -4,6 +4,7 @@ QAbstractItemModel for destination planning tree (v2 / QTreeView path).
 
 from __future__ import annotations
 
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QAbstractItemModel, QModelIndex, Qt, Signal
@@ -75,6 +76,8 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         self._invalid_internal_pointer_logged_gen: int = -1
         self._coalesce_dest_structure_signal_depth: int = 0
         self._pending_dest_structure_signal: bool = False
+        # Set by MainWindow to :class:`ozlink_console.dest_scroll_profiler.DestScrollProfiler` when enabled.
+        self._dest_scroll_profiler_ref: Any = None
 
     def begin_coalesce_destination_structure_signal(self) -> None:
         """Batch multiple structural mutations; emit :attr:`destination_structure_changed` once on end."""
@@ -203,50 +206,62 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         return EXPLORER_COLUMN_COUNT
 
     def data(self, index: QModelIndex, role: int = Qt.DisplayRole):
-        if not index.isValid():
-            return None
-        node = self._node(index)
-        if node is None or not isinstance(node, _Node):
-            return None
-        p = getattr(node, "payload", None)
-        if not isinstance(p, dict):
-            return None
-        col = index.column()
-        if role == Qt.DisplayRole:
-            if col == 0:
-                return p.get("base_display_label") or ""
-            if col == 1:
-                return explorer_size_label(p)
-            if col == 2:
-                return explorer_type_label(p)
-            if col == 3:
-                return explorer_date_label(p)
-            return None
-        if role == Qt.UserRole:
-            return p if col == 0 else None
-        if role == Qt.ForegroundRole:
-            c = p.get("_model_foreground")
-            if c is not None:
-                return QBrush(c)
-            if col != 0:
+        prof = getattr(self, "_dest_scroll_profiler_ref", None)
+        _t0 = None
+        if prof is not None and getattr(prof, "should_record_fine_grained", lambda: False)():
+            _t0 = time.perf_counter()
+        try:
+            if not index.isValid():
                 return None
-            ws = destination_payload_workspace_row_state(p)
-            if ws == WORKSPACE_ROW_STATE_CACHED_PROVISIONAL:
-                return QBrush(QColor(145, 105, 45))
-            if destination_payload_is_planned_workspace_row(p) or ws == WORKSPACE_ROW_STATE_PLANNED_ONLY:
-                return QBrush(QColor(65, 105, 175))
-            if ws == WORKSPACE_ROW_STATE_LIVE_CONFIRMED:
+            node = self._node(index)
+            if node is None or not isinstance(node, _Node):
                 return None
+            p = getattr(node, "payload", None)
+            if not isinstance(p, dict):
+                return None
+            col = index.column()
+            if role == Qt.DisplayRole:
+                if col == 0:
+                    return p.get("base_display_label") or ""
+                if col == 1:
+                    return explorer_size_label(p)
+                if col == 2:
+                    return explorer_type_label(p)
+                if col == 3:
+                    return explorer_date_label(p)
+                return None
+            if role == Qt.UserRole:
+                return p if col == 0 else None
+            if role == Qt.ForegroundRole:
+                c = p.get("_model_foreground")
+                if c is not None:
+                    return QBrush(c)
+                if col != 0:
+                    return None
+                ws = destination_payload_workspace_row_state(p)
+                if ws == WORKSPACE_ROW_STATE_CACHED_PROVISIONAL:
+                    return QBrush(QColor(145, 105, 45))
+                if destination_payload_is_planned_workspace_row(p) or ws == WORKSPACE_ROW_STATE_PLANNED_ONLY:
+                    return QBrush(QColor(65, 105, 175))
+                if ws == WORKSPACE_ROW_STATE_LIVE_CONFIRMED:
+                    return None
+                return None
+            if role == Qt.BackgroundRole:
+                c = p.get("_model_background")
+                return QBrush(c) if c is not None else None
+            if role == Qt.ToolTipRole:
+                tip = p.get("_model_tooltip")
+                return tip if tip else None
+            if role == Qt.DecorationRole and col == 0:
+                return explorer_icon_for_node(p)
             return None
-        if role == Qt.BackgroundRole:
-            c = p.get("_model_background")
-            return QBrush(c) if c is not None else None
-        if role == Qt.ToolTipRole:
-            tip = p.get("_model_tooltip")
-            return tip if tip else None
-        if role == Qt.DecorationRole and col == 0:
-            return explorer_icon_for_node(p)
-        return None
+        finally:
+            if _t0 is not None:
+                prof.record(
+                    "model",
+                    "DestinationPlanningTreeModel.data",
+                    time.perf_counter() - _t0,
+                )
 
     def flags(self, index: QModelIndex) -> Qt.ItemFlags:
         if not index.isValid():

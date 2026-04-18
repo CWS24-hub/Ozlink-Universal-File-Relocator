@@ -75,6 +75,10 @@ class DestScrollProfiler:
         except Exception:
             return False
 
+    def should_record_fine_grained(self) -> bool:
+        """True during an active scroll profile window — safe to time per-cell hot paths (``data``/paint)."""
+        return bool(self._active() and self._capturing)
+
     def install_on_destination_tree(self, tree, model) -> None:
         """Connect scrollbar + model signals (after setModel)."""
         try:
