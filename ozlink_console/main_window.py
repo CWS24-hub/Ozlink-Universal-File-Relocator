@@ -95,7 +95,11 @@ from ozlink_console.tree_models.explorer_columns import (
     planned_leaf_filename_implies_document_file,
 )
 from ozlink_console.tree_models.sharepoint_source_model import SharePointSourceTreeModel
-from ozlink_console.tree_models.destination_planning_model import DestinationPlanningTreeModel, NestedSpec
+from ozlink_console.tree_models.destination_planning_model import (
+    DESTINATION_PLAN_LEAF_EXCLUSION_PAINT_ROLE,
+    DestinationPlanningTreeModel,
+    NestedSpec,
+)
 from ozlink_console.destination_legacy_snapshot_identity import DestinationLibraryCandidate
 from ozlink_console.destination_startup_snapshot_roots import (
     DestinationStartupSnapshotRootContext,
@@ -1834,11 +1838,17 @@ class DestinationPlanningTreeDelegate(QStyledItemDelegate):
             if not (getattr(self.window, "_plan_leaf_exclusions", None) or set()):
                 super().paint(painter, option, index)
                 return
-            node_data = index.data(Qt.UserRole) or {}
-            if not self.window._plan_leaf_exclusion_display_active("destination", node_data):
+            model = index.model()
+            if isinstance(model, DestinationPlanningTreeModel):
+                excluded = bool(index.data(DESTINATION_PLAN_LEAF_EXCLUSION_PAINT_ROLE))
+            else:
+                node_data_probe = index.data(Qt.UserRole) or {}
+                excluded = self.window._plan_leaf_exclusion_display_active("destination", node_data_probe)
+            if not excluded:
                 super().paint(painter, option, index)
                 return
 
+            node_data = index.data(Qt.UserRole) or {}
             custom_option = QStyleOptionViewItem(option)
             self.initStyleOption(custom_option, index)
             base_text = self.window.get_source_item_display_name(node_data, custom_option.text)
@@ -1872,8 +1882,6 @@ class DestinationPlanningTreeDelegate(QStyledItemDelegate):
                 )
 
     def setModelData(self, editor, model, index):
-        from ozlink_console.tree_models.destination_planning_model import DestinationPlanningTreeModel
-
         if (
             isinstance(model, DestinationPlanningTreeModel)
             and index.isValid()
@@ -6721,6 +6729,7 @@ class MainWindow(QMainWindow):
                 self.destination_planning_model._dest_scroll_profiler_ref = self._dest_scroll_profiler
             else:
                 self.destination_planning_model._dest_scroll_profiler_ref = None
+            self._sync_destination_plan_leaf_exclusion_paint_contract()
             sharepoint_model_view = True
         else:
             raise RuntimeError(f"build_tree_panel: unexpected panel_key {panel_key!r}")
@@ -9511,6 +9520,7 @@ class MainWindow(QMainWindow):
         self._restore_selected_candidate_path = ""
         self.planned_moves = []
         self._plan_leaf_exclusions = set()
+        self._sync_destination_plan_leaf_exclusion_paint_contract()
         self._clear_source_projection_descendants_cache(reason="runtime_draft_cleared", caller="_clear_runtime_draft_state")
         self.proposed_folders = []
         self._memory_restore_complete = False
@@ -11047,6 +11057,7 @@ class MainWindow(QMainWindow):
                 cp = self._canonical_source_projection_path(p)
                 if cp:
                     self._plan_leaf_exclusions.add(cp)
+        self._sync_destination_plan_leaf_exclusion_paint_contract()
         self._needs_review_dismissed_inherited_paths = set()
         for p in getattr(session_state, "NeedsReviewDismissedInheritedSourcePaths", None) or []:
             if isinstance(p, str) and p.strip():
@@ -39400,6 +39411,17 @@ class MainWindow(QMainWindow):
             canon = self._canonical_source_projection_path(node_data.get("source_path", ""))
         return bool(canon and self._is_leaf_path_excluded_for_plan(canon))
 
+    def _sync_destination_plan_leaf_exclusion_paint_contract(self) -> None:
+        """Keep DESTINATION_PLAN_LEAF_EXCLUSION_PAINT_ROLE aligned with PlanLeafExclusions (cheap scroll probe)."""
+        m = getattr(self, "destination_planning_model", None)
+        if m is None:
+            return
+        excl = getattr(self, "_plan_leaf_exclusions", None) or set()
+        if not excl:
+            m.set_plan_leaf_exclusion_paint_contract(None, None)
+        else:
+            m.set_plan_leaf_exclusion_paint_contract(frozenset(excl), self._canonical_source_projection_path)
+
     def _mark_destination_indicators_for_leaf_planning_change(self, *, removed_direct_move=None, inherited_move=None):
         """Partial destination indicator refresh (avoids full destination materialization)."""
         paths: list[str] = []
@@ -56611,6 +56633,7 @@ class MainWindow(QMainWindow):
             _sp_discard = self._canonical_source_projection_path(source_node.get("source_path", ""))
             if _sp_discard:
                 self._plan_leaf_exclusions.discard(_sp_discard)
+                self._sync_destination_plan_leaf_exclusion_paint_contract()
             source_item = self._find_visible_source_item_by_path(source_node.get("source_path", ""))
             source_item_node = self._source_tree_row_payload(source_item) if source_item is not None else {}
             if not source_item_node:
@@ -57676,6 +57699,7 @@ class MainWindow(QMainWindow):
                 pass
             self._planned_move_by_source_path_cache_signature = None
         self._plan_leaf_exclusions.add(canon)
+        self._sync_destination_plan_leaf_exclusion_paint_contract()
         self._planrule_log(
             "leaf_exclude",
             action_origin="exclude",
@@ -57706,6 +57730,7 @@ class MainWindow(QMainWindow):
         if not canon or canon not in self._plan_leaf_exclusions:
             return
         self._plan_leaf_exclusions.discard(canon)
+        self._sync_destination_plan_leaf_exclusion_paint_contract()
         raw = self._find_inherited_planned_move_for_source_path_raw(canon)
         self._planrule_log(
             "leaf_include",

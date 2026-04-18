@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from PySide6.QtCore import QModelIndex, Qt
 
-from ozlink_console.tree_models.destination_planning_model import DestinationPlanningTreeModel
+from ozlink_console.tree_models.destination_planning_model import (
+    DESTINATION_PLAN_LEAF_EXCLUSION_PAINT_ROLE,
+    DestinationPlanningTreeModel,
+)
 
 
 def test_destination_model_reset_and_payload_access():
@@ -233,3 +236,25 @@ def test_find_indices_resolves_casefold_via_side_map_not_full_bucket_scan():
     mixed = model.find_indices_for_canonical_destination_path(r"site\lib\hr\contractor bank.docx")
     assert len(mixed) == 1
     assert (mixed[0].data(Qt.UserRole) or {}).get("name") == "Contractor bank.docx"
+
+
+def test_plan_leaf_exclusion_paint_role_matches_contract():
+    """Delegate probes DESTINATION_PLAN_LEAF_EXCLUSION_PAINT_ROLE instead of full UserRole for exclusion."""
+    model = DestinationPlanningTreeModel()
+    model.reset_root_payloads(
+        [
+            {
+                "base_display_label": "File: a.txt",
+                "name": "a.txt",
+                "is_folder": False,
+                "item_path": r"Root\a.txt",
+                "source_path": r"Src\a.txt",
+            }
+        ]
+    )
+    ix = model.index(0, 0, QModelIndex())
+    assert ix.data(DESTINATION_PLAN_LEAF_EXCLUSION_PAINT_ROLE) is False
+    model.set_plan_leaf_exclusion_paint_contract(frozenset({"canon_a"}), lambda s: "canon_a" if s else "")
+    assert ix.data(DESTINATION_PLAN_LEAF_EXCLUSION_PAINT_ROLE) is True
+    model.set_plan_leaf_exclusion_paint_contract(frozenset({"other"}), lambda s: "canon_a" if s else "")
+    assert ix.data(DESTINATION_PLAN_LEAF_EXCLUSION_PAINT_ROLE) is False

@@ -5,7 +5,7 @@ QAbstractItemModel for destination planning tree (v2 / QTreeView path).
 from __future__ import annotations
 
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import AbstractSet, Any, Callable, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QAbstractItemModel, QModelIndex, Qt, Signal
 from PySide6.QtGui import QBrush, QColor
@@ -29,6 +29,10 @@ from ozlink_console.tree_models.explorer_columns import (
 )
 
 NestedSpec = Tuple[Dict[str, Any], List["NestedSpec"]]
+
+# Paint-time only: whether the destination name column should show plan-leaf exclusion strikethrough.
+# Delegates should prefer this over Qt.UserRole when probing exclusion, so scroll does not pull full payloads.
+DESTINATION_PLAN_LEAF_EXCLUSION_PAINT_ROLE = Qt.UserRole + 48
 
 
 class _Node:
@@ -80,6 +84,9 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         self._ur0_return_cache: Optional[Tuple[int, Any, Any]] = None
         # Set by MainWindow to :class:`ozlink_console.dest_scroll_profiler.DestScrollProfiler` when enabled.
         self._dest_scroll_profiler_ref: Any = None
+        # Canonical source paths in PlanLeafExclusions + path normalizer; used only for DESTINATION_PLAN_LEAF_EXCLUSION_PAINT_ROLE.
+        self._plan_leaf_exclusion_canonical_paths: Optional[AbstractSet[str]] = None
+        self._canonical_source_projection_path_fn: Optional[Callable[[str], str]] = None
 
     def beginResetModel(self) -> None:
         self._ur0_return_cache = None
@@ -225,6 +232,23 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
                 return None
             col = index.column()
             _prof_detail = f"DestinationPlanningTreeModel.data:r{int(role)}:c{col}"
+            if role == DESTINATION_PLAN_LEAF_EXCLUSION_PAINT_ROLE:
+                if col != 0:
+                    return None
+                excl = self._plan_leaf_exclusion_canonical_paths
+                canon_fn = self._canonical_source_projection_path_fn
+                if not excl or not canon_fn:
+                    return False
+                node = self._node(index)
+                if node is None or not isinstance(node, _Node):
+                    return False
+                p = getattr(node, "payload", None)
+                if not isinstance(p, dict):
+                    return False
+                if p.get("is_folder") is not False:
+                    return False
+                canon = canon_fn(str(p.get("source_path", "") or ""))
+                return bool(canon and canon in excl)
             # Qt.UserRole (=256) col 0: row payload dict; delegate + views query often — cache last resolve.
             if role == Qt.UserRole:
                 if col != 0:
@@ -303,6 +327,31 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
                     _prof_detail,
                     time.perf_counter() - _t0,
                 )
+
+    def set_plan_leaf_exclusion_paint_contract(
+        self,
+        paths: Optional[AbstractSet[str]],
+        canon_fn: Optional[Callable[[str], str]],
+    ) -> None:
+        """Wire PlanLeafExclusions + canonical source projection for DESTINATION_PLAN_LEAF_EXCLUSION_PAINT_ROLE."""
+        self._plan_leaf_exclusion_canonical_paths = frozenset(paths) if paths else None
+        self._canonical_source_projection_path_fn = canon_fn
+        self._emit_plan_leaf_exclusion_paint_changed()
+
+    def _emit_plan_leaf_exclusion_paint_changed(self) -> None:
+        r = DESTINATION_PLAN_LEAF_EXCLUSION_PAINT_ROLE
+
+        def emit_for_parent(par: QModelIndex) -> None:
+            n = self.rowCount(par)
+            if n <= 0:
+                return
+            top = self.index(0, 0, par)
+            bottom = self.index(n - 1, 0, par)
+            self.dataChanged.emit(top, bottom, [r])
+            for ridx in range(n):
+                emit_for_parent(self.index(ridx, 0, par))
+
+        emit_for_parent(QModelIndex())
 
     def flags(self, index: QModelIndex) -> Qt.ItemFlags:
         if not index.isValid():
