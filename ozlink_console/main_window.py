@@ -45983,6 +45983,33 @@ class MainWindow(QMainWindow):
             self._destination_quiet_startup_overlay_structural_suppress = False
             log_info("destination_quiet_startup_overlay_structural_suppress_off", entry_reason=rr[:220])
         self._destination_overlay_terminal_reconcile_done = False
+        if (
+            not bool(force_authoritative_bind)
+            and not bool(_shutdown_pre_save)
+            and self._destination_user_scroll_interaction_active()
+        ):
+            _prior = str(getattr(self, "_destination_materialize_pended_for_scroll_reason", "") or "")
+            self._destination_materialize_pended_for_scroll_reason = r
+            self._destination_materialize_pended_for_scroll_kwargs = {
+                "allow_defer": bool(allow_defer),
+                "prefer_chunked_projection": bool(prefer_chunked_projection),
+                "narrow_restore_real_snapshot": bool(narrow_restore_real_snapshot),
+            }
+            log_info(
+                "destination_scroll_overlay_blocked",
+                reason=str(r)[:220],
+                coalesced_with_prior=bool(_prior),
+                prior_reason_excerpt=str(_prior)[:120],
+            )
+            _dsp_ov = getattr(self, "_dest_scroll_profiler", None)
+            if _dsp_ov is not None:
+                _dsp_ov.note_heavy_work_deferred(f"overlay_materialize:{str(r)[:80]}")
+            t_idle = getattr(self, "_destination_tree_scroll_idle_timer", None)
+            if t_idle is not None:
+                idle_ms = max(120, int(getattr(self, "_destination_tree_scroll_idle_ms", 280) or 280))
+                t_idle.start(idle_ms)
+            self._on_destination_state_mutation(r, None)
+            return 0
         _force_auth_flush = (
             bool(_shutdown_pre_save)
             or MainWindow._destination_materialize_requires_authoritative_hard_flush(self, r)
@@ -46038,41 +46065,6 @@ class MainWindow(QMainWindow):
                     function="_apply_destination_planning_overlays",
                     delay_ms=3200,
                 )
-            self._on_destination_state_mutation(r, None)
-            return 0
-        _scroll_idle_fn = getattr(self, "_destination_user_scroll_interaction_active", None)
-        if (
-            not _shutdown_pre_save
-            and not _force_auth_flush
-            and callable(_scroll_idle_fn)
-            and _scroll_idle_fn()
-        ):
-            if r == "destination_full_tree_idle_success":
-                log_info(
-                    "startup_lifecycle_temp_full_tree_idle_deferred_due_to_interaction",
-                    reason=r[:220],
-                    detail="destination_tree_scroll_window_active",
-                )
-            elif "deferred_graph_ids_resolved" in r:
-                log_info(
-                    "startup_lifecycle_temp_interaction_deferral",
-                    work_kind="destination_planning_overlay",
-                    reason=r[:220],
-                    detail="destination_tree_scroll_window_active",
-                )
-            self._destination_materialize_pended_for_scroll_reason = r
-            self._destination_materialize_pended_for_scroll_kwargs = {
-                "allow_defer": allow_defer,
-                "prefer_chunked_projection": prefer_chunked_projection,
-                "narrow_restore_real_snapshot": narrow_restore_real_snapshot,
-            }
-            _dsp_ov = getattr(self, "_dest_scroll_profiler", None)
-            if _dsp_ov is not None:
-                _dsp_ov.note_heavy_work_deferred(f"overlay_materialize:{str(r)[:80]}")
-            t_idle = getattr(self, "_destination_tree_scroll_idle_timer", None)
-            if t_idle is not None:
-                idle_ms = max(120, int(getattr(self, "_destination_tree_scroll_idle_ms", 280) or 280))
-                t_idle.start(idle_ms)
             self._on_destination_state_mutation(r, None)
             return 0
         if (
