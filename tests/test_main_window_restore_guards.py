@@ -187,6 +187,12 @@ class _MaterializeSkipHost:
     def _destination_reconcile_all_planned_parents_after_graph_update(self) -> None:
         return None
 
+    def _destination_planning_overlay_run_terminal_reconcile_if_needed(self, _reason: str) -> None:
+        return None
+
+    def _destination_planning_overlay_emit_finalize_finished_log(self, *_a, **_k) -> None:
+        return None
+
     def _cancel_destination_future_async_projection(self, reason=""):
         self.cancel_projection_calls.append(str(reason or ""))
 

@@ -331,6 +331,17 @@ class SharePointSourceTreeModel(QAbstractItemModel):
     ) -> None:
         """Remove existing rows under ``parent`` and insert new child nodes from payloads."""
         ctx = dict(log_context) if log_context else {}
+        if ctx.get("replace_reason"):
+            log_info(
+                "source_replace_all_children_destructive",
+                reason=str(ctx.get("replace_reason") or ""),
+                child_count=len(child_payloads),
+                **{
+                    k: ctx[k]
+                    for k in ("worker_id", "drive_id", "item_id", "item_id_suffix", "parent_path_excerpt")
+                    if k in ctx
+                },
+            )
         gen = self.structure_generation()
         if not self.is_index_live(parent):
             log_info(
@@ -537,6 +548,20 @@ class SharePointSourceTreeModel(QAbstractItemModel):
         raw = str(pl.get("item_path") or pl.get("semantic_path") or pl.get("display_path") or "").strip()
         return raw.replace("/", "\\").casefold()
 
+    @staticmethod
+    def _normalize_source_drive_item_key(pl: Dict[str, Any], default_drive: str = "") -> Tuple[str, str]:
+        did = str(pl.get("drive_id") or pl.get("library_id") or "").strip()
+        if not did:
+            did = str(default_drive or "").strip()
+        iid = str(pl.get("id") or "").strip()
+        return (did, iid)
+
+    def _folder_child_path_fallback_key(self, pl: Dict[str, Any]) -> str:
+        k = self._path_key_for_payload(pl)
+        if k:
+            return k.casefold()
+        return self._merge_root_row_path_key(pl)
+
     def _remove_root_row(self, row: int) -> None:
         parent_node = self._invisible
         ch = parent_node._children or []
@@ -639,39 +664,73 @@ class SharePointSourceTreeModel(QAbstractItemModel):
         folder_node._children = children
         return folder_node
 
+    @staticmethod
+    def _source_shell_row_removal_allowed(pl: Dict[str, Any], *, enrich_only: bool) -> bool:
+        if enrich_only:
+            return False
+        if pl.get("source_shell_provisional"):
+            return False
+        return True
+
     def merge_sharepoint_source_root_graph_children(
         self,
         graph_payloads: List[Dict[str, Any]],
         *,
         enrich_only: bool = False,
+        default_drive_id: str = "",
     ) -> Dict[str, int]:
-        """Merge live Graph root children into the tree without resetting the model (startup shell)."""
+        """Merge live Graph root children into the tree without resetting the model (startup shell).
+
+        Rows match on ``(drive_id, item_id)`` first; path keys are a fallback when ids align after renames.
+        Snapshot ``source_shell_provisional`` rows are retained when missing from the Graph listing unless
+        ``enrich_only`` is used to suppress all structural removals (quiet overlay).
+        """
         inv = QModelIndex()
-        stats = {"updated": 0, "inserted": 0, "removed": 0, "enrich_only": int(bool(enrich_only))}
-        incoming: List[Dict[str, Any]] = [
-            dict(p) for p in (graph_payloads or []) if isinstance(p, dict) and str(p.get("id") or "").strip()
-        ]
+        dd = str(default_drive_id or "").strip()
+        before_count = self.count_snapshot_shell_nodes_depth_first()
+        stats = {
+            "updated": 0,
+            "inserted": 0,
+            "removed": 0,
+            "matched": 0,
+            "enrich_only": int(bool(enrich_only)),
+        }
+        incoming: List[Dict[str, Any]] = []
+        for p in graph_payloads or []:
+            if not isinstance(p, dict):
+                continue
+            pl = dict(p)
+            iid = str(pl.get("id") or "").strip()
+            if not iid:
+                continue
+            if dd and not str(pl.get("drive_id") or pl.get("library_id") or "").strip():
+                pl["drive_id"] = dd
+            incoming.append(pl)
         incoming.sort(key=self._root_graph_sort_key)
-        incoming_by_id = {str(p["id"]).strip(): p for p in incoming}
+        incoming_by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for p in incoming:
+            k = self._normalize_source_drive_item_key(p, dd)
+            if k[1]:
+                incoming_by_key[k] = p
         incoming_by_path: Dict[str, Dict[str, Any]] = {}
         for p in incoming:
             pk = self._merge_root_row_path_key(p)
             if pk and pk not in incoming_by_path:
                 incoming_by_path[pk] = p
 
-        used: set[str] = set()
+        used_key: set[Tuple[str, str]] = set()
         for r in range(self.rowCount(inv)):
             ix = self.index(r, 0, inv)
             pl = ix.data(Qt.UserRole) or {}
             if not isinstance(pl, dict) or pl.get("placeholder"):
                 continue
-            gid = str(pl.get("id") or "").strip()
-            if not gid:
-                continue
-            inc = incoming_by_id.get(gid)
+            ek = self._normalize_source_drive_item_key(pl, dd)
+            inc = incoming_by_key.get(ek)
+            if inc is None and ek[1] and dd:
+                inc = incoming_by_key.get((dd, ek[1]))
             if inc is None:
                 continue
-            used.add(gid)
+            used_key.add(self._normalize_source_drive_item_key(inc, dd))
             prev_children_loaded = bool(pl.get("children_loaded")) if pl.get("is_folder") else False
             inc_copy = dict(inc)
 
@@ -683,6 +742,7 @@ class SharePointSourceTreeModel(QAbstractItemModel):
 
             self.update_payload_for_index(ix, mutator)
             stats["updated"] += 1
+            stats["matched"] += 1
 
         for r in range(self.rowCount(inv) - 1, -1, -1):
             pl = self.index(r, 0, inv).data(Qt.UserRole) or {}
@@ -690,50 +750,247 @@ class SharePointSourceTreeModel(QAbstractItemModel):
                 continue
             if pl.get("placeholder"):
                 role = str(pl.get("placeholder_role") or "")
-                if incoming_by_id and role in ("empty_library_message", "loading_in_progress", "terminal_empty"):
+                if incoming and incoming_by_key and role in ("empty_library_message", "loading_in_progress", "terminal_empty"):
                     self._remove_root_row(r)
                     stats["removed"] += 1
                 continue
             gid = str(pl.get("id") or "").strip()
             if not gid:
-                if incoming_by_id and not enrich_only:
+                if incoming_by_key and self._source_shell_row_removal_allowed(pl, enrich_only=enrich_only):
                     self._remove_root_row(r)
                     stats["removed"] += 1
                 continue
-            if gid not in incoming_by_id:
-                pk = self._merge_root_row_path_key(pl)
-                inc_path = incoming_by_path.get(pk) if pk else None
-                if inc_path is not None:
-                    inc_gid = str(inc_path.get("id") or "").strip()
-                    if inc_gid and inc_gid not in used:
-                        ix = self.index(r, 0, inv)
-                        prev_children_loaded = bool(pl.get("children_loaded")) if pl.get("is_folder") else False
-                        inc_copy = dict(inc_path)
+            ek = self._normalize_source_drive_item_key(pl, dd)
+            if ek in used_key:
+                continue
+            pk = self._merge_root_row_path_key(pl)
+            inc_path = incoming_by_path.get(pk) if pk else None
+            if inc_path is not None:
+                ik = self._normalize_source_drive_item_key(inc_path, dd)
+                if ik[1] and ik not in used_key:
+                    ix = self.index(r, 0, inv)
+                    prev_children_loaded = bool(pl.get("children_loaded")) if pl.get("is_folder") else False
+                    inc_copy = dict(inc_path)
 
-                        def mutator_path(
-                            payload: Dict[str, Any], _prev=prev_children_loaded, _inc=inc_copy
-                        ) -> None:
-                            payload.update(_inc)
-                            payload.pop("source_shell_provisional", None)
-                            if payload.get("is_folder") and _prev:
-                                payload["children_loaded"] = True
+                    def mutator_path(
+                        payload: Dict[str, Any], _prev=prev_children_loaded, _inc=inc_copy
+                    ) -> None:
+                        payload.update(_inc)
+                        payload.pop("source_shell_provisional", None)
+                        if payload.get("is_folder") and _prev:
+                            payload["children_loaded"] = True
 
-                        self.update_payload_for_index(ix, mutator_path)
-                        used.add(inc_gid)
-                        stats["updated"] += 1
-                        continue
-                if not enrich_only:
-                    self._remove_root_row(r)
-                    stats["removed"] += 1
+                    self.update_payload_for_index(ix, mutator_path)
+                    used_key.add(ik)
+                    stats["updated"] += 1
+                    stats["matched"] += 1
+                    continue
+            if self._source_shell_row_removal_allowed(pl, enrich_only=enrich_only):
+                self._remove_root_row(r)
+                stats["removed"] += 1
 
         for inc in incoming:
-            gid = str(inc.get("id") or "").strip()
-            if not gid or gid in used:
+            ik = self._normalize_source_drive_item_key(inc, dd)
+            if not ik[1] or ik in used_key:
                 continue
             row_ins = self._root_graph_insertion_row(inc)
             self._insert_root_child_at(row_ins, inc)
-            used.add(gid)
+            used_key.add(ik)
             stats["inserted"] += 1
 
         self._rebuild_path_index()
+        after_count = self.count_snapshot_shell_nodes_depth_first()
+        log_info(
+            "source_root_merge_forensic",
+            before_count=int(before_count),
+            after_count=int(after_count),
+            matched=int(stats["matched"]),
+            inserted=int(stats["inserted"]),
+            updated=int(stats["updated"]),
+            removed=int(stats["removed"]),
+            enrich_only=int(bool(enrich_only)),
+            default_drive_id_suffix=dd[-16:] if len(dd) > 16 else dd,
+        )
+        return stats
+
+    def merge_sharepoint_folder_children(
+        self,
+        parent: QModelIndex,
+        child_payloads: List[Dict[str, Any]],
+        *,
+        drive_id: str,
+        log_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, int]:
+        """Merge Graph folder children into ``parent``, preserving existing subtree nodes for matched ids."""
+        ctx = dict(log_context) if log_context else {}
+        dd = str(drive_id or "").strip()
+        stats = {"matched": 0, "inserted": 0, "updated": 0, "removed": 0, "before_count": 0, "after_count": 0}
+        gen = self.structure_generation()
+        if not self.is_index_live(parent):
+            log_info(
+                "source_folder_merge_skip_invalid_parent",
+                model_generation=gen,
+                child_count=len(child_payloads),
+                **{
+                    k: ctx[k]
+                    for k in ("worker_id", "drive_id", "item_id", "item_id_suffix", "parent_path_excerpt")
+                    if k in ctx
+                },
+            )
+            return stats
+        parent_node = self._node(parent)
+        if parent_node is None:
+            return stats
+        parent_pl = parent_node.payload or {}
+        parent_path = str(parent_pl.get("item_path") or parent_pl.get("display_path") or "")[:400]
+
+        old_children = list(parent_node._children or [])
+        stats["before_count"] = sum(1 for c in old_children if not c.is_placeholder())
+
+        incoming: List[Dict[str, Any]] = []
+        for p in child_payloads or []:
+            if not isinstance(p, dict):
+                continue
+            pl = dict(p)
+            if dd and not str(pl.get("drive_id") or pl.get("library_id") or "").strip():
+                pl["drive_id"] = dd
+            incoming.append(pl)
+        incoming.sort(key=self._root_graph_sort_key)
+        incoming_dedup: List[Dict[str, Any]] = []
+        _seen_folder_inc: set[Tuple[str, str]] = set()
+        for pl in incoming:
+            nk = self._normalize_source_drive_item_key(pl, dd)
+            if not nk[1] or nk in _seen_folder_inc:
+                continue
+            _seen_folder_inc.add(nk)
+            incoming_dedup.append(pl)
+        incoming = incoming_dedup
+
+        incoming_by_path: Dict[str, Dict[str, Any]] = {}
+        for p in incoming:
+            pk = self._folder_child_path_fallback_key(p)
+            if pk and pk not in incoming_by_path:
+                incoming_by_path[pk] = p
+
+        existing_by_key: Dict[Tuple[str, str], _Node] = {}
+        existing_by_path: Dict[str, _Node] = {}
+        for c in old_children:
+            if c.is_placeholder():
+                continue
+            pl = c.payload or {}
+            k = self._normalize_source_drive_item_key(pl, dd)
+            if k[1]:
+                existing_by_key[k] = c
+            pk = self._folder_child_path_fallback_key(pl)
+            if pk and pk not in existing_by_path:
+                existing_by_path[pk] = c
+
+        used_nodes: set[int] = set()
+        used_incoming_keys: set[Tuple[str, str]] = set()
+        final_nodes: List[_Node] = []
+
+        def _apply_payload_to_node(node: _Node, inc_payload: Dict[str, Any]) -> None:
+            prev_children_loaded = bool(node.payload.get("children_loaded")) if node.payload.get("is_folder") else False
+            inc_copy = dict(inc_payload)
+
+            def mutator(payload: Dict[str, Any], _prev=prev_children_loaded, _inc=inc_copy) -> None:
+                payload.update(_inc)
+                payload.pop("source_shell_provisional", None)
+                if payload.get("is_folder") and _prev:
+                    payload["children_loaded"] = True
+
+            self.update_payload_for_index(self._index_for_node(node), mutator)
+
+        for inc in incoming:
+            nk = self._normalize_source_drive_item_key(inc, dd)
+            if not nk[1]:
+                continue
+            match: Optional[_Node] = existing_by_key.get(nk)
+            if match is None:
+                pk = self._folder_child_path_fallback_key(inc)
+                cand = existing_by_path.get(pk) if pk else None
+                if cand is not None and id(cand) not in used_nodes:
+                    match = cand
+            if match is not None and id(match) not in used_nodes:
+                _apply_payload_to_node(match, inc)
+                final_nodes.append(match)
+                used_nodes.add(id(match))
+                used_incoming_keys.add(nk)
+                stats["matched"] += 1
+                stats["updated"] += 1
+                continue
+            row = len(final_nodes)
+            ch_list: Optional[List[_Node]] = None if inc.get("is_folder") else []
+            node = _Node(parent_node, row, dict(inc), ch_list)
+            final_nodes.append(node)
+            used_incoming_keys.add(nk)
+            stats["inserted"] += 1
+
+        for c in old_children:
+            if c.is_placeholder():
+                continue
+            if id(c) in used_nodes:
+                continue
+            pl = c.payload or {}
+            nk = self._normalize_source_drive_item_key(pl, dd)
+            if nk[1] and nk in used_incoming_keys:
+                continue
+            if pl.get("source_shell_provisional"):
+                final_nodes.append(c)
+                continue
+            if self._source_shell_row_removal_allowed(pl, enrich_only=False):
+                stats["removed"] += 1
+                continue
+            final_nodes.append(c)
+
+        final_nodes.sort(key=lambda n: self._root_graph_sort_key(n.payload or {}))
+
+        if not final_nodes:
+            empty_pl = {
+                "placeholder": True,
+                "placeholder_role": "terminal_empty",
+                "base_display_label": "This folder is empty.",
+                "tree_role": "source",
+            }
+            final_nodes = [_Node(parent_node, 0, empty_pl, [])]
+
+        old_count = len(old_children)
+        if old_count:
+            for old_child in list(old_children):
+                self._unregister_subtree_paths(old_child)
+            self.beginRemoveRows(parent, 0, old_count - 1)
+            parent_node._children = []
+            self.endRemoveRows()
+        n = len(final_nodes)
+        self.beginInsertRows(parent, 0, n - 1)
+        parent_node._children = final_nodes
+        self._reindex(parent_node)
+        self.endInsertRows()
+        for c in final_nodes:
+            self._register_subtree_paths(c)
+        self._bump_structure_generation()
+        stats["after_count"] = sum(1 for c in final_nodes if not c.is_placeholder())
+        log_info(
+            "source_folder_merge_forensic",
+            parent_path_excerpt=parent_path,
+            before_count=int(stats["before_count"]),
+            after_count=int(stats["after_count"]),
+            matched=int(stats["matched"]),
+            inserted=int(stats["inserted"]),
+            updated=int(stats["updated"]),
+            removed=int(stats["removed"]),
+            model_generation=self.structure_generation(),
+            **{k: ctx[k] for k in ("worker_id", "drive_id", "item_id", "item_id_suffix") if k in ctx},
+        )
+        log_info(
+            "source_replace_children_complete",
+            model_generation=self.structure_generation(),
+            child_count=n,
+            mode="merged_payloads",
+            **{
+                k: ctx[k]
+                for k in ("worker_id", "drive_id", "item_id", "item_id_suffix", "parent_path_excerpt")
+                if k in ctx
+            },
+        )
         return stats

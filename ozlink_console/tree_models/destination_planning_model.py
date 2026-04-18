@@ -483,6 +483,35 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             return True
         return False
 
+    def _graph_root_enrich_only_prune_unmatched(
+        self,
+        pl: Dict[str, Any],
+        incoming_by_id: Dict[str, Dict[str, Any]],
+        incoming_by_path: Dict[str, Dict[str, Any]],
+    ) -> tuple[bool, str]:
+        """When Graph shallow roots are known, drop enrich-only retention for authority-invalid rows."""
+
+        if not isinstance(pl, dict) or not incoming_by_id:
+            return False, ""
+        if destination_payload_is_planned_workspace_row(pl):
+            return False, ""
+        if destination_payload_workspace_row_state(pl) == WORKSPACE_ROW_STATE_PLANNED_ONLY:
+            return False, ""
+        ref = next(iter(incoming_by_id.values()), None)
+        inc_drive = str((ref or {}).get("drive_id") or "").strip() if isinstance(ref, dict) else ""
+        row_drive = str(pl.get("drive_id") or "").strip()
+        if row_drive and inc_drive and row_drive.casefold() != inc_drive.casefold():
+            return True, "root_drive_mismatch_vs_graph_shallow"
+        gid = str(pl.get("id") or "").strip()
+        if self._merge_preserves_root_row_without_graph_id(pl):
+            return False, ""
+        if gid and gid not in incoming_by_id:
+            pk = self._merge_root_row_path_key(pl)
+            if pk and pk in incoming_by_path:
+                return False, ""
+            return True, "structural_root_id_not_in_graph_shallow_listing"
+        return False, ""
+
     @staticmethod
     def _merge_root_row_path_key(pl: Dict[str, Any]) -> str:
         """Canonical key for matching a snapshot root row to an incoming Graph root by path (ids may change)."""
@@ -596,7 +625,19 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
                         used.add(inc_gid)
                         stats["updated"] += 1
                         continue
-                if not enrich_only:
+                do_remove = not enrich_only
+                prune_reason = ""
+                if enrich_only:
+                    do_remove, prune_reason = self._graph_root_enrich_only_prune_unmatched(
+                        pl, incoming_by_id, incoming_by_path
+                    )
+                if do_remove:
+                    log_info(
+                        "destination_root_authority_merge_pruned_unmatched_root",
+                        reason=str(prune_reason or "non_enrich_removal")[:120],
+                        enrich_only=bool(enrich_only),
+                        had_graph_incoming=bool(incoming_by_id),
+                    )
                     self._remove_root_row(r)
                     stats["removed"] += 1
 
@@ -610,6 +651,15 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             stats["inserted"] += 1
 
         self._rebuild_path_index()
+        log_info(
+            "destination_root_authority_merge_summary",
+            updated=int(stats.get("updated", 0) or 0),
+            inserted=int(stats.get("inserted", 0) or 0),
+            removed=int(stats.get("removed", 0) or 0),
+            skipped_planned=int(stats.get("skipped_planned", 0) or 0),
+            enrich_only=bool(enrich_only),
+            incoming_graph_root_count=len(incoming_by_id),
+        )
         return stats
 
     def merge_bootstrap_cached_provisional_folder_paths(

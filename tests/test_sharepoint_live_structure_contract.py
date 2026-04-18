@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import nullcontext
 from types import MethodType
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -101,6 +102,27 @@ class _SharePointAuthoritativeMaterializeHost:
 
     def _destination_lifecycle_trace_TEMP(self, *args, **kwargs) -> None:
         return None
+
+    def _startup_post_snapshot_trace_event(self, *_a, **_k) -> None:
+        return None
+
+    def _destination_planning_overlay_run_terminal_reconcile_if_needed(self, _reason: str) -> None:
+        return None
+
+    def _destination_materialize_profile_start_cycle(self) -> None:
+        return None
+
+    def _destination_materialize_profile_finish_cycle(self, _reason: str) -> None:
+        return None
+
+    def _destination_materialize_profile_span(self, _phase: str):
+        return nullcontext()
+
+    def _destination_planning_overlay_emit_finalize_finished_log(self, *_a, **_k) -> None:
+        return None
+
+    def _destination_finalize_pass_log_reason(self, _ctx: str) -> bool:
+        return False
 
     def _try_skip_redundant_destination_future_model_materialize(self, _reason):
         return None

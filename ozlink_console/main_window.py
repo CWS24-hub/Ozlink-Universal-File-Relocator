@@ -96,6 +96,13 @@ from ozlink_console.tree_models.explorer_columns import (
 )
 from ozlink_console.tree_models.sharepoint_source_model import SharePointSourceTreeModel
 from ozlink_console.tree_models.destination_planning_model import DestinationPlanningTreeModel, NestedSpec
+from ozlink_console.destination_startup_snapshot_roots import (
+    DestinationStartupSnapshotRootContext,
+    allowed_semantic_root_segments_cf_from_snapshot,
+    filter_promoted_semantic_paths_for_destination_roots,
+    sanitize_destination_startup_snapshot_top_level,
+    select_validated_destination_startup_snapshot,
+)
 from ozlink_console.dev_mode import is_dev_mode
 from ozlink_console.logger import (
     flush_logger,
@@ -109,6 +116,7 @@ from ozlink_console.logger import (
 from ozlink_console.memory import MemoryManager, WORKSPACE_SNAPSHOT_SCHEMA_VERSION
 from ozlink_console.version_info import APP_VERSION
 from ozlink_console.models import AllocationRow, ProposedFolder, SessionState, SubmissionBatch
+from ozlink_console.planning_selector_restore import library_combo_index_for_session_restore
 from ozlink_console.requests_store import RequestStore
 from ozlink_console.graph_folder_execution_safety import compute_graph_unsafe_folder_step_indices
 from ozlink_console.graph_folder_execution_expansion import expand_graph_transfer_steps
@@ -2906,6 +2914,8 @@ class MainWindow(QMainWindow):
         self._destination_startup_snapshot_mount_seen = False
         # Drive id for the library whose session snapshot was mounted (loading placeholder must not wipe it).
         self._destination_snapshot_mount_drive_id: str = ""
+        # Tracks which destination drive promoted semantic paths belong to (cleared on library change).
+        self._destination_startup_promotion_scope_drive_id: str = ""
         # After first Graph root bind merge (or shallow reset) for destination — overlay teardown may run.
         self._destination_startup_snapshot_preservation_applied: bool = False
         # SharePoint source: recursive session snapshot mounted before Graph root bind (Phase 1 shell).
@@ -3028,6 +3038,7 @@ class MainWindow(QMainWindow):
         self._destination_runtime_snapshot_force_refresh_during_tick: bool = False
         self._destination_startup_promoted_semantic_paths: set[str] = set()
         self._destination_startup_promoted_semantic_paths_cap: int = 4000
+        self._destination_startup_allowed_semantic_root_segments_cf: set[str] = set()
         self._destination_startup_descendant_injection_active: bool = False
         self._destination_startup_descendant_queue_completed_logged: bool = False
         self._destination_startup_descendant_queue_paused_for_authority: bool = False
@@ -3316,6 +3327,10 @@ class MainWindow(QMainWindow):
         # After descendant injection mutates the live destination model, non-workspace draft saves must
         # still refresh DestinationTreeSnapshot (see _build_current_draft_shell_state / shutdown prep).
         self._destination_tree_snapshot_dirty_for_persist = False
+        # Set only during :meth:`_save_draft_shell` preflight: authoritative destination tree for session JSON.
+        self._destination_draft_save_destination_snapshot_override: list | None = None
+        # True only while :meth:`_save_draft_shell` body runs (enables force-live snapshot; avoids startup UI freeze).
+        self._destination_save_in_progress: bool = False
         # Transient: legacy flag; shutdown pre-save no longer runs full overlay convergence (bounded persist).
         self._destination_shutdown_pre_save_overlay_flush = False
         # Canonical parent path (casefold) → monotonic time; caps memory for invalid-parent enqueue dedupe.
@@ -7883,9 +7898,19 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._log_restore_exception("persist_workspace_ui_state", exc)
 
+    def _destination_force_live_snapshot_allowed(self) -> bool:
+        """Force-live destination snapshot walk is UI-heavy; allow only during save or shutdown capture."""
+        return bool(getattr(self, "_destination_save_in_progress", False)) or bool(
+            getattr(self, "_application_shutting_down", False)
+        )
+
     def _refresh_runtime_tree_snapshot(self, panel_key):
         if panel_key not in {"source", "destination"}:
             return []
+        if panel_key == "destination":
+            _fr = bool(getattr(self, "_destination_runtime_snapshot_force_refresh_during_tick", False))
+            if _fr and not self._destination_force_live_snapshot_allowed():
+                self._destination_runtime_snapshot_force_refresh_during_tick = False
         dirty_dest_before = bool(
             panel_key == "destination" and getattr(self, "_destination_tree_snapshot_dirty_for_persist", False)
         )
@@ -7927,6 +7952,68 @@ class MainWindow(QMainWindow):
             reason=str(reason or "")[:220],
         )
 
+    def _destination_startup_snapshot_root_context(self) -> DestinationStartupSnapshotRootContext:
+        """Identity context for validating persisted destination snapshot roots at workspace restore."""
+
+        mode = self._planning_browse_mode("destination")
+        dest = self._intended_destination_drive_id_for_snapshot_validation()
+        src = str(self._current_selected_source_drive_id() or "").strip()
+        if not src:
+            src = str((getattr(self, "pending_root_drive_ids", {}) or {}).get("source") or "").strip()
+        gnames = getattr(self, "_destination_graph_shallow_destination_root_names_cf", None)
+        gfrozen = gnames if isinstance(gnames, frozenset) else (frozenset(gnames) if isinstance(gnames, (set, list, tuple)) and gnames else None)
+        strict_row = str(mode or "").strip().lower() == "sharepoint"
+        return DestinationStartupSnapshotRootContext(
+            browse_mode=str(mode or "")[:40],
+            destination_drive_id=dest,
+            source_drive_id=src,
+            graph_shallow_root_names_cf=gfrozen,
+            strict_missing_row_drive=strict_row,
+        )
+
+    def _apply_destination_tree_snapshot_identity_fields(self, state: SessionState, destination_library, destination_site) -> None:
+        """Persist snapshot-level destination library identity alongside DestinationTreeSnapshot."""
+        did = str(destination_library.get("id", "") or "").strip() if isinstance(destination_library, dict) else ""
+        state.DestinationTreeSnapshotIdentityDriveId = did
+        state.DestinationTreeSnapshotIdentityLibraryId = did
+        state.DestinationTreeSnapshotIdentityLibraryName = (
+            str(destination_library.get("name", "") or "").strip() if isinstance(destination_library, dict) else ""
+        )
+        site_id = ""
+        if isinstance(destination_site, dict):
+            site_id = str(destination_site.get("id", "") or "").strip()
+        state.DestinationTreeSnapshotIdentitySiteId = site_id
+        if did or state.DestinationTreeSnapshotIdentityLibraryName:
+            log_info(
+                "destination_snapshot_identity_persisted",
+                source="session_state",
+                drive_id_suffix=did[-16:] if len(did) > 16 else did,
+                library_id_suffix=did[-16:] if len(did) > 16 else did,
+                library_name_excerpt=str(state.DestinationTreeSnapshotIdentityLibraryName or "")[:120],
+                site_id_suffix=site_id[-16:] if len(site_id) > 16 else site_id,
+            )
+
+    def _intended_destination_drive_id_for_snapshot_validation(self) -> str:
+        """Prefer persisted session/snapshot envelope over combo (combo may be wrong before selector restore)."""
+        shell = getattr(self, "_draft_shell_state", None)
+        state = shell if isinstance(shell, SessionState) else SessionState()
+        for key in (
+            "DestinationTreeSnapshotIdentityDriveId",
+            "SelectedDestinationLibraryId",
+        ):
+            v = str(getattr(state, key, "") or "").strip()
+            if v:
+                return v
+        dest = str(self._current_selected_destination_drive_id() or "").strip()
+        if dest:
+            return dest
+        return str((getattr(self, "pending_root_drive_ids", {}) or {}).get("destination") or "").strip()
+
+    def _destination_startup_snapshot_identity_matches_active(self, active_drive_id: str) -> bool:
+        m = str(getattr(self, "_destination_snapshot_mount_drive_id", "") or "").strip()
+        a = str(active_drive_id or "").strip()
+        return bool(m and a and m.casefold() == a.casefold())
+
     def _destination_startup_promoted_semantic_paths_note(self, paths: list[str] | set[str]) -> None:
         """Bounded set of planning semantic paths that must win over full-tree enumerate during merge."""
         cap = int(getattr(self, "_destination_startup_promoted_semantic_paths_cap", 4000) or 4000)
@@ -7935,7 +8022,9 @@ class MainWindow(QMainWindow):
         if not isinstance(s, set):
             s = set()
             self._destination_startup_promoted_semantic_paths = s
-        for raw in paths or []:
+        allowed = getattr(self, "_destination_startup_allowed_semantic_root_segments_cf", None)
+        filtered = filter_promoted_semantic_paths_for_destination_roots(paths, allowed if allowed else None)
+        for raw in filtered:
             p = self.normalize_memory_path(str(raw or "").strip())
             if not p:
                 continue
@@ -7968,9 +8057,7 @@ class MainWindow(QMainWindow):
         return out
 
     def _destination_startup_promote_runtime_snapshot_after_graph_bind(self, *, branch_path_excerpt: str) -> None:
-        """Merge live destination model into authoritative runtime snapshot during graph descendant injection."""
-        self._destination_session_snapshot_force_live_once = True
-        self._destination_runtime_snapshot_force_refresh_during_tick = True
+        """Best-effort runtime snapshot refresh after graph bind (never force-live: avoids UI-thread freeze)."""
         nodes_before = -1
         try:
             rs0 = getattr(self, "_runtime_session_tree_snapshots", None)
@@ -7994,16 +8081,11 @@ class MainWindow(QMainWindow):
             )
         except Exception as exc:
             self._log_restore_exception("destination_startup_promote_runtime_snapshot_after_graph_bind", exc)
-        finally:
-            self._destination_session_snapshot_force_live_once = False
-            self._destination_runtime_snapshot_force_refresh_during_tick = False
 
     def _destination_startup_snapshot_handoff_before_authority_full_walk(self) -> None:
-        """Best-effort: flush dirty runtime destination snapshot from live model before full-tree walk clears trust."""
+        """Best-effort refresh before full-tree walk (no force-live during startup)."""
         if not bool(getattr(self, "_destination_tree_snapshot_dirty_for_persist", False)):
             return
-        self._destination_session_snapshot_force_live_once = True
-        self._destination_runtime_snapshot_force_refresh_during_tick = True
         try:
             self._refresh_runtime_tree_snapshot("destination")
             rs = getattr(self, "_runtime_session_tree_snapshots", None)
@@ -8013,9 +8095,6 @@ class MainWindow(QMainWindow):
             )
         except Exception as exc:
             self._log_restore_exception("destination_startup_snapshot_handoff_before_authority_full_walk", exc)
-        finally:
-            self._destination_session_snapshot_force_live_once = False
-            self._destination_runtime_snapshot_force_refresh_during_tick = False
 
     def _destination_maybe_log_startup_descendant_queue_completed(self) -> None:
         if not bool(getattr(self, "_destination_startup_descendant_injection_active", False)):
@@ -9115,6 +9194,48 @@ class MainWindow(QMainWindow):
         self.try_restore_main_window()
         self.flash_taskbar()
 
+    def _destination_force_live_destination_snapshot_for_session_persist(self, *, reason: str = "draft_save") -> list:
+        """Capture live destination planning model and mirror into runtime session cache for JSON persist.
+
+        Uses force-live only while :attr:`_destination_save_in_progress` or shutdown so startup restore paths
+        never block the UI thread on a full model walk.
+        """
+        if not self._destination_force_live_snapshot_allowed():
+            rs = getattr(self, "_runtime_session_tree_snapshots", None)
+            if isinstance(rs, dict) and isinstance(rs.get("destination"), list):
+                return list(rs["destination"])
+            return []
+        self._destination_session_snapshot_force_live_once = True
+        self._destination_runtime_snapshot_force_refresh_during_tick = True
+        try:
+            fresh = list(self._capture_tree_items_snapshot("destination") or [])
+            rs = getattr(self, "_runtime_session_tree_snapshots", None)
+            if isinstance(rs, dict):
+                rs["destination"] = list(fresh)
+            snap_n = int(self._count_tree_snapshot_nodes(fresh))
+            try:
+                mod_n = int(self._count_destination_model_non_placeholder_nodes())
+            except Exception:
+                mod_n = -1
+            diff = int(mod_n - snap_n) if mod_n >= 0 and snap_n >= 0 else None
+            log_info(
+                "destination_save_live_snapshot_capture_forced",
+                reason=str(reason)[:120],
+                snapshot_recursive_nodes=int(snap_n),
+                model_non_placeholder_nodes=int(mod_n),
+                node_count_delta=diff,
+            )
+            log_info(
+                "destination_save_using_runtime_snapshot",
+                snapshot_recursive_nodes=int(snap_n),
+                model_non_placeholder_nodes=int(mod_n),
+                difference=diff,
+            )
+            return fresh
+        finally:
+            self._destination_session_snapshot_force_live_once = False
+            self._destination_runtime_snapshot_force_refresh_during_tick = False
+
     def _build_current_draft_shell_state(self, *, include_workspace_ui: bool = False):
         state = SessionState()
         existing_state = self._draft_shell_state if isinstance(self._draft_shell_state, SessionState) else SessionState()
@@ -9124,19 +9245,29 @@ class MainWindow(QMainWindow):
             "source_selected_path": "",
             "destination_selected_path": "",
         }
+        _dest_persist = getattr(self, "_destination_draft_save_destination_snapshot_override", None)
         workspace_tree_snapshots = (
             {
                 "source": self._capture_tree_items_snapshot("source"),
-                "destination": self._capture_tree_items_snapshot("destination"),
+                "destination": (
+                    list(_dest_persist)
+                    if _dest_persist is not None
+                    else self._capture_tree_items_snapshot("destination")
+                ),
             }
             if include_workspace_ui and hasattr(self, "source_tree_widget")
             else {
                 "source": list(getattr(existing_state, "SourceTreeSnapshot", []) or []),
-                "destination": list(getattr(existing_state, "DestinationTreeSnapshot", []) or []),
+                "destination": (
+                    list(_dest_persist)
+                    if _dest_persist is not None
+                    else list(getattr(existing_state, "DestinationTreeSnapshot", []) or [])
+                ),
             }
         )
         if (
-            (not include_workspace_ui)
+            _dest_persist is None
+            and (not include_workspace_ui)
             and getattr(self, "_destination_tree_snapshot_dirty_for_persist", False)
             and hasattr(self, "source_tree_widget")
         ):
@@ -9178,11 +9309,15 @@ class MainWindow(QMainWindow):
         if isinstance(source_site, dict):
             state.SelectedSourceSiteKey = source_site.get("site_key") or source_site.get("web_url") or source_site.get("id", "")
         state.SelectedSourceLibrary = source_library.get("name", "") if isinstance(source_library, dict) else ""
+        state.SelectedSourceLibraryId = str(source_library.get("id", "") or "").strip() if isinstance(source_library, dict) else ""
         state.SelectedDestinationSite = destination_site.get("name", "") if isinstance(destination_site, dict) else ""
         state.SelectedDestinationSiteKey = ""
         if isinstance(destination_site, dict):
             state.SelectedDestinationSiteKey = destination_site.get("site_key") or destination_site.get("web_url") or destination_site.get("id", "")
         state.SelectedDestinationLibrary = destination_library.get("name", "") if isinstance(destination_library, dict) else ""
+        state.SelectedDestinationLibraryId = (
+            str(destination_library.get("id", "") or "").strip() if isinstance(destination_library, dict) else ""
+        )
         state.SourceBrowseMode = self._planning_browse_mode("source")
         state.DestinationBrowseMode = self._planning_browse_mode("destination")
         operator_upn = self.current_session_context.get("operator_upn", "")
@@ -9199,6 +9334,7 @@ class MainWindow(QMainWindow):
             state.DestinationSelectedPath = str(workspace_ui_state.get("destination_selected_path", "") or "")
             state.SourceTreeSnapshot = list(workspace_tree_snapshots.get("source", []) or [])
             state.DestinationTreeSnapshot = list(workspace_tree_snapshots.get("destination", []) or [])
+            self._apply_destination_tree_snapshot_identity_fields(state, destination_library, destination_site)
         else:
             state.SourceExpandedAll = bool(getattr(existing_state, "SourceExpandedAll", False))
             state.DestinationExpandedAll = bool(getattr(existing_state, "DestinationExpandedAll", False))
@@ -9210,6 +9346,7 @@ class MainWindow(QMainWindow):
             state.DestinationSelectedPath = str(getattr(existing_state, "DestinationSelectedPath", "") or "")
             state.SourceTreeSnapshot = list(workspace_tree_snapshots.get("source", []) or [])
             state.DestinationTreeSnapshot = list(workspace_tree_snapshots.get("destination", []) or [])
+            self._apply_destination_tree_snapshot_identity_fields(state, destination_library, destination_site)
         if not state.DraftName:
             operator_display = self.current_session_context.get("operator_display_name", "") or "Planning Session"
             state.DraftName = f"{operator_display} Draft"
@@ -9217,7 +9354,9 @@ class MainWindow(QMainWindow):
         state.NeedsReviewDismissedInheritedSourcePaths = sorted(
             getattr(self, "_needs_review_dismissed_inherited_paths", set()) or set()
         )
-        if include_workspace_ui and hasattr(self, "source_tree_widget") and not getattr(
+        if getattr(self, "_destination_draft_save_destination_snapshot_override", None) is not None:
+            self._destination_tree_snapshot_dirty_for_persist = False
+        elif include_workspace_ui and hasattr(self, "source_tree_widget") and not getattr(
             self, "_destination_descendant_apply_tick_running", False
         ):
             self._destination_tree_snapshot_dirty_for_persist = False
@@ -10364,7 +10503,50 @@ class MainWindow(QMainWindow):
             running=worker.isRunning() if worker else False,
         )
         if worker is not None:
-            worker.deleteLater()
+            still_running = False
+            try:
+                still_running = bool(
+                    _shiboken_is_valid(worker) and hasattr(worker, "isRunning") and worker.isRunning()
+                )
+            except Exception:
+                still_running = False
+            if still_running:
+                log_info(
+                    "destination_rebind_worker_cleanup_deferred_until_finished",
+                    worker_role="root",
+                    panel_key=panel_key,
+                    worker_id=worker_id,
+                    note="join_before_deleteLater",
+                )
+                try:
+                    self._shutdown_worker_safe_join(worker, timeout_ms=1800)
+                except Exception:
+                    pass
+                try:
+                    still_running = bool(
+                        _shiboken_is_valid(worker) and hasattr(worker, "isRunning") and worker.isRunning()
+                    )
+                except Exception:
+                    still_running = False
+            if still_running:
+                log_info(
+                    "root_worker_cleanup_delete_deferred_until_thread_finished",
+                    panel_key=panel_key,
+                    worker_id=worker_id,
+                )
+                try:
+                    worker.finished.connect(worker.deleteLater, Qt.ConnectionType.UniqueConnection)
+                except TypeError:
+                    try:
+                        worker.finished.connect(worker.deleteLater)
+                    except Exception:
+                        pass
+                return
+            try:
+                if _shiboken_is_valid(worker):
+                    worker.deleteLater()
+            except Exception:
+                pass
         self._log_worker_lifecycle("cleaned_up", "root", worker_id, panel_key)
 
     def _cleanup_folder_worker(self, worker_key, worker_id):
@@ -10388,7 +10570,50 @@ class MainWindow(QMainWindow):
             running=worker.isRunning() if worker else False,
         )
         if worker is not None:
-            worker.deleteLater()
+            still_running = False
+            try:
+                still_running = bool(
+                    _shiboken_is_valid(worker) and hasattr(worker, "isRunning") and worker.isRunning()
+                )
+            except Exception:
+                still_running = False
+            if still_running:
+                log_info(
+                    "destination_rebind_worker_cleanup_deferred_until_finished",
+                    worker_role="folder",
+                    panel_key=str(worker_key)[:200],
+                    worker_id=worker_id,
+                    note="join_before_deleteLater",
+                )
+                try:
+                    self._shutdown_worker_safe_join(worker, timeout_ms=1800)
+                except Exception:
+                    pass
+                try:
+                    still_running = bool(
+                        _shiboken_is_valid(worker) and hasattr(worker, "isRunning") and worker.isRunning()
+                    )
+                except Exception:
+                    still_running = False
+            if still_running:
+                log_info(
+                    "folder_worker_cleanup_delete_deferred_until_thread_finished",
+                    worker_key=str(worker_key)[:200],
+                    worker_id=worker_id,
+                )
+                try:
+                    worker.finished.connect(worker.deleteLater, Qt.ConnectionType.UniqueConnection)
+                except TypeError:
+                    try:
+                        worker.finished.connect(worker.deleteLater)
+                    except Exception:
+                        pass
+                return
+            try:
+                if _shiboken_is_valid(worker):
+                    worker.deleteLater()
+            except Exception:
+                pass
         self._log_worker_lifecycle("cleaned_up", "folder", worker_id, worker_key)
 
     def _tree_item_is_alive(self, item):
@@ -10645,9 +10870,11 @@ class MainWindow(QMainWindow):
             "SelectedSourceSite": str(getattr(state, "SelectedSourceSite", "") or ""),
             "SelectedSourceSiteKey": str(getattr(state, "SelectedSourceSiteKey", "") or ""),
             "SelectedSourceLibrary": str(getattr(state, "SelectedSourceLibrary", "") or ""),
+            "SelectedSourceLibraryId": str(getattr(state, "SelectedSourceLibraryId", "") or ""),
             "SelectedDestinationSite": str(getattr(state, "SelectedDestinationSite", "") or ""),
             "SelectedDestinationSiteKey": str(getattr(state, "SelectedDestinationSiteKey", "") or ""),
             "SelectedDestinationLibrary": str(getattr(state, "SelectedDestinationLibrary", "") or ""),
+            "SelectedDestinationLibraryId": str(getattr(state, "SelectedDestinationLibraryId", "") or ""),
         }
         graph_audit_stored = dict(audit)
         graph_audit_stored["phase"] = str(trigger_phase or "workspace_snapshot")
@@ -10673,6 +10900,12 @@ class MainWindow(QMainWindow):
             # Mirror of SessionState.DestinationTreeSnapshot for startup merge when session JSON is stale/minimal.
             "destination_tree_snapshot": dest_snap,
             "destination_tree_snapshot_node_count": dest_tree_node_count,
+            "destination_tree_snapshot_identity": {
+                "drive_id": str(getattr(state, "DestinationTreeSnapshotIdentityDriveId", "") or ""),
+                "library_id": str(getattr(state, "DestinationTreeSnapshotIdentityLibraryId", "") or ""),
+                "library_name": str(getattr(state, "DestinationTreeSnapshotIdentityLibraryName", "") or ""),
+                "site_id": str(getattr(state, "DestinationTreeSnapshotIdentitySiteId", "") or ""),
+            },
         }
 
     def _persist_workspace_snapshot_file(self, *, phase: str = "") -> None:
@@ -10773,6 +11006,17 @@ class MainWindow(QMainWindow):
         try:
             if not self._ensure_active_draft_session():
                 return False
+
+            self._destination_save_in_progress = True
+            self._destination_draft_save_destination_snapshot_override = None
+            try:
+                _preflight = self._destination_force_live_destination_snapshot_for_session_persist(
+                    reason="draft_save_preflight"
+                )
+                self._destination_draft_save_destination_snapshot_override = list(_preflight or [])
+            except Exception as exc:
+                self._log_restore_exception("destination_draft_save_live_snapshot_preflight", exc)
+                self._destination_draft_save_destination_snapshot_override = None
 
             _shut = getattr(self, "_application_shutting_down", False)
             _t_build = time.perf_counter() if _shut else None
@@ -10932,6 +11176,9 @@ class MainWindow(QMainWindow):
                     error_excerpt=str(exc)[:400],
                 )
             return False
+        finally:
+            self._destination_save_in_progress = False
+            self._destination_draft_save_destination_snapshot_override = None
 
     def _handle_export_draft(self):
         if self.memory_manager is None:
@@ -18817,9 +19064,12 @@ class MainWindow(QMainWindow):
         has_saved_selector_restore = any(
             [
                 bool(getattr(restore_state, "SelectedSourceSite", "") or getattr(restore_state, "SelectedSourceSiteKey", "")),
-                bool(getattr(restore_state, "SelectedSourceLibrary", "")),
+                bool(getattr(restore_state, "SelectedSourceLibrary", "") or getattr(restore_state, "SelectedSourceLibraryId", "")),
                 bool(getattr(restore_state, "SelectedDestinationSite", "") or getattr(restore_state, "SelectedDestinationSiteKey", "")),
-                bool(getattr(restore_state, "SelectedDestinationLibrary", "")),
+                bool(
+                    getattr(restore_state, "SelectedDestinationLibrary", "")
+                    or getattr(restore_state, "SelectedDestinationLibraryId", "")
+                ),
             ]
         )
 
@@ -18868,6 +19118,145 @@ class MainWindow(QMainWindow):
             return True
         finally:
             selector.blockSignals(False)
+
+    def _planning_library_selector_item_rows(self, selector):
+        rows: list[tuple[str, Any]] = []
+        if selector is None:
+            return rows
+        try:
+            for i in range(selector.count()):
+                rows.append((selector.itemText(i), selector.itemData(i)))
+        except Exception:
+            return []
+        return rows
+
+    def _set_planning_library_selector_unresolved(self, panel_key: str, *, selector, outcome_tag: str) -> None:
+        """Clear library selection and show a safe placeholder (no implicit index-0 bind)."""
+        if selector is None:
+            return
+        selector.blockSignals(True)
+        try:
+            try:
+                selector.setCurrentIndex(-1)
+            except Exception:
+                pass
+        finally:
+            selector.blockSignals(False)
+        if panel_key == "source":
+            try:
+                self.bottom_source.setText("Source: Not Set")
+            except Exception:
+                pass
+            self.set_tree_placeholder("source", "Select a source library to load root content.")
+        else:
+            try:
+                self.bottom_destination.setText("Destination: Not Set")
+            except Exception:
+                pass
+            self.set_tree_placeholder("destination", "Select a destination library to load root content.")
+        try:
+            self.pending_root_drive_ids[panel_key] = ""
+            self.active_root_request_signatures[panel_key] = None
+            self.loaded_root_request_signatures[panel_key] = None
+        except Exception:
+            pass
+        self.update_selector_context_labels()
+        log_info(
+            "destination_library_restore_blocked_unresolved"
+            if panel_key == "destination"
+            else "source_library_restore_blocked_unresolved",
+            panel_key=panel_key,
+            outcome_tag=str(outcome_tag or "")[:120],
+        )
+
+    def _quiesce_destination_workers_for_rebind(self, *, reason: str, incoming_signature: dict[str, Any] | None = None) -> None:
+        """Bounded wait so destination root/folder QThreads retire before a new library bind."""
+        t0 = time.perf_counter()
+        log_info(
+            "destination_rebind_worker_quiesce_begin",
+            reason=str(reason or "")[:240],
+            incoming_signature=dict(incoming_signature or {}),
+        )
+        workers: list[tuple[str, str, Any]] = []
+
+        entry = (self.root_load_workers or {}).get("destination")
+        if isinstance(entry, dict):
+            w = entry.get("worker")
+            wid = str(entry.get("id") or "")
+            if w is not None:
+                try:
+                    if _shiboken_is_valid(w) and hasattr(w, "isRunning") and w.isRunning():
+                        workers.append(("destination_root_active", wid, w))
+                except Exception:
+                    pass
+
+        for wid, rentry in list((self.root_load_retired_workers or {}).items()):
+            if not isinstance(rentry, dict) or rentry.get("panel_key") != "destination":
+                continue
+            w = rentry.get("worker")
+            if w is None:
+                continue
+            try:
+                if _shiboken_is_valid(w) and hasattr(w, "isRunning") and w.isRunning():
+                    workers.append(("destination_root_retired", str(wid), w))
+            except Exception:
+                pass
+
+        for wk, fentry in list((self.folder_load_workers or {}).items()):
+            if not str(wk).startswith("destination:") or not isinstance(fentry, dict):
+                continue
+            w = fentry.get("worker")
+            if w is None:
+                continue
+            try:
+                if _shiboken_is_valid(w) and hasattr(w, "isRunning") and w.isRunning():
+                    workers.append(("destination_folder_active", str(wk), w))
+            except Exception:
+                pass
+
+        for fwid, fentry in list((self.folder_load_retired_workers or {}).items()):
+            if not isinstance(fentry, dict):
+                continue
+            wk = str(fentry.get("worker_key") or "")
+            if not wk.startswith("destination:"):
+                continue
+            w = fentry.get("worker")
+            if w is None:
+                continue
+            try:
+                if _shiboken_is_valid(w) and hasattr(w, "isRunning") and w.isRunning():
+                    workers.append(("destination_folder_retired", str(fwid), w))
+            except Exception:
+                pass
+
+        budget_ms = 2400
+        per_cap = max(200, budget_ms // max(1, len(workers))) if workers else budget_ms
+        still: list[tuple[str, str]] = []
+        for slot, wid, w in workers:
+            try:
+                self._shutdown_worker_safe_join(w, timeout_ms=min(800, per_cap))
+            except Exception:
+                pass
+            try:
+                if _shiboken_is_valid(w) and hasattr(w, "isRunning") and w.isRunning():
+                    still.append((slot, wid))
+                    log_info(
+                        "destination_rebind_worker_retired_waiting",
+                        slot=str(slot)[:80],
+                        worker_id=str(wid)[:160],
+                    )
+            except Exception:
+                pass
+
+        log_info(
+            "destination_rebind_worker_quiesce_summary",
+            reason=str(reason or "")[:240],
+            workers_seen=int(len(workers)),
+            still_running=int(len(still)),
+            wall_ms=round((time.perf_counter() - t0) * 1000.0, 2),
+        )
+        if not still:
+            log_info("destination_rebind_worker_safe_to_replace", reason=str(reason or "")[:240])
 
     def _populate_library_selector_for_group(self, selector_group):
         if selector_group == "source":
@@ -19027,24 +19416,98 @@ class MainWindow(QMainWindow):
         if destination_site_matched:
             self.on_site_selector_changed("destination", force=True, chain_library=False)
 
-        source_library_index = self._find_selector_index(
-            source_library_selector,
-            [state.SelectedSourceLibrary],
-            data_keys=("id", "name"),
+        src_rows = self._planning_library_selector_item_rows(source_library_selector)
+        src_idx, src_tag = library_combo_index_for_session_restore(
+            stored_drive_id=str(getattr(state, "SelectedSourceLibraryId", "") or ""),
+            stored_display_name=str(getattr(state, "SelectedSourceLibrary", "") or ""),
+            item_rows=src_rows,
         )
-        destination_library_index = self._find_selector_index(
-            destination_library_selector,
-            [state.SelectedDestinationLibrary],
-            data_keys=("id", "name"),
+        source_library_matched = False
+        if src_idx >= 0:
+            if self._set_selector_index_safely(source_library_selector, src_idx):
+                source_library_matched = True
+                log_info(
+                    "source_library_restore_match_success",
+                    outcome_tag=src_tag,
+                    index=src_idx,
+                    stored_drive_id=str(getattr(state, "SelectedSourceLibraryId", "") or ""),
+                    stored_name=str(getattr(state, "SelectedSourceLibrary", "") or ""),
+                    selector_item_count=len(src_rows),
+                )
+                if src_tag == "legacy_name_only":
+                    log_info(
+                        "source_library_restore_legacy_name_only",
+                        stored_name=str(getattr(state, "SelectedSourceLibrary", "") or ""),
+                        selector_item_count=len(src_rows),
+                    )
+                    log_info(
+                        "source_library_restore_used_fallback_name_match",
+                        stored_name=str(getattr(state, "SelectedSourceLibrary", "") or ""),
+                    )
+        elif src_tag == "no_session_hint":
+            source_library_matched = False
+        else:
+            self._set_planning_library_selector_unresolved("source", selector=source_library_selector, outcome_tag=src_tag)
+            log_info(
+                "source_library_restore_match_failed",
+                stored_name=str(getattr(state, "SelectedSourceLibrary", "") or ""),
+                stored_drive_id=str(getattr(state, "SelectedSourceLibraryId", "") or ""),
+                outcome_tag=src_tag,
+                selector_item_count=len(src_rows),
+                source_site_context=str(getattr(state, "SelectedSourceSite", "") or ""),
+            )
+
+        dst_rows = self._planning_library_selector_item_rows(destination_library_selector)
+        dst_idx, dst_tag = library_combo_index_for_session_restore(
+            stored_drive_id=str(getattr(state, "SelectedDestinationLibraryId", "") or ""),
+            stored_display_name=str(getattr(state, "SelectedDestinationLibrary", "") or ""),
+            item_rows=dst_rows,
         )
-        source_library_matched = self._set_selector_index_safely(source_library_selector, source_library_index)
-        destination_library_matched = self._set_selector_index_safely(destination_library_selector, destination_library_index)
+        destination_library_matched = False
+        if dst_idx >= 0:
+            if self._set_selector_index_safely(destination_library_selector, dst_idx):
+                destination_library_matched = True
+                log_info(
+                    "destination_library_restore_match_success",
+                    outcome_tag=dst_tag,
+                    index=dst_idx,
+                    stored_drive_id=str(getattr(state, "SelectedDestinationLibraryId", "") or ""),
+                    stored_name=str(getattr(state, "SelectedDestinationLibrary", "") or ""),
+                    selector_item_count=len(dst_rows),
+                )
+                if dst_tag == "legacy_name_only":
+                    log_info(
+                        "destination_library_restore_legacy_name_only",
+                        stored_name=str(getattr(state, "SelectedDestinationLibrary", "") or ""),
+                        selector_item_count=len(dst_rows),
+                    )
+                    log_info(
+                        "destination_library_restore_used_fallback_name_match",
+                        stored_name=str(getattr(state, "SelectedDestinationLibrary", "") or ""),
+                    )
+        elif dst_tag == "no_session_hint":
+            destination_library_matched = False
+        else:
+            self._set_planning_library_selector_unresolved(
+                "destination", selector=destination_library_selector, outcome_tag=dst_tag
+            )
+            log_info(
+                "destination_library_restore_match_failed",
+                stored_name=str(getattr(state, "SelectedDestinationLibrary", "") or ""),
+                stored_drive_id=str(getattr(state, "SelectedDestinationLibraryId", "") or ""),
+                outcome_tag=dst_tag,
+                selector_item_count=len(dst_rows),
+                destination_site_context=str(getattr(state, "SelectedDestinationSite", "") or ""),
+            )
+
         self._log_restore_phase(
             "phase2_library_match",
             source_library_matched=source_library_matched,
-            source_library_index=source_library_index,
+            source_library_index=src_idx,
+            source_restore_tag=src_tag,
             destination_library_matched=destination_library_matched,
-            destination_library_index=destination_library_index,
+            destination_library_index=dst_idx,
+            destination_restore_tag=dst_tag,
             selector_signals_suppressed=self._suppress_selector_change_handlers,
         )
 
@@ -19170,6 +19633,17 @@ class MainWindow(QMainWindow):
         prov_applied = False
         try:
             self._apply_browse_modes_from_session_state()
+            _id = self._intended_destination_drive_id_for_snapshot_validation()
+            log_info(
+                "destination_startup_selector_identity_ready",
+                has_intended=bool(_id),
+                intended_drive_suffix=_id[-16:] if len(_id) > 16 else _id,
+            )
+            try:
+                self._post_login_restore_phase2_selectors_and_planned_moves_inner()
+            finally:
+                pass
+            self._refresh_pending_destination_snapshot_after_selector_identity()
             prov_applied = bool(
                 self._destination_apply_provisional_session_snapshot_if_eligible(phase="post_login_phase2_pre_selectors")
             )
@@ -19178,13 +19652,11 @@ class MainWindow(QMainWindow):
             raise
 
         if prov_applied:
-            # Yield one event-loop tick so Qt can paint the provisional snapshot before synchronous
-            # ``list_site_drives`` / root workers / planned-moves table refresh run on this thread.
             self._startup_post_snapshot_trace_event("phase2_deferred_tail_scheduled", defer_ms=0)
 
             def _deferred_tail():
                 try:
-                    self._post_login_restore_phase2_selectors_and_planned_moves_inner()
+                    pass
                 finally:
                     self._post_login_restore_phase2_finally_body()
 
@@ -19193,10 +19665,7 @@ class MainWindow(QMainWindow):
                 lambda: self._safe_invoke("post_login_phase2_after_provisional_snapshot", _deferred_tail),
             )
         else:
-            try:
-                self._post_login_restore_phase2_selectors_and_planned_moves_inner()
-            finally:
-                self._post_login_restore_phase2_finally_body()
+            self._post_login_restore_phase2_finally_body()
 
     def _schedule_post_login_restore_phase4_if_pending(self) -> None:
         """Re-run phase-4 when the first invoke ran before the destination tree was ready."""
@@ -20039,24 +20508,80 @@ class MainWindow(QMainWindow):
         *,
         workspace_sidecar: dict | None,
     ) -> tuple[list, str, int, int]:
-        """Choose richer destination tree by recursive node count: session JSON vs WorkspaceSnapshot sidecar."""
-        session_list = list(session_destination_snaps or [])
-        try:
-            n_sess = int(self._count_tree_snapshot_nodes(session_list))
-        except Exception:
-            n_sess = 0
+        """Choose session vs workspace sidecar destination snapshot after root validation (validity > richness)."""
+
+        state = self._draft_shell_state if isinstance(self._draft_shell_state, SessionState) else SessionState()
+        combo_did = str(self._current_selected_destination_drive_id() or "").strip()
+        intended = str(
+            getattr(state, "DestinationTreeSnapshotIdentityDriveId", "")
+            or getattr(state, "SelectedDestinationLibraryId", "")
+            or ""
+        ).strip()
+        if not intended:
+            intended = combo_did
+        sess_drive = str(getattr(state, "DestinationTreeSnapshotIdentityDriveId", "") or "").strip()
+        sess_lib = str(getattr(state, "DestinationTreeSnapshotIdentityLibraryId", "") or "").strip()
+        if not sess_drive and not sess_lib:
+            sess_drive = sess_lib = str(getattr(state, "SelectedDestinationLibraryId", "") or "").strip()
+        if not sess_drive and not sess_lib:
+            sess_drive = sess_lib = combo_did
+        sidecar_d = ""
+        sidecar_lib = ""
+        if isinstance(workspace_sidecar, dict):
+            ident = workspace_sidecar.get("destination_tree_snapshot_identity")
+            if isinstance(ident, dict):
+                sidecar_d = str(ident.get("drive_id") or ident.get("library_id") or "").strip()
+                sidecar_lib = str(ident.get("library_id") or ident.get("drive_id") or "").strip() or sidecar_d
         side_list: list = []
         if isinstance(workspace_sidecar, dict):
             raw = workspace_sidecar.get("destination_tree_snapshot")
             if isinstance(raw, list):
                 side_list = list(raw)
+        ctx = self._destination_startup_snapshot_root_context()
+        chosen, label, _n_sess_san, _n_side_san, meta = select_validated_destination_startup_snapshot(
+            list(session_destination_snaps or []),
+            side_list,
+            ctx,
+            session_envelope_drive_id=sess_drive,
+            session_envelope_library_id=sess_lib,
+            sidecar_envelope_drive_id=sidecar_d,
+            sidecar_envelope_library_id=sidecar_lib,
+            intended_drive_id=intended,
+        )
+        n_sess = int(meta.get("session_raw_nodes", 0) or 0)
+        n_side = int(meta.get("sidecar_raw_nodes", 0) or 0)
+        return chosen, str(label), n_sess, n_side
+
+    def _refresh_pending_destination_snapshot_after_selector_identity(self) -> None:
+        """Re-select destination snapshot using authoritative selector drive id (post phase2 selectors)."""
         try:
-            n_side = int(self._count_tree_snapshot_nodes(side_list))
-        except Exception:
-            n_side = 0
-        if n_side > n_sess:
-            return side_list, "WorkspaceSnapshot.destination_tree_snapshot", n_sess, n_side
-        return session_list, "SessionState.DestinationTreeSnapshot", n_sess, n_side
+            tree_snapshots = self._session_workspace_tree_snapshots()
+            dest_snaps_session = list(tree_snapshots.get("destination", []) or [])
+            mm = getattr(self, "memory_manager", None)
+            sidecar = mm.read_workspace_snapshot_optional() if mm is not None else None
+            dest_snaps, sel_src, _, _ = self._select_destination_tree_snapshot_for_startup(
+                dest_snaps_session,
+                workspace_sidecar=sidecar,
+            )
+            pending = dict(self._pending_session_tree_snapshots or {})
+            pending["destination"] = list(dest_snaps)
+            self._pending_session_tree_snapshots = pending
+            rs = getattr(self, "_runtime_session_tree_snapshots", None)
+            if isinstance(rs, dict):
+                rs["destination"] = list(dest_snaps)
+            try:
+                self._destination_startup_allowed_semantic_root_segments_cf = allowed_semantic_root_segments_cf_from_snapshot(
+                    dest_snaps
+                )
+            except Exception:
+                self._destination_startup_allowed_semantic_root_segments_cf = set()
+            log_info(
+                "destination_startup_snapshot_applied_after_selector_identity_resolved",
+                selected_source=str(sel_src)[:120],
+                top_level_roots=len(dest_snaps),
+            )
+        except Exception as exc:
+            self._log_restore_exception("refresh_pending_destination_snapshot_after_selector_identity", exc)
 
     def _runtime_tree_snapshot_for_panel(self, panel_key):
         snapshots = getattr(self, "_runtime_session_tree_snapshots", {}) or {}
@@ -20635,6 +21160,11 @@ class MainWindow(QMainWindow):
         return child_paths
 
     def _begin_session_workspace_ui_restore(self):
+        try:
+            self._destination_session_snapshot_force_live_once = False
+            self._destination_runtime_snapshot_force_refresh_during_tick = False
+        except Exception:
+            pass
         ui_state = self._session_workspace_ui_state()
         tree_snapshots = self._session_workspace_tree_snapshots()
         dest_snaps_session = list(tree_snapshots.get("destination", []) or [])
@@ -20644,6 +21174,12 @@ class MainWindow(QMainWindow):
             dest_snaps_session,
             workspace_sidecar=sidecar,
         )
+        try:
+            self._destination_startup_allowed_semantic_root_segments_cf = allowed_semantic_root_segments_cf_from_snapshot(
+                dest_snaps
+            )
+        except Exception:
+            self._destination_startup_allowed_semantic_root_segments_cf = set()
         if sel_src.startswith("Workspace") and isinstance(self._draft_shell_state, SessionState):
             self._draft_shell_state.DestinationTreeSnapshot = list(dest_snaps)
         try:
@@ -20718,9 +21254,9 @@ class MainWindow(QMainWindow):
 
         pending_panels = set()
         state = self._draft_shell_state if isinstance(self._draft_shell_state, SessionState) else SessionState()
-        if state.SelectedSourceLibrary:
+        if state.SelectedSourceLibrary or getattr(state, "SelectedSourceLibraryId", ""):
             pending_panels.add("source")
-        if state.SelectedDestinationLibrary:
+        if state.SelectedDestinationLibrary or getattr(state, "SelectedDestinationLibraryId", ""):
             pending_panels.add("destination")
 
         self._pending_session_workspace_ui_state = ui_state
@@ -21263,7 +21799,17 @@ class MainWindow(QMainWindow):
                 self._destination_flush_descendant_apply_resume_to_model_payloads()
             except Exception:
                 pass
-            _force_live = bool(getattr(self, "_destination_session_snapshot_force_live_once", False))
+            _raw_force = bool(getattr(self, "_destination_session_snapshot_force_live_once", False))
+            _allowed = self._destination_force_live_snapshot_allowed()
+            if _raw_force and not _allowed:
+                log_info(
+                    "destination_force_live_snapshot_blocked_startup",
+                    note="force_live_only_during_save_or_shutdown",
+                    tick_running=bool(getattr(self, "_destination_descendant_apply_tick_running", False)),
+                )
+                self._destination_session_snapshot_force_live_once = False
+                self._destination_runtime_snapshot_force_refresh_during_tick = False
+            _force_live = _raw_force and _allowed
             if getattr(self, "_destination_descendant_apply_tick_running", False) and not _force_live:
                 self._post_tick_descendant_drain_pending = True
                 self._destination_post_tick_deferred_boundary_log("snapshot_capture_deferred_tick_running")
@@ -22224,7 +22770,26 @@ class MainWindow(QMainWindow):
                 self._queue_deferred_destination_library_root(site, library, force_refresh)
                 return
 
+            if panel_key == "destination":
+                self._quiesce_destination_workers_for_rebind(
+                    reason="load_library_root_before_new_destination_bind",
+                    incoming_signature=request_signature,
+                )
+
             self._log_library_restore_step("load_root_step_04_pending_state_enter", panel_key=panel_key)
+            if panel_key == "destination":
+                prev_scope = str(getattr(self, "_destination_startup_promotion_scope_drive_id", "") or "").strip()
+                cur_d = str(drive_id or "").strip()
+                if prev_scope and cur_d and prev_scope.casefold() != cur_d.casefold():
+                    ps = getattr(self, "_destination_startup_promoted_semantic_paths", None)
+                    if isinstance(ps, set):
+                        ps.clear()
+                    log_info(
+                        "destination_startup_promotion_scope_cleared_drive_change",
+                        previous_drive_suffix=prev_scope[-16:] if len(prev_scope) > 16 else prev_scope,
+                        new_drive_suffix=cur_d[-16:] if len(cur_d) > 16 else cur_d,
+                    )
+                self._destination_startup_promotion_scope_drive_id = cur_d
             self.pending_root_drive_ids[panel_key] = drive_id
             self.pending_folder_loads[panel_key] = set()
             if panel_key == "destination":
@@ -25231,6 +25796,27 @@ class MainWindow(QMainWindow):
         if not snaps:
             log_info("destination_provisional_startup_skipped", phase=str(phase)[:80], reason="no_destination_snapshot")
             return False
+        if not self._intended_destination_drive_id_for_snapshot_validation():
+            log_info(
+                "destination_startup_snapshot_deferred_until_selector_restore",
+                phase=str(phase)[:80],
+                reason="intended_destination_drive_unknown",
+            )
+            return False
+        try:
+            _ctx_pv = self._destination_startup_snapshot_root_context()
+            snaps, _ = sanitize_destination_startup_snapshot_top_level(
+                snaps, _ctx_pv, selection_tag="provisional_startup", log_validation_summary=True
+            )
+        except Exception as exc:
+            self._log_restore_exception("destination_provisional_snapshot_sanitize", exc)
+        if not snaps:
+            log_info(
+                "destination_provisional_startup_skipped",
+                phase=str(phase)[:80],
+                reason="all_top_level_roots_failed_destination_validation",
+            )
+            return False
         destination_stamp_snapshot_tree_workspace_state(snaps)
         roots: list = []
         for snap in snaps:
@@ -25259,6 +25845,7 @@ class MainWindow(QMainWindow):
             or self._current_selected_destination_drive_id()
             or ""
         ).strip()
+        self._destination_startup_promotion_scope_drive_id = str(self._destination_snapshot_mount_drive_id or "").strip()
         self._destination_last_startup_status_reason = "provisional_snapshot_first_paint"
         self._set_tree_status_message("destination", msg, loading=False)
         self._startup_post_snapshot_trace_reset()
@@ -25327,6 +25914,12 @@ class MainWindow(QMainWindow):
         tree.setUpdatesEnabled(False)
         try:
             tree.setEnabled(True)
+            if panel_key == "destination" and self._planning_browse_mode("destination") != "local" and items:
+                self._destination_graph_shallow_destination_root_names_cf = frozenset(
+                    str(it.get("name") or "").strip().casefold()
+                    for it in (items or [])
+                    if isinstance(it, dict) and str(it.get("name") or "").strip()
+                )
             if panel_key == "destination":
                 log_info(
                     "destination_startup_model_step",
@@ -25345,37 +25938,48 @@ class MainWindow(QMainWindow):
                     and items
                     and not getattr(self, "_destination_provisional_startup_applied", False)
                 ):
-                    roots_pp: list = []
-                    for snap in pending_dest_snaps:
-                        spec = self._destination_tree_snapshot_dict_to_nested_spec(
-                            snap if isinstance(snap, dict) else {}
+                    try:
+                        _ctx_bind = self._destination_startup_snapshot_root_context()
+                        pending_dest_snaps, _ = sanitize_destination_startup_snapshot_top_level(
+                            pending_dest_snaps,
+                            _ctx_bind,
+                            selection_tag="pre_graph_bind_reset_nested",
+                            log_validation_summary=False,
                         )
-                        if spec is not None:
-                            roots_pp.append(spec)
-                    if roots_pp:
-                        destination_stamp_snapshot_tree_workspace_state(list(pending_dest_snaps))
-                        model.reset_nested(roots_pp)
-                        self._destination_startup_snapshot_mount_seen = True
-                        self._destination_session_snapshot_path_cf_set_cache = None
-                        self._destination_snapshot_mount_drive_id = str(
-                            (getattr(self, "pending_root_drive_ids", {}) or {}).get("destination")
-                            or self._current_selected_destination_drive_id()
-                            or ""
-                        ).strip()
-                        pre_graph_snapshot_mount = True
-                        log_info(
-                            "destination_pending_session_snapshot_bind_before_graph_root",
-                            root_rows=len(roots_pp),
-                            snapshot_nodes=int(self._count_tree_snapshot_nodes(pending_dest_snaps)),
-                        )
-                        self._destination_prune_pending_snapshot_branch_refresh_after_provisional_mount(
-                            list(pending_dest_snaps)
-                        )
-                        log_info(
-                            "destination_startup_model_step",
-                            step="after_pre_graph_snapshot_reset_nested",
-                            **self._destination_forensic_destination_model_counts(),
-                        )
+                    except Exception as exc:
+                        self._log_restore_exception("destination_pre_graph_bind_snapshot_sanitize", exc)
+                    if pending_dest_snaps:
+                        roots_pp: list = []
+                        for snap in pending_dest_snaps:
+                            spec = self._destination_tree_snapshot_dict_to_nested_spec(
+                                snap if isinstance(snap, dict) else {}
+                            )
+                            if spec is not None:
+                                roots_pp.append(spec)
+                        if roots_pp:
+                            destination_stamp_snapshot_tree_workspace_state(list(pending_dest_snaps))
+                            model.reset_nested(roots_pp)
+                            self._destination_startup_snapshot_mount_seen = True
+                            self._destination_session_snapshot_path_cf_set_cache = None
+                            self._destination_snapshot_mount_drive_id = str(
+                                (getattr(self, "pending_root_drive_ids", {}) or {}).get("destination")
+                                or self._current_selected_destination_drive_id()
+                                or ""
+                            ).strip()
+                            pre_graph_snapshot_mount = True
+                            log_info(
+                                "destination_pending_session_snapshot_bind_before_graph_root",
+                                root_rows=len(roots_pp),
+                                snapshot_nodes=int(self._count_tree_snapshot_nodes(pending_dest_snaps)),
+                            )
+                            self._destination_prune_pending_snapshot_branch_refresh_after_provisional_mount(
+                                list(pending_dest_snaps)
+                            )
+                            log_info(
+                                "destination_startup_model_step",
+                                step="after_pre_graph_snapshot_reset_nested",
+                                **self._destination_forensic_destination_model_counts(),
+                            )
             prov_by_id: dict[str, dict] = {}
             if (
                 panel_key == "destination"
@@ -25474,11 +26078,15 @@ class MainWindow(QMainWindow):
                         else:
                             merged_payloads.append(pl)
                     payloads = merged_payloads
+                did_shell_early = str(
+                    self.pending_root_drive_ids.get("destination") or self._current_selected_destination_drive_id() or ""
+                ).strip()
                 snap_preserving = bool(
                     (
                         bool(getattr(self, "_destination_provisional_startup_applied", False))
                         or bool(pre_graph_snapshot_mount)
                         or bool(getattr(self, "_destination_startup_snapshot_mount_seen", False))
+                        or self._destination_startup_snapshot_identity_matches_active(did_shell_early)
                     )
                     and hasattr(model, "merge_sharepoint_library_root_graph_children")
                 )
@@ -25490,9 +26098,7 @@ class MainWindow(QMainWindow):
                     nodes_before = 0
                 _fc_pre = self._destination_forensic_destination_model_counts()
                 self._destination_provisional_startup_applied = False
-                did_shell = str(
-                    self.pending_root_drive_ids.get("destination") or self._current_selected_destination_drive_id() or ""
-                ).strip()
+                did_shell = did_shell_early
                 self._destination_sharepoint_root_graph_bound_drive_id = did_shell
                 merge_stats: dict | None = None
                 if snap_preserving:
@@ -25581,7 +26187,33 @@ class MainWindow(QMainWindow):
                         inserted_root_rows=int(_ins),
                     )
                     self._destination_startup_snapshot_preservation_applied = True
+                    log_info(
+                        "destination_authority_handoff_preserved_valid_startup_descendants",
+                        drive_id_suffix=did_shell[-16:] if len(did_shell) > 16 else did_shell,
+                        merge_removed=int(_rm),
+                        merge_inserted=int(_ins),
+                        merge_updated=int(_upd),
+                    )
+                    log_info(
+                        "destination_authority_handoff_summary",
+                        outcome="merge_preserve",
+                        snap_preserving=True,
+                        drive_id_suffix=did_shell[-16:] if len(did_shell) > 16 else did_shell,
+                    )
                 else:
+                    log_info(
+                        "destination_authority_handoff_summary",
+                        outcome="shallow_graph_reset",
+                        snap_preserving=False,
+                        mount_matches_active=bool(self._destination_startup_snapshot_identity_matches_active(did_shell)),
+                        drive_id_suffix=did_shell[-16:] if len(did_shell) > 16 else did_shell,
+                    )
+                    if not self._destination_startup_snapshot_identity_matches_active(did_shell):
+                        log_info(
+                            "destination_authority_handoff_dropped_invalid_library_snapshot",
+                            drive_id_suffix=did_shell[-16:] if len(did_shell) > 16 else did_shell,
+                            mount_suffix=str(getattr(self, "_destination_snapshot_mount_drive_id", "") or "")[-16:],
+                        )
                     self._destination_full_library_reconcile_pending = True
                     self._destination_authority_pending_shell = True
                     self._destination_startup_lifecycle_temp_post_snapshot_mutation(
@@ -26998,6 +27630,14 @@ class MainWindow(QMainWindow):
         if not isinstance(snap, dict) or snap.get("placeholder"):
             return False
         if destination_payload_is_planned_workspace_row(snap):
+            # Stale exports may carry a display name that disagrees with the last path segment; do not
+            # treat such snapshot paths as authoritative intended canonical (regression: phantom rows).
+            nm = str(snap.get("name") or "").strip()
+            path = str(snap.get("item_path") or snap.get("destination_path") or "").strip()
+            if nm and path:
+                segs = [p for p in str(path).replace("/", "\\").split("\\") if p]
+                if segs and segs[-1].strip().casefold() != nm.casefold():
+                    return False
             return True
         if destination_payload_workspace_row_state(snap) == WORKSPACE_ROW_STATE_CACHED_PROVISIONAL:
             return True
@@ -27562,6 +28202,16 @@ class MainWindow(QMainWindow):
                             live_path_excerpt=str(pre_live_path or "")[:400],
                         )
             else:
+                if len(name_match_indices) > 1:
+                    lost_sub = 1 + self._destination_count_planned_snapshot_tree_nodes(nested)
+                    st["lost"] += lost_sub
+                    log_info(
+                        "destination_reconcile_planned_row_ambiguous_live_name_matches",
+                        snapshot_name_excerpt=str(snap_name)[:200],
+                        live_name_match_count=int(len(name_match_indices)),
+                        lost_subtree_nodes=int(lost_sub),
+                    )
+                    return st
                 ex_ix = self._destination_find_planned_workspace_row_for_snapshot_reconcile(
                     snap, path_lookup_canonical=intended_canon
                 )

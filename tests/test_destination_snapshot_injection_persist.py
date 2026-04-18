@@ -346,10 +346,58 @@ class DestinationUnresolvedParentPruneTests(unittest.TestCase):
         self.assertIn("destination_shutdown_final_snapshot_capture", topics)
 
 
-class DestinationStartupSnapshotAuthorityHandoffTests(unittest.TestCase):
-    def test_startup_promote_updates_runtime_snapshot_while_tick_running(self):
+class DestinationDraftSaveRuntimeSnapshotTests(unittest.TestCase):
+    def test_force_persist_noop_when_not_in_save_pipeline(self):
         w = MainWindow.__new__(MainWindow)
-        w._destination_descendant_apply_tick_running = True
+        w._destination_save_in_progress = False
+        w._application_shutting_down = False
+        w._runtime_session_tree_snapshots = {"destination": [{"stale": True}], "source": []}
+        with patch("ozlink_console.main_window.log_info"):
+            out = MainWindow._destination_force_live_destination_snapshot_for_session_persist(w, reason="unit")
+        self.assertEqual(out, [{"stale": True}])
+
+    def test_force_persist_updates_runtime_session_destination(self):
+        w = MainWindow.__new__(MainWindow)
+        w._destination_save_in_progress = True
+        w._application_shutting_down = False
+        w._runtime_session_tree_snapshots = {"destination": [], "source": []}
+        w._capture_tree_items_snapshot = lambda p: [{"text": "live", "data": {}, "children": []}]
+        w._count_tree_snapshot_nodes = lambda s: MainWindow._count_tree_snapshot_nodes(w, s)
+        w._count_destination_model_non_placeholder_nodes = MagicMock(return_value=3)
+        with patch("ozlink_console.main_window.log_info"):
+            out = MainWindow._destination_force_live_destination_snapshot_for_session_persist(w, reason="unit")
+        self.assertEqual(len(out), 1)
+        self.assertEqual(w._runtime_session_tree_snapshots["destination"], out)
+
+    def test_build_prefers_save_override_for_destination_tree(self):
+        w = MainWindow.__new__(MainWindow)
+        w.active_draft_session_id = "DRAFT-UNIT"
+        w._draft_shell_state = SessionState()
+        w._draft_shell_state.DraftId = "DRAFT-UNIT"
+        w._destination_draft_save_destination_snapshot_override = [{"text": "from_save", "data": {}, "children": []}]
+        w.planning_inputs = {}
+        w.source_tree_widget = MagicMock()
+        w._capture_workspace_tree_state = MagicMock(
+            return_value={
+                "source_expanded_paths": set(),
+                "destination_expanded_paths": set(),
+                "source_selected_path": "",
+                "destination_selected_path": "",
+            }
+        )
+        w._panel_is_expanded_all = MagicMock(return_value=False)
+        w._planning_browse_mode = lambda panel: "browse"
+        w.current_session_context = {"user_role": "user", "operator_upn": "", "tenant_domain": ""}
+        with patch.object(MainWindow, "_capture_tree_items_snapshot", return_value=[{"text": "src"}]):
+            st = MainWindow._build_current_draft_shell_state(w, include_workspace_ui=True)
+        self.assertEqual(list(st.DestinationTreeSnapshot or []), [{"text": "from_save", "data": {}, "children": []}])
+
+
+class DestinationStartupSnapshotAuthorityHandoffTests(unittest.TestCase):
+    def test_startup_promote_updates_runtime_snapshot_via_refresh(self):
+        w = MainWindow.__new__(MainWindow)
+        # Force-live walks are save/shutdown-only; promotion uses refresh without blocking the UI thread.
+        w._destination_descendant_apply_tick_running = False
         w._runtime_session_tree_snapshots = {"destination": [], "source": []}
         w._destination_tree_snapshot_dirty_for_persist = True
         w._destination_flush_descendant_apply_resume_to_model_payloads = MagicMock()

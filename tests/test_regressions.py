@@ -448,6 +448,9 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._draft_shell_state = SessionState(
             SelectedSourceLibrary="Files to be Migrated",
             SelectedDestinationLibrary="Documents",
+            SelectedDestinationLibraryId="drive-dest-1",
+            DestinationTreeSnapshotIdentityDriveId="drive-dest-1",
+            DestinationTreeSnapshotIdentityLibraryId="drive-dest-1",
             SourceExpandedPaths=["FTBMRoot\\Public"],
             DestinationExpandedPaths=["Root\\Finance"],
             SourceExpandedAll=True,
@@ -463,7 +466,12 @@ class DestinationReplayRegressionTests(unittest.TestCase):
             DestinationTreeSnapshot=[{
                 "text": "Folder: Destination Snapshot",
                 "expanded": True,
-                "data": {"item_path": "Root\\Finance", "is_folder": True},
+                "data": {
+                    "item_path": "Root\\Finance",
+                    "is_folder": True,
+                    "drive_id": "drive-dest-1",
+                    "tree_role": "destination",
+                },
                 "children": [],
             }],
         )
@@ -961,110 +969,120 @@ class DestinationReplayRegressionTests(unittest.TestCase):
 
     def test_destination_graph_authority_non_empty_folder_payload_replaces_richer_visible_branch(self):
         """Graph-owned mode: non-empty Graph children must bind even if the UI subtree looked larger."""
-        app = QApplication.instance() or QApplication([])
-        window = MainWindow.__new__(MainWindow)
-        model = DestinationPlanningTreeModel()
-        model.reset_root_payloads(
-            [
-                {
-                    "base_display_label": "Folder: Finance",
-                    "name": "Finance",
-                    "is_folder": True,
-                    "item_path": r"Root\Finance",
-                    "drive_id": "drive-1",
-                    "id": "item-1",
-                }
-            ]
-        )
-        fin_ix = model.index(0, 0, QModelIndex())
-        model.replace_all_children(
-            fin_ix,
-            [
-                {
-                    "base_display_label": "Folder: Payroll",
-                    "name": "Payroll",
-                    "is_folder": True,
-                    "item_path": r"Root\Finance\Payroll",
-                    "drive_id": "drive-1",
-                    "id": "pay-1",
-                }
-            ],
-        )
+        import ozlink_console.main_window as main_window_module
 
-        window.destination_planning_model = model
-        window.pending_folder_loads = {"destination": set()}
-        window.folder_load_workers = {
-            "destination:item-1": {
-                "id": "folder-1",
-                "destination_folder_parent_persistent": QPersistentModelIndex(fin_ix),
+        with patch.object(
+            main_window_module.destination_authority_contract,
+            "graph_owns_visible_real_destination_structure",
+            lambda _h: True,
+        ):
+            app = QApplication.instance() or QApplication([])
+            window = MainWindow.__new__(MainWindow)
+            model = DestinationPlanningTreeModel()
+            model.reset_root_payloads(
+                [
+                    {
+                        "base_display_label": "Folder: Finance",
+                        "name": "Finance",
+                        "is_folder": True,
+                        "item_path": r"Root\Finance",
+                        "drive_id": "drive-1",
+                        "id": "item-1",
+                    }
+                ]
+            )
+            fin_ix = model.index(0, 0, QModelIndex())
+            model.replace_all_children(
+                fin_ix,
+                [
+                    {
+                        "base_display_label": "Folder: Payroll",
+                        "name": "Payroll",
+                        "is_folder": True,
+                        "item_path": r"Root\Finance\Payroll",
+                        "drive_id": "drive-1",
+                        "id": "pay-1",
+                    }
+                ],
+            )
+
+            window.destination_planning_model = model
+            window.pending_folder_loads = {"destination": set()}
+            window.folder_load_workers = {
+                "destination:item-1": {
+                    "id": "folder-1",
+                    "destination_folder_parent_persistent": QPersistentModelIndex(fin_ix),
+                }
             }
-        }
-        window._memory_restore_in_progress = False
-        window._snapshot_branch_refresh_baseline_by_worker = {}
-        window._destination_preserved_children_by_worker = {"destination:item-1": []}
-        window._log_worker_lifecycle = lambda *args, **kwargs: None
-        window._log_restore_phase = lambda *args, **kwargs: None
-        window.normalize_memory_path = MainWindow.normalize_memory_path.__get__(window, MainWindow)
-        window._count_visible_subtree_nodes_index = MainWindow._count_visible_subtree_nodes_index.__get__(
-            window, MainWindow
-        )
-        window._count_folder_payload_nodes = MainWindow._count_folder_payload_nodes.__get__(window, MainWindow)
+            window._memory_restore_in_progress = False
+            window._snapshot_branch_refresh_baseline_by_worker = {}
+            window._destination_preserved_children_by_worker = {"destination:item-1": []}
+            window._log_worker_lifecycle = lambda *args, **kwargs: None
+            window._log_restore_phase = lambda *args, **kwargs: None
+            window.normalize_memory_path = MainWindow.normalize_memory_path.__get__(window, MainWindow)
+            window._count_visible_subtree_nodes_index = MainWindow._count_visible_subtree_nodes_index.__get__(
+                window, MainWindow
+            )
+            window._count_folder_payload_nodes = MainWindow._count_folder_payload_nodes.__get__(window, MainWindow)
 
-        def _payload_from_graph(child):
-            cid = str(child.get("id") or "")
-            name = str(child.get("name") or "")
-            return {
-                "id": cid,
-                "name": name,
-                "is_folder": True,
-                "item_path": child.get("item_path"),
+            def _payload_from_graph(child):
+                cid = str(child.get("id") or "")
+                name = str(child.get("name") or "")
+                return {
+                    "id": cid,
+                    "name": name,
+                    "is_folder": True,
+                    "item_path": child.get("item_path"),
+                    "drive_id": "drive-1",
+                }
+
+            window._destination_payload_from_graph_item = _payload_from_graph
+            window._apply_tree_item_visual_state = lambda *a, **k: None
+            window._destination_lifecycle_trace_TEMP = lambda *a, **k: None
+            window._mark_destination_real_tree_snapshot_stale = lambda: None
+            window._destination_semantic_path = MainWindow._destination_semantic_path.__get__(window, MainWindow)
+            window._canonical_destination_projection_path = MainWindow._canonical_destination_projection_path.__get__(
+                window, MainWindow
+            )
+            window._destination_collect_planned_workspace_children_under_model = lambda _ix: []
+            window._destination_planned_workspace_snapshot_identity_only_tree = lambda snap: snap
+            window._destination_register_planned_workspace_snapshot_for_parent_path = lambda *a, **k: None
+            window._destination_invoke_planned_workspace_reconcile_after_graph_folder_load = lambda *a, **k: None
+            window.destination_tree_widget = _TreeStub()
+            window._destination_expand_burst_should_coalesce = lambda _p: False
+            window._safe_invoke = lambda _name, _fn, *a, **k: None
+            window.unresolved_proposed_by_parent_path = {}
+            window.unresolved_allocations_by_parent_path = {}
+
+            payload = {
+                "panel_key": "destination",
                 "drive_id": "drive-1",
+                "item_id": "item-1",
+                "items": [
+                    {
+                        "id": "c-a",
+                        "name": "Alpha",
+                        "is_folder": True,
+                        "item_path": r"Root\Finance\Alpha",
+                    },
+                    {
+                        "id": "c-b",
+                        "name": "Beta",
+                        "is_folder": True,
+                        "item_path": r"Root\Finance\Beta",
+                    },
+                ],
             }
 
-        window._destination_payload_from_graph_item = _payload_from_graph
-        window._apply_tree_item_visual_state = lambda *a, **k: None
-        window._destination_lifecycle_trace_TEMP = lambda *a, **k: None
-        window._mark_destination_real_tree_snapshot_stale = lambda: None
-        window._destination_semantic_path = MainWindow._destination_semantic_path.__get__(window, MainWindow)
-        window._canonical_destination_projection_path = MainWindow._canonical_destination_projection_path.__get__(
-            window, MainWindow
-        )
-        window._destination_collect_planned_workspace_children_under_model = lambda _ix: []
-        window._destination_planned_workspace_snapshot_identity_only_tree = lambda snap: snap
-        window._destination_register_planned_workspace_snapshot_for_parent_path = lambda *a, **k: None
-        window._destination_invoke_planned_workspace_reconcile_after_graph_folder_load = lambda *a, **k: None
-        window.destination_tree_widget = _TreeStub()
-        window._destination_expand_burst_should_coalesce = lambda _p: False
-        window._safe_invoke = lambda _name, _fn, *a, **k: None
+            window.on_folder_load_success(payload, "folder-1")
 
-        payload = {
-            "panel_key": "destination",
-            "drive_id": "drive-1",
-            "item_id": "item-1",
-            "items": [
-                {
-                    "id": "c-a",
-                    "name": "Alpha",
-                    "is_folder": True,
-                    "item_path": r"Root\Finance\Alpha",
-                },
-                {
-                    "id": "c-b",
-                    "name": "Beta",
-                    "is_folder": True,
-                    "item_path": r"Root\Finance\Beta",
-                },
-            ],
-        }
-
-        window.on_folder_load_success(payload, "folder-1")
-
-        self.assertEqual(model.rowCount(fin_ix), 2)
-        paths = sorted(
-            (model.index(r, 0, fin_ix).data(Qt.UserRole) or {}).get("item_path")
-            for r in range(model.rowCount(fin_ix))
-        )
-        self.assertEqual(paths, [r"Root\Finance\Alpha", r"Root\Finance\Beta"])
+            self.assertEqual(model.rowCount(fin_ix), 2)
+            paths = sorted(
+                (model.index(r, 0, fin_ix).data(Qt.UserRole) or {}).get("item_path")
+                for r in range(model.rowCount(fin_ix))
+            )
+            self.assertEqual(paths, [r"Root\Finance\Alpha", r"Root\Finance\Beta"])
+            _ = app
 
     def test_folder_worker_success_skips_deleted_tree_item(self):
         window = MainWindow.__new__(MainWindow)
@@ -1274,6 +1292,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
 
     def test_restore_workspace_tree_panel_state_reapplies_expanded_all(self):
         window = MainWindow.__new__(MainWindow)
+        window._pending_session_tree_snapshots = {}
         window.destination_tree_widget = QTreeWidget()
         window.destination_expand_all_button = _ButtonStub()
         window._expand_all_pending = {"source": False, "destination": False}

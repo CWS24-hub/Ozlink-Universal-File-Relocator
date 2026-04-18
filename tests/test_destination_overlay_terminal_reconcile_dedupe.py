@@ -11,9 +11,13 @@ def test_single_overlay_pass_runs_global_planned_reconcile_once():
     host.destination_tree_widget = None
     host.reconcile_count = 0
 
-    def _rec():
+    def _rec(*_a, **_k):
         host.reconcile_count += 1
 
+    host._destination_planning_overlay_run_terminal_reconcile_if_needed = (
+        lambda r: MainWindow._destination_planning_overlay_run_terminal_reconcile_if_needed(host, r)
+    )
+    host._destination_planning_overlay_emit_finalize_finished_log = lambda *_a, **_k: None
     host._destination_reconcile_all_planned_parents_after_graph_update = _rec
     MainWindow._apply_destination_planning_overlays(host, "folder_worker_success", allow_defer=False)
     assert host.reconcile_count == 1
@@ -25,9 +29,13 @@ def test_authority_shell_nested_overlay_does_not_triple_global_planned_reconcile
     host.destination_tree_widget = None
     host.reconcile_count = 0
 
-    def _rec():
+    def _rec(*_a, **_k):
         host.reconcile_count += 1
 
+    host._destination_planning_overlay_run_terminal_reconcile_if_needed = (
+        lambda r: MainWindow._destination_planning_overlay_run_terminal_reconcile_if_needed(host, r)
+    )
+    host._destination_planning_overlay_emit_finalize_finished_log = lambda *_a, **_k: None
     host._destination_reconcile_all_planned_parents_after_graph_update = _rec
     host._planning_browse_mode = lambda key: "sharepoint" if key == "destination" else "local"
     host._destination_sharepoint_planning_destination_active = lambda: True

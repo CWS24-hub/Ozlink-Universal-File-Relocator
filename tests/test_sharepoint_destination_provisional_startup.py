@@ -8,6 +8,7 @@ from PySide6.QtCore import QModelIndex, Qt
 from PySide6.QtWidgets import QApplication, QTreeView
 
 from ozlink_console.main_window import MainWindow
+from ozlink_console.models import SessionState
 from ozlink_console.sharepoint_destination_overlay_attach import (
     WORKSPACE_ROW_STATE_CACHED_PROVISIONAL,
     WORKSPACE_ROW_STATE_LIVE_CONFIRMED,
@@ -65,6 +66,10 @@ def test_apply_provisional_sets_status_and_model_rows_without_graph():
         ],
     }
     mw._runtime_session_tree_snapshots = {"source": [], "destination": []}
+    mw._draft_shell_state = SessionState(
+        SelectedDestinationLibraryId="d1",
+        DestinationTreeSnapshotIdentityDriveId="d1",
+    )
     mw._set_tree_status_message = lambda *a, **k: None
     mw._schedule_snapshot_branch_refresh = lambda *a, **k: None
     ok = MainWindow._destination_apply_provisional_session_snapshot_if_eligible(mw, phase="test")

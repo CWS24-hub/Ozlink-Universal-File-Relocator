@@ -92,9 +92,13 @@ class SessionState:
     SelectedSourceSite: str = ""
     SelectedSourceSiteKey: str = ""
     SelectedSourceLibrary: str = ""
+    # Graph drive id for the selected source library (SharePoint document library).
+    SelectedSourceLibraryId: str = ""
     SelectedDestinationSite: str = ""
     SelectedDestinationSiteKey: str = ""
     SelectedDestinationLibrary: str = ""
+    # Graph drive id for the selected destination library (durable restore key).
+    SelectedDestinationLibraryId: str = ""
     # Planning header platform (sharepoint | local); restored before site/library rebind on import/restore.
     SourceBrowseMode: str = "sharepoint"
     DestinationBrowseMode: str = "sharepoint"
@@ -109,6 +113,11 @@ class SessionState:
     WorkspacePanelCollapsed: bool = False
     SourceTreeSnapshot: list[dict[str, Any]] = field(default_factory=list)
     DestinationTreeSnapshot: list[dict[str, Any]] = field(default_factory=list)
+    # Snapshot-level destination library identity for DestinationTreeSnapshot (Graph drive id = library id).
+    DestinationTreeSnapshotIdentityDriveId: str = ""
+    DestinationTreeSnapshotIdentityLibraryId: str = ""
+    DestinationTreeSnapshotIdentityLibraryName: str = ""
+    DestinationTreeSnapshotIdentitySiteId: str = ""
     # Canonical source paths (files) excluded from inherited folder allocations; persisted with draft session.
     PlanLeafExclusions: list[str] = field(default_factory=list)
     # Source paths for inherited_mapping rows the user dismissed in Needs Review (UI only; does not change the plan).

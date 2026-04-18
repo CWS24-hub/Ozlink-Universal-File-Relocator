@@ -182,6 +182,15 @@ def run_app():
             **thread_inventory_snapshot(),
             **qt_threadpool_snapshot(),
         )
+        try:
+            window._shutdown_terminal_completion_gate(phase="aboutToQuit")
+        except Exception as exc:
+            log_info(
+                "shutdown_trace",
+                event="shutdown_terminal_gate_failed",
+                phase="aboutToQuit",
+                error=str(exc)[:240],
+            )
         _log_shutdown_thread_inventory("aboutToQuit")
 
     app.aboutToQuit.connect(_on_about_to_quit)

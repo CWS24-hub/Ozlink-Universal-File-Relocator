@@ -124,6 +124,7 @@ def test_allocation_descendant_overlay_preserves_live_graph_folder_type(monkeypa
         "item_path": "Root3\\Reports",
         "destination_path": "Root3\\Reports",
         "tree_role": "destination",
+        "workspace_row_state": "live_confirmed",
         "children_loaded": False,
         "drive_id": "d1",
         "library_id": "d1",

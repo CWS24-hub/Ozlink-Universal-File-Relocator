@@ -333,20 +333,20 @@ def _child_names(dm, pix):
 
 
 def test_ensure_sharepoint_graph_only_defers_planned_under_unloaded_library_children(monkeypatch):
-    """Regression: ``not_loaded`` under a live hub with ``children_loaded`` false must not create planned folders."""
+    """Graph authority: a visible hub with ``children_loaded`` false still attempts planned-chain bind (Option 3)."""
     mw, _dm = _graph_mw_unloaded_library_hub(monkeypatch)
     calls: list[tuple] = []
 
-    def _no_planned_bind(*_a, **_k):
-        calls.append(1)
-        raise AssertionError("structural planned bind must not run before Graph children load")
+    def _capture_planned_bind(*a, **k):
+        calls.append((a, k))
+        return QModelIndex()
 
-    mw._sharepoint_bind_planned_segment_chain = _no_planned_bind
+    mw._sharepoint_bind_planned_segment_chain = _capture_planned_bind
     out = MainWindow._ensure_destination_projection_path_sharepoint_graph_only(
         mw, r"Root3\Finance\Payroll", leaf_is_file=False
     )
     assert out is None
-    assert calls == []
+    assert len(calls) == 1
 
 
 def test_ensure_sharepoint_graph_only_creates_planned_chain_under_visible_parent(monkeypatch):

@@ -1,0 +1,476 @@
+"""
+Destination startup snapshot — top-level root validation for SharePoint Graph authority.
+
+Rejects persisted/sidecar top-level roots that cannot belong to the current destination
+library (e.g. rows whose drive identity matches the source library or a foreign drive).
+
+This module is intentionally generic (no name-based bans on specific folders).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from ozlink_console.logger import log_info
+from ozlink_console.paths import normalize_manifest_path
+from ozlink_console.sharepoint_destination_overlay_attach import (
+    WORKSPACE_ROW_STATE_PLANNED_ONLY,
+    destination_payload_is_planned_workspace_row,
+    destination_payload_workspace_row_state,
+)
+
+
+@dataclass
+class DestinationStartupSnapshotRootContext:
+    """Identity context available during session/workspace restore (may be partial)."""
+
+    browse_mode: str  # "sharepoint" | "local" | ""
+    destination_drive_id: str = ""
+    source_drive_id: str = ""
+    # Optional: casefolded Graph shallow root **names** when authority is already known.
+    graph_shallow_root_names_cf: frozenset[str] | None = None
+    # When destination drive is known and row is not planned, require row drive_id (SharePoint).
+    strict_missing_row_drive: bool = True
+
+
+@dataclass
+class DestinationStartupSnapshotSanitizeStats:
+    kept_top_level: int = 0
+    pruned_top_level: int = 0
+    uncertain_top_level: int = 0
+    prune_reasons: list[str] = field(default_factory=list)
+
+
+def _root_display_name(snap: dict[str, Any]) -> str:
+    d = snap.get("data") if isinstance(snap.get("data"), dict) else {}
+    return str(snap.get("text") or d.get("name") or d.get("base_display_label") or "").strip()
+
+
+def _root_path_excerpt(snap: dict[str, Any]) -> str:
+    d = snap.get("data") if isinstance(snap.get("data"), dict) else {}
+    for k in ("item_path", "destination_path", "semantic_path", "display_path"):
+        v = str(d.get(k) or "").strip()
+        if v:
+            return v[:200]
+    return _root_display_name(snap)[:200]
+
+
+def _drive_id_from_payload(pl: dict[str, Any]) -> str:
+    if not isinstance(pl, dict):
+        return ""
+    return str(pl.get("drive_id") or pl.get("library_id") or pl.get("parent_drive_id") or "").strip()
+
+
+def _should_keep_planned_top_level(pl: dict[str, Any]) -> bool:
+    if destination_payload_is_planned_workspace_row(pl):
+        return True
+    st = destination_payload_workspace_row_state(pl)
+    if st == WORKSPACE_ROW_STATE_PLANNED_ONLY:
+        return True
+    return False
+
+
+def classify_destination_top_level_snapshot_root(
+    snap: dict[str, Any],
+    ctx: DestinationStartupSnapshotRootContext,
+) -> tuple[str, str]:
+    """Return (decision, reason) where decision is keep|prune|uncertain."""
+
+    if not isinstance(snap, dict):
+        return "prune", "not_dict"
+    pl = snap.get("data") if isinstance(snap.get("data"), dict) else {}
+    if pl.get("placeholder"):
+        return "keep", "placeholder_scaffolding"
+
+    mode = str(ctx.browse_mode or "").strip().lower()
+    if mode == "local":
+        return "keep", "local_browse_skip_sharepoint_root_checks"
+
+    if mode and mode != "sharepoint":
+        return "uncertain", f"unknown_browse_mode_{mode}"
+
+    if _should_keep_planned_top_level(pl):
+        return "keep", "planned_workspace_row"
+
+    tr = str(pl.get("tree_role") or "").strip().lower()
+    if tr == "source":
+        return "prune", "tree_role_source"
+
+    rid = _drive_id_from_payload(pl)
+    dest = str(ctx.destination_drive_id or "").strip()
+    src = str(ctx.source_drive_id or "").strip()
+
+    if dest and rid and rid.casefold() != dest.casefold():
+        if src and rid.casefold() == src.casefold():
+            return "prune", "root_drive_matches_source_not_destination"
+        return "prune", "root_drive_id_not_destination_library"
+
+    if not dest and src and rid and rid.casefold() == src.casefold():
+        return "prune", "root_drive_matches_source_destination_not_yet_bound"
+
+    gset = ctx.graph_shallow_root_names_cf
+    if gset and len(gset) > 0 and not _should_keep_planned_top_level(pl):
+        nm = str(pl.get("name") or "").strip() or _root_display_name(snap)
+        ncf = nm.casefold()
+        if ncf and ncf not in gset:
+            return "prune", "root_name_not_in_graph_shallow_authority"
+
+    if not rid and not dest:
+        return "uncertain", "no_drive_fingerprint_yet"
+
+    if (
+        dest
+        and not rid
+        and not _should_keep_planned_top_level(pl)
+        and bool(getattr(ctx, "strict_missing_row_drive", True))
+    ):
+        return "prune", "strict_row_drive_missing_when_intended_known"
+
+    return "keep", "passed_sharepoint_root_checks"
+
+
+def sanitize_destination_startup_snapshot_top_level(
+    snapshots: list | None,
+    ctx: DestinationStartupSnapshotRootContext,
+    *,
+    selection_tag: str = "",
+    log_validation_summary: bool = True,
+) -> tuple[list, DestinationStartupSnapshotSanitizeStats]:
+    """Drop invalid **top-level** roots only; nested rows under a kept root are left unchanged."""
+
+    stats = DestinationStartupSnapshotSanitizeStats()
+    out: list = []
+    for snap in list(snapshots or []):
+        if not isinstance(snap, dict):
+            continue
+        decision, reason = classify_destination_top_level_snapshot_root(snap, ctx)
+        name_excerpt = _root_path_excerpt(snap)
+        if decision == "prune":
+            stats.pruned_top_level += 1
+            stats.prune_reasons.append(reason)
+            log_info(
+                "destination_startup_snapshot_root_pruned_invalid",
+                selection_tag=str(selection_tag or "")[:120],
+                reason=str(reason)[:120],
+                root_path_excerpt=name_excerpt[:200],
+            )
+            continue
+        if decision == "uncertain":
+            stats.uncertain_top_level += 1
+            log_info(
+                "destination_startup_snapshot_root_validation_uncertain",
+                selection_tag=str(selection_tag or "")[:120],
+                reason=str(reason)[:120],
+                root_path_excerpt=name_excerpt[:200],
+            )
+        stats.kept_top_level += 1
+        out.append(snap)
+
+    if log_validation_summary:
+        log_info(
+            "destination_startup_snapshot_root_validation_summary",
+            selection_tag=str(selection_tag or "")[:120],
+            browse_mode=str(ctx.browse_mode or "")[:40],
+            dest_drive_suffix=(str(ctx.destination_drive_id or "")[-16:] if ctx.destination_drive_id else ""),
+            source_drive_suffix=(str(ctx.source_drive_id or "")[-16:] if ctx.source_drive_id else ""),
+            kept_top_level=int(stats.kept_top_level),
+            pruned_top_level=int(stats.pruned_top_level),
+            uncertain_top_level=int(stats.uncertain_top_level),
+        )
+    return out, stats
+
+
+def first_path_segment_cf(path: str) -> str:
+    s = normalize_manifest_path(str(path or "").strip())
+    if not s:
+        return ""
+    seg = s.replace("/", "\\").split("\\", 1)[0].strip()
+    return seg.casefold() if seg else ""
+
+
+def allowed_semantic_root_segments_cf_from_snapshot(snapshots: list | None) -> set[str]:
+    """Build a casefolded set of first path segments from sanitized top-level roots."""
+
+    out: set[str] = set()
+    for snap in list(snapshots or []):
+        if not isinstance(snap, dict):
+            continue
+        d = snap.get("data") if isinstance(snap.get("data"), dict) else {}
+        path = ""
+        for k in ("item_path", "destination_path", "semantic_path", "display_path"):
+            v = str(d.get(k) or "").strip()
+            if v:
+                path = v
+                break
+        seg = first_path_segment_cf(path)
+        if not seg:
+            nm = str(d.get("name") or snap.get("text") or "").strip()
+            seg = nm.casefold() if nm else ""
+        if seg:
+            out.add(seg)
+    return out
+
+
+def filter_promoted_semantic_paths_for_destination_roots(
+    paths: list[str] | set[str],
+    allowed_root_segments_cf: set[str] | None,
+) -> list[str]:
+    """Drop promoted paths whose first segment is not under an allowed destination root name."""
+
+    if not allowed_root_segments_cf:
+        return [str(p or "").strip() for p in paths or [] if str(p or "").strip()]
+    filtered: list[str] = []
+    dropped = 0
+    for raw in paths or []:
+        p = str(raw or "").strip()
+        if not p:
+            continue
+        seg = first_path_segment_cf(p)
+        if seg and seg not in allowed_root_segments_cf:
+            dropped += 1
+            continue
+        filtered.append(p)
+    if dropped:
+        log_info(
+            "destination_startup_promoted_paths_filtered_foreign_root_segment",
+            dropped=int(dropped),
+            allowed_root_segments=len(allowed_root_segments_cf),
+        )
+    return filtered
+
+
+def apply_destination_snapshot_identity_gate(
+    snapshots: list,
+    *,
+    intended_drive_id: str,
+    snapshot_stored_drive_id: str,
+    snapshot_stored_library_id: str,
+    source: str,
+) -> tuple[list, str]:
+    """Enforce snapshot-level destination drive identity before any visible restore.
+
+    Returns ``(snapshots_or_empty, outcome_tag)``. Empty list means do not render this source.
+    """
+
+    intended = str(intended_drive_id or "").strip()
+    if not intended:
+        log_info(
+            "destination_startup_snapshot_blocked_unresolved_identity",
+            source=str(source)[:40],
+            reason="intended_destination_drive_unknown",
+        )
+        return [], "blocked_intended_unknown"
+
+    stored_d = str(snapshot_stored_drive_id or "").strip()
+    stored_lib = str(snapshot_stored_library_id or "").strip()
+    eff = stored_d or stored_lib
+    if not eff:
+        log_info(
+            "destination_startup_snapshot_blocked_unresolved_identity",
+            source=str(source)[:40],
+            reason="snapshot_envelope_missing_drive",
+        )
+        return [], "blocked_no_snapshot_envelope"
+
+    if eff.casefold() != intended.casefold():
+        log_info(
+            "destination_startup_snapshot_rejected_identity_mismatch",
+            source=str(source)[:40],
+            intended_drive_suffix=intended[-16:] if len(intended) > 16 else intended,
+            stored_drive_suffix=eff[-16:] if len(eff) > 16 else eff,
+        )
+        return [], "rejected_envelope_mismatch"
+
+    log_info(
+        "destination_snapshot_identity_loaded",
+        source=str(source)[:40],
+        drive_id_suffix=eff[-16:] if len(eff) > 16 else eff,
+        library_id_suffix=eff[-16:] if len(eff) > 16 else eff,
+        library_name_excerpt="",
+    )
+    return list(snapshots or []), "identity_ok"
+
+
+def prune_nested_snapshot_nodes_for_wrong_drive(
+    snapshots: list | None,
+    intended_drive_id: str,
+    *,
+    selection_tag: str = "",
+    max_nodes: int = 100_000,
+) -> tuple[list, int]:
+    """Remove subtrees whose payload drive_id contradicts the intended destination drive (bounded)."""
+
+    intended = str(intended_drive_id or "").strip()
+    if not intended or not snapshots:
+        return list(snapshots or []), 0
+
+    pruned = 0
+    visited = 0
+
+    def walk(node: Any) -> dict | None:
+        nonlocal pruned, visited
+        if visited >= max_nodes:
+            return None
+        if not isinstance(node, dict):
+            return None
+        visited += 1
+        pl = node.get("data") if isinstance(node.get("data"), dict) else {}
+        rid = _drive_id_from_payload(pl)
+        if rid and rid.casefold() != intended.casefold():
+            pruned += 1
+            log_info(
+                "destination_startup_snapshot_row_pruned_identity_mismatch",
+                selection_tag=str(selection_tag or "")[:120],
+                reason="nested_drive_mismatch",
+                drive_suffix=rid[-16:] if len(rid) > 16 else rid,
+            )
+            return None
+        ch_in = list(node.get("children") or [])
+        ch_out: list = []
+        for ch in ch_in:
+            kept = walk(ch)
+            if kept is not None:
+                ch_out.append(kept)
+        out = dict(node)
+        out["children"] = ch_out
+        return out
+
+    out_roots: list = []
+    for snap in list(snapshots or []):
+        if isinstance(snap, dict):
+            kept = walk(snap)
+            if kept is not None:
+                out_roots.append(kept)
+    return out_roots, pruned
+
+
+def select_validated_destination_startup_snapshot(
+    session_destination_snaps: list,
+    workspace_sidecar_destination_snaps: list | None,
+    ctx: DestinationStartupSnapshotRootContext,
+    *,
+    session_envelope_drive_id: str = "",
+    session_envelope_library_id: str = "",
+    sidecar_envelope_drive_id: str = "",
+    sidecar_envelope_library_id: str = "",
+    intended_drive_id: str = "",
+) -> tuple[list, str, int, int, dict[str, Any]]:
+    """Choose session vs sidecar after identity gate + sanitization; validity outranks raw node count.
+
+    Returns (selected_list, label, n_sess_nodes_after, n_side_nodes_after, meta).
+    """
+
+    session_list = list(session_destination_snaps or [])
+    side_list = list(workspace_sidecar_destination_snaps or [])
+
+    sess_gated, sess_gate_tag = apply_destination_snapshot_identity_gate(
+        session_list,
+        intended_drive_id=intended_drive_id,
+        snapshot_stored_drive_id=session_envelope_drive_id,
+        snapshot_stored_library_id=session_envelope_library_id or session_envelope_drive_id,
+        source="session",
+    )
+    side_gated, side_gate_tag = apply_destination_snapshot_identity_gate(
+        side_list,
+        intended_drive_id=intended_drive_id,
+        snapshot_stored_drive_id=sidecar_envelope_drive_id,
+        snapshot_stored_library_id=sidecar_envelope_library_id or sidecar_envelope_drive_id,
+        source="sidecar",
+    )
+
+    sess_gated, _npr_s = prune_nested_snapshot_nodes_for_wrong_drive(
+        sess_gated, intended_drive_id, selection_tag="session_nested_prune"
+    )
+    side_gated, _npr_t = prune_nested_snapshot_nodes_for_wrong_drive(
+        side_gated, intended_drive_id, selection_tag="sidecar_nested_prune"
+    )
+
+    sess_san, st_sess = sanitize_destination_startup_snapshot_top_level(
+        sess_gated, ctx, selection_tag="session_candidate", log_validation_summary=False
+    )
+    side_san, st_side = sanitize_destination_startup_snapshot_top_level(
+        side_gated, ctx, selection_tag="sidecar_candidate", log_validation_summary=False
+    )
+
+    log_info(
+        "destination_startup_snapshot_validation_summary_strict",
+        session_identity_gate=str(sess_gate_tag)[:80],
+        sidecar_identity_gate=str(side_gate_tag)[:80],
+        intended_drive_suffix=str(intended_drive_id or "")[-16:],
+        session_kept_top=int(st_sess.kept_top_level),
+        session_pruned_top=int(st_sess.pruned_top_level),
+        sidecar_kept_top=int(st_side.kept_top_level),
+        sidecar_pruned_top=int(st_side.pruned_top_level),
+    )
+
+    n_sess = snapshot_node_count_recursive(sess_san)
+    n_side = snapshot_node_count_recursive(side_san)
+    n_sess_raw = snapshot_node_count_recursive(session_list)
+    n_side_raw = snapshot_node_count_recursive(side_list)
+
+    log_info(
+        "destination_startup_snapshot_candidate_sanitized",
+        session_nodes_after=int(n_sess),
+        sidecar_nodes_after=int(n_side),
+        session_nodes_before=int(n_sess_raw),
+        sidecar_nodes_before=int(n_side_raw),
+        session_pruned_top_level=int(st_sess.pruned_top_level),
+        sidecar_pruned_top_level=int(st_side.pruned_top_level),
+    )
+
+    usable_sess = n_sess > 0
+    usable_side = n_side > 0
+
+    label = "SessionState.DestinationTreeSnapshot"
+    chosen: list = sess_san
+    if usable_sess and not usable_side:
+        label = "SessionState.DestinationTreeSnapshot"
+        chosen = sess_san
+    elif usable_side and not usable_sess:
+        label = "WorkspaceSnapshot.destination_tree_snapshot"
+        chosen = side_san
+    elif usable_sess and usable_side:
+        if n_side > n_sess:
+            label = "WorkspaceSnapshot.destination_tree_snapshot"
+            chosen = side_san
+        else:
+            label = "SessionState.DestinationTreeSnapshot"
+            chosen = sess_san
+    else:
+        # Both empty after sanitization — prefer session (usually fewer stale sidecars).
+        chosen = sess_san
+        label = "SessionState.DestinationTreeSnapshot_fallback_empty"
+
+    meta = {
+        "session_sanitized_nodes": n_sess,
+        "sidecar_sanitized_nodes": n_side,
+        "session_raw_nodes": int(n_sess_raw),
+        "sidecar_raw_nodes": int(n_side_raw),
+        "chosen_label": label,
+        "session_identity_gate": str(sess_gate_tag),
+        "sidecar_identity_gate": str(side_gate_tag),
+    }
+    log_info(
+        "destination_startup_snapshot_selection_after_validation",
+        selected_source=str(label)[:120],
+        chosen_nodes=int(snapshot_node_count_recursive(chosen)),
+        usable_session=bool(usable_sess),
+        usable_sidecar=bool(usable_side),
+    )
+    return chosen, label, n_sess, n_side, meta
+
+
+def snapshot_node_count_recursive(snapshots: list | None) -> int:
+    n = 0
+
+    def walk(node: Any) -> None:
+        nonlocal n
+        if isinstance(node, dict):
+            n += 1
+            for ch in list(node.get("children") or []):
+                walk(ch)
+
+    for r in list(snapshots or []):
+        walk(r)
+    return n

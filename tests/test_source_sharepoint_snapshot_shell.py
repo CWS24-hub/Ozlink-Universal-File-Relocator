@@ -188,6 +188,48 @@ class SourceSharePointSnapshotShellTests(unittest.TestCase):
         w._restore_tree_items_snapshot("source", snapshots, "msg")
         self.assertEqual(model.rowCount(QModelIndex()), 1)
 
+    def test_force_refresh_root_replaces_instead_of_merge(self):
+        _app()
+        w = _identity_window(drive_id="drive-F")
+        w.normalize_memory_path = MainWindow.normalize_memory_path.__get__(w, MainWindow)
+        w._canonical_source_projection_path = MainWindow._canonical_source_projection_path.__get__(w, MainWindow)
+        tree = QTreeView()
+        model = SharePointSourceTreeModel(
+            parent=tree,
+            column_labels=["Name", "Size", "Type", "Modified"],
+            source_index_key_fn=MainWindow._source_payload_index_key.__get__(w, MainWindow),
+        )
+        snapshots = [
+            {
+                "text": "Folder: Root",
+                "data": _snap_r("drive-F", "site-key-1", "hub\\Root", True, id="root-1", children_loaded=True),
+                "children": [
+                    {
+                        "text": "Folder: Deep",
+                        "data": _snap_r("drive-F", "site-key-1", "hub\\Root\\Deep", True, id="deep-1", children_loaded=True),
+                        "children": [],
+                    }
+                ],
+            }
+        ]
+        model.mount_from_session_snapshot_roots(snapshots)
+        w.source_tree_widget = tree
+        w.source_sharepoint_model = model
+        w.source_tree_status = _LabelStub()
+        w.pending_root_drive_ids = {"source": "drive-F"}
+        w._root_tree_bind_in_progress = False
+        w._log_root_success_step = lambda *a, **k: None
+        w._source_startup_snapshot_mount_seen = True
+        w._source_sharepoint_root_force_replace = True
+        w._set_tree_status_message = lambda *a, **k: None
+        w._prewarm_source_path_lookup_cache_after_source_root_bind = lambda: None
+        w._apply_tree_item_visual_state = MainWindow._apply_tree_item_visual_state.__get__(w, MainWindow)
+        before = len(model.iter_depth_first())
+        items = [{"name": "Root", "id": "root-1", "is_folder": True}]
+        MainWindow._apply_root_payload_to_source_model_view(w, "source", items)
+        after = len(model.iter_depth_first())
+        self.assertLess(after, before)
+
     def test_graph_root_merge_preserves_descendants(self):
         _app()
         w = _identity_window(drive_id="drive-M")
@@ -226,6 +268,126 @@ class SourceSharePointSnapshotShellTests(unittest.TestCase):
         MainWindow._apply_root_payload_to_source_model_view(w, "source", items)
         after = len(model.iter_depth_first())
         self.assertGreaterEqual(after, before)
+
+    def test_loading_placeholder_preserves_startup_shell_same_identity(self):
+        _app()
+        w = _identity_window(drive_id="drive-P")
+        w._planning_browse_mode = MainWindow._planning_browse_mode.__get__(w, MainWindow)
+        tree = QTreeView()
+        model = SharePointSourceTreeModel(
+            parent=tree,
+            source_index_key_fn=lambda pl: str(pl.get("item_path", "") or "").replace("/", "\\").strip(),
+        )
+        snapshots = [
+            {
+                "text": "Folder: Root",
+                "data": _snap_r("drive-P", "site-key-1", "Root", True, id="r1", children_loaded=True),
+                "children": [
+                    {
+                        "text": "File: a.txt",
+                        "data": _snap_r("drive-P", "site-key-1", "Root\\a.txt", False, id="f1"),
+                        "children": [],
+                    }
+                ],
+            }
+        ]
+        model.mount_from_session_snapshot_roots(snapshots)
+        w.source_tree_widget = tree
+        w.source_sharepoint_model = model
+        w.source_tree_status = _LabelStub()
+        w._source_startup_snapshot_mount_seen = True
+        w._source_snapshot_mount_drive_id = "drive-P"
+        w.pending_root_drive_ids = {"source": "drive-P"}
+        w._source_sharepoint_root_force_replace = False
+        w._set_tree_status_message = lambda *a, **k: None
+        before = len(model.iter_depth_first())
+        MainWindow.set_tree_placeholder(w, "source", "Loading root content...")
+        after = len(model.iter_depth_first())
+        self.assertEqual(after, before)
+
+    def test_loading_placeholder_force_replace_still_destructive(self):
+        _app()
+        w = _identity_window(drive_id="drive-F")
+        w._planning_browse_mode = MainWindow._planning_browse_mode.__get__(w, MainWindow)
+        tree = QTreeView()
+        model = SharePointSourceTreeModel(
+            parent=tree,
+            source_index_key_fn=lambda pl: str(pl.get("item_path", "") or "").strip(),
+        )
+        model.mount_from_session_snapshot_roots(
+            [
+                {
+                    "text": "x",
+                    "data": _snap_r("drive-F", "site-key-1", "X", True, id="x1", children_loaded=True),
+                    "children": [],
+                }
+            ]
+        )
+        w.source_tree_widget = tree
+        w.source_sharepoint_model = model
+        w.source_tree_status = _LabelStub()
+        w._source_startup_snapshot_mount_seen = True
+        w._source_snapshot_mount_drive_id = "drive-F"
+        w.pending_root_drive_ids = {"source": "drive-F"}
+        w._source_sharepoint_root_force_replace = True
+        w._set_tree_status_message = lambda *a, **k: None
+        MainWindow.set_tree_placeholder(w, "source", "Loading root content...")
+        self.assertEqual(len(model.iter_depth_first()), 1)
+        pl0 = model.index(0, 0, QModelIndex()).data(Qt.UserRole) or {}
+        self.assertTrue(pl0.get("placeholder"))
+
+    def test_loading_placeholder_drive_mismatch_destructive(self):
+        _app()
+        w = _identity_window(drive_id="drive-F")
+        w._planning_browse_mode = MainWindow._planning_browse_mode.__get__(w, MainWindow)
+        tree = QTreeView()
+        model = SharePointSourceTreeModel(
+            parent=tree,
+            source_index_key_fn=lambda pl: str(pl.get("item_path", "") or "").strip(),
+        )
+        model.mount_from_session_snapshot_roots(
+            [
+                {
+                    "text": "x",
+                    "data": _snap_r("drive-F", "site-key-1", "X", True, id="x1", children_loaded=True),
+                    "children": [],
+                }
+            ]
+        )
+        w.source_tree_widget = tree
+        w.source_sharepoint_model = model
+        w.source_tree_status = _LabelStub()
+        w._source_startup_snapshot_mount_seen = True
+        w._source_snapshot_mount_drive_id = "drive-F"
+        w.pending_root_drive_ids = {"source": "drive-OTHER"}
+        w._source_sharepoint_root_force_replace = False
+        w._set_tree_status_message = lambda *a, **k: None
+        MainWindow.set_tree_placeholder(w, "source", "Loading root content...")
+        self.assertEqual(len(model.iter_depth_first()), 1)
+
+    def test_guard_local_browse_mode_no_preservation(self):
+        _app()
+        w = _identity_window(drive_id="drive-L")
+        w._source_browse_mode = "local"
+        w._planning_browse_mode = MainWindow._planning_browse_mode.__get__(w, MainWindow)
+        w._source_startup_snapshot_mount_seen = True
+        w._source_snapshot_mount_drive_id = "drive-L"
+        w.pending_root_drive_ids = {"source": "drive-L"}
+        sup, info = MainWindow._source_loading_placeholder_shell_preservation_guard(w, "Loading root content...")
+        self.assertFalse(sup)
+        self.assertEqual(info["action_taken"], "not_sharepoint_browse_mode")
+
+    def test_guard_site_key_mismatch_blocks_preservation(self):
+        _app()
+        w = _identity_window(drive_id="drive-S")
+        w._planning_browse_mode = MainWindow._planning_browse_mode.__get__(w, MainWindow)
+        w._source_startup_snapshot_mount_seen = True
+        w._source_snapshot_mount_drive_id = "drive-S"
+        w.pending_root_drive_ids = {"source": "drive-S"}
+        w.planning_inputs["Source Site"] = _SelectorStub({"site_key": "other-site", "id": "other-site", "name": "Site"})
+        sup, info = MainWindow._source_loading_placeholder_shell_preservation_guard(w, "Loading root content...")
+        self.assertFalse(sup)
+        self.assertEqual(info["action_taken"], "site_key_mismatch_session_vs_selector")
 
     def test_no_duplicate_path_keys_after_mount(self):
         _app()
