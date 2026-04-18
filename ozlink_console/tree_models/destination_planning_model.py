@@ -208,18 +208,23 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
     def data(self, index: QModelIndex, role: int = Qt.DisplayRole):
         prof = getattr(self, "_dest_scroll_profiler_ref", None)
         _t0 = None
+        _prof_detail = "DestinationPlanningTreeModel.data"
         if prof is not None and getattr(prof, "should_record_fine_grained", lambda: False)():
             _t0 = time.perf_counter()
         try:
             if not index.isValid():
+                _prof_detail = "DestinationPlanningTreeModel.data:invalid_index"
                 return None
             node = self._node(index)
             if node is None or not isinstance(node, _Node):
+                _prof_detail = "DestinationPlanningTreeModel.data:no_node"
                 return None
             p = getattr(node, "payload", None)
             if not isinstance(p, dict):
+                _prof_detail = "DestinationPlanningTreeModel.data:no_payload"
                 return None
             col = index.column()
+            _prof_detail = f"DestinationPlanningTreeModel.data:r{int(role)}:c{col}"
             if role == Qt.DisplayRole:
                 if col == 0:
                     return p.get("base_display_label") or ""
@@ -259,7 +264,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             if _t0 is not None:
                 prof.record(
                     "model",
-                    "DestinationPlanningTreeModel.data",
+                    _prof_detail,
                     time.perf_counter() - _t0,
                 )
 

@@ -92,60 +92,79 @@ def explorer_size_label(node_data: Dict[str, Any]) -> str:
     return ""
 
 
+def _explorer_type_label_cache_tag(node_data: Dict[str, Any]) -> str:
+    raw = node_data.get("raw") if isinstance(node_data.get("raw"), dict) else {}
+    mime = ""
+    if isinstance(raw, dict):
+        file_meta = raw.get("file") if isinstance(raw.get("file"), dict) else {}
+        mime = str(file_meta.get("mimeType") or "").strip().lower()
+    parts = (
+        str(node_data.get("placeholder") or ""),
+        str(node_data.get("is_folder") or ""),
+        str(node_data.get("node_origin") or ""),
+        str(node_data.get("verification_state") or ""),
+        str(node_data.get("row_kind") or ""),
+        str(node_data.get("planned_allocation") or ""),
+        str(node_data.get("proposed") or ""),
+        str(node_data.get("name") or ""),
+        mime,
+    )
+    return "|".join(parts)
+
+
 def explorer_type_label(node_data: Dict[str, Any]) -> str:
     if not node_data or node_data.get("placeholder"):
         return ""
+    tag = _explorer_type_label_cache_tag(node_data)
+    if node_data.get("_explorer_type_lbl_tag") == tag and "_explorer_type_lbl_val" in node_data:
+        return str(node_data.get("_explorer_type_lbl_val") or "")
     origin = str(node_data.get("node_origin", "")).lower()
     if origin == "localfilesystem":
-        if node_data.get("is_folder"):
-            return "File folder"
-        return _type_from_filename(str(node_data.get("name", "")))
-    if node_data.get("proposed") or origin == "proposed":
-        return "Proposed folder"
-
-    vs_planned = str(node_data.get("verification_state", "")).strip() == "planned_only"
-    rk = str(node_data.get("row_kind", "")).strip().lower()
-    if (
-        vs_planned
-        and rk in {"planned_folder", "planned_file"}
-        and not node_data.get("planned_allocation")
-        and origin != "plannedallocation"
-    ):
-        if rk == "planned_file":
-            return "Planned file"
-        if rk == "planned_folder":
-            return "Planned folder"
-
-    if node_data.get("planned_allocation") or origin == "plannedallocation":
-        if node_data.get("is_folder"):
-            return "Allocated folder"
-        return "Allocated file"
-    if origin == "projecteddestination":
-        if node_data.get("is_folder"):
-            return "File folder"
-        return _type_from_filename(str(node_data.get("name", "")))
-    if origin == "projectedallocationdescendant":
-        if node_data.get("is_folder"):
-            return "File folder"
-        return _type_from_filename(str(node_data.get("name", "")))
-    if node_data.get("is_folder"):
-        return "File folder"
-    raw = node_data.get("raw") if isinstance(node_data.get("raw"), dict) else {}
-    file_meta = raw.get("file") if isinstance(raw.get("file"), dict) else {}
-    mime = str(file_meta.get("mimeType") or "").strip().lower()
-    if "pdf" in mime:
-        return "PDF Document"
-    if "wordprocessingml" in mime or mime == "application/msword":
-        return "Microsoft Word Document"
-    if "spreadsheetml" in mime or mime == "application/vnd.ms-excel":
-        return "Microsoft Excel Worksheet"
-    if "presentationml" in mime or mime == "application/vnd.ms-powerpoint":
-        return "Microsoft PowerPoint Presentation"
-    if mime.startswith("image/"):
-        return "Image"
-    if mime.startswith("text/"):
-        return "Text Document"
-    return _type_from_filename(str(node_data.get("name", "")))
+        out = "File folder" if node_data.get("is_folder") else _type_from_filename(str(node_data.get("name", "")))
+    elif node_data.get("proposed") or origin == "proposed":
+        out = "Proposed folder"
+    else:
+        vs_planned = str(node_data.get("verification_state", "")).strip() == "planned_only"
+        rk = str(node_data.get("row_kind", "")).strip().lower()
+        if (
+            vs_planned
+            and rk in {"planned_folder", "planned_file"}
+            and not node_data.get("planned_allocation")
+            and origin != "plannedallocation"
+        ):
+            if rk == "planned_file":
+                out = "Planned file"
+            else:
+                out = "Planned folder"
+        elif node_data.get("planned_allocation") or origin == "plannedallocation":
+            out = "Allocated folder" if node_data.get("is_folder") else "Allocated file"
+        elif origin == "projecteddestination":
+            out = "File folder" if node_data.get("is_folder") else _type_from_filename(str(node_data.get("name", "")))
+        elif origin == "projectedallocationdescendant":
+            out = "File folder" if node_data.get("is_folder") else _type_from_filename(str(node_data.get("name", "")))
+        elif node_data.get("is_folder"):
+            out = "File folder"
+        else:
+            raw = node_data.get("raw") if isinstance(node_data.get("raw"), dict) else {}
+            file_meta = raw.get("file") if isinstance(raw.get("file"), dict) else {}
+            mime = str(file_meta.get("mimeType") or "").strip().lower()
+            if "pdf" in mime:
+                out = "PDF Document"
+            elif "wordprocessingml" in mime or mime == "application/msword":
+                out = "Microsoft Word Document"
+            elif "spreadsheetml" in mime or mime == "application/vnd.ms-excel":
+                out = "Microsoft Excel Worksheet"
+            elif "presentationml" in mime or mime == "application/vnd.ms-powerpoint":
+                out = "Microsoft PowerPoint Presentation"
+            elif mime.startswith("image/"):
+                out = "Image"
+            elif mime.startswith("text/"):
+                out = "Text Document"
+            else:
+                out = _type_from_filename(str(node_data.get("name", "")))
+    node_data["_explorer_type_lbl_tag"] = tag
+    node_data["_explorer_type_lbl_val"] = out
+    return out
 
 
 def explorer_date_label(node_data: Dict[str, Any]) -> str:
@@ -153,20 +172,34 @@ def explorer_date_label(node_data: Dict[str, Any]) -> str:
         return ""
     raw = node_data.get("raw") if isinstance(node_data.get("raw"), dict) else {}
     iso = raw.get("lastModifiedDateTime") or node_data.get("last_modified")
+    tag = str(iso or "")
+    if node_data.get("_explorer_date_lbl_tag") == tag and "_explorer_date_lbl_val" in node_data:
+        return str(node_data.get("_explorer_date_lbl_val") or "")
     if not iso:
+        node_data["_explorer_date_lbl_tag"] = tag
+        node_data["_explorer_date_lbl_val"] = "—"
         return "—"
     iso_str = str(iso).strip()
     qdt = QDateTime.fromString(iso_str, Qt.DateFormat.ISODateWithMs)
     if not qdt.isValid():
         qdt = QDateTime.fromString(iso_str, Qt.DateFormat.ISODate)
     if qdt.isValid():
-        return QLocale.system().toString(qdt.toLocalTime(), QLocale.FormatType.ShortFormat)
+        out = QLocale.system().toString(qdt.toLocalTime(), QLocale.FormatType.ShortFormat)
+        node_data["_explorer_date_lbl_tag"] = tag
+        node_data["_explorer_date_lbl_val"] = out
+        return out
     try:
         s = str(iso).replace("Z", "+00:00")
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         qdt2 = QDateTime.fromSecsSinceEpoch(int(dt.timestamp()))
-        return QLocale.system().toString(qdt2, QLocale.FormatType.ShortFormat)
+        out = QLocale.system().toString(qdt2, QLocale.FormatType.ShortFormat)
+        node_data["_explorer_date_lbl_tag"] = tag
+        node_data["_explorer_date_lbl_val"] = out
+        return out
     except Exception:
-        return str(iso)[:22]
+        out = str(iso)[:22]
+        node_data["_explorer_date_lbl_tag"] = tag
+        node_data["_explorer_date_lbl_val"] = out
+        return out

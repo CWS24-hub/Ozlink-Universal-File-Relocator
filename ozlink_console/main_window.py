@@ -2793,6 +2793,13 @@ _SHUTDOWN_ORPHAN_QTHREADS: list[Any] = []
 
 
 def _shutdown_orphan_qthread_finalize(worker: Any) -> None:
+    # Use ``is True`` so MagicMock auto-attrs (truthy) do not short-circuit tests / odd wrappers.
+    if getattr(worker, "_oz_shutdown_orphan_finalize_done", False) is True:
+        return
+    try:
+        setattr(worker, "_oz_shutdown_orphan_finalize_done", True)
+    except Exception:
+        pass
     try:
         while worker in _SHUTDOWN_ORPHAN_QTHREADS:
             _SHUTDOWN_ORPHAN_QTHREADS.remove(worker)
@@ -9274,20 +9281,34 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             try:
+                fin = getattr(worker, "finished", None)
+                if fin is not None:
+                    fin.disconnect()
+            except Exception:
+                pass
+            try:
+                if _shiboken_is_valid(worker) and not worker.isRunning():
+                    _shutdown_orphan_qthread_finalize(worker)
+                    try:
+                        registry_slots_cleared_total += int(self._purge_worker_from_shutdown_registries(worker))
+                    except Exception:
+                        pass
+                    orphan_detached += 1
+                    log_info(
+                        "shutdown_trace",
+                        event="shutdown_worker_orphan_already_stopped",
+                        worker_type=type(worker).__name__,
+                    )
+                    continue
+            except Exception:
+                pass
+            try:
                 if worker not in _SHUTDOWN_ORPHAN_QTHREADS:
                     _SHUTDOWN_ORPHAN_QTHREADS.append(worker)
             except Exception:
                 pass
             try:
-                worker.finished.connect(
-                    partial(_shutdown_orphan_qthread_finalize, worker),
-                    Qt.ConnectionType.UniqueConnection,
-                )
-            except TypeError:
-                try:
-                    worker.finished.connect(partial(_shutdown_orphan_qthread_finalize, worker))
-                except Exception:
-                    pass
+                worker.finished.connect(partial(_shutdown_orphan_qthread_finalize, worker))
             except Exception:
                 pass
             try:
