@@ -216,10 +216,10 @@ class DestScrollProfiler:
             self._by_key.items(),
             key=lambda kv: float(kv[1]["total_ms"]),
             reverse=True,
-        )[:12]
-        top5 = [
+        )[:16]
+        top_hotspots = [
             {"category": k[0], "name": k[1], **{a: round(float(v), 3) if a != "count" else int(v) for a, v in d.items()}}
-            for k, d in ranked[:5]
+            for k, d in ranked[:8]
         ]
         cat_summary = {
             c: {
@@ -245,7 +245,7 @@ class DestScrollProfiler:
             "pct_of_wall_ms_overlap_note": pct_note,
             "sum_tracked_ms": round(sum_tracked, 3),
             "overlap_warning": "Percents sum nested/overlapping work; can exceed 100% of wall_ms.",
-            "top_hotspots": top5[:5],
+            "top_hotspots": top_hotspots[:8],
             "timeline_sample_json": json.dumps(timeline_trim, separators=(",", ":")),
         }
         log_info("dest_scroll_profile_window", **payload)

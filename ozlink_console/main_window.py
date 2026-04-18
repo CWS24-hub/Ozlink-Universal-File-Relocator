@@ -45920,6 +45920,27 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._log_restore_exception(f"destination_planning_overlay_gui_chunk.phase_{phase}", exc)
             self._destination_planning_overlay_gui_chunk_state = None
+        finally:
+            _dsp_gc = getattr(self, "_dest_scroll_profiler", None)
+            if _dsp_gc is not None:
+                _ph = int(phase)
+                _chunk_names = {
+                    0: "replay_overlays",
+                    1: "apply_visible_destination_allocation_descendants",
+                    2: "hydrate_allocations_expanded",
+                    3: "hydrate_prefix_chain",
+                    4: "refresh_indicators_restore_expand",
+                    5: "reconcile_semantic_duplicates",
+                    6: "fingerprint_status_auth",
+                    7: "audit_overlay_placement",
+                    8: "terminal_planned_reconcile",
+                    9: "finalize_emit",
+                }
+                _dsp_gc.record(
+                    "chunks",
+                    f"overlay_gui_chunk:{_chunk_names.get(_ph, 'phase_' + str(_ph))}",
+                    time.perf_counter() - t_phase0,
+                )
 
     def _apply_destination_planning_overlays(
         self,
@@ -46287,6 +46308,12 @@ class MainWindow(QMainWindow):
         narrow_restore_real_snapshot=False,
         force_authoritative_bind=False,
     ):
+        if self._destination_user_scroll_interaction_active():
+            log_info(
+                "destination_scroll_forensic_overlay_body_during_scroll",
+                reason=str(reason or "")[:220],
+                force_authoritative_bind=bool(force_authoritative_bind),
+            )
         self._destination_future_model_last_blocked_source_restore = False
         if getattr(self, "_destination_suppress_steady_materialize_skip_once", False):
             self._destination_suppress_steady_materialize_skip_once = False
