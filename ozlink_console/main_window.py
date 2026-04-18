@@ -8146,11 +8146,26 @@ class MainWindow(QMainWindow):
         if getattr(self, "_legacy_identity_inference_authoritative_rebind_done", False):
             return
         t = str(trigger or "")[:120]
+        dm = getattr(self, "destination_planning_model", None)
+        nodes_before = -1
+        if dm is not None and hasattr(dm, "iter_depth_first"):
+            try:
+                nodes_before = sum(1 for _ in dm.iter_depth_first())
+            except Exception:
+                nodes_before = -1
+        _fld = getattr(self, "folder_load_workers", None) or {}
+        _dest_gw = sum(1 for k in _fld if str(k).startswith("destination:"))
         log_info(
             "destination_legacy_inference_authoritative_rebind_started",
             trigger=t,
-            sel_src_excerpt=str(sel_src or "")[:120],
+            sel_src=str(sel_src or "")[:220],
             top_level_roots=len(dest_snaps) if isinstance(dest_snaps, list) else -1,
+            model_nodes_iter_depth_first_before=int(nodes_before),
+            destination_root_worker_running=bool(MainWindow._root_load_worker_running(self, "destination")),
+            active_destination_graph_folder_workers=int(_dest_gw),
+            pending_destination_folder_loads=len(
+                (getattr(self, "pending_folder_loads", None) or {}).get("destination", set()) or set()
+            ),
         )
         prov = False
         overlay_ret = 0
@@ -8173,13 +8188,28 @@ class MainWindow(QMainWindow):
                 or 0
             )
             self._legacy_identity_inference_authoritative_rebind_done = True
+            nodes_after = -1
+            if dm is not None and hasattr(dm, "iter_depth_first"):
+                try:
+                    nodes_after = sum(1 for _ in dm.iter_depth_first())
+                except Exception:
+                    nodes_after = -1
+            _fld2 = getattr(self, "folder_load_workers", None) or {}
+            _dest_gw2 = sum(1 for k in _fld2 if str(k).startswith("destination:"))
             log_info(
                 "destination_legacy_inference_authoritative_rebind_completed",
                 trigger=t,
                 ok=True,
                 provisional_applied=bool(prov),
                 overlay_applied_count=int(overlay_ret),
-                sel_src_excerpt=str(sel_src or "")[:120],
+                sel_src=str(sel_src or "")[:220],
+                model_nodes_iter_depth_first_before=int(nodes_before),
+                model_nodes_iter_depth_first_after=int(nodes_after),
+                destination_root_worker_running=bool(MainWindow._root_load_worker_running(self, "destination")),
+                active_destination_graph_folder_workers=int(_dest_gw2),
+                pending_destination_folder_loads=len(
+                    (getattr(self, "pending_folder_loads", None) or {}).get("destination", set()) or set()
+                ),
             )
         except Exception as exc:
             self._log_restore_exception("legacy_identity_inference_authoritative_rebind", exc)
@@ -8256,6 +8286,7 @@ class MainWindow(QMainWindow):
                     not before_inferred
                     or not tree_materialized
                     or bool(dest_snaps)
+                    or not dest_snaps
                 )
             )
             if needs_authoritative_rebind:
