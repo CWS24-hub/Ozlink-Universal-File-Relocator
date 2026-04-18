@@ -71,8 +71,11 @@ def test_apply_visible_model_branch_uses_flag_not_child_presence():
     }
     move = {"destination_path": "\\D", "target_name": "F", "source": {"is_folder": True, "name": "F"}}
 
+    dmodel.find_indices_for_canonical_destination_path = lambda _p: [ix]
+    dmodel.is_index_live = lambda _i: True
+
     mw._build_planned_move_destination_lookup = lambda: {"alloc_by_path": {}}  # noqa: E731
-    mw._destination_model_build_allocation_apply_pairs = lambda _m, _l: [(ix, move)]  # noqa: E731
+    mw._destination_model_build_allocation_apply_pairs = lambda _m, _l: [("\\D", move)]  # noqa: E731
     mw._destination_bind_normalized_expanded_targets = lambda _ep: {"\\Alloc"}  # noqa: E731
     mw._destination_semantic_path = lambda _nd: "\\Alloc"  # noqa: E731
     mw._destination_bind_allocation_descendants_eager_active = lambda: True  # noqa: E731
@@ -110,8 +113,11 @@ def test_apply_visible_model_skips_apply_when_descendants_already_applied():
     }
     move = {"destination_path": "\\D", "target_name": "F", "source": {"is_folder": True, "name": "F"}}
 
+    dmodel.find_indices_for_canonical_destination_path = lambda _p: [ix]
+    dmodel.is_index_live = lambda _i: True
+
     mw._build_planned_move_destination_lookup = lambda: {"alloc_by_path": {}}  # noqa: E731
-    mw._destination_model_build_allocation_apply_pairs = lambda _m, _l: [(ix, move)]  # noqa: E731
+    mw._destination_model_build_allocation_apply_pairs = lambda _m, _l: [("\\D", move)]  # noqa: E731
     mw._destination_bind_normalized_expanded_targets = lambda _ep: {"\\Alloc"}  # noqa: E731
     mw._destination_semantic_path = lambda _nd: "\\Alloc"  # noqa: E731
     mw._destination_bind_allocation_descendants_eager_active = lambda: True  # noqa: E731

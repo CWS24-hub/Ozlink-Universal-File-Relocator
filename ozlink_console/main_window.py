@@ -38041,40 +38041,72 @@ class MainWindow(QMainWindow):
                 return True
         return False
 
+    def _safe_resolve_live_indices_for_canonical_destination_path(self, model, canonical_path: str) -> List[QModelIndex]:
+        """Resolve fresh QModelIndex rows for a canonical path after yields/processEvents (no stale index reuse)."""
+        if not canonical_path or model is None:
+            return []
+        try:
+            hits = model.find_indices_for_canonical_destination_path(canonical_path)
+        except Exception:
+            return []
+        out: List[QModelIndex] = []
+        for ix in hits or []:
+            try:
+                if not ix.isValid():
+                    continue
+                if hasattr(model, "is_index_live") and not model.is_index_live(ix):
+                    continue
+            except RuntimeError:
+                continue
+            out.append(ix)
+        return out
+
+    def _safe_resolve_index_for_path(self, model, canonical_path: str) -> Optional[QModelIndex]:
+        """First live QModelIndex for ``canonical_path``, or None if the row no longer exists."""
+        for ix in self._safe_resolve_live_indices_for_canonical_destination_path(model, canonical_path):
+            return ix
+        return None
+
     def _destination_model_build_allocation_apply_pairs(self, dmodel, pm_lookup):
-        """Planned allocation folder rows with resolved moves: path-index first, then one tree walk for misses."""
-        pairs = []
-        seen = set()
+        """Planned allocation folder rows with resolved moves: canonical path + move (indexes re-resolved at apply time)."""
+        pairs: list[tuple[str, Any]] = []
+        paths_with_pair: set[str] = set()
         alloc_by_path = pm_lookup.get("alloc_by_path") or {}
         for ap, move in alloc_by_path.items():
             if not ap:
                 continue
-            for ix in dmodel.find_indices_for_canonical_destination_path(ap):
+            try:
+                hits = dmodel.find_indices_for_canonical_destination_path(ap)
+            except Exception:
+                hits = []
+            if not hits:
+                continue
+            any_ok = False
+            for ix in hits:
                 if not ix.isValid():
                     continue
                 nd = ix.data(Qt.UserRole) or {}
-                if not self.node_is_planned_allocation(nd) or not bool(nd.get("is_folder", False)):
-                    continue
-                ptr = ix.internalPointer()
-                sid = id(ptr) if ptr is not None else None
-                if sid is None or sid in seen:
-                    continue
-                seen.add(sid)
-                pairs.append((ix, move))
+                if self.node_is_planned_allocation(nd) and bool(nd.get("is_folder", False)):
+                    any_ok = True
+                    break
+            if any_ok:
+                pairs.append((ap, move))
+                paths_with_pair.add(ap)
+
         for ix in dmodel.iter_depth_first():
-            ptr = ix.internalPointer()
-            sid = id(ptr) if ptr is not None else None
-            if sid is not None and sid in seen:
-                continue
             nd = ix.data(Qt.UserRole) or {}
             if not self.node_is_planned_allocation(nd) or not bool(nd.get("is_folder", False)):
+                continue
+            key = self._destination_payload_index_key(nd)
+            if not key:
+                continue
+            if key in paths_with_pair:
                 continue
             move = self._find_planned_move_for_destination_node_indexed(nd, pm_lookup)
             if move is None:
                 continue
-            if sid is not None:
-                seen.add(sid)
-            pairs.append((ix, move))
+            pairs.append((key, move))
+            paths_with_pair.add(key)
         return pairs
 
     def _apply_visible_destination_allocation_descendants(self, *, destination_expanded_paths=None):
@@ -38098,10 +38130,10 @@ class MainWindow(QMainWindow):
             for ap in alloc_by_path:
                 if not ap:
                     continue
-                for ix in dmodel.find_indices_for_canonical_destination_path(ap):
-                    visited += 1
-                    if visited % 40 == 0:
-                        QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+                visited += 1
+                if visited % 40 == 0:
+                    QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+                for ix in self._safe_resolve_live_indices_for_canonical_destination_path(dmodel, ap):
                     node_data = ix.data(Qt.UserRole) or {}
                     if not self.node_is_planned_allocation(node_data):
                         continue
@@ -38123,10 +38155,9 @@ class MainWindow(QMainWindow):
                     touched += 1
             if touched:
                 return applied_count
+            fallback_paths: list[str] = []
+            fallback_seen: set[str] = set()
             for ix in dmodel.iter_depth_first():
-                visited += 1
-                if visited % 40 == 0:
-                    QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
                 node_data = ix.data(Qt.UserRole) or {}
                 if not self.node_is_planned_allocation(node_data):
                     continue
@@ -38136,31 +38167,26 @@ class MainWindow(QMainWindow):
                     continue
                 if bool(node_data.get("children_loaded")):
                     continue
-                nd = dict(node_data)
-                nd["children_loaded"] = True
-                nd["projection_unresolved_terminal"] = False
-
-                def _mut(p):
-                    p.clear()
-                    p.update(nd)
-
-                dmodel.update_payload_for_index(ix, _mut)
-            return applied_count
-
-        pm_lookup = self._build_planned_move_destination_lookup()
-        for ix, move in self._destination_model_build_allocation_apply_pairs(dmodel, pm_lookup):
-            visited += 1
-            if visited % 40 == 0:
-                QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
-            node_data = ix.data(Qt.UserRole) or {}
-            if not self.node_is_planned_allocation(node_data):
-                continue
-            if not bool(node_data.get("is_folder", False)):
-                continue
-            allocation_pass += 1
-            if bool(node_data.get("allocation_descendants_applied")):
-                nd = dict(node_data)
-                if not bool(nd.get("children_loaded")):
+                key = self._destination_payload_index_key(node_data)
+                if not key or key in fallback_seen:
+                    continue
+                fallback_seen.add(key)
+                fallback_paths.append(key)
+            for ap in fallback_paths:
+                visited += 1
+                if visited % 40 == 0:
+                    QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+                for ix in self._safe_resolve_live_indices_for_canonical_destination_path(dmodel, ap):
+                    node_data = ix.data(Qt.UserRole) or {}
+                    if not self.node_is_planned_allocation(node_data):
+                        continue
+                    if not bool(node_data.get("is_folder", False)):
+                        continue
+                    if not bool(node_data.get("allocation_descendants_applied")):
+                        continue
+                    if bool(node_data.get("children_loaded")):
+                        continue
+                    nd = dict(node_data)
                     nd["children_loaded"] = True
                     nd["projection_unresolved_terminal"] = False
 
@@ -38169,15 +38195,40 @@ class MainWindow(QMainWindow):
                         p.update(nd)
 
                     dmodel.update_payload_for_index(ix, _mut)
-            else:
-                sem = self._destination_semantic_path(node_data)
-                if self._destination_bind_should_apply_allocation_descendants_now(sem, nt):
-                    applied_count += self._apply_allocation_descendants_to_model_index(
-                        ix,
-                        move,
-                        collect_reason="eager_bind_allocation_descendants",
-                        enqueue_reason="eager_bind_allocation_descendants",
-                    )
+            return applied_count
+
+        pm_lookup = self._build_planned_move_destination_lookup()
+        for path, move in self._destination_model_build_allocation_apply_pairs(dmodel, pm_lookup):
+            visited += 1
+            if visited % 40 == 0:
+                QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+            for ix in self._safe_resolve_live_indices_for_canonical_destination_path(dmodel, path):
+                node_data = ix.data(Qt.UserRole) or {}
+                if not self.node_is_planned_allocation(node_data):
+                    continue
+                if not bool(node_data.get("is_folder", False)):
+                    continue
+                allocation_pass += 1
+                if bool(node_data.get("allocation_descendants_applied")):
+                    nd = dict(node_data)
+                    if not bool(nd.get("children_loaded")):
+                        nd["children_loaded"] = True
+                        nd["projection_unresolved_terminal"] = False
+
+                        def _mut(p):
+                            p.clear()
+                            p.update(nd)
+
+                        dmodel.update_payload_for_index(ix, _mut)
+                else:
+                    sem = self._destination_semantic_path(node_data)
+                    if self._destination_bind_should_apply_allocation_descendants_now(sem, nt):
+                        applied_count += self._apply_allocation_descendants_to_model_index(
+                            ix,
+                            move,
+                            collect_reason="eager_bind_allocation_descendants",
+                            enqueue_reason="eager_bind_allocation_descendants",
+                        )
             if allocation_pass % 2 == 0:
                 QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
         if applied_count:
