@@ -7548,12 +7548,26 @@ class MainWindow(QMainWindow):
         st = getattr(self, "_graph_ids_deferred_planning_refresh_chunk_state", None)
         if isinstance(st, dict):
             self._graph_ids_deferred_planning_refresh_merge_paths_into_active_chunk(paths_list)
+            prev_r = list(st.get("reasons") or [])
+            for _r in list(reasons or []):
+                if _r not in prev_r:
+                    prev_r.append(_r)
+            st["reasons"] = prev_r
+            st["combined_reason"] = "__".join(prev_r) if prev_r else str(combined_reason)
             log_info(
                 "graph_ids_deferred_planning_refresh_chunk_restarted_merge",
-                combined_reason=str(combined_reason)[:220],
+                combined_reason=str(st.get("combined_reason") or combined_reason)[:220],
                 source_projection_path_count=int(len(st.get("source_paths") or [])),
+                merged_reason_count=int(len(prev_r)),
             )
             return
+        log_info(
+            "graph_ids_deferred_planning_refresh_chunk_path_entered",
+            combined_reason=str(combined_reason)[:220],
+            reason_count=int(len(reasons or [])),
+            reasons_excerpt=[str(x)[:120] for x in (reasons or [])][:12],
+            source_projection_path_count=int(len(paths_list)),
+        )
         self._graph_ids_deferred_planning_refresh_chunk_state = {
             "reasons": list(reasons),
             "combined_reason": str(combined_reason),
@@ -7912,7 +7926,7 @@ class MainWindow(QMainWindow):
 
         if (
             getattr(self, "_graph_ids_deferred_planning_refresh_chunk_state", None) is not None
-            and reasons == ["graph_ids_resolved_from_sharepoint_paths"]
+            and "graph_ids_resolved_from_sharepoint_paths" in reasons
         ):
             self._graph_ids_deferred_planning_refresh_merge_paths_into_active_chunk(
                 [str(p) for p in source_projection_paths]
@@ -7952,7 +7966,7 @@ class MainWindow(QMainWindow):
         self._deferred_planning_refresh_reasons = []
         self._deferred_source_projection_paths = set()
 
-        if reasons == ["graph_ids_resolved_from_sharepoint_paths"]:
+        if "graph_ids_resolved_from_sharepoint_paths" in reasons:
             self._deferred_planning_refresh_running = True
             try:
                 self._graph_ids_deferred_planning_refresh_begin_chunked(
@@ -46585,48 +46599,52 @@ class MainWindow(QMainWindow):
             _rr = str(r)
 
             def _kick_graph_overlay_frame():
-                self._destination_graph_overlay_deferred_frame_kick = False
-                # Timer may fire while the user is scrolling again; mirror destination_scroll_overlay_blocked
-                # so graph_resolve_overlay_yield_frame work runs after scroll idle (same pending flush path).
-                if (
-                    not bool(force_authoritative_bind)
-                    and not bool(_shutdown_pre_save)
-                    and self._destination_user_scroll_interaction_active()
-                ):
-                    _prior = str(getattr(self, "_destination_materialize_pended_for_scroll_reason", "") or "")
-                    self._destination_materialize_pended_for_scroll_reason = _rr
-                    self._destination_materialize_pended_for_scroll_kwargs = {
-                        "allow_defer": _ad,
-                        "prefer_chunked_projection": True,
-                        "narrow_restore_real_snapshot": _nr,
-                    }
-                    log_info(
-                        "destination_scroll_graph_resolve_yield_deferred",
-                        reason=str(_rr)[:220],
-                        reason_excerpt=str(_rr)[:220],
-                        coalesced_with_prior=bool(_prior),
-                        prior_reason_excerpt=str(_prior)[:120],
+                # Clear kick only after this deferred frame finishes (including nested overlay re-entries)
+                # so we do not log/schedule graph_resolve_overlay_yield_frame in a tight loop.
+                try:
+                    # Timer may fire while the user is scrolling again; mirror destination_scroll_overlay_blocked
+                    # so graph_resolve_overlay_yield_frame work runs after scroll idle (same pending flush path).
+                    if (
+                        not bool(force_authoritative_bind)
+                        and not bool(_shutdown_pre_save)
+                        and self._destination_user_scroll_interaction_active()
+                    ):
+                        _prior = str(getattr(self, "_destination_materialize_pended_for_scroll_reason", "") or "")
+                        self._destination_materialize_pended_for_scroll_reason = _rr
+                        self._destination_materialize_pended_for_scroll_kwargs = {
+                            "allow_defer": _ad,
+                            "prefer_chunked_projection": True,
+                            "narrow_restore_real_snapshot": _nr,
+                        }
+                        log_info(
+                            "destination_scroll_graph_resolve_yield_deferred",
+                            reason=str(_rr)[:220],
+                            reason_excerpt=str(_rr)[:220],
+                            coalesced_with_prior=bool(_prior),
+                            prior_reason_excerpt=str(_prior)[:120],
+                        )
+                        _dsp_k = getattr(self, "_dest_scroll_profiler", None)
+                        if _dsp_k is not None:
+                            _dsp_k.note_heavy_work_deferred(
+                                f"graph_resolve_overlay_yield_frame:{str(_rr)[:80]}"
+                            )
+                        t_idle = getattr(self, "_destination_tree_scroll_idle_timer", None)
+                        if t_idle is not None:
+                            idle_ms = max(
+                                120,
+                                int(getattr(self, "_destination_tree_scroll_idle_ms", 280) or 280),
+                            )
+                            t_idle.start(idle_ms)
+                        self._on_destination_state_mutation(_rr, None)
+                        return
+                    self._apply_destination_planning_overlays(
+                        _rr,
+                        allow_defer=_ad,
+                        prefer_chunked_projection=True,
+                        narrow_restore_real_snapshot=_nr,
                     )
-                    _dsp_k = getattr(self, "_dest_scroll_profiler", None)
-                    if _dsp_k is not None:
-                        _dsp_k.note_heavy_work_deferred(
-                            f"graph_resolve_overlay_yield_frame:{str(_rr)[:80]}"
-                        )
-                    t_idle = getattr(self, "_destination_tree_scroll_idle_timer", None)
-                    if t_idle is not None:
-                        idle_ms = max(
-                            120,
-                            int(getattr(self, "_destination_tree_scroll_idle_ms", 280) or 280),
-                        )
-                        t_idle.start(idle_ms)
-                    self._on_destination_state_mutation(_rr, None)
-                    return
-                self._apply_destination_planning_overlays(
-                    _rr,
-                    allow_defer=_ad,
-                    prefer_chunked_projection=True,
-                    narrow_restore_real_snapshot=_nr,
-                )
+                finally:
+                    self._destination_graph_overlay_deferred_frame_kick = False
 
             _t_chunk0 = time.perf_counter()
             log_info(
