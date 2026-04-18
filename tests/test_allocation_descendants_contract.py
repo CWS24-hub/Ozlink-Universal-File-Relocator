@@ -71,21 +71,14 @@ def test_apply_visible_model_branch_uses_flag_not_child_presence():
     }
     move = {"destination_path": "\\D", "target_name": "F", "source": {"is_folder": True, "name": "F"}}
 
-    dmodel.find_indices_for_canonical_destination_path = lambda _p: [ix]
+    _find_pass = {"n": 0}
+
+    def _find(_p):
+        _find_pass["n"] += 1
+        return [ix] if _find_pass["n"] == 1 else []
+
+    dmodel.find_indices_for_canonical_destination_path = _find
     dmodel.is_index_live = lambda _i: True
-
-    _once = {"done": False}
-
-    def _first_live_if(_path, pred):
-        nd = ix.data.return_value or {}
-        if _once["done"]:
-            return None
-        if pred(ix, nd):
-            _once["done"] = True
-            return ix
-        return None
-
-    dmodel.first_live_index_for_canonical_destination_path_if = _first_live_if
 
     mw._build_planned_move_destination_lookup = lambda: {"alloc_by_path": {}}  # noqa: E731
     mw._destination_model_build_allocation_apply_pairs = lambda _m, _l: [("\\D", move)]  # noqa: E731
@@ -126,21 +119,14 @@ def test_apply_visible_model_skips_apply_when_descendants_already_applied():
     }
     move = {"destination_path": "\\D", "target_name": "F", "source": {"is_folder": True, "name": "F"}}
 
-    dmodel.find_indices_for_canonical_destination_path = lambda _p: [ix]
+    _find_pass_b = {"n": 0}
+
+    def _find_b(_p):
+        _find_pass_b["n"] += 1
+        return [ix] if _find_pass_b["n"] == 1 else []
+
+    dmodel.find_indices_for_canonical_destination_path = _find_b
     dmodel.is_index_live = lambda _i: True
-
-    _once2 = {"done": False}
-
-    def _first_live_if2(_path, pred):
-        nd = ix.data.return_value or {}
-        if _once2["done"]:
-            return None
-        if pred(ix, nd):
-            _once2["done"] = True
-            return ix
-        return None
-
-    dmodel.first_live_index_for_canonical_destination_path_if = _first_live_if2
 
     mw._build_planned_move_destination_lookup = lambda: {"alloc_by_path": {}}  # noqa: E731
     mw._destination_model_build_allocation_apply_pairs = lambda _m, _l: [("\\D", move)]  # noqa: E731
@@ -160,3 +146,83 @@ def test_apply_visible_model_skips_apply_when_descendants_already_applied():
     p = {"node_origin": "plannedallocation", "is_folder": True, "allocation_descendants_applied": True}
     mut(p)
     assert p.get("children_loaded") is True
+
+
+def test_allocation_apply_one_index_per_resolve_second_pass_after_first_removed_from_resolve():
+    """After first mutation, re-resolve must not reuse a stale sibling QModelIndex from the prior list."""
+    mw = MainWindow.__new__(MainWindow)
+    dmodel = MagicMock()
+    ix1, ix2 = MagicMock(), MagicMock()
+    ix1.isValid.return_value = True
+    ix2.isValid.return_value = True
+    phase = {"n": 0}
+
+    def _find(_p):
+        if phase["n"] == 0:
+            return [ix1, ix2]
+        if phase["n"] == 1:
+            return [ix2]
+        return []
+
+    dmodel.find_indices_for_canonical_destination_path = _find
+    dmodel.is_index_live = lambda _i: True
+    applied = []
+
+    def _pred(_ix, nd):
+        return nd.get("work") is True
+
+    ix1.data.return_value = {"work": True}
+    ix2.data.return_value = {"work": True}
+
+    def _apply(ix, _nd):
+        applied.append(ix)
+        if ix is ix1:
+            phase["n"] = 1
+        elif ix is ix2:
+            phase["n"] = 2
+
+    n = mw._destination_allocation_apply_canonical_path_one_index_per_resolve(
+        dmodel,
+        "\\Canon",
+        predicate=_pred,
+        apply_once=_apply,
+    )
+    assert n == 2
+    assert applied == [ix1, ix2]
+
+
+def test_allocation_apply_one_index_per_resolve_read_only_scan_skips_completed_first_row():
+    """Fresh list each round: first row may no longer qualify; scan picks the next qualifying index."""
+    mw = MainWindow.__new__(MainWindow)
+    dmodel = MagicMock()
+    ix1, ix2 = MagicMock(), MagicMock()
+    ix1.isValid.return_value = True
+    ix2.isValid.return_value = True
+    dmodel.find_indices_for_canonical_destination_path = lambda _p: [ix1, ix2]
+    dmodel.is_index_live = lambda _i: True
+    nd1 = {"work": True, "row": 1}
+    nd2 = {"work": True, "row": 2}
+    ix1.data.return_value = nd1
+    ix2.data.return_value = nd2
+    applied = []
+
+    def _pred(_ix, nd):
+        return nd.get("work") is True
+
+    def _apply(ix, nd):
+        applied.append(ix)
+        if nd.get("row") == 1:
+            nd1["work"] = False
+            ix1.data.return_value = dict(nd1)
+        elif nd.get("row") == 2:
+            nd2["work"] = False
+            ix2.data.return_value = dict(nd2)
+
+    n = mw._destination_allocation_apply_canonical_path_one_index_per_resolve(
+        dmodel,
+        "\\Canon",
+        predicate=_pred,
+        apply_once=_apply,
+    )
+    assert n == 2
+    assert applied == [ix1, ix2]

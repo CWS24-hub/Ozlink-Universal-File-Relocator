@@ -24,7 +24,7 @@ import requests
 from datetime import datetime, timezone
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Tuple
 import xml.etree.ElementTree as ET
 
 from PySide6.QtWidgets import (
@@ -38153,10 +38153,9 @@ class MainWindow(QMainWindow):
     def _safe_resolve_live_indices_for_canonical_destination_path(self, model, canonical_path: str) -> List[QModelIndex]:
         """Resolve fresh QModelIndex rows for a canonical path after yields/processEvents (no stale index reuse).
 
-        Do not iterate the returned list while calling ``update_payload_for_index`` — that can invalidate
-        sibling indices in the same snapshot. For repeated per-path mutations, use
-        :meth:`DestinationPlanningTreeModel.first_live_index_for_canonical_destination_path_if` in a
-        ``while True`` loop instead.
+        Do not call ``update_payload_for_index`` in a loop over this list — the first update can
+        invalidate later sibling indices from the same snapshot. For repeated per-path mutations,
+        use :meth:`_destination_allocation_apply_canonical_path_one_index_per_resolve` instead.
         """
         if not canonical_path or model is None:
             return []
@@ -38181,6 +38180,53 @@ class MainWindow(QMainWindow):
         for ix in self._safe_resolve_live_indices_for_canonical_destination_path(model, canonical_path):
             return ix
         return None
+
+    def _destination_allocation_apply_canonical_path_one_index_per_resolve(
+        self,
+        dmodel,
+        canonical_path: str,
+        *,
+        predicate: Callable[[QModelIndex, Dict[str, Any]], bool],
+        apply_once: Callable[[QModelIndex, Dict[str, Any]], None],
+    ) -> int:
+        """Apply allocation work for ``canonical_path`` without reusing stale sibling indices.
+
+        Each round: resolve a fresh live-index list, scan it **read-only** for the first index that
+        satisfies ``predicate``, apply at most one ``update_payload_for_index`` / structural change via
+        ``apply_once``, then re-resolve. Repeat until no qualifying live index remains.
+
+        Mutations must not run inside the read-only scan over ``indices`` — only after a single target
+        is chosen.
+        """
+        applied_rounds = 0
+        while True:
+            indices = self._safe_resolve_live_indices_for_canonical_destination_path(dmodel, canonical_path)
+            if not indices:
+                break
+            target: Optional[QModelIndex] = None
+            for cand in indices:
+                try:
+                    if not dmodel.is_index_live(cand):
+                        continue
+                except RuntimeError:
+                    continue
+                nd = cand.data(Qt.UserRole) or {}
+                if not isinstance(nd, dict):
+                    nd = {}
+                try:
+                    if predicate(cand, nd):
+                        target = cand
+                        break
+                except Exception:
+                    continue
+            if target is None:
+                break
+            nd = target.data(Qt.UserRole) or {}
+            if not isinstance(nd, dict):
+                nd = {}
+            apply_once(target, nd)
+            applied_rounds += 1
+        return applied_rounds
 
     def _destination_model_build_allocation_apply_pairs(self, dmodel, pm_lookup):
         """Planned allocation folder rows with resolved moves: canonical path + move (indexes re-resolved at apply time)."""
@@ -38250,27 +38296,29 @@ class MainWindow(QMainWindow):
                     and not bool(nd.get("children_loaded"))
                 )
 
+            def _lazy_apply_children_loaded(ix, node_data):
+                nd = dict(node_data)
+                nd["children_loaded"] = True
+                nd["projection_unresolved_terminal"] = False
+
+                def _mut(p, repl=nd):
+                    p.clear()
+                    p.update(repl)
+
+                dmodel.update_payload_for_index(ix, _mut)
+
             for ap in alloc_by_path:
                 if not ap:
                     continue
                 visited += 1
                 if visited % 40 == 0:
                     QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
-                while True:
-                    ix = dmodel.first_live_index_for_canonical_destination_path_if(ap, _lazy_mark_children_loaded_pred)
-                    if ix is None:
-                        break
-                    node_data = ix.data(Qt.UserRole) or {}
-                    nd = dict(node_data)
-                    nd["children_loaded"] = True
-                    nd["projection_unresolved_terminal"] = False
-
-                    def _mut(p, repl=nd):
-                        p.clear()
-                        p.update(repl)
-
-                    dmodel.update_payload_for_index(ix, _mut)
-                    touched += 1
+                touched += self._destination_allocation_apply_canonical_path_one_index_per_resolve(
+                    dmodel,
+                    ap,
+                    predicate=_lazy_mark_children_loaded_pred,
+                    apply_once=_lazy_apply_children_loaded,
+                )
             if touched:
                 return applied_count
             fallback_paths: list[str] = []
@@ -38294,20 +38342,12 @@ class MainWindow(QMainWindow):
                 visited += 1
                 if visited % 40 == 0:
                     QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
-                while True:
-                    ix = dmodel.first_live_index_for_canonical_destination_path_if(ap, _lazy_mark_children_loaded_pred)
-                    if ix is None:
-                        break
-                    node_data = ix.data(Qt.UserRole) or {}
-                    nd = dict(node_data)
-                    nd["children_loaded"] = True
-                    nd["projection_unresolved_terminal"] = False
-
-                    def _mut(p):
-                        p.clear()
-                        p.update(nd)
-
-                    dmodel.update_payload_for_index(ix, _mut)
+                self._destination_allocation_apply_canonical_path_one_index_per_resolve(
+                    dmodel,
+                    ap,
+                    predicate=_lazy_mark_children_loaded_pred,
+                    apply_once=_lazy_apply_children_loaded,
+                )
             return applied_count
 
         pm_lookup = self._build_planned_move_destination_lookup()
@@ -38326,12 +38366,9 @@ class MainWindow(QMainWindow):
             visited += 1
             if visited % 40 == 0:
                 QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
-            while True:
-                ix = dmodel.first_live_index_for_canonical_destination_path_if(path, _eager_allocation_descendant_work_pred)
-                if ix is None:
-                    break
-                node_data = ix.data(Qt.UserRole) or {}
-                allocation_pass += 1
+
+            def _eager_apply_once(ix, node_data, _move=move):
+                nonlocal applied_count
                 if bool(node_data.get("allocation_descendants_applied")):
                     nd = dict(node_data)
                     nd["children_loaded"] = True
@@ -38345,10 +38382,17 @@ class MainWindow(QMainWindow):
                 else:
                     applied_count += self._apply_allocation_descendants_to_model_index(
                         ix,
-                        move,
+                        _move,
                         collect_reason="eager_bind_allocation_descendants",
                         enqueue_reason="eager_bind_allocation_descendants",
                     )
+
+            allocation_pass += self._destination_allocation_apply_canonical_path_one_index_per_resolve(
+                dmodel,
+                path,
+                predicate=_eager_allocation_descendant_work_pred,
+                apply_once=_eager_apply_once,
+            )
             if allocation_pass % 2 == 0:
                 QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
         if applied_count:
