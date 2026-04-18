@@ -24,6 +24,7 @@ class UnresolvedQueueRemovalReason(StrEnum):
     planning_memory_queue_rebuilt = "planning_memory_queue_rebuilt"
     user_planned_move_retargeted = "user_planned_move_retargeted"
     removed_from_tree_user_action = "removed_from_tree_user_action"
+    pruned_invalid_parent_structure = "pruned_invalid_parent_structure"
 
 
 def legal_overlay_resolution_reasons() -> frozenset[UnresolvedQueueRemovalReason]:
