@@ -74,6 +74,19 @@ def test_apply_visible_model_branch_uses_flag_not_child_presence():
     dmodel.find_indices_for_canonical_destination_path = lambda _p: [ix]
     dmodel.is_index_live = lambda _i: True
 
+    _once = {"done": False}
+
+    def _first_live_if(_path, pred):
+        nd = ix.data.return_value or {}
+        if _once["done"]:
+            return None
+        if pred(ix, nd):
+            _once["done"] = True
+            return ix
+        return None
+
+    dmodel.first_live_index_for_canonical_destination_path_if = _first_live_if
+
     mw._build_planned_move_destination_lookup = lambda: {"alloc_by_path": {}}  # noqa: E731
     mw._destination_model_build_allocation_apply_pairs = lambda _m, _l: [("\\D", move)]  # noqa: E731
     mw._destination_bind_normalized_expanded_targets = lambda _ep: {"\\Alloc"}  # noqa: E731
@@ -115,6 +128,19 @@ def test_apply_visible_model_skips_apply_when_descendants_already_applied():
 
     dmodel.find_indices_for_canonical_destination_path = lambda _p: [ix]
     dmodel.is_index_live = lambda _i: True
+
+    _once2 = {"done": False}
+
+    def _first_live_if2(_path, pred):
+        nd = ix.data.return_value or {}
+        if _once2["done"]:
+            return None
+        if pred(ix, nd):
+            _once2["done"] = True
+            return ix
+        return None
+
+    dmodel.first_live_index_for_canonical_destination_path_if = _first_live_if2
 
     mw._build_planned_move_destination_lookup = lambda: {"alloc_by_path": {}}  # noqa: E731
     mw._destination_model_build_allocation_apply_pairs = lambda _m, _l: [("\\D", move)]  # noqa: E731

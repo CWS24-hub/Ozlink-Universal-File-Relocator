@@ -395,6 +395,48 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
                 out.append(ix)
         return out
 
+    def first_live_index_for_canonical_destination_path_if(
+        self,
+        canonical_key: str,
+        predicate: Callable[[QModelIndex, Dict[str, Any]], bool],
+    ) -> Optional[QModelIndex]:
+        """First live index for ``canonical_key`` where ``predicate(index, node_data)`` is true.
+
+        Walks internal path registration order and builds one :class:`QModelIndex` at a time from
+        each node — no pre-built list of indices held across structural updates.
+        """
+        if not canonical_key or self._destination_index_key_fn is None:
+            return None
+        nodes = self._path_to_nodes.get(canonical_key) or []
+        if not nodes:
+            pk = self._path_cf_to_key.get(canonical_key.casefold())
+            if pk:
+                nodes = self._path_to_nodes.get(pk) or []
+        if not nodes:
+            cf = canonical_key.casefold()
+            n_buckets = len(self._path_to_nodes)
+            if n_buckets and n_buckets <= 4096:
+                for k, lst in self._path_to_nodes.items():
+                    if k.casefold() == cf:
+                        nodes = lst
+                        self._path_cf_to_key[cf] = k
+                        break
+        for n in nodes:
+            ix = self._index_for_node(n)
+            if not ix.isValid():
+                continue
+            if not self.is_index_live(ix):
+                continue
+            nd = ix.data(Qt.UserRole) or {}
+            if not isinstance(nd, dict):
+                nd = {}
+            try:
+                if predicate(ix, nd):
+                    return ix
+            except Exception:
+                continue
+        return None
+
     def clear(self) -> None:
         self.beginResetModel()
         self._invisible._children = []
