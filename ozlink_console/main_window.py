@@ -3040,6 +3040,11 @@ class MainWindow(QMainWindow):
         self._destination_startup_promoted_semantic_paths: set[str] = set()
         self._destination_startup_promoted_semantic_paths_cap: int = 4000
         self._destination_startup_allowed_semantic_root_segments_cf: set[str] = set()
+        self._last_destination_snapshot_selection_meta: dict | None = None
+        self._legacy_identity_inference_retry_attempt_count: int = 0
+        self._legacy_identity_inference_retry_site_key: str | None = None
+        self._legacy_identity_inference_retry_timer_pending: bool = False
+        self._legacy_identity_inference_retry_trigger: str = ""
         self._destination_startup_descendant_injection_active: bool = False
         self._destination_startup_descendant_queue_completed_logged: bool = False
         self._destination_startup_descendant_queue_paused_for_authority: bool = False
@@ -8070,6 +8075,125 @@ class MainWindow(QMainWindow):
             else str(state.DestinationTreeSnapshotIdentityDriveId),
             library_name_excerpt=str(state.DestinationTreeSnapshotIdentityLibraryName or "")[:120],
         )
+
+    def _destination_retry_site_identity_key(self) -> str:
+        if not getattr(self, "planning_inputs", None):
+            return ""
+        site_sel = self.planning_inputs.get("Destination Site")
+        site = site_sel.currentData() if site_sel is not None else None
+        if isinstance(site, dict):
+            return str(site.get("id") or "").strip()
+        return ""
+
+    def _legacy_snapshot_identity_inference_meta_should_retry(self, meta: dict | None) -> bool:
+        if not isinstance(meta, dict):
+            return False
+        if not meta.get("legacy_inference_retry_recommended"):
+            return False
+        r = meta.get("reason")
+        return r in ("blocked_legacy_no_candidates", "low_confidence", "insufficient_signal")
+
+    def _meta_legacy_inference_resolved_with_stamp(self, meta: dict | None) -> bool:
+        if not isinstance(meta, dict):
+            return False
+        label = str(meta.get("chosen_label") or "")
+        stamp = None
+        if "WorkspaceSnapshot.destination_tree_snapshot" in label and "fallback" not in label:
+            stamp = meta.get("sidecar_legacy_identity_stamp")
+        elif "SessionState.DestinationTreeSnapshot" in label:
+            stamp = meta.get("session_legacy_identity_stamp")
+        else:
+            stamp = meta.get("session_legacy_identity_stamp") or meta.get("sidecar_legacy_identity_stamp")
+        return isinstance(stamp, dict) and bool(stamp.get("destination_snapshot_identity_inferred_from_legacy"))
+
+    def _maybe_schedule_legacy_snapshot_identity_inference_retry(self, trigger: str) -> None:
+        if not getattr(self, "_main_window_qobject_ready", False):
+            return
+        key = self._destination_retry_site_identity_key()
+        prev = getattr(self, "_legacy_identity_inference_retry_site_key", None)
+        if prev != key:
+            self._legacy_identity_inference_retry_attempt_count = 0
+            self._legacy_identity_inference_retry_site_key = key
+        if self._legacy_identity_inference_retry_attempt_count >= 2:
+            return
+        if self._legacy_identity_inference_retry_timer_pending:
+            return
+        meta = getattr(self, "_last_destination_snapshot_selection_meta", None)
+        if not self._legacy_snapshot_identity_inference_meta_should_retry(meta):
+            return
+        self._legacy_identity_inference_retry_timer_pending = True
+        self._legacy_identity_inference_retry_trigger = str(trigger or "")[:120]
+
+        def _run():
+            self._legacy_identity_inference_retry_timer_pending = False
+            self._safe_invoke(
+                "legacy_snapshot_identity_inference_retry",
+                lambda: self._retry_legacy_snapshot_identity_inference(self),
+            )
+
+        QTimer.singleShot(0, _run)
+
+    def _retry_legacy_snapshot_identity_inference(self, win=None) -> None:
+        if self._legacy_identity_inference_retry_attempt_count >= 2:
+            return
+        self._legacy_identity_inference_retry_attempt_count += 1
+        trigger = str(getattr(self, "_legacy_identity_inference_retry_trigger", "") or "")[:120]
+        state = self._draft_shell_state if isinstance(self._draft_shell_state, SessionState) else None
+        before_inferred = bool(state and getattr(state, "DestinationTreeSnapshotIdentityInferredFromLegacy", False))
+        try:
+            log_info(
+                "destination_legacy_inference_retry_started",
+                trigger=trigger,
+                site_key_excerpt=self._destination_retry_site_identity_key()[:48],
+            )
+            tree_snapshots = self._session_workspace_tree_snapshots()
+            dest_snaps_session = list(tree_snapshots.get("destination", []) or [])
+            mm = getattr(self, "memory_manager", None)
+            sidecar = mm.read_workspace_snapshot_optional() if mm is not None else None
+            dest_snaps, _sel_src, _n_sess, _n_side, meta = self._select_destination_tree_snapshot_for_startup(
+                dest_snaps_session,
+                workspace_sidecar=sidecar,
+            )
+            pending = dict(self._pending_session_tree_snapshots or {})
+            pending["destination"] = list(dest_snaps)
+            self._pending_session_tree_snapshots = pending
+            rs = getattr(self, "_runtime_session_tree_snapshots", None)
+            if isinstance(rs, dict):
+                rs["destination"] = list(dest_snaps)
+            try:
+                self._destination_startup_allowed_semantic_root_segments_cf = allowed_semantic_root_segments_cf_from_snapshot(
+                    dest_snaps
+                )
+            except Exception:
+                self._destination_startup_allowed_semantic_root_segments_cf = set()
+            after_inferred = bool(state and getattr(state, "DestinationTreeSnapshotIdentityInferredFromLegacy", False))
+            stamp_ok = self._meta_legacy_inference_resolved_with_stamp(meta)
+            still_blocked = bool(meta.get("legacy_inference_retry_recommended"))
+            if still_blocked:
+                log_info(
+                    "destination_legacy_inference_retry_failed",
+                    trigger=trigger,
+                    reason=str(meta.get("reason") or "")[:80],
+                    session_gate=str(meta.get("session_identity_gate") or "")[:80],
+                    sidecar_gate=str(meta.get("sidecar_identity_gate") or "")[:80],
+                )
+            else:
+                log_info(
+                    "destination_legacy_inference_retry_success",
+                    trigger=trigger,
+                    stamp_applied=bool(stamp_ok),
+                    identity_inferred_from_legacy=after_inferred,
+                )
+            if stamp_ok and after_inferred and not before_inferred:
+                self._schedule_destination_bind_reconcile_after_workers(delay_ms=180)
+        except Exception as exc:
+            log_info(
+                "destination_legacy_inference_retry_failed",
+                trigger=trigger,
+                reason="exception",
+                error=str(exc)[:500],
+            )
+            self._log_restore_exception("legacy_snapshot_identity_inference_retry", exc)
 
     def _intended_destination_drive_id_for_snapshot_validation(self) -> str:
         """Prefer persisted session/snapshot envelope over combo (combo may be wrong before selector restore)."""
@@ -19398,6 +19522,9 @@ class MainWindow(QMainWindow):
         finally:
             library_selector.blockSignals(False)
 
+        if selector_group == "destination" and libraries:
+            self._maybe_schedule_legacy_snapshot_identity_inference_retry("destination_libraries_loaded")
+
         return True
 
     def _apply_browse_modes_from_session_state(self) -> None:
@@ -20588,7 +20715,7 @@ class MainWindow(QMainWindow):
         session_destination_snaps: list,
         *,
         workspace_sidecar: dict | None,
-    ) -> tuple[list, str, int, int]:
+    ) -> tuple[list, str, int, int, dict]:
         """Choose session vs workspace sidecar destination snapshot after root validation (validity > richness)."""
 
         state = self._draft_shell_state if isinstance(self._draft_shell_state, SessionState) else SessionState()
@@ -20632,6 +20759,7 @@ class MainWindow(QMainWindow):
             legacy_library_candidates=legacy_cands or None,
         )
         self._apply_destination_snapshot_legacy_identity_stamp(meta)
+        self._last_destination_snapshot_selection_meta = meta
         n_sess = int(meta.get("session_raw_nodes", 0) or 0)
         n_side = int(meta.get("sidecar_raw_nodes", 0) or 0)
         return chosen, str(label), n_sess, n_side, meta
@@ -21473,6 +21601,8 @@ class MainWindow(QMainWindow):
                 return
 
             self._populate_library_selector_for_group(selector_group)
+            if selector_group == "destination":
+                self._maybe_schedule_legacy_snapshot_identity_inference_retry("destination_site_stabilized")
             if chain_library:
                 self.on_library_selector_changed(selector_group, force=force)
         except Exception as exc:

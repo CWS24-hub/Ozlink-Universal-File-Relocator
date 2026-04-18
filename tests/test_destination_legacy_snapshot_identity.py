@@ -148,6 +148,31 @@ class LegacySnapshotIdentityInferenceTests(unittest.TestCase):
         st = meta.get("session_legacy_identity_stamp")
         self.assertIsInstance(st, dict)
         self.assertTrue(st.get("destination_snapshot_identity_inferred_from_legacy"))
+        self.assertFalse(meta.get("legacy_inference_retry_recommended"))
+        self.assertIsNone(meta.get("reason"))
+
+    def test_select_validated_retry_meta_no_legacy_candidates(self):
+        snap = _snap_many_row_votes("drive-x", 5)
+        ctx = DestinationStartupSnapshotRootContext(
+            browse_mode="sharepoint",
+            destination_drive_id="drive-x",
+            source_drive_id="src",
+        )
+        chosen, label, _, _, meta = select_validated_destination_startup_snapshot(
+            [snap],
+            [],
+            ctx,
+            session_envelope_drive_id="",
+            session_envelope_library_id="",
+            sidecar_envelope_drive_id="",
+            sidecar_envelope_library_id="",
+            intended_drive_id="drive-x",
+            legacy_library_candidates=[],
+        )
+        self.assertEqual(chosen, [])
+        self.assertIn("SessionState", label)
+        self.assertTrue(meta.get("legacy_inference_retry_recommended"))
+        self.assertEqual(meta.get("reason"), "blocked_legacy_no_candidates")
 
     def test_session_state_roundtrip_inferred_flag(self):
         s = SessionState(

@@ -378,6 +378,48 @@ def apply_destination_snapshot_identity_gate_with_legacy(
     return gated, strict_tag, stamp
 
 
+def canonical_legacy_inference_block_reason(gate_tag: str) -> str:
+    """Map identity gate tags to canonical ``meta['reason']`` values used for deferred retry."""
+
+    t = str(gate_tag or "")
+    if t == "blocked_legacy_no_candidates":
+        return "blocked_legacy_no_candidates"
+    if t in ("legacy_identity_low_unresolved", "legacy_identity_medium_unresolved"):
+        return "low_confidence"
+    if t in ("legacy_identity_high_ambiguous", "legacy_identity_high_intended_mismatch"):
+        return "insufficient_signal"
+    return ""
+
+
+def pick_legacy_inference_retry_meta(
+    sess_gate_tag: str,
+    side_gate_tag: str,
+    n_sess_raw: int,
+    n_side_raw: int,
+    intended_drive_id: str,
+) -> tuple[str | None, bool]:
+    """Whether startup legacy inference is blocked in a way that may clear after libraries load."""
+
+    if not str(intended_drive_id or "").strip():
+        return None, False
+    reasons: list[str] = []
+    if int(n_sess_raw) > 0:
+        r = canonical_legacy_inference_block_reason(str(sess_gate_tag))
+        if r:
+            reasons.append(r)
+    if int(n_side_raw) > 0:
+        r = canonical_legacy_inference_block_reason(str(side_gate_tag))
+        if r:
+            reasons.append(r)
+    if not reasons:
+        return None, False
+    priority = ("blocked_legacy_no_candidates", "low_confidence", "insufficient_signal")
+    for p in priority:
+        if p in reasons:
+            return p, True
+    return reasons[0], True
+
+
 def apply_destination_snapshot_identity_gate(
     snapshots: list,
     *,
@@ -583,6 +625,13 @@ def select_validated_destination_startup_snapshot(
         chosen = sess_san
         label = "SessionState.DestinationTreeSnapshot_fallback_empty"
 
+    reason, legacy_inference_retry_recommended = pick_legacy_inference_retry_meta(
+        str(sess_gate_tag),
+        str(side_gate_tag),
+        int(n_sess_raw),
+        int(n_side_raw),
+        str(intended_drive_id),
+    )
     meta = {
         "session_sanitized_nodes": n_sess,
         "sidecar_sanitized_nodes": n_side,
@@ -593,6 +642,8 @@ def select_validated_destination_startup_snapshot(
         "sidecar_identity_gate": str(side_gate_tag),
         "session_legacy_identity_stamp": sess_legacy_stamp,
         "sidecar_legacy_identity_stamp": side_legacy_stamp,
+        "reason": reason,
+        "legacy_inference_retry_recommended": bool(legacy_inference_retry_recommended),
     }
     log_info(
         "destination_startup_snapshot_selection_after_validation",
@@ -600,6 +651,8 @@ def select_validated_destination_startup_snapshot(
         chosen_nodes=int(snapshot_node_count_recursive(chosen)),
         usable_session=bool(usable_sess),
         usable_sidecar=bool(usable_side),
+        legacy_inference_retry_recommended=bool(legacy_inference_retry_recommended),
+        legacy_inference_block_reason=str(reason or "")[:80],
     )
     return chosen, label, n_sess, n_side, meta
 
