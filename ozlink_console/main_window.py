@@ -1830,6 +1830,13 @@ class DestinationPlanningTreeDelegate(QStyledItemDelegate):
         if prof is not None and prof.should_record_fine_grained():
             _t0 = time.perf_counter()
         try:
+            # Skip Qt.UserRole unless plan-leaf exclusion styling may apply (only column 0; needs exclusions set).
+            if index.column() != 0:
+                super().paint(painter, option, index)
+                return
+            if not (getattr(self.window, "_plan_leaf_exclusions", None) or set()):
+                super().paint(painter, option, index)
+                return
             node_data = index.data(Qt.UserRole) or {}
             if not self.window._plan_leaf_exclusion_display_active("destination", node_data):
                 super().paint(painter, option, index)
