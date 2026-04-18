@@ -840,7 +840,16 @@ def test_deferred_planning_refresh_graph_ids_resolve_overlays_without_idle_defer
     mw._log_restore_exception = lambda *a, **k: None
     mw._destination_steady_state_full_materialize_redundant = lambda: False
     mw._destination_lifecycle_trace_TEMP = lambda *a, **k: None
-    MainWindow._run_deferred_planning_refresh(mw)
+    mw._application_shutting_down = False
+    mw._restore_abort_active = lambda: False
+    mw._destination_user_scroll_interaction_active = lambda: False
+    mw._unresolved_proposed_queue_size = lambda: len(mw.unresolved_proposed_by_parent_path or {})
+    mw._unresolved_allocation_queue_size = lambda: len(mw.unresolved_allocations_by_parent_path or {})
+    with patch(
+        "ozlink_console.main_window.QTimer.singleShot",
+        side_effect=lambda _delay_ms, callback: callback(),
+    ):
+        MainWindow._run_deferred_planning_refresh(mw)
     assert len(calls) == 1
     assert calls[0][0] == "deferred_graph_ids_resolved_from_sharepoint_paths"
     assert calls[0][1] is True

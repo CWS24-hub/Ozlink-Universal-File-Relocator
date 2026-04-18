@@ -45,7 +45,11 @@ class DeferredPlanningRefreshGraphIdsTests(unittest.TestCase):
 
         with patch("ozlink_console.main_window.is_dev_mode", return_value=False):
             with patch("ozlink_console.main_window.log_info"):
-                MainWindow._run_deferred_planning_refresh(w)
+                with patch(
+                    "ozlink_console.main_window.QTimer.singleShot",
+                    side_effect=lambda _delay_ms, callback: callback(),
+                ):
+                    MainWindow._run_deferred_planning_refresh(w)
 
         self.assertEqual(len(enum_calls), 1, "second full-tree enumerate must be skipped when overlay does not run")
 
@@ -66,7 +70,11 @@ class DeferredPlanningRefreshGraphIdsTests(unittest.TestCase):
 
         with patch("ozlink_console.main_window.is_dev_mode", return_value=False):
             with patch("ozlink_console.main_window.log_info"):
-                MainWindow._run_deferred_planning_refresh(w)
+                with patch(
+                    "ozlink_console.main_window.QTimer.singleShot",
+                    side_effect=lambda _delay_ms, callback: callback(),
+                ):
+                    MainWindow._run_deferred_planning_refresh(w)
 
         self.assertEqual(len(enum_calls), 2)
 

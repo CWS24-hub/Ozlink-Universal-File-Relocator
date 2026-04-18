@@ -3439,6 +3439,9 @@ class MainWindow(QMainWindow):
         self._graph_ids_refresh_batch_timer = QTimer(self)
         self._graph_ids_refresh_batch_timer.setSingleShot(True)
         self._graph_ids_refresh_batch_timer.timeout.connect(self._flush_graph_ids_refresh_batch)
+        # Multi-tick cooperative driver for graph_ids-only deferred planning refresh (see
+        # ``_graph_ids_deferred_planning_refresh_chunk_tick``).
+        self._graph_ids_deferred_planning_refresh_chunk_state = None
         self._loading_visual_phase = 0
         self._loading_visual_timer = QTimer(self)
         self._loading_visual_timer.setInterval(1100)
@@ -7400,12 +7403,28 @@ class MainWindow(QMainWindow):
         prev_reasons = list(getattr(self, "_deferred_planning_refresh_reasons", []))
         pending_before = bool(getattr(self, "_deferred_planning_refresh_pending", False))
         reason_text = str(reason or "").strip() or "planning_change"
+        _incoming_paths = (
+            [str(path or "").strip() for path in (source_projection_paths or []) if str(path or "").strip()]
+            if source_projection_paths
+            else []
+        )
+        if (
+            reason_text == "graph_ids_resolved_from_sharepoint_paths"
+            and getattr(self, "_graph_ids_deferred_planning_refresh_chunk_state", None) is not None
+        ):
+            _added = self._graph_ids_deferred_planning_refresh_merge_paths_into_active_chunk(_incoming_paths)
+            if notify_saved:
+                self._notify_planning_change_saved()
+            log_info(
+                "graph_ids_deferred_planning_refresh_queue_merged_into_active_chunk",
+                added_paths=int(_added),
+                skipped_deferred_timer_restart=True,
+            )
+            return
         if reason_text not in self._deferred_planning_refresh_reasons:
             self._deferred_planning_refresh_reasons.append(reason_text)
-        if source_projection_paths:
-            self._deferred_source_projection_paths.update(
-                str(path or "").strip() for path in source_projection_paths if str(path or "").strip()
-            )
+        if _incoming_paths:
+            self._deferred_source_projection_paths.update(_incoming_paths)
         self._deferred_planning_refresh_pending = True
         if notify_saved:
             self._notify_planning_change_saved()
@@ -7429,100 +7448,13 @@ class MainWindow(QMainWindow):
                 timer_restart_ms=int(interval),
             )
 
-    def _run_deferred_planning_refresh(self):
-        if getattr(self, "_application_shutting_down", False):
-            timer = getattr(self, "_deferred_planning_refresh_timer", None)
-            if timer is not None:
-                try:
-                    timer.stop()
-                except Exception:
-                    pass
-            had_pending = bool(getattr(self, "_deferred_planning_refresh_pending", False))
-            self._deferred_planning_refresh_pending = False
-            self._deferred_planning_refresh_reasons = []
-            self._deferred_source_projection_paths = set()
-            log_info(
-                "shutdown_trace",
-                event="deferred_planning_refresh_skipped",
-                reason="application_shutting_down",
-                had_pending_refresh=had_pending,
-            )
-            return
-        if not getattr(self, "_deferred_planning_refresh_pending", False):
-            return
-        if self._restore_abort_active():
-            self._deferred_planning_refresh_pending = False
-            self._deferred_planning_refresh_reasons = []
-            self._deferred_source_projection_paths = set()
-            self._log_restore_phase(
-                "deferred_planning_refresh_skipped",
-                reason="restore_abort_mode",
-                restore_abort_reason=str(getattr(self, "_restore_abort_reason", "") or ""),
-            )
-            return
-
-        reasons = list(getattr(self, "_deferred_planning_refresh_reasons", []))
-        combined_reason = "__".join(reasons) if reasons else "deferred_planning_refresh"
-        source_projection_paths = set(getattr(self, "_deferred_source_projection_paths", set()))
-
-        # Graph-ID refresh walks overlays / projection caches on the GUI thread (~seconds). If the user is
-        # actively scrolling the destination tree, postpone until scroll idle (same window as indicator defer).
-        if "graph_ids_resolved_from_sharepoint_paths" in reasons:
-            _scroll_fn = getattr(self, "_destination_user_scroll_interaction_active", None)
-            try:
-                _scrolling = bool(callable(_scroll_fn) and _scroll_fn())
-            except Exception:
-                _scrolling = False
-            if _scrolling:
-                _defer_ms = max(120, int(getattr(self, "_destination_tree_scroll_idle_ms", 280) or 280))
-                _tmr = getattr(self, "_deferred_planning_refresh_timer", None)
-                if _tmr is not None:
-                    _tmr.stop()
-                    _tmr.start(_defer_ms)
-                log_info(
-                    "graph_ids_deferred_planning_refresh_deferred_for_destination_scroll",
-                    defer_ms=int(_defer_ms),
-                    source_projection_path_count=int(len(source_projection_paths)),
-                    combined_reason=str(combined_reason)[:220],
-                )
-                return
-
-        self._deferred_planning_refresh_pending = False
-        self._deferred_planning_refresh_reasons = []
-        self._deferred_source_projection_paths = set()
-
-        self._deferred_planning_refresh_running = True
-        try:
-            self._run_deferred_planning_refresh_inner(
-                reasons,
-                combined_reason,
-                source_projection_paths,
-            )
-        finally:
-            self._deferred_planning_refresh_running = False
-            self._graph_ids_drain_followup_after_deferred_refresh()
-
-    def _run_deferred_planning_refresh_inner(self, reasons, combined_reason, source_projection_paths):
-        _gid_wall0 = None
-        if "graph_ids_resolved_from_sharepoint_paths" in reasons:
-            _gid_wall0 = time.perf_counter()
-            log_info(
-                "graph_ids_deferred_planning_refresh_begin",
-                combined_reason=str(combined_reason)[:220],
-                source_projection_path_count=int(len(source_projection_paths)),
-                graph_ids_coalesced_merge_events=int(
-                    getattr(self, "_graph_ids_last_coalesced_merge_events", 0) or 0
-                ),
-            )
-        # Skip synchronous destination future-model bind when the UI was already updated
-        # incrementally (add/remove allocation overlays). Full binds can freeze for large libraries.
-        # Multiple reasons in one flush imply a combined delta — run at least one full materialize.
+    def _deferred_planning_refresh_compute_skip_full_and_overlay_decision(self, reasons, combined_reason):
+        """Shared skip/overlay flags for deferred planning refresh (inner + graph_ids chunk driver)."""
         skip_full_destination_future_model = (
             len(reasons) == 1
             and bool(reasons)
             and reasons[0] in _INCREMENTAL_DEFERRED_PLANNING_REFRESH_REASONS
         )
-        # Graph path/id enrichment updates row metadata only; destination tree structure is unchanged.
         if reasons == ["graph_ids_resolved_from_sharepoint_paths"]:
             skip_full_destination_future_model = True
         force_dest_full = bool(getattr(self, "_destination_require_deferred_full_materialize_once", False))
@@ -7559,6 +7491,508 @@ class MainWindow(QMainWindow):
                     reasons=str(combined_reason)[:220],
                     skip_full_destination_future_model=True,
                 )
+        _dest_tree = getattr(self, "destination_tree_widget", None)
+        _outer_dest_overlay = (
+            _dest_tree is not None
+            and ((not skip_full_destination_future_model) or force_dest_full)
+        )
+        _run_dest_overlay = bool(
+            _outer_dest_overlay and not self._destination_steady_state_full_materialize_redundant()
+        )
+        return {
+            "skip_full_destination_future_model": bool(skip_full_destination_future_model),
+            "force_dest_full": bool(force_dest_full),
+            "overlay_backlog": int(overlay_backlog),
+            "_run_dest_overlay": bool(_run_dest_overlay),
+        }
+
+    def _graph_ids_deferred_planning_refresh_merge_paths_into_active_chunk(self, paths) -> int:
+        """Append unique source projection paths to an in-flight graph_ids chunk job; returns paths added."""
+        st = getattr(self, "_graph_ids_deferred_planning_refresh_chunk_state", None)
+        if not isinstance(st, dict):
+            return 0
+        base = st.setdefault("source_paths", [])
+        seen = set(base)
+        added = 0
+        for p in paths or []:
+            s = str(p or "").strip()
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            base.append(s)
+            added += 1
+        return int(added)
+
+    def _graph_ids_deferred_planning_refresh_chunk_schedule_next(self) -> None:
+        QTimer.singleShot(
+            0,
+            lambda: self._safe_invoke(
+                "graph_ids_deferred_planning_refresh_chunk",
+                self._graph_ids_deferred_planning_refresh_chunk_tick,
+            ),
+        )
+
+    def _graph_ids_deferred_planning_refresh_chunk_complete(self) -> None:
+        self._graph_ids_deferred_planning_refresh_chunk_state = None
+        self._deferred_planning_refresh_running = False
+        self._graph_ids_drain_followup_after_deferred_refresh()
+        if getattr(self, "_deferred_planning_refresh_pending", False):
+            _tmr = getattr(self, "_deferred_planning_refresh_timer", None)
+            if _tmr is not None:
+                _tmr.start(0)
+
+    def _graph_ids_deferred_planning_refresh_begin_chunked(
+        self, reasons, combined_reason, source_projection_paths
+    ) -> None:
+        paths_list = sorted({str(p).strip() for p in source_projection_paths if str(p or "").strip()})
+        st = getattr(self, "_graph_ids_deferred_planning_refresh_chunk_state", None)
+        if isinstance(st, dict):
+            self._graph_ids_deferred_planning_refresh_merge_paths_into_active_chunk(paths_list)
+            log_info(
+                "graph_ids_deferred_planning_refresh_chunk_restarted_merge",
+                combined_reason=str(combined_reason)[:220],
+                source_projection_path_count=int(len(st.get("source_paths") or [])),
+            )
+            return
+        self._graph_ids_deferred_planning_refresh_chunk_state = {
+            "reasons": list(reasons),
+            "combined_reason": str(combined_reason),
+            "source_paths": paths_list,
+            "source_cursor": 0,
+            "phase": 0,
+            "chunk_seq": 0,
+        }
+        self._graph_ids_deferred_planning_refresh_chunk_schedule_next()
+
+    def _graph_ids_deferred_planning_refresh_chunk_tick(self) -> None:
+        if getattr(self, "_application_shutting_down", False):
+            self._graph_ids_deferred_planning_refresh_chunk_state = None
+            self._deferred_planning_refresh_running = False
+            return
+        st = getattr(self, "_graph_ids_deferred_planning_refresh_chunk_state", None)
+        if not isinstance(st, dict):
+            return
+        if "graph_ids_resolved_from_sharepoint_paths" in (st.get("reasons") or []):
+            _scroll_fn = getattr(self, "_destination_user_scroll_interaction_active", None)
+            try:
+                _scrolling = bool(callable(_scroll_fn) and _scroll_fn())
+            except Exception:
+                _scrolling = False
+            if _scrolling:
+                _defer_ms = max(120, int(getattr(self, "_destination_tree_scroll_idle_ms", 280) or 280))
+                QTimer.singleShot(
+                    _defer_ms,
+                    lambda: self._safe_invoke(
+                        "graph_ids_deferred_planning_refresh_chunk_scroll_idle",
+                        self._graph_ids_deferred_planning_refresh_chunk_tick,
+                    ),
+                )
+                log_info(
+                    "graph_ids_deferred_planning_refresh_chunk_deferred_for_destination_scroll",
+                    defer_ms=int(_defer_ms),
+                    phase=int(st.get("phase", 0) or 0),
+                )
+                return
+
+        phase = int(st.get("phase", 0) or 0)
+        st["chunk_seq"] = int(st.get("chunk_seq", 0) or 0) + 1
+        chunk_seq = int(st["chunk_seq"])
+        t_chunk0 = time.perf_counter()
+        reasons = list(st.get("reasons") or [])
+        combined_reason = str(st.get("combined_reason") or "")
+        _path_budget = 24
+        _chunk_budget_ms = 4.0
+
+        def _phase_name(p: int) -> str:
+            return {
+                0: "init_flags",
+                1: "enumerate_first",
+                2: "destination_overlay",
+                3: "source_projection_paths",
+                4: "enumerate_second",
+                5: "finalize",
+            }.get(p, f"phase_{p}")
+
+        def _chunk_log(phase_idx: int, items_processed: int, extra: Optional[Dict[str, Any]] = None) -> None:
+            elapsed_ms = round((time.perf_counter() - t_chunk0) * 1000.0, 3)
+            payload = {
+                "phase": int(phase_idx),
+                "phase_name": str(_phase_name(phase_idx)),
+                "chunk_seq": int(chunk_seq),
+                "items_processed": int(items_processed),
+                "elapsed_ms": float(elapsed_ms),
+            }
+            if extra:
+                payload.update(extra)
+            log_info("graph_ids_deferred_planning_refresh_chunk", **payload)
+            if elapsed_ms > _chunk_budget_ms:
+                log_info(
+                    "graph_ids_deferred_planning_refresh_chunk_budget_exceeded",
+                    phase=int(phase_idx),
+                    phase_name=str(_phase_name(phase_idx)),
+                    chunk_seq=int(chunk_seq),
+                    elapsed_ms=float(elapsed_ms),
+                    budget_ms=float(_chunk_budget_ms),
+                )
+
+        try:
+            if phase == 0:
+                _gid_wall0 = time.perf_counter()
+                st["_gid_wall0"] = _gid_wall0
+                log_info(
+                    "graph_ids_deferred_planning_refresh_begin",
+                    combined_reason=str(combined_reason)[:220],
+                    source_projection_path_count=int(len(st.get("source_paths") or [])),
+                    graph_ids_coalesced_merge_events=int(
+                        getattr(self, "_graph_ids_last_coalesced_merge_events", 0) or 0
+                    ),
+                )
+                _dec = self._deferred_planning_refresh_compute_skip_full_and_overlay_decision(reasons, combined_reason)
+                st.update(_dec)
+                self._destination_lifecycle_trace_TEMP(
+                    fn="_run_deferred_planning_refresh",
+                    reason=combined_reason,
+                    step_kind="projection_materialize",
+                    extra=(
+                        "skip_full_destination_future_model="
+                        + str(st.get("skip_full_destination_future_model"))
+                        + ";n_src_paths="
+                        + str(len(st.get("source_paths") or []))
+                    ),
+                )
+                if is_dev_mode():
+                    if st.get("skip_full_destination_future_model"):
+                        log_info(
+                            "deferred_planning_refresh",
+                            mode="incremental_only",
+                            reasons=combined_reason,
+                            skip_full_destination=True,
+                        )
+                    else:
+                        violators = [r for r in reasons if r not in _INCREMENTAL_DEFERRED_PLANNING_REFRESH_REASONS]
+                        log_info(
+                            "deferred_planning_refresh",
+                            mode="full_destination_finalize",
+                            reasons=combined_reason,
+                            skip_full_destination=False,
+                            non_incremental_reasons=violators,
+                        )
+                st["_finalize_overlay_structural"] = False
+                st["_vp_finalize_before"] = -1
+                st["_vp_finalize_after"] = -1
+                st["_pex"] = {}
+                _chunk_log(0, 0)
+                st["phase"] = 1
+                self._graph_ids_deferred_planning_refresh_chunk_schedule_next()
+                return
+
+            if phase == 1:
+                _pex = st.setdefault("_pex", {})
+                _run_dest_overlay = bool(st.get("_run_dest_overlay"))
+                _t_enum0 = time.perf_counter()
+                _vp_finalize_before = -1
+                try:
+                    if getattr(self, "destination_planning_model", None) is not None:
+                        _vp_fb, _av_fb = self._destination_enumerate_visible_planned_paths_and_all_visible()
+                        _vp_finalize_before = len(_vp_fb)
+                        if not _run_dest_overlay:
+                            st["_vp_finalize_after"] = _vp_finalize_before
+                except Exception:
+                    _vp_finalize_before = -1
+                    if not _run_dest_overlay:
+                        st["_vp_finalize_after"] = -1
+                finally:
+                    _pex["enumerate_first_wall_ms"] = round((time.perf_counter() - _t_enum0) * 1000.0, 3)
+                st["_vp_finalize_before"] = int(_vp_finalize_before)
+                log_info(
+                    "destination_finalize_started",
+                    combined_reason=str(combined_reason)[:220],
+                    skip_full_destination_future_model=bool(st.get("skip_full_destination_future_model")),
+                    force_destination_full=bool(st.get("force_dest_full")),
+                    visible_planned_before=int(_vp_finalize_before),
+                    run_destination_overlay=bool(_run_dest_overlay),
+                )
+                _chunk_log(1, max(0, int(_vp_finalize_before)))
+                st["phase"] = 2
+                self._graph_ids_deferred_planning_refresh_chunk_schedule_next()
+                return
+
+            if phase == 2:
+                _pex = st.setdefault("_pex", {})
+                _run_dest_overlay = bool(st.get("_run_dest_overlay"))
+                items_overlay = 0
+                if _run_dest_overlay:
+                    st["_finalize_overlay_structural"] = True
+                    _graph_resolve = "graph_ids_resolved_from_sharepoint_paths" in reasons
+                    if (
+                        bool(getattr(self, "_memory_restore_in_progress", False))
+                        and self._destination_graph_authority_supersedes_memory_restore_gate()
+                    ):
+                        log_info(
+                            "destination_overlay_gate_bypass_for_authority",
+                            caller="_run_deferred_planning_refresh_chunked",
+                            combined_reason=str(combined_reason)[:200],
+                            detail="deferred_planning_refresh_runs_destination_overlays_under_graph_authority",
+                        )
+                    _forensic_deferred = dest_forensic.slow_pass_forensic_enabled() and (
+                        "graph_ids_resolved_from_sharepoint_paths" in reasons
+                    )
+                    st["_forensic_deferred"] = bool(_forensic_deferred)
+                    _mat_reason = f"deferred_{combined_reason}"
+                    _t_def = time.perf_counter()
+                    self._apply_destination_planning_overlays(
+                        _mat_reason,
+                        allow_defer=True,
+                        prefer_chunked_projection=bool(_graph_resolve),
+                    )
+                    _pex["apply_destination_planning_overlays_wall_ms"] = round(
+                        (time.perf_counter() - _t_def) * 1000.0, 3
+                    )
+                    items_overlay = 1
+                    if _forensic_deferred:
+                        log_info(
+                            "destination_slow_pass_forensic",
+                            phase="deferred_graph_ids_resolved_from_sharepoint_paths",
+                            combined_reason=str(combined_reason)[:220],
+                            materialize_reason=str(_mat_reason)[:220],
+                            apply_destination_planning_overlays_ms=round(
+                                (time.perf_counter() - _t_def) * 1000.0, 2
+                            ),
+                            skip_full_destination_future_model=bool(st.get("skip_full_destination_future_model")),
+                            allow_defer_destination=True,
+                            overlay_terminal_reconcile_done_after_apply=bool(
+                                getattr(self, "_destination_overlay_terminal_reconcile_done", False)
+                            ),
+                        )
+                    if bool(st.get("force_dest_full")):
+                        self._destination_require_deferred_full_materialize_once = False
+                _chunk_log(2, int(items_overlay))
+                st["phase"] = 3
+                self._graph_ids_deferred_planning_refresh_chunk_schedule_next()
+                return
+
+            if phase == 3:
+                _pex = st.setdefault("_pex", {})
+                paths = list(st.get("source_paths") or [])
+                _t_src = time.perf_counter()
+                if getattr(self, "source_tree_widget", None) is None or not paths:
+                    _pex["source_projection_schedule_wall_ms"] = round((time.perf_counter() - _t_src) * 1000.0, 3)
+                    _pex["source_projection_paths_scheduled"] = 0
+                    _chunk_log(3, 0, {"source_cursor": int(len(paths)), "source_total": int(len(paths))})
+                    st["phase"] = 4
+                    self._graph_ids_deferred_planning_refresh_chunk_schedule_next()
+                    return
+                try:
+                    i0 = int(st.get("source_cursor", 0) or 0)
+                    processed = 0
+                    t_budget = time.perf_counter()
+                    while i0 < len(paths):
+                        batch = paths[i0 : i0 + _path_budget]
+                        i0 += len(batch)
+                        processed += len(batch)
+                        self._schedule_source_projection_refresh_for_paths(
+                            batch,
+                            f"source_projection_deferred_{combined_reason}",
+                            delay_ms=50,
+                        )
+                        if (time.perf_counter() - t_budget) * 1000.0 >= _chunk_budget_ms:
+                            break
+                    st["source_cursor"] = int(i0)
+                    _pex["source_projection_paths_scheduled"] = int(len(paths))
+                    _pex["source_projection_schedule_wall_ms"] = round((time.perf_counter() - _t_src) * 1000.0, 3)
+                    _chunk_log(3, int(processed), {"source_cursor": int(i0), "source_total": int(len(paths))})
+                    if i0 < len(paths):
+                        self._graph_ids_deferred_planning_refresh_chunk_schedule_next()
+                        return
+                except Exception as exc:
+                    self._log_restore_exception("deferred_planning_refresh.source", exc)
+                    _pex["source_projection_schedule_wall_ms"] = round((time.perf_counter() - _t_src) * 1000.0, 3)
+                st["phase"] = 4
+                self._graph_ids_deferred_planning_refresh_chunk_schedule_next()
+                return
+
+            if phase == 4:
+                _pex = st.setdefault("_pex", {})
+                _run_dest_overlay = bool(st.get("_run_dest_overlay"))
+                if _run_dest_overlay:
+                    _t_enum1 = time.perf_counter()
+                    try:
+                        if getattr(self, "destination_planning_model", None) is not None:
+                            _vp_fa, _av_fa = self._destination_enumerate_visible_planned_paths_and_all_visible()
+                            st["_vp_finalize_after"] = len(_vp_fa)
+                        else:
+                            st["_vp_finalize_after"] = int(st.get("_vp_finalize_before", -1) or -1)
+                    except Exception:
+                        st["_vp_finalize_after"] = -1
+                    _pex["enumerate_second_wall_ms"] = round((time.perf_counter() - _t_enum1) * 1000.0, 3)
+                    _pex["destination_enumerate_second_pass"] = True
+                else:
+                    _pex["destination_enumerate_second_pass_skipped"] = True
+                    _pex["enumerate_second_wall_ms"] = 0.0
+                _vp_b = int(st.get("_vp_finalize_before", -1) or -1)
+                _vp_a = int(st.get("_vp_finalize_after", -1) or -1)
+                log_info(
+                    "destination_finalize_finished",
+                    combined_reason=str(combined_reason)[:220],
+                    skip_full_destination_future_model=bool(st.get("skip_full_destination_future_model")),
+                    visible_planned_before=int(_vp_b),
+                    visible_planned_after=int(_vp_a),
+                    ran_full_destination_overlay_pass=bool(st.get("_finalize_overlay_structural")),
+                    destination_enumerate_second_pass_skipped=bool(not _run_dest_overlay),
+                )
+                _chunk_log(4, max(0, _vp_a))
+                st["phase"] = 5
+                self._graph_ids_deferred_planning_refresh_chunk_schedule_next()
+                return
+
+            if phase == 5:
+                _pex = st.setdefault("_pex", {})
+                _t_prog = time.perf_counter()
+                self.update_progress_summaries()
+                _pex["progress_summaries_wall_ms"] = round((time.perf_counter() - _t_prog) * 1000.0, 3)
+                _t_title = time.perf_counter()
+                self._set_window_title_status()
+                _pex["window_title_status_wall_ms"] = round((time.perf_counter() - _t_title) * 1000.0, 3)
+                if "graph_ids_resolved_from_sharepoint_paths" in reasons:
+                    _pex["graph_ids_coalesced_merge_events"] = int(
+                        getattr(self, "_graph_ids_last_coalesced_merge_events", 0) or 0
+                    )
+                    self._graph_ids_last_coalesced_merge_events = 0
+                _gid_wall0 = float(st.get("_gid_wall0") or time.perf_counter())
+                log_info(
+                    "graph_ids_deferred_planning_refresh_end",
+                    combined_reason=str(combined_reason)[:220],
+                    elapsed_ms=round((time.perf_counter() - _gid_wall0) * 1000.0, 2),
+                    source_projection_path_count=int(len(st.get("source_paths") or [])),
+                )
+                _chunk_log(5, 1, {"chunk_driver": "graph_ids_cooperative"})
+                self._graph_ids_deferred_planning_refresh_chunk_complete()
+                return
+        except Exception as exc:
+            self._log_restore_exception("graph_ids_deferred_planning_refresh_chunk", exc)
+            self._graph_ids_deferred_planning_refresh_chunk_complete()
+
+    def _run_deferred_planning_refresh(self):
+        if getattr(self, "_application_shutting_down", False):
+            timer = getattr(self, "_deferred_planning_refresh_timer", None)
+            if timer is not None:
+                try:
+                    timer.stop()
+                except Exception:
+                    pass
+            had_pending = bool(getattr(self, "_deferred_planning_refresh_pending", False))
+            self._deferred_planning_refresh_pending = False
+            self._deferred_planning_refresh_reasons = []
+            self._deferred_source_projection_paths = set()
+            self._graph_ids_deferred_planning_refresh_chunk_state = None
+            log_info(
+                "shutdown_trace",
+                event="deferred_planning_refresh_skipped",
+                reason="application_shutting_down",
+                had_pending_refresh=had_pending,
+            )
+            return
+        if not getattr(self, "_deferred_planning_refresh_pending", False):
+            return
+        if self._restore_abort_active():
+            self._deferred_planning_refresh_pending = False
+            self._deferred_planning_refresh_reasons = []
+            self._deferred_source_projection_paths = set()
+            self._graph_ids_deferred_planning_refresh_chunk_state = None
+            self._log_restore_phase(
+                "deferred_planning_refresh_skipped",
+                reason="restore_abort_mode",
+                restore_abort_reason=str(getattr(self, "_restore_abort_reason", "") or ""),
+            )
+            return
+
+        reasons = list(getattr(self, "_deferred_planning_refresh_reasons", []))
+        combined_reason = "__".join(reasons) if reasons else "deferred_planning_refresh"
+        source_projection_paths = set(getattr(self, "_deferred_source_projection_paths", set()))
+
+        if (
+            getattr(self, "_graph_ids_deferred_planning_refresh_chunk_state", None) is not None
+            and reasons == ["graph_ids_resolved_from_sharepoint_paths"]
+        ):
+            self._graph_ids_deferred_planning_refresh_merge_paths_into_active_chunk(
+                [str(p) for p in source_projection_paths]
+            )
+            self._deferred_planning_refresh_pending = False
+            self._deferred_planning_refresh_reasons = []
+            self._deferred_source_projection_paths = set()
+            log_info(
+                "graph_ids_deferred_planning_refresh_timer_flush_merged_into_active_chunk",
+                merged_source_paths=int(len(source_projection_paths)),
+            )
+            return
+
+        # Graph-ID refresh walks overlays / projection caches on the GUI thread (~seconds). If the user is
+        # actively scrolling the destination tree, postpone until scroll idle (same window as indicator defer).
+        if "graph_ids_resolved_from_sharepoint_paths" in reasons:
+            _scroll_fn = getattr(self, "_destination_user_scroll_interaction_active", None)
+            try:
+                _scrolling = bool(callable(_scroll_fn) and _scroll_fn())
+            except Exception:
+                _scrolling = False
+            if _scrolling:
+                _defer_ms = max(120, int(getattr(self, "_destination_tree_scroll_idle_ms", 280) or 280))
+                _tmr = getattr(self, "_deferred_planning_refresh_timer", None)
+                if _tmr is not None:
+                    _tmr.stop()
+                    _tmr.start(_defer_ms)
+                log_info(
+                    "graph_ids_deferred_planning_refresh_deferred_for_destination_scroll",
+                    defer_ms=int(_defer_ms),
+                    source_projection_path_count=int(len(source_projection_paths)),
+                    combined_reason=str(combined_reason)[:220],
+                )
+                return
+
+        self._deferred_planning_refresh_pending = False
+        self._deferred_planning_refresh_reasons = []
+        self._deferred_source_projection_paths = set()
+
+        if reasons == ["graph_ids_resolved_from_sharepoint_paths"]:
+            self._deferred_planning_refresh_running = True
+            try:
+                self._graph_ids_deferred_planning_refresh_begin_chunked(
+                    reasons,
+                    combined_reason,
+                    source_projection_paths,
+                )
+            except Exception:
+                self._deferred_planning_refresh_running = False
+                self._graph_ids_deferred_planning_refresh_chunk_state = None
+                raise
+            return
+
+        self._deferred_planning_refresh_running = True
+        try:
+            self._run_deferred_planning_refresh_inner(
+                reasons,
+                combined_reason,
+                source_projection_paths,
+            )
+        finally:
+            self._deferred_planning_refresh_running = False
+            self._graph_ids_drain_followup_after_deferred_refresh()
+
+    def _run_deferred_planning_refresh_inner(self, reasons, combined_reason, source_projection_paths):
+        _gid_wall0 = None
+        if "graph_ids_resolved_from_sharepoint_paths" in reasons:
+            _gid_wall0 = time.perf_counter()
+            log_info(
+                "graph_ids_deferred_planning_refresh_begin",
+                combined_reason=str(combined_reason)[:220],
+                source_projection_path_count=int(len(source_projection_paths)),
+                graph_ids_coalesced_merge_events=int(
+                    getattr(self, "_graph_ids_last_coalesced_merge_events", 0) or 0
+                ),
+            )
+        _dec = self._deferred_planning_refresh_compute_skip_full_and_overlay_decision(reasons, combined_reason)
+        skip_full_destination_future_model = _dec["skip_full_destination_future_model"]
+        force_dest_full = _dec["force_dest_full"]
+        _run_dest_overlay = _dec["_run_dest_overlay"]
         self._destination_lifecycle_trace_TEMP(
             fn="_run_deferred_planning_refresh",
             reason=combined_reason,
@@ -7582,15 +8016,6 @@ class MainWindow(QMainWindow):
                     skip_full_destination=False,
                     non_incremental_reasons=violators,
                 )
-
-        _dest_tree = getattr(self, "destination_tree_widget", None)
-        _outer_dest_overlay = (
-            _dest_tree is not None
-            and ((not skip_full_destination_future_model) or force_dest_full)
-        )
-        _run_dest_overlay = bool(
-            _outer_dest_overlay and not self._destination_steady_state_full_materialize_redundant()
-        )
 
         _finalize_overlay_structural = False
         _vp_finalize_before = -1
