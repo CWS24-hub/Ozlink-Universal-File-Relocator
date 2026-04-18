@@ -85,11 +85,24 @@ def explorer_size_label(node_data: Dict[str, Any]) -> str:
     if not node_data or node_data.get("placeholder"):
         return ""
     if node_data.get("is_folder"):
+        tag = "folder"
+        if node_data.get("_explorer_size_lbl_tag") == tag and "_explorer_size_lbl_val" in node_data:
+            return str(node_data.get("_explorer_size_lbl_val") or "")
+        node_data["_explorer_size_lbl_tag"] = tag
+        node_data["_explorer_size_lbl_val"] = ""
         return ""
     size = node_data.get("size")
-    if isinstance(size, int) and size > 0:
-        return QLocale.system().formattedDataSize(size)
-    return ""
+    tag = f"n|{int(size)}" if isinstance(size, int) and size > 0 else "empty"
+    if node_data.get("_explorer_size_lbl_tag") == tag and "_explorer_size_lbl_val" in node_data:
+        return str(node_data.get("_explorer_size_lbl_val") or "")
+    if not isinstance(size, int) or size <= 0:
+        node_data["_explorer_size_lbl_tag"] = tag
+        node_data["_explorer_size_lbl_val"] = ""
+        return ""
+    out = QLocale.system().formattedDataSize(size)
+    node_data["_explorer_size_lbl_tag"] = tag
+    node_data["_explorer_size_lbl_val"] = out
+    return out
 
 
 def _explorer_type_label_cache_tag(node_data: Dict[str, Any]) -> str:
