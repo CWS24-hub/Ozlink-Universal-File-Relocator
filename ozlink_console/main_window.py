@@ -2965,6 +2965,8 @@ class MainWindow(QMainWindow):
         self._startup_memory_presentation_row_count: int = -1
         self._startup_memory_sync_present_ms: int = 0
         self._startup_memory_sync_expand_affordances_done: bool = False
+        # Foreground startup: lite unresolved-queue replay only; blocks heavy persisted replay entry.
+        self._startup_memory_minimal_replay_active: bool = False
         self._startup_background_refine_pending: dict[str, Any] | None = None
         self._destination_background_refine_paused_for_interaction: bool = False
         self._destination_snapshot_drain_deferred_for_scroll: bool = False
@@ -10458,6 +10460,8 @@ class MainWindow(QMainWindow):
         """Use folder-worker replay slice/parent budget for heavy full-materialize paths."""
         r = str(reason or "").strip()
         if r in {"folder_worker_success", "folder_load"}:
+            return True
+        if "startup_memory_minimal_replay" in r:
             return True
         return r.startswith("deferred_graph_ids_resolved")
 
@@ -39749,6 +39753,12 @@ class MainWindow(QMainWindow):
         return pairs
 
     def _apply_visible_destination_allocation_descendants(self, *, destination_expanded_paths=None):
+        if getattr(self, "_startup_memory_minimal_replay_active", False):
+            log_info(
+                "startup_memory_minimal_replay_heavy_path_blocked",
+                blocked="apply_visible_destination_allocation_descendants",
+            )
+            return 0
         tree = getattr(self, "destination_tree_widget", None)
         if tree is None:
             return 0
@@ -47964,6 +47974,66 @@ class MainWindow(QMainWindow):
             "visible_planned_enumeration_count": len(all_visible),
         }
 
+    def _startup_memory_minimal_replay_pass(self, ctx: str, reason: str) -> dict[str, Any]:
+        """Bounded foreground replay: unresolved proposed/allocation queues only (no full persisted replay).
+
+        Does not run :meth:`_apply_visible_destination_allocation_descendants`, materialize, or full overlay body.
+        Stops when :meth:`_startup_memory_full_workspace_audit_run` reports no missing persisted rows, or after a
+        fixed round cap (with stall detection).
+        """
+        c = str(ctx or "startup_planned_workspace_memory_truth")
+        r = str(reason or "")
+        mr_reason = f"{c}:startup_memory_minimal_replay"
+        raw_max = str(os.environ.get("OZLINK_STARTUP_MINIMAL_REPLAY_MAX_ROUNDS", "") or "").strip()
+        try:
+            max_rounds = max(8, min(512, int(raw_max))) if raw_max else 96
+        except ValueError:
+            max_rounds = 96
+        total_prop = 0
+        total_alloc = 0
+        self._startup_memory_minimal_replay_active = True
+        try:
+            stall = 0
+            replay_rounds_executed = 0
+            for round_i in range(max_rounds):
+                audit = self._startup_memory_full_workspace_audit_run()
+                miss_pl = int(audit.get("missing_visible_planned_rows", 0) or 0)
+                miss_pr = int(audit.get("missing_visible_proposed_folders", 0) or 0)
+                if miss_pl == 0 and miss_pr == 0:
+                    return {
+                        "complete": True,
+                        "rounds": int(replay_rounds_executed),
+                        "n_prop": int(total_prop),
+                        "n_alloc": int(total_alloc),
+                        "audit": audit,
+                    }
+                if round_i > 0 and round_i % 8 == 0:
+                    try:
+                        QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+                    except Exception:
+                        pass
+                n_prop = int(self._replay_unresolved_proposed_overlay(mr_reason, "") or 0)
+                n_alloc = int(self._replay_unresolved_allocation_overlay(mr_reason, "") or 0)
+                replay_rounds_executed += 1
+                total_prop += n_prop
+                total_alloc += n_alloc
+                if n_prop == 0 and n_alloc == 0:
+                    stall += 1
+                    if stall >= 3:
+                        break
+                else:
+                    stall = 0
+            audit_final = self._startup_memory_full_workspace_audit_run()
+            return {
+                "complete": False,
+                "rounds": int(replay_rounds_executed),
+                "n_prop": int(total_prop),
+                "n_alloc": int(total_alloc),
+                "audit": audit_final,
+            }
+        finally:
+            self._startup_memory_minimal_replay_active = False
+
     def _startup_memory_mark_saved_descendant_expand_affordances(self) -> None:
         """Folders with persisted rows strictly underneath must show an expand arrow before Graph/materialize."""
         model = getattr(self, "destination_planning_model", None)
@@ -48304,6 +48374,13 @@ class MainWindow(QMainWindow):
 
     def _destination_planning_overlay_replay_persisted_only(self, ctx: str, *, destination_expanded_paths: Optional[set[str]] = None) -> int:
         """Replay unresolved proposed/allocation queues + visible allocation descendants (no reconcile/hydrate)."""
+        if getattr(self, "_startup_memory_minimal_replay_active", False):
+            log_info(
+                "startup_memory_minimal_replay_heavy_path_blocked",
+                blocked="destination_planning_overlay_replay_persisted_only",
+                ctx=str(ctx or "")[:200],
+            )
+            return 0
         with self._destination_materialize_profile_span("lite_replay_unresolved_proposed_overlay"):
             n_prop = self._replay_unresolved_proposed_overlay(ctx, "")
         with self._destination_materialize_profile_span("lite_replay_unresolved_allocation_overlay"):
@@ -48396,8 +48473,9 @@ class MainWindow(QMainWindow):
         """Attach persisted planned/proposed/allocation overlays without full-tree gates or reconcile storms.
 
         **Foreground**: queue reset, prune, projection cancel, expanded-path closure for bind — fast path to
-        ``startup_memory_visible_tree_ready``. Heavy :meth:`_destination_planning_overlay_replay_persisted_only`
-        runs only after grace in :meth:`_maybe_start_startup_background_refine_after_grace` (not on UI thread hot path).
+        ``startup_memory_visible_tree_ready``. Bounded lite replay drains unresolved queues until the persisted
+        workspace is visible. Heavy :meth:`_destination_planning_overlay_replay_persisted_only` (including allocation
+        descendants apply) runs only after grace in :meth:`_maybe_start_startup_background_refine_after_grace`.
         """
         r = str(reason or "")
         self._startup_memory_planned_attach_skipped_log = []
@@ -48440,7 +48518,34 @@ class MainWindow(QMainWindow):
                 QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
             except Exception:
                 pass
-            n = 0
+            min_rep = self._startup_memory_minimal_replay_pass(ctx, r)
+            n = int(min_rep.get("n_prop", 0) or 0) + int(min_rep.get("n_alloc", 0) or 0)
+            audit_after = min_rep.get("audit") or self._startup_memory_full_workspace_audit_run()
+            miss_pl_a = int(audit_after.get("missing_visible_planned_rows", 0) or 0)
+            miss_pr_a = int(audit_after.get("missing_visible_proposed_folders", 0) or 0)
+            persisted_complete = miss_pl_a == 0 and miss_pr_a == 0
+            if persisted_complete:
+                log_info(
+                    "startup_memory_minimal_replay_complete",
+                    present_visible_planned_rows=int(audit_after.get("present_visible_planned_rows", 0) or 0),
+                    missing_visible_planned_rows=0,
+                    missing_visible_proposed_folders=0,
+                    minimal_replay_rounds=int(min_rep.get("rounds", 0) or 0),
+                    lite_overlay_rows=int(n),
+                )
+            else:
+                miss_paths: list[str] = []
+                miss_paths.extend(list(audit_after.get("missing_planned_paths") or [])[:48])
+                miss_paths.extend(list(audit_after.get("missing_proposed_paths") or [])[:32])
+                log_info(
+                    "startup_memory_incomplete_after_minimal_replay",
+                    reason=r[:200],
+                    missing_visible_planned_rows=int(miss_pl_a),
+                    missing_visible_proposed_folders=int(miss_pr_a),
+                    minimal_replay_rounds=int(min_rep.get("rounds", 0) or 0),
+                    lite_overlay_rows=int(n),
+                    missing=miss_paths[:64],
+                )
             _present_ms = int((time.perf_counter() - _t_pres) * 1000)
             self._startup_memory_sync_present_ms = int(_present_ms)
             ws_rows = -1
@@ -48453,23 +48558,26 @@ class MainWindow(QMainWindow):
                 "startup_memory_presenting_complete",
                 reason=r[:200],
                 elapsed_ms=int(_present_ms),
-                overlay_replay_rows=0,
-                note="persisted_replay_deferred_to_background",
+                overlay_replay_rows=int(n),
+                note="foreground_minimal_replay_then_heavy_persisted_replay_deferred_to_background",
                 expanded_path_closure_count=len(exp_bind),
             )
             log_info(
                 "startup_memory_workspace_fully_visible",
                 reason=r[:200],
                 workspace_visible_rows=int(ws_rows),
-                overlay_replay_rows=0,
+                overlay_replay_rows=int(n),
                 note="session_snapshot_and_queues_ready_persisted_replay_follows_background",
             )
             log_info(
                 "startup_memory_visible_tree_ready",
                 reason=r[:200],
-                overlay_replay_rows=0,
+                overlay_replay_rows=int(n),
                 expanded_path_closure_count=len(exp_bind),
                 deferred_background_refine_scheduled=True,
+                persisted_workspace_audit_complete=bool(persisted_complete),
+                missing_visible_planned_rows=int(miss_pl_a),
+                missing_visible_proposed_folders=int(miss_pr_a),
             )
             self._destination_startup_memory_phase = "memory_presented"
             # Saved workspace is visible; allow snapshot capture — background refine (audits) follows later.

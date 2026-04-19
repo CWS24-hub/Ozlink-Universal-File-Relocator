@@ -1,4 +1,5 @@
-"""Regression: startup memory-truth presents the memory-restored tree fast; persisted replay runs after grace."""
+"""Regression: startup memory-truth shows the full persisted workspace via bounded foreground minimal replay;
+full persisted replay (descendants apply, etc.) stays deferred until after grace."""
 
 from __future__ import annotations
 
@@ -38,6 +39,19 @@ def _minimal_mw_for_memory_truth_body():
     mw._destination_startup_memory_workspace_building = False
     mw._count_destination_model_non_placeholder_nodes = lambda: 120
     mw._destination_user_scroll_interaction_active = lambda: False
+    mw._startup_memory_full_workspace_audit_run = lambda: {
+        "expected_total_persisted_planned_rows": 24,
+        "expected_total_persisted_proposed_folders": 8,
+        "present_visible_planned_rows": 24,
+        "present_visible_proposed_folders": 8,
+        "missing_visible_planned_rows": 0,
+        "missing_visible_proposed_folders": 0,
+        "missing_planned_paths": [],
+        "missing_proposed_paths": [],
+        "visible_planned_enumeration_count": 32,
+    }
+    mw._replay_unresolved_proposed_overlay = lambda *a, **k: 0
+    mw._replay_unresolved_allocation_overlay = lambda *a, **k: 0
     return mw
 
 
@@ -361,3 +375,138 @@ def test_scroll_idle_resumes_descendant_and_clears_flag():
     MainWindow._destination_on_destination_tree_scroll_idle(mw)
     assert mw._destination_descendant_apply_deferred_for_scroll_resume is False
     assert sched == ["tick"]
+
+
+def test_minimal_replay_complete_log_before_visible_tree_ready():
+    """Persisted workspace audit is clean before ``startup_memory_visible_tree_ready`` when replay converges."""
+    mw = _minimal_mw_for_memory_truth_body()
+    audit_calls = [0]
+
+    def audit():
+        audit_calls[0] += 1
+        if audit_calls[0] == 1:
+            return {
+                "present_visible_planned_rows": 0,
+                "missing_visible_planned_rows": 2,
+                "missing_visible_proposed_folders": 0,
+                "missing_planned_paths": ["Root3\\Deep\\A\\Miss"],
+                "missing_proposed_paths": [],
+                "expected_total_persisted_planned_rows": 24,
+                "expected_total_persisted_proposed_folders": 8,
+                "present_visible_proposed_folders": 0,
+                "visible_planned_enumeration_count": 0,
+            }
+        return {
+            "present_visible_planned_rows": 24,
+            "missing_visible_planned_rows": 0,
+            "missing_visible_proposed_folders": 0,
+            "missing_planned_paths": [],
+            "missing_proposed_paths": [],
+            "expected_total_persisted_planned_rows": 24,
+            "expected_total_persisted_proposed_folders": 8,
+            "present_visible_proposed_folders": 8,
+            "visible_planned_enumeration_count": 32,
+        }
+
+    mw._startup_memory_full_workspace_audit_run = audit
+    seq: list[str] = []
+
+    def capture(msg: str, **_kwargs):
+        if isinstance(msg, str):
+            seq.append(msg)
+
+    with patch.dict(os.environ, {"OZLINK_STARTUP_BACKGROUND_REFINE_GRACE_MS": "120"}, clear=False):
+        with patch("ozlink_console.main_window.log_info", side_effect=capture):
+            with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
+                with _memory_truth_timer_queue() as drain:
+                    MainWindow._apply_destination_planning_overlays_body_memory_truth_startup(
+                        mw,
+                        "startup_planned_workspace_memory_truth",
+                    )
+                    assert seq.index("startup_memory_minimal_replay_complete") < seq.index(
+                        "startup_memory_visible_tree_ready"
+                    )
+                    drain()
+
+
+def test_foreground_no_allocation_descendants_apply_before_visible_tree_ready():
+    """Heavy allocation-descendants apply is not invoked during minimal foreground replay."""
+    mw = _minimal_mw_for_memory_truth_body()
+    mw._apply_visible_destination_allocation_descendants = MagicMock(return_value=0)
+    msgs: list[str] = []
+
+    def capture(msg: str, **_kwargs):
+        msgs.append(str(msg))
+
+    with patch.dict(os.environ, {"OZLINK_STARTUP_BACKGROUND_REFINE_GRACE_MS": "120"}, clear=False):
+        with patch("ozlink_console.main_window.log_info", side_effect=capture):
+            with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
+                with _memory_truth_timer_queue() as drain:
+                    MainWindow._apply_destination_planning_overlays_body_memory_truth_startup(
+                        mw,
+                        "startup_planned_workspace_memory_truth",
+                    )
+                    vis = msgs.index("startup_memory_visible_tree_ready")
+                    for i in range(vis):
+                        assert "materialize_destination_future_model" not in msgs[i]
+                    assert mw._apply_visible_destination_allocation_descendants.call_count == 0
+                    drain()
+
+
+def test_heavy_persisted_replay_blocked_while_minimal_replay_flag_active():
+    """Guard B: full persisted replay cannot run during the minimal-replay critical section."""
+    mw = MainWindow.__new__(MainWindow)
+    mw._startup_memory_minimal_replay_active = True
+    logged: list[str] = []
+
+    def cap(msg: str, **_k):
+        logged.append(str(msg))
+
+    with patch("ozlink_console.main_window.log_info", side_effect=cap):
+        n = MainWindow._destination_planning_overlay_replay_persisted_only(mw, "ctx")
+    assert n == 0
+    assert "startup_memory_minimal_replay_heavy_path_blocked" in logged
+
+
+def test_minimal_replay_stalls_within_bounded_rounds():
+    """Minimal replay does not spin unbounded when unresolved replay makes no progress."""
+    mw = _minimal_mw_for_memory_truth_body()
+    mw._startup_memory_full_workspace_audit_run = lambda: {
+        "present_visible_planned_rows": 0,
+        "missing_visible_planned_rows": 5,
+        "missing_visible_proposed_folders": 1,
+        "missing_planned_paths": ["a"],
+        "missing_proposed_paths": ["b"],
+        "expected_total_persisted_planned_rows": 24,
+        "expected_total_persisted_proposed_folders": 8,
+        "present_visible_proposed_folders": 0,
+        "visible_planned_enumeration_count": 0,
+    }
+    prop_calls = [0]
+    alloc_calls = [0]
+
+    def c_prop(*_a, **_k):
+        prop_calls[0] += 1
+        return 0
+
+    def c_alloc(*_a, **_k):
+        alloc_calls[0] += 1
+        return 0
+
+    mw._replay_unresolved_proposed_overlay = c_prop
+    mw._replay_unresolved_allocation_overlay = c_alloc
+
+    with patch.dict(
+        os.environ,
+        {"OZLINK_STARTUP_BACKGROUND_REFINE_GRACE_MS": "120", "OZLINK_STARTUP_MINIMAL_REPLAY_MAX_ROUNDS": "96"},
+        clear=False,
+    ):
+        with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
+            with _memory_truth_timer_queue() as drain:
+                MainWindow._apply_destination_planning_overlays_body_memory_truth_startup(
+                    mw,
+                    "startup_planned_workspace_memory_truth",
+                )
+                drain()
+    assert prop_calls[0] == 3
+    assert alloc_calls[0] == 3
