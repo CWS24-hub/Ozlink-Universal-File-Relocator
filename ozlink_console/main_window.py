@@ -2967,8 +2967,10 @@ class MainWindow(QMainWindow):
         self._startup_memory_sync_expand_affordances_done: bool = False
         # Foreground startup: lite unresolved-queue replay only; blocks heavy persisted replay entry.
         self._startup_memory_minimal_replay_active: bool = False
-        # During minimal replay only: lift worker slice/parent budgets in unresolved overlay replay (not materialize).
+        # Tests / explicit opt-in only: never set during foreground minimal replay (that path must stay bounded).
         self._startup_memory_replay_unbounded: bool = False
+        # False only while startup memory-truth is binding the visible tree before ``startup_memory_visible_tree_ready``.
+        self._startup_memory_interactive_ready: bool = True
         self._startup_background_refine_pending: dict[str, Any] | None = None
         self._destination_background_refine_paused_for_interaction: bool = False
         self._destination_snapshot_drain_deferred_for_scroll: bool = False
@@ -48127,27 +48129,100 @@ class MainWindow(QMainWindow):
 
         return int(paths_seeded), int(prefixes_added)
 
+    def _destination_full_tree_authority_walk_in_progress(self) -> bool:
+        """True while the SharePoint full-library walk worker is still running (authority graph incomplete)."""
+        w = getattr(self, "_destination_full_tree_worker", None)
+        if w is None:
+            return False
+        try:
+            return bool(w.isRunning())
+        except Exception:
+            return False
+
+    def _startup_memory_minimal_replay_progress_snapshot(self, audit: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Workspace missing counts come from ``audit`` when provided (same round as loop header) to avoid extra audit passes."""
+        if audit is None:
+            audit = self._startup_memory_full_workspace_audit_run()
+        try:
+            vis_future = int(self._count_visible_destination_future_state_nodes() or 0)
+        except Exception:
+            vis_future = -1
+        return {
+            "unresolved_parent_groups_proposed": len(getattr(self, "unresolved_proposed_by_parent_path", None) or {}),
+            "unresolved_parent_groups_allocation": len(
+                getattr(self, "unresolved_allocations_by_parent_path", None) or {}
+            ),
+            "unresolved_proposed_queue": int(self._unresolved_proposed_queue_size() or 0),
+            "unresolved_allocation_queue": int(self._unresolved_allocation_queue_size() or 0),
+            "missing_visible_planned_rows": int(audit.get("missing_visible_planned_rows", 0) or 0),
+            "missing_visible_proposed_folders": int(audit.get("missing_visible_proposed_folders", 0) or 0),
+            "visible_future_branch_count": vis_future,
+        }
+
+    def _startup_memory_minimal_replay_meaningful_progress(
+        self, before: dict[str, Any], after: dict[str, Any]
+    ) -> bool:
+        if not before or not after:
+            return False
+        try:
+            if int(after["unresolved_parent_groups_proposed"]) < int(before["unresolved_parent_groups_proposed"]):
+                return True
+            if int(after["unresolved_parent_groups_allocation"]) < int(before["unresolved_parent_groups_allocation"]):
+                return True
+            if int(after["unresolved_proposed_queue"]) < int(before["unresolved_proposed_queue"]):
+                return True
+            if int(after["unresolved_allocation_queue"]) < int(before["unresolved_allocation_queue"]):
+                return True
+            if int(after["missing_visible_planned_rows"]) < int(before["missing_visible_planned_rows"]):
+                return True
+            if int(after["missing_visible_proposed_folders"]) < int(before["missing_visible_proposed_folders"]):
+                return True
+            vf_b = int(before.get("visible_future_branch_count", -1) or -1)
+            vf_a = int(after.get("visible_future_branch_count", -1) or -1)
+            if vf_b >= 0 and vf_a > vf_b:
+                return True
+        except Exception:
+            return False
+        return False
+
     def _startup_memory_minimal_replay_pass(self, ctx: str, reason: str) -> dict[str, Any]:
         """Bounded foreground replay: unresolved proposed/allocation queues only (no full persisted replay).
 
         Does not run :meth:`_apply_visible_destination_allocation_descendants`, materialize, or full overlay body.
         Exits when the full-workspace audit is clean, when both unresolved queues are empty (no replay work left),
-        or when ``max_rounds`` is reached. Zero overlay progress in a round does not imply completion — replay may
-        return 0 while queues still hold unresolved entries (time/budget slices).
+        when a round makes no **meaningful** progress (metrics unchanged — remainder deferred to background), or when
+        ``max_rounds`` is reached. Never uses the unbounded replay slice (120s / huge parent budgets) on the
+        startup critical path.
         """
         c = str(ctx or "startup_planned_workspace_memory_truth")
         r = str(reason or "")
         mr_reason = f"{c}:startup_memory_minimal_replay"
         raw_max = str(os.environ.get("OZLINK_STARTUP_MINIMAL_REPLAY_MAX_ROUNDS", "") or "").strip()
         try:
-            max_rounds = max(1, min(512, int(raw_max))) if raw_max else 96
+            max_rounds = max(1, min(512, int(raw_max))) if raw_max else 1
         except ValueError:
-            max_rounds = 96
+            max_rounds = 1
+        if self._destination_full_tree_authority_walk_in_progress():
+            max_rounds = min(int(max_rounds), 1)
         total_prop = 0
         total_alloc = 0
         self._startup_memory_minimal_replay_active = True
-        self._startup_memory_replay_unbounded = True
         try:
+            _ft_busy = self._destination_full_tree_authority_walk_in_progress()
+            log_info(
+                "startup_foreground_overlay_blocked",
+                note="startup_memory_minimal_replay_critical_section",
+                max_rounds_cap=int(max_rounds),
+                full_tree_authority_walk_in_progress=bool(_ft_busy),
+                unresolved_proposed_parents=int(
+                    len(getattr(self, "unresolved_proposed_by_parent_path", None) or {})
+                ),
+                unresolved_allocation_parents=int(
+                    len(getattr(self, "unresolved_allocations_by_parent_path", None) or {})
+                ),
+                unresolved_proposed_queue=int(self._unresolved_proposed_queue_size() or 0),
+                unresolved_allocation_queue=int(self._unresolved_allocation_queue_size() or 0),
+            )
             replay_rounds_executed = 0
             for round_i in range(max_rounds):
                 audit = self._startup_memory_full_workspace_audit_run()
@@ -48208,6 +48283,7 @@ class MainWindow(QMainWindow):
                         QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
                     except Exception:
                         pass
+                snap_pre = self._startup_memory_minimal_replay_progress_snapshot(audit)
                 n_prop = int(self._replay_unresolved_proposed_overlay(mr_reason, "") or 0)
                 n_alloc = int(self._replay_unresolved_allocation_overlay(mr_reason, "") or 0)
                 replay_rounds_executed += 1
@@ -48215,6 +48291,7 @@ class MainWindow(QMainWindow):
                 total_alloc += n_alloc
                 qp_after = int(self._unresolved_proposed_queue_size() or 0)
                 qa_after = int(self._unresolved_allocation_queue_size() or 0)
+                snap_post = self._startup_memory_minimal_replay_progress_snapshot()
                 log_info(
                     "startup_memory_minimal_replay_progress",
                     round=int(round_i),
@@ -48226,6 +48303,42 @@ class MainWindow(QMainWindow):
                     unresolved_proposed_queue=int(qp_after),
                     unresolved_allocation_queue=int(qa_after),
                 )
+                if not self._startup_memory_minimal_replay_meaningful_progress(snap_pre, snap_post):
+                    log_info(
+                        "startup_foreground_replay_stopped_no_meaningful_progress",
+                        round=int(round_i),
+                        snapshot_before=snap_pre,
+                        snapshot_after=snap_post,
+                        full_tree_authority_walk_in_progress=bool(
+                            self._destination_full_tree_authority_walk_in_progress()
+                        ),
+                    )
+                    log_info(
+                        "startup_replay_deferred_until_interactive",
+                        round=int(round_i),
+                        unresolved_proposed_parents=int(
+                            len(getattr(self, "unresolved_proposed_by_parent_path", None) or {})
+                        ),
+                        unresolved_allocation_parents=int(
+                            len(getattr(self, "unresolved_allocations_by_parent_path", None) or {})
+                        ),
+                        unresolved_proposed_queue=int(self._unresolved_proposed_queue_size() or 0),
+                        unresolved_allocation_queue=int(self._unresolved_allocation_queue_size() or 0),
+                        missing_visible_planned_rows=int(snap_post.get("missing_visible_planned_rows", 0) or 0),
+                        missing_visible_proposed_folders=int(snap_post.get("missing_visible_proposed_folders", 0) or 0),
+                        full_tree_authority_walk_in_progress=bool(
+                            self._destination_full_tree_authority_walk_in_progress()
+                        ),
+                    )
+                    audit_stop = self._startup_memory_full_workspace_audit_run()
+                    return {
+                        "complete": False,
+                        "exit_reason": "no_meaningful_progress",
+                        "rounds": int(replay_rounds_executed),
+                        "n_prop": int(total_prop),
+                        "n_alloc": int(total_alloc),
+                        "audit": audit_stop,
+                    }
             audit_final = self._startup_memory_full_workspace_audit_run()
             log_info(
                 "startup_memory_minimal_replay_exit_reason",
@@ -48245,7 +48358,6 @@ class MainWindow(QMainWindow):
             }
         finally:
             self._startup_memory_minimal_replay_active = False
-            self._startup_memory_replay_unbounded = False
 
     def _startup_memory_mark_saved_descendant_expand_affordances(self) -> None:
         """Folders with persisted rows strictly underneath must show an expand arrow before Graph/materialize."""
@@ -48706,6 +48818,7 @@ class MainWindow(QMainWindow):
             planned_moves_count=len(self.planned_moves or []),
             proposed_folders_count=len(self.proposed_folders or []),
         )
+        self._startup_memory_interactive_ready = False
         self._destination_startup_memory_phase = "memory_presenting"
         self._startup_memory_presentation_wall_t0 = float(_t_pres)
         self._startup_memory_planned_attach_active = True
@@ -48782,6 +48895,7 @@ class MainWindow(QMainWindow):
                 overlay_replay_rows=int(n),
                 note="session_snapshot_and_queues_ready_persisted_replay_follows_background",
             )
+            self._startup_memory_interactive_ready = True
             log_info(
                 "startup_memory_visible_tree_ready",
                 reason=r[:200],
@@ -52458,6 +52572,20 @@ class MainWindow(QMainWindow):
         return len(ordered_paths)
 
     def _schedule_destination_restore_materialization_queue(self, reason, trigger_path="", delay_ms=None):
+        rsn = str(reason or "")
+        if not getattr(self, "_startup_memory_interactive_ready", True) and rsn == "replay_budget":
+            log_info(
+                "startup_overlay_heavy_work_deferred",
+                reason=rsn[:80],
+                trigger_path_excerpt=str(self.normalize_memory_path(trigger_path))[:240],
+                unresolved_proposed_queue=int(self._unresolved_proposed_queue_size() or 0),
+                unresolved_allocation_queue=int(self._unresolved_allocation_queue_size() or 0),
+                full_tree_authority_walk_in_progress=bool(
+                    self._destination_full_tree_authority_walk_in_progress()
+                ),
+                note="restore_materialization_queue_replay_budget",
+            )
+            return
         delay = self._restore_queue_tick_delay_ms if delay_ms is None else max(0, int(delay_ms))
         QTimer.singleShot(
             delay,
@@ -52539,6 +52667,25 @@ class MainWindow(QMainWindow):
         backoff_reason: str = "budget_suppression",
     ) -> None:
         if int(remaining_queue_size or 0) <= 0:
+            return
+        if not getattr(self, "_startup_memory_interactive_ready", True):
+            log_info(
+                "startup_replay_deferred_until_interactive",
+                replay_kind=str(replay_kind or "")[:20],
+                remaining_queue_size=int(remaining_queue_size),
+                backoff_reason=str(backoff_reason or "")[:80],
+                trigger_path_excerpt=str(self.normalize_memory_path(trigger_path))[:240],
+                unresolved_proposed_parents=int(
+                    len(getattr(self, "unresolved_proposed_by_parent_path", None) or {})
+                ),
+                unresolved_allocation_parents=int(
+                    len(getattr(self, "unresolved_allocations_by_parent_path", None) or {})
+                ),
+                full_tree_authority_walk_in_progress=bool(
+                    self._destination_full_tree_authority_walk_in_progress()
+                ),
+                note="replay_budget_resume_foreground_blocked",
+            )
             return
         rk = str(replay_kind or "").strip().lower()
         if rk not in ("proposed", "allocation"):
@@ -52802,6 +52949,8 @@ class MainWindow(QMainWindow):
             slice_timer.start()
 
             startup_replay_unbounded = bool(getattr(self, "_startup_memory_replay_unbounded", False))
+            if getattr(self, "_startup_memory_minimal_replay_active", False):
+                startup_replay_unbounded = False
             if startup_replay_unbounded:
                 log_info(
                     "startup_memory_replay_unbounded_mode_enabled",
@@ -53058,6 +53207,8 @@ class MainWindow(QMainWindow):
             slice_timer.start()
 
             startup_replay_unbounded = bool(getattr(self, "_startup_memory_replay_unbounded", False))
+            if getattr(self, "_startup_memory_minimal_replay_active", False):
+                startup_replay_unbounded = False
             if startup_replay_unbounded:
                 log_info(
                     "startup_memory_replay_unbounded_mode_enabled",

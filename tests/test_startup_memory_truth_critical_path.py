@@ -56,6 +56,7 @@ def _minimal_mw_for_memory_truth_body():
     }
     mw._replay_unresolved_proposed_overlay = lambda *a, **k: 0
     mw._replay_unresolved_allocation_overlay = lambda *a, **k: 0
+    mw._count_visible_destination_future_state_nodes = lambda: 0
     return mw
 
 
@@ -413,8 +414,24 @@ def test_minimal_replay_complete_log_before_visible_tree_ready():
         }
 
     mw._startup_memory_full_workspace_audit_run = audit
-    mw._unresolved_proposed_queue_size = lambda: 1
-    mw._unresolved_allocation_queue_size = lambda: 1
+    _qs = {"qp": 1, "qa": 1}
+
+    def _q_prop():
+        return int(_qs["qp"])
+
+    def _q_alloc():
+        return int(_qs["qa"])
+
+    mw._unresolved_proposed_queue_size = _q_prop
+    mw._unresolved_allocation_queue_size = _q_alloc
+
+    def _drain_replay_prop(*_a, **_k):
+        _qs["qp"] = 0
+        _qs["qa"] = 0
+        return 1
+
+    mw._replay_unresolved_proposed_overlay = _drain_replay_prop
+    mw._replay_unresolved_allocation_overlay = lambda *_a, **_k: 0
     seq: list[str] = []
 
     def capture(msg: str, **_kwargs):
@@ -493,14 +510,20 @@ def test_minimal_replay_runs_until_max_rounds_when_queues_still_nonempty():
     prop_calls = [0]
     alloc_calls = [0]
 
+    _st = {"qp": 8, "qa": 8}
+
     def c_prop(*_a, **_k):
         prop_calls[0] += 1
+        _st["qp"] = max(0, int(_st["qp"]) - 1)
         return 0
 
     def c_alloc(*_a, **_k):
         alloc_calls[0] += 1
+        _st["qa"] = max(0, int(_st["qa"]) - 1)
         return 0
 
+    mw._unresolved_proposed_queue_size = lambda: int(_st["qp"])
+    mw._unresolved_allocation_queue_size = lambda: int(_st["qa"])
     mw._replay_unresolved_proposed_overlay = c_prop
     mw._replay_unresolved_allocation_overlay = c_alloc
 
@@ -601,8 +624,17 @@ def test_workspace_audit_missing_zero_before_visible_tree_ready_when_converged()
         }
 
     mw._startup_memory_full_workspace_audit_run = audit
-    mw._unresolved_proposed_queue_size = lambda: 1
-    mw._unresolved_allocation_queue_size = lambda: 1
+    _qs = {"qp": 1, "qa": 1}
+
+    def _drain_prop(*_a, **_k):
+        _qs["qp"] = 0
+        _qs["qa"] = 0
+        return 1
+
+    mw._unresolved_proposed_queue_size = lambda: int(_qs["qp"])
+    mw._unresolved_allocation_queue_size = lambda: int(_qs["qa"])
+    mw._replay_unresolved_proposed_overlay = _drain_prop
+    mw._replay_unresolved_allocation_overlay = lambda *_a, **_k: 0
     vis_kw: dict = {}
 
     def cap(msg: str, **kwargs):
@@ -778,8 +810,20 @@ def test_minimal_replay_logs_progress_each_round_when_replay_runs():
         "present_visible_proposed_folders": 0,
         "visible_planned_enumeration_count": 0,
     }
-    mw._unresolved_proposed_queue_size = lambda: 1
-    mw._unresolved_allocation_queue_size = lambda: 1
+    _st = {"qp": 10, "qa": 10}
+
+    def _dec_prop(*_a, **_k):
+        _st["qp"] = max(0, int(_st["qp"]) - 1)
+        return 0
+
+    def _dec_alloc(*_a, **_k):
+        _st["qa"] = max(0, int(_st["qa"]) - 1)
+        return 0
+
+    mw._unresolved_proposed_queue_size = lambda: int(_st["qp"])
+    mw._unresolved_allocation_queue_size = lambda: int(_st["qa"])
+    mw._replay_unresolved_proposed_overlay = _dec_prop
+    mw._replay_unresolved_allocation_overlay = _dec_alloc
     progress: list[str] = []
     exits: list[str] = []
 
