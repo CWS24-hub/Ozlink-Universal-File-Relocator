@@ -29,8 +29,31 @@ _LOCAL_FIRST_EDIT_PREFIX = "local_first_edit_"
 _LOCAL_FIRST_DEFERRED_MATERIALIZE_REASONS: frozenset[str] = frozenset(
     (
         "planned_item_moved",
+        "planned_item_moved_manual_drag",
+        "planned_item_moved_paste_quick",
     )
 )
+
+# Deferred planning refresh / idle overlay may prefix reasons with ``deferred_`` (e.g. combined refresh).
+_NARROW_PLANNED_ITEM_MOVE_OVERLAY_REASONS: frozenset[str] = frozenset(
+    (
+        "planned_item_moved",
+        "planned_item_moved_manual_drag",
+        "planned_item_moved_paste_quick",
+    )
+)
+
+
+def _strip_deferred_planning_reason_prefix(reason: str) -> str:
+    r = str(reason or "").strip()
+    if r.startswith("deferred_"):
+        return r[len("deferred_") :]
+    return r
+
+
+def is_narrow_planned_item_move_overlay_reason(reason: str) -> bool:
+    """True for planned-move follow-ups that must use narrow replay, not full destination materialize."""
+    return _strip_deferred_planning_reason_prefix(reason) in _NARROW_PLANNED_ITEM_MOVE_OVERLAY_REASONS
 
 
 def is_local_first_deferred_materialize_reason(reason: str) -> bool:
@@ -40,7 +63,7 @@ def is_local_first_deferred_materialize_reason(reason: str) -> bool:
     including: rename, assign, unassign, retarget, cut/paste, proposed folder create/remove — use
     ``local_first_edit_<action>`` when scheduling deferred overlay.
     """
-    r = str(reason or "").strip()
+    r = _strip_deferred_planning_reason_prefix(reason)
     if r in _LOCAL_FIRST_DEFERRED_MATERIALIZE_REASONS:
         return True
     if r.startswith(_LOCAL_FIRST_EDIT_PREFIX):

@@ -7493,20 +7493,30 @@ class MainWindow(QMainWindow):
 
     def _deferred_planning_refresh_compute_skip_full_and_overlay_decision(self, reasons, combined_reason):
         """Shared skip/overlay flags for deferred planning refresh (inner + graph_ids chunk driver)."""
+        _manual_drag_only = (
+            len(reasons) == 1
+            and bool(reasons)
+            and str(reasons[0] or "") == "planned_item_moved_manual_drag"
+        )
         skip_full_destination_future_model = (
             len(reasons) == 1
             and bool(reasons)
             and reasons[0] in _INCREMENTAL_DEFERRED_PLANNING_REFRESH_REASONS
         )
+        if _manual_drag_only:
+            skip_full_destination_future_model = True
         if reasons == ["graph_ids_resolved_from_sharepoint_paths"]:
             skip_full_destination_future_model = True
         force_dest_full = bool(getattr(self, "_destination_require_deferred_full_materialize_once", False))
-        if force_dest_full:
+        if _manual_drag_only:
+            force_dest_full = False
+            skip_full_destination_future_model = True
+        elif force_dest_full:
             skip_full_destination_future_model = False
         overlay_backlog = int(self._unresolved_proposed_queue_size() or 0) + int(
             self._unresolved_allocation_queue_size() or 0
         )
-        if overlay_backlog > 0:
+        if overlay_backlog > 0 and not _manual_drag_only:
             skip_full_destination_future_model = False
             if is_dev_mode():
                 log_info(
@@ -8063,6 +8073,13 @@ class MainWindow(QMainWindow):
         skip_full_destination_future_model = _dec["skip_full_destination_future_model"]
         force_dest_full = _dec["force_dest_full"]
         _run_dest_overlay = _dec["_run_dest_overlay"]
+        if reasons == ["planned_item_moved_manual_drag"]:
+            log_info(
+                "drag_move_finalize_narrow_path_enforced",
+                combined_reason=str(combined_reason)[:220],
+                skip_full_destination_future_model=bool(skip_full_destination_future_model),
+                run_destination_overlay=bool(_run_dest_overlay),
+            )
         self._destination_lifecycle_trace_TEMP(
             fn="_run_deferred_planning_refresh",
             reason=combined_reason,
@@ -16809,9 +16826,10 @@ class MainWindow(QMainWindow):
         else:
             self._destination_bind_scope_paths = None
         _allow_defer = planning_interaction_contract.is_local_first_deferred_materialize_reason(reason)
+        _pref_chunk = not planning_interaction_contract.is_narrow_planned_item_move_overlay_reason(reason)
         try:
             applied_count = self._apply_destination_planning_overlays(
-                reason, allow_defer=_allow_defer, prefer_chunked_projection=True
+                reason, allow_defer=_allow_defer, prefer_chunked_projection=_pref_chunk
             )
         finally:
             self._destination_bind_scope_paths = None
@@ -17935,6 +17953,31 @@ class MainWindow(QMainWindow):
         if len(segments) <= 1:
             return ""
         return "\\".join(segments[:-1])
+
+    def _destination_drag_move_narrow_bind_scope_paths(
+        self,
+        *,
+        old_proj: str,
+        new_proj: str,
+        target_path: str,
+        current_projection_path: str,
+        target_projection_path: str,
+    ) -> set[str]:
+        """Endpoints plus immediate parents only — local-first manual drag idle follow-up bind scope."""
+        s: set[str] = set()
+        for _p in (old_proj, new_proj, target_path, current_projection_path, target_projection_path):
+            raw = str(_p or "").strip()
+            if not raw:
+                continue
+            _c = self._canonical_destination_projection_path(raw) or self.normalize_memory_path(raw)
+            if _c:
+                s.add(_c)
+                pp = self._destination_parent_path(_c)
+                if pp:
+                    pc = self._canonical_destination_projection_path(pp) or self.normalize_memory_path(str(pp).strip())
+                    if pc:
+                        s.add(pc)
+        return s
 
     def _show_proposed_path_builder_dialog(self, base_path):
         dialog = QDialog(self)
@@ -48106,6 +48149,14 @@ class MainWindow(QMainWindow):
     ):
         """Narrow overlay replay for user edits (bind-scoped); avoids full materialize gates."""
         r = str(reason or "")
+        _drag_delta = "planned_item_moved_manual_drag" in r
+        _vp_before = -1
+        if _drag_delta:
+            try:
+                _vp0, _ = self._destination_enumerate_visible_planned_paths_and_all_visible()
+                _vp_before = len(_vp0)
+            except Exception:
+                _vp_before = -1
         self._destination_planned_chain_overlay_relax = True
         try:
             self._cancel_destination_future_async_projection(r or "local_first_edit")
@@ -48114,6 +48165,16 @@ class MainWindow(QMainWindow):
                 phase="local_first_edit",
                 first_render_path=str(r)[:120],
             )
+            if _drag_delta and _vp_before >= 0:
+                try:
+                    _vp1, _ = self._destination_enumerate_visible_planned_paths_and_all_visible()
+                    log_info(
+                        "drag_move_visible_planned_delta",
+                        before=int(_vp_before),
+                        after=int(len(_vp1)),
+                    )
+                except Exception:
+                    pass
             log_info("local_first_edit_overlay_pass_complete", reason=r[:200], overlay_replay_rows=int(n))
             return int(n)
         finally:
@@ -48222,6 +48283,21 @@ class MainWindow(QMainWindow):
                 reason,
                 allow_defer=allow_defer,
                 prefer_chunked_projection=prefer_chunked_projection,
+                narrow_restore_real_snapshot=narrow_restore_real_snapshot,
+                force_authoritative_bind=force_authoritative_bind,
+            )
+        if planning_interaction_contract.is_narrow_planned_item_move_overlay_reason(str(reason or "")):
+            _rn = str(reason or "")
+            _base = (
+                _rn[len("deferred_") :]
+                if _rn.startswith("deferred_")
+                else _rn
+            )
+            log_info("drag_move_full_materialize_blocked", reason=_base[:220])
+            return self._apply_destination_planning_overlays_body_local_first_edit(
+                f"local_first_edit_{_base}",
+                allow_defer=allow_defer,
+                prefer_chunked_projection=False,
                 narrow_restore_real_snapshot=narrow_restore_real_snapshot,
                 force_authoritative_bind=force_authoritative_bind,
             )
@@ -58842,6 +58918,25 @@ class MainWindow(QMainWindow):
                     _deferred_paths = frozenset()
                 elif _norm_paths:
                     _deferred_paths = frozenset(_norm_paths)
+                if incremental_kind == "manual":
+                    _drag_scope = self._destination_drag_move_narrow_bind_scope_paths(
+                        old_proj=str(old_proj or ""),
+                        new_proj=str(new_proj or ""),
+                        target_path=str(target_path or ""),
+                        current_projection_path=str(current_projection_path or ""),
+                        target_projection_path=str(target_projection_path or ""),
+                    )
+                    self._destination_planned_move_materialize_bind_scope = _drag_scope or None
+                    log_info(
+                        "drag_move_local_first_applied",
+                        path_from=str(old_proj or "")[:400],
+                        path_to=str(new_proj or "")[:400],
+                    )
+                    log_info(
+                        "drag_move_narrow_followup_scheduled",
+                        scope_paths=sorted(_drag_scope)[:64],
+                        reason="planned_item_moved_manual_drag",
+                    )
                 self._persist_planning_change_lightweight(
                     planning_refresh_reason=planning_refresh_reason,
                     deferred_source_projection_paths=_deferred_paths,
@@ -58877,11 +58972,32 @@ class MainWindow(QMainWindow):
         _moved_narrow = self._expand_source_projection_paths_with_parents(
             self._collect_source_projection_paths_for_move_networks(move, rewritten_related)
         )
-        _pm_scope: set[str] = set()
-        for _p in (old_proj, new_proj, target_path, current_projection_path, target_projection_path):
-            _c = self._canonical_destination_projection_path(str(_p or "")) or self.normalize_memory_path(str(_p or "").strip())
-            if _c:
-                _pm_scope.add(_c)
+        if from_manual_planning_drag:
+            _pm_scope = self._destination_drag_move_narrow_bind_scope_paths(
+                old_proj=str(old_proj or ""),
+                new_proj=str(new_proj or ""),
+                target_path=str(target_path or ""),
+                current_projection_path=str(current_projection_path or ""),
+                target_projection_path=str(target_projection_path or ""),
+            )
+            log_info(
+                "drag_move_local_first_applied",
+                path_from=str(old_proj or "")[:400],
+                path_to=str(new_proj or "")[:400],
+            )
+            log_info(
+                "drag_move_narrow_followup_scheduled",
+                scope_paths=sorted(_pm_scope)[:64],
+                reason="planned_item_moved_manual_drag",
+            )
+        else:
+            _pm_scope = set()
+            for _p in (old_proj, new_proj, target_path, current_projection_path, target_projection_path):
+                _c = self._canonical_destination_projection_path(str(_p or "")) or self.normalize_memory_path(
+                    str(_p or "").strip()
+                )
+                if _c:
+                    _pm_scope.add(_c)
         self._destination_planned_move_materialize_bind_scope = _pm_scope or None
         self._schedule_deferred_destination_materialization("planned_item_moved", delay_ms=220)
         self._persist_planning_change("planned_item_moved", source_projection_paths=_moved_narrow)
