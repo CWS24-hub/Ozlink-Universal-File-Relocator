@@ -2957,6 +2957,8 @@ class MainWindow(QMainWindow):
         self._destination_snapshot_mount_drive_id: str = ""
         # Tracks which destination drive promoted semantic paths belong to (cleared on library change).
         self._destination_startup_promotion_scope_drive_id: str = ""
+        # While memory-truth startup is still attaching / deferred refinement — coalesce forced live snapshot churn.
+        self._destination_startup_memory_workspace_building: bool = False
         # After first Graph root bind merge (or shallow reset) for destination — overlay teardown may run.
         self._destination_startup_snapshot_preservation_applied: bool = False
         # SharePoint source: recursive session snapshot mounted before Graph root bind (Phase 1 shell).
@@ -10084,6 +10086,14 @@ class MainWindow(QMainWindow):
         Uses force-live only while :attr:`_destination_save_in_progress` or shutdown so startup restore paths
         never block the UI thread on a full model walk.
         """
+        if getattr(self, "_destination_startup_memory_workspace_building", False) and not getattr(
+            self, "_application_shutting_down", False
+        ):
+            log_info("startup_snapshot_capture_deferred", reason="startup_memory_tree_still_building")
+            rs = getattr(self, "_runtime_session_tree_snapshots", None)
+            if isinstance(rs, dict) and isinstance(rs.get("destination"), list):
+                return list(rs["destination"])
+            return []
         if not self._destination_force_live_snapshot_allowed():
             rs = getattr(self, "_runtime_session_tree_snapshots", None)
             if isinstance(rs, dict) and isinstance(rs.get("destination"), list):
@@ -10155,7 +10165,13 @@ class MainWindow(QMainWindow):
             and getattr(self, "_destination_tree_snapshot_dirty_for_persist", False)
             and hasattr(self, "source_tree_widget")
         ):
-            if getattr(self, "_destination_descendant_apply_tick_running", False):
+            if getattr(self, "_destination_startup_memory_workspace_building", False):
+                log_info(
+                    "startup_snapshot_capture_deferred",
+                    reason="startup_memory_tree_still_building",
+                    context="draft_shell_partial_refresh",
+                )
+            elif getattr(self, "_destination_descendant_apply_tick_running", False):
                 log_info(
                     "destination_snapshot_saved_from_stale_cache",
                     context="draft_shell_partial_refresh_deferred_tick",
@@ -26899,7 +26915,7 @@ class MainWindow(QMainWindow):
             self._apply_destination_planning_overlays(
                 "startup_planned_workspace_memory_truth",
                 allow_defer=True,
-                prefer_chunked_projection=True,
+                prefer_chunked_projection=False,
             )
         except Exception as exc:
             self._log_restore_exception("startup_planned_workspace_memory_truth", exc)
@@ -38950,6 +38966,32 @@ class MainWindow(QMainWindow):
                 self._destination_maybe_log_startup_descendant_queue_completed()
             except Exception:
                 pass
+            try:
+                self._destination_maybe_clear_stale_descendant_apply_state_if_idle()
+            except Exception:
+                pass
+
+    def _destination_maybe_clear_stale_descendant_apply_state_if_idle(self) -> None:
+        """Clear orphaned active apply state when queues are drained and no graph walk is in progress."""
+        if getattr(self, "_destination_descendant_apply_tick_running", False):
+            return
+        st = getattr(self, "_destination_descendant_apply_state", None)
+        if st is None:
+            return
+        dq = getattr(self, "_destination_descendant_apply_queue", None)
+        if dq and len(dq) > 0:
+            return
+        if int(self._unresolved_proposed_queue_size() or 0) > 0:
+            return
+        if int(self._unresolved_allocation_queue_size() or 0) > 0:
+            return
+        if isinstance(st, dict) and st.get("graph_walk"):
+            return
+        log_info(
+            "destination_descendant_apply_state_cleared_stale_active",
+            reason="queues_drained_no_real_active_work",
+        )
+        self._destination_descendant_apply_state = None
 
     def _run_destination_descendant_apply_tick_body(self) -> None:
         st_gate = getattr(self, "_destination_descendant_apply_state", None)
@@ -47756,6 +47798,228 @@ class MainWindow(QMainWindow):
                     prefix_canon.add(c)
         return live | prefix_canon
 
+    def _startup_memory_collect_all_persisted_workspace_canonical_paths(self) -> list[str]:
+        """Every persisted planned/proposed destination path (full workspace), for audits and expand affordance."""
+        out: list[str] = []
+        graph_auth = destination_authority_contract.graph_owns_visible_real_destination_structure(self)
+        for move in getattr(self, "planned_moves", None) or []:
+            if not isinstance(move, dict):
+                continue
+            proj = self._allocation_projection_path(move)
+            if not proj:
+                continue
+            if graph_auth:
+                proj = self._canonical_destination_path_with_visible_library_anchor(proj) or proj
+            c = self._canonical_destination_projection_path(proj) or self.normalize_memory_path(proj)
+            if c:
+                out.append(c)
+        for pf in getattr(self, "proposed_folders", None) or []:
+            raw = self._proposed_destination_path(pf)
+            if not raw:
+                continue
+            adj = raw
+            if graph_auth:
+                adj = self._canonical_destination_path_with_visible_library_anchor(raw) or raw
+            c = self._canonical_destination_projection_path(adj) or self.normalize_memory_path(adj)
+            if c:
+                out.append(c)
+        return out
+
+    def _startup_memory_full_workspace_audit_run(self) -> dict[str, Any]:
+        """Startup completeness vs the full persisted planned/proposed payload (not the narrow intended subset)."""
+        graph_auth = destination_authority_contract.graph_owns_visible_real_destination_structure(self)
+        planned_paths: list[str] = []
+        for move in getattr(self, "planned_moves", None) or []:
+            if not isinstance(move, dict):
+                continue
+            proj = self._allocation_projection_path(move)
+            if not proj:
+                continue
+            if graph_auth:
+                proj = self._canonical_destination_path_with_visible_library_anchor(proj) or proj
+            c = self._canonical_destination_projection_path(proj) or self.normalize_memory_path(proj)
+            if c:
+                planned_paths.append(c)
+        proposed_paths: list[str] = []
+        for pf in getattr(self, "proposed_folders", None) or []:
+            raw = self._proposed_destination_path(pf)
+            if not raw:
+                continue
+            adj = raw
+            if graph_auth:
+                adj = self._canonical_destination_path_with_visible_library_anchor(raw) or raw
+            c = self._canonical_destination_projection_path(adj) or self.normalize_memory_path(adj)
+            if c:
+                proposed_paths.append(c)
+        _vp, all_visible = self._destination_enumerate_visible_planned_paths_and_all_visible()
+        del _vp
+        all_cf = {str(p or "").strip().casefold() for p in all_visible if str(p or "").strip()}
+        pres_pl = sum(1 for p in planned_paths if p.casefold() in all_cf)
+        pres_pr = sum(1 for p in proposed_paths if p.casefold() in all_cf)
+        miss_pl = [p for p in planned_paths if p.casefold() not in all_cf]
+        miss_pr = [p for p in proposed_paths if p.casefold() not in all_cf]
+        return {
+            "expected_total_persisted_planned_rows": len(planned_paths),
+            "expected_total_persisted_proposed_folders": len(proposed_paths),
+            "present_visible_planned_rows": int(pres_pl),
+            "present_visible_proposed_folders": int(pres_pr),
+            "missing_visible_planned_rows": len(miss_pl),
+            "missing_visible_proposed_folders": len(miss_pr),
+            "missing_planned_paths": miss_pl,
+            "missing_proposed_paths": miss_pr,
+            "visible_planned_enumeration_count": len(all_visible),
+        }
+
+    def _startup_memory_mark_saved_descendant_expand_affordances(self) -> None:
+        """Folders with persisted rows strictly underneath must show an expand arrow before Graph/materialize."""
+        model = getattr(self, "destination_planning_model", None)
+        if model is None:
+            return
+        all_paths = self._startup_memory_collect_all_persisted_workspace_canonical_paths()
+        if not all_paths:
+            return
+        cf_paths = [p.casefold().strip() for p in all_paths if str(p or "").strip()]
+        log_cap = 64
+        logged = 0
+
+        def _strict_descendant_of(folder_cf: str, child_cf: str) -> bool:
+            if not folder_cf or not child_cf:
+                return False
+            prefix = folder_cf + "\\"
+            return child_cf != folder_cf and child_cf.startswith(prefix)
+
+        def _walk(par: QModelIndex) -> None:
+            nonlocal logged
+            for r in range(model.rowCount(par)):
+                ix = model.index(r, 0, par)
+                if not ix.isValid():
+                    continue
+                pl = self._destination_model_index_user_role_dict(ix)
+                if pl.get("placeholder"):
+                    _walk(ix)
+                    continue
+                if pl.get("is_folder"):
+                    try:
+                        hc = model.hasChildren(ix)
+                    except Exception:
+                        hc = True
+                    if not hc:
+                        rp = self._destination_row_raw_path_for_path_lookup_match(pl)
+                        vc = (
+                            (self._canonical_destination_projection_path(rp) or rp)
+                            if rp
+                            else ""
+                        )
+                        if vc:
+                            fcf = vc.casefold().strip()
+                            has_desc = any(_strict_descendant_of(fcf, c) for c in cf_paths)
+                            if has_desc and not pl.get("_destination_expand_affordance"):
+
+                                def _mut(payload: dict[str, Any]) -> None:
+                                    payload["_destination_expand_affordance"] = True
+
+                                try:
+                                    model.update_payload_for_index(ix, _mut)
+                                except Exception:
+                                    pass
+                                else:
+                                    if logged < log_cap:
+                                        logged += 1
+                                        log_info(
+                                            "startup_memory_folder_marked_expandable",
+                                            path=str(vc)[:400],
+                                            reason="saved_descendants_present",
+                                        )
+                _walk(ix)
+
+        _walk(QModelIndex())
+
+    def _startup_memory_truth_deferred_finish(
+        self, ctx: str, reason: str, overlay_replay_rows: int, expanded_path_closure_count: int
+    ) -> None:
+        """Heavy startup memory-truth follow-up: chain ensure, full audit, fingerprint (after visible tree pass)."""
+        del ctx  # reserved for tracing
+        r = str(reason or "")
+        log_info(
+            "startup_memory_visible_planned_audit_begin",
+            reason=r[:200],
+            expanded_path_closure_count=int(expanded_path_closure_count),
+            chain_ensure_attempts=0,
+            note="deferred_phase_before_chain_ensure",
+        )
+        log_info(
+            "startup_memory_full_workspace_audit_begin",
+            reason=r[:200],
+            overlay_replay_rows=int(overlay_replay_rows),
+        )
+        ens_n, _ens_miss = self._startup_memory_truth_ensure_missing_intended_paths()
+        self._startup_memory_mark_saved_descendant_expand_affordances()
+        self._bump_destination_materialized_overlay_fingerprint(
+            phase="startup_planned_workspace_memory_truth",
+            first_render_path="memory_truth_startup_deferred",
+        )
+        audit = self._startup_memory_full_workspace_audit_run()
+        skipped_n = len(getattr(self, "_startup_memory_planned_attach_skipped_log", None) or [])
+        log_info(
+            "startup_memory_full_workspace_audit_complete",
+            reason=r[:200],
+            expected_total_persisted_planned_rows=int(audit.get("expected_total_persisted_planned_rows", 0)),
+            expected_total_persisted_proposed_folders=int(audit.get("expected_total_persisted_proposed_folders", 0)),
+            present_visible_planned_rows=int(audit.get("present_visible_planned_rows", 0)),
+            present_visible_proposed_folders=int(audit.get("present_visible_proposed_folders", 0)),
+            missing_visible_planned_rows=int(audit.get("missing_visible_planned_rows", 0)),
+            missing_visible_proposed_folders=int(audit.get("missing_visible_proposed_folders", 0)),
+            visible_planned_enumeration_count=int(audit.get("visible_planned_enumeration_count", 0)),
+            skipped_attach_events=int(skipped_n),
+            chain_ensure_rows=int(ens_n),
+        )
+        for mp in (audit.get("missing_planned_paths") or [])[:32]:
+            log_info(
+                "startup_memory_full_workspace_missing",
+                path=str(mp)[:400],
+                reason="persisted_planned_row_not_visible",
+            )
+        for mp in (audit.get("missing_proposed_paths") or [])[:24]:
+            log_info(
+                "startup_memory_full_workspace_missing",
+                path=str(mp)[:400],
+                reason="persisted_proposed_folder_not_visible",
+            )
+        narrow = self._startup_memory_visible_planned_audit_run()
+        log_info(
+            "startup_memory_visible_planned_audit_complete",
+            reason=r[:200],
+            expected_visible_planned_rows=int(narrow.get("expected_visible_planned_rows", 0)),
+            present_visible_planned_rows=int(narrow.get("present_visible_planned_rows", 0)),
+            missing_visible_planned_rows=int(narrow.get("missing_visible_planned_rows", 0)),
+            missing_visible_proposed_folders=int(narrow.get("missing_visible_proposed_folders", 0)),
+            visible_planned_enumeration_count=int(narrow.get("visible_planned_enumeration_count", 0)),
+            overlay_replay_rows=int(overlay_replay_rows),
+            skipped_attach_events=int(skipped_n),
+            chain_ensure_rows=int(ens_n),
+            note="narrow_intended_subset_supplement",
+        )
+        for mp in (narrow.get("missing_paths") or [])[:32]:
+            log_info(
+                "startup_memory_visible_planned_missing",
+                path=str(mp)[:400],
+                reason="absent_from_visible_planned_model_after_replay_ensure",
+            )
+        for mp in (narrow.get("missing_proposed_paths") or [])[:24]:
+            log_info(
+                "startup_memory_visible_planned_missing",
+                path=str(mp)[:400],
+                reason="proposed_folder_absent_from_visible_planned_model_after_replay_ensure",
+            )
+        log_info(
+            "startup_memory_planned_attach_complete",
+            reason=r[:200],
+            attached_planned_rows=int(audit.get("visible_planned_enumeration_count", 0)),
+            overlay_replay_rows=int(overlay_replay_rows),
+            skipped_planned_rows=int(skipped_n),
+            note="attached_planned_rows_is_visible_planned_enumeration_not_replay_count",
+        )
+
     def _startup_memory_visible_planned_audit_run(self) -> dict[str, Any]:
         """Compare persisted intended targets to visible planned rows; used for startup completeness logging."""
         intended = self._destination_collect_intended_workspace_target_canonical_paths()
@@ -47866,9 +48130,8 @@ class MainWindow(QMainWindow):
     ):
         """Attach persisted planned/proposed/allocation overlays without full-tree gates or reconcile storms.
 
-        **Visible-tree completeness**: replays unresolved queues rebuilt from ``planned_moves``/``proposed_folders``,
-        passes full **prefix-closure** expanded paths so descendant bind is not starved, then runs a relaxed
-        chain-ensure pass for any persisted target still absent from the visible planned enumeration.
+        **Visible-tree first**: replay + expand-path bind only on the hot path so the tree can paint; chain-ensure,
+        full-workspace audit, and fingerprint bump run on a short defer (see ``_startup_memory_truth_deferred_finish``).
         """
         r = str(reason or "")
         self._startup_memory_planned_attach_skipped_log = []
@@ -47880,6 +48143,7 @@ class MainWindow(QMainWindow):
         )
         self._startup_memory_planned_attach_active = True
         self._destination_planned_chain_overlay_relax = True
+        self._destination_startup_memory_workspace_building = True
         try:
             try:
                 self._reset_unresolved_proposed_queue()
@@ -47898,52 +48162,40 @@ class MainWindow(QMainWindow):
             n = self._destination_planning_overlay_replay_persisted_only(
                 ctx, destination_expanded_paths=exp_bind
             )
-            ens_n, _ens_miss = self._startup_memory_truth_ensure_missing_intended_paths()
-            self._bump_destination_materialized_overlay_fingerprint(
-                phase="startup_planned_workspace_memory_truth",
-                first_render_path="memory_truth_startup_lite",
-            )
+            self._startup_memory_mark_saved_descendant_expand_affordances()
+            log_info("startup_memory_truth_materialize_deferred_until_visible_tree_ready", reason=r[:200])
+            try:
+                QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+            except Exception:
+                pass
             log_info(
-                "startup_memory_visible_planned_audit_begin",
+                "startup_memory_visible_tree_ready",
                 reason=r[:200],
+                overlay_replay_rows=int(n),
                 expanded_path_closure_count=len(exp_bind),
-                chain_ensure_attempts=int(ens_n),
             )
-            audit = self._startup_memory_visible_planned_audit_run()
-            skipped_n = len(getattr(self, "_startup_memory_planned_attach_skipped_log", None) or [])
-            log_info(
-                "startup_memory_visible_planned_audit_complete",
-                reason=r[:200],
-                expected_visible_planned_rows=int(audit.get("expected_visible_planned_rows", 0)),
-                present_visible_planned_rows=int(audit.get("present_visible_planned_rows", 0)),
-                missing_visible_planned_rows=int(audit.get("missing_visible_planned_rows", 0)),
-                missing_visible_proposed_folders=int(audit.get("missing_visible_proposed_folders", 0)),
-                visible_planned_enumeration_count=int(audit.get("visible_planned_enumeration_count", 0)),
-                overlay_replay_rows=int(n),
-                skipped_attach_events=int(skipped_n),
-                chain_ensure_rows=int(ens_n),
-            )
-            for mp in (audit.get("missing_paths") or [])[:32]:
-                log_info(
-                    "startup_memory_visible_planned_missing",
-                    path=str(mp)[:400],
-                    reason="absent_from_visible_planned_model_after_replay_ensure",
-                )
-            for mp in (audit.get("missing_proposed_paths") or [])[:24]:
-                log_info(
-                    "startup_memory_visible_planned_missing",
-                    path=str(mp)[:400],
-                    reason="proposed_folder_absent_from_visible_planned_model_after_replay_ensure",
-                )
-            log_info(
-                "startup_memory_planned_attach_complete",
-                reason=r[:200],
-                attached_planned_rows=int(audit.get("visible_planned_enumeration_count", 0)),
-                overlay_replay_rows=int(n),
-                skipped_planned_rows=int(skipped_n),
-                note="attached_planned_rows_is_visible_planned_enumeration_not_replay_count",
-            )
+
+            def _finish() -> None:
+                try:
+                    self._startup_memory_truth_deferred_finish(ctx, r, int(n), len(exp_bind))
+                except Exception as exc:
+                    self._log_restore_exception("startup_memory_truth_deferred_finish", exc)
+                finally:
+                    self._destination_startup_memory_workspace_building = False
+                    log_info("startup_memory_truth_materialize_released", reason=str(r)[:200])
+                    log_info("startup_snapshot_capture_released_after_startup_settle")
+                    try:
+                        self._mark_destination_tree_snapshot_dirty_after_injection(
+                            reason="startup_memory_truth_settled"
+                        )
+                    except Exception:
+                        pass
+
+            QTimer.singleShot(100, lambda: self._safe_invoke("startup_memory_truth_deferred_finish", _finish))
             return int(n)
+        except Exception:
+            self._destination_startup_memory_workspace_building = False
+            raise
         finally:
             self._startup_memory_planned_attach_active = False
             self._destination_planned_chain_overlay_relax = False
