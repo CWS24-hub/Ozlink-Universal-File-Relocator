@@ -3130,6 +3130,10 @@ class MainWindow(QMainWindow):
         self._destination_visible_path_lookup_log_ts: dict[str, float] = {}
         self._destination_bind_scope_paths: Optional[set[str]] = None
         self._destination_planned_move_materialize_bind_scope: Optional[set[str]] = None
+        self._destination_local_first_edit_bind_scope: Optional[set[str]] = None
+        self._startup_memory_planned_attach_skipped_log: list[dict[str, str]] = []
+        self._startup_memory_planned_attach_active: bool = False
+        self._destination_planned_chain_overlay_relax: bool = False
         self._source_projection_row_relationship_sig: dict[str, str] = {}
         self._source_projection_refresh_eval_plan_sig: str = ""
         # >0 while code holds stale destination QModelIndex rows or runs graph refresh loops that
@@ -16495,6 +16499,8 @@ class MainWindow(QMainWindow):
         return False
 
     def _should_defer_destination_materialization(self, reason):
+        if planning_interaction_contract.is_local_first_deferred_materialize_reason(str(reason or "")):
+            return False
         destination_tree = getattr(self, "destination_tree_widget", None)
         if destination_tree is None:
             return False
@@ -16663,6 +16669,24 @@ class MainWindow(QMainWindow):
         timer.stop()
         timer.start(max(0, int(delay_ms)))
 
+    def _schedule_local_first_edit_deferred_followup(
+        self,
+        action: str,
+        scope_paths: Optional[set[str]] = None,
+        *,
+        path_excerpt: str = "",
+    ) -> None:
+        act = str(action or "").strip().lower().replace(" ", "_")
+        reason = f"local_first_edit_{act}"
+        self._destination_local_first_edit_bind_scope = set(scope_paths) if scope_paths else None
+        log_info("local_first_edit_applied", action=act, path=str(path_excerpt or "")[:400])
+        log_info(
+            "local_first_deferred_followup_scheduled",
+            reason=reason,
+            scope_paths=sorted(list(scope_paths or []))[:48],
+        )
+        self._schedule_deferred_destination_materialization(reason, delay_ms=120)
+
     def _run_deferred_destination_materialization(self):
         if _shutdown_mutation_skip_for_host(self, "_run_deferred_destination_materialization"):
             return
@@ -16758,8 +16782,14 @@ class MainWindow(QMainWindow):
                 set(self._destination_drfws_affected_paths) if self._destination_drfws_affected_paths else None
             )
         elif planning_interaction_contract.is_local_first_deferred_materialize_reason(reason):
+            merged_scope: set[str] = set()
             _pms = getattr(self, "_destination_planned_move_materialize_bind_scope", None)
-            self._destination_bind_scope_paths = set(_pms) if _pms else None
+            _lfs = getattr(self, "_destination_local_first_edit_bind_scope", None)
+            if _pms:
+                merged_scope |= set(_pms)
+            if _lfs:
+                merged_scope |= set(_lfs)
+            self._destination_bind_scope_paths = merged_scope if merged_scope else None
         else:
             self._destination_bind_scope_paths = None
         _allow_defer = planning_interaction_contract.is_local_first_deferred_materialize_reason(reason)
@@ -16771,6 +16801,7 @@ class MainWindow(QMainWindow):
             self._destination_bind_scope_paths = None
             if planning_interaction_contract.is_local_first_deferred_materialize_reason(reason):
                 self._destination_planned_move_materialize_bind_scope = None
+                self._destination_local_first_edit_bind_scope = None
         self._destination_deferred_reconcile_burst_pending = False
         if _probe:
             log_info(
@@ -31581,6 +31612,7 @@ class MainWindow(QMainWindow):
                 intended_path=str(normalized_target or "")[:400],
                 reason="no_destination_planning_model",
             )
+            self._startup_memory_planned_attach_note_skip("no_destination_planning_model", str(normalized_target or ""))
             return None
         _graph_strict = destination_authority_contract.graph_owns_visible_real_destination_structure(self)
         walk_base = str(normalized_target or "").strip()
@@ -31598,6 +31630,7 @@ class MainWindow(QMainWindow):
                 intended_path=str(normalized_target or "")[:400],
                 reason="empty_library_relative_segments",
             )
+            self._startup_memory_planned_attach_note_skip("empty_library_relative_segments", str(normalized_target or ""))
             return QModelIndex()
         parent_ix = QModelIndex()
         nearest_visible = ""
@@ -31644,7 +31677,7 @@ class MainWindow(QMainWindow):
                                 live_graph_parent_pl=_ppl_gate,
                                 parent_anchor_index_valid=True,
                             )
-                            if _defer:
+                            if _defer and not getattr(self, "_destination_planned_chain_overlay_relax", False):
                                 self._log_restore_phase(
                                     "sharepoint_overlay_planned_chain_suppressed_graph_authority",
                                     normalized_target=normalized_target,
@@ -31700,21 +31733,32 @@ class MainWindow(QMainWindow):
                         nearest_visible_parent="",
                         depth=int(depth),
                     )
+                    self._startup_memory_planned_attach_note_skip(
+                        "missing_child_and_no_valid_parent_index",
+                        str(walk_base or normalized_target or "")[:400],
+                    )
                 return None
             pl = self._destination_model_index_user_role_dict(child_ix)
             if not self._destination_row_allows_sharepoint_projection_traversal(pl):
-                self._log_restore_phase(
-                    "sharepoint_overlay_parent_not_graph_backed",
-                    normalized_target=normalized_target,
-                    path=current_path,
-                )
-                log_info(
-                    "destination_planned_chain_bind_skipped",
-                    intended_path=str(walk_base)[:400],
-                    reason="row_does_not_allow_sharepoint_projection_traversal",
-                    path_excerpt=str(current_path)[:260],
-                )
-                return None
+                if getattr(self, "_destination_planned_chain_overlay_relax", False):
+                    log_info(
+                        "destination_planned_chain_bind_memory_truth_traversal_relaxed",
+                        intended_path=str(walk_base)[:400],
+                        path_excerpt=str(current_path)[:260],
+                    )
+                else:
+                    self._log_restore_phase(
+                        "sharepoint_overlay_parent_not_graph_backed",
+                        normalized_target=normalized_target,
+                        path=current_path,
+                    )
+                    log_info(
+                        "destination_planned_chain_bind_skipped",
+                        intended_path=str(walk_base)[:400],
+                        reason="row_does_not_allow_sharepoint_projection_traversal",
+                        path_excerpt=str(current_path)[:260],
+                    )
+                    return None
             nearest_visible = current_path
             parent_ix = child_ix
         return parent_ix
@@ -41679,6 +41723,19 @@ class MainWindow(QMainWindow):
             self.planned_moves_status.setText("Planned item renamed.")
             self.refresh_planned_moves_table()
             self._persist_planning_change("planned_item_renamed")
+            _rn_alloc = self._allocation_projection_path(move)
+            _rn_scope: set[str] = set()
+            if _rn_alloc:
+                _rn_c = self._canonical_destination_projection_path(str(_rn_alloc)) or self.normalize_memory_path(
+                    str(_rn_alloc)
+                )
+                if _rn_c:
+                    _rn_scope.add(_rn_c)
+            self._schedule_local_first_edit_deferred_followup(
+                "rename",
+                scope_paths=_rn_scope if _rn_scope else None,
+                path_excerpt=str(_rn_alloc or "")[:400],
+            )
             if not rebuild_tree():
                 QMessageBox.information(
                     dlg,
@@ -42353,6 +42410,17 @@ class MainWindow(QMainWindow):
             self.planned_moves_status.setText("Planned item renamed.")
         self.refresh_planned_moves_table()
         self._persist_planning_change("planned_item_renamed")
+        _rn_alloc = self._allocation_projection_path(move)
+        _rn_scope: set[str] = set()
+        if _rn_alloc:
+            _rn_c = self._canonical_destination_projection_path(str(_rn_alloc)) or self.normalize_memory_path(str(_rn_alloc))
+            if _rn_c:
+                _rn_scope.add(_rn_c)
+        self._schedule_local_first_edit_deferred_followup(
+            "rename",
+            scope_paths=_rn_scope if _rn_scope else None,
+            path_excerpt=str(_rn_alloc or "")[:400],
+        )
         return True
 
     def _planning_retarget_planned_file_to_folder_node(
@@ -47635,6 +47703,109 @@ class MainWindow(QMainWindow):
                     time.perf_counter() - _t0,
                 )
 
+    def _startup_memory_planned_attach_note_skip(self, skip_reason: str, path: str = "") -> None:
+        if not getattr(self, "_startup_memory_planned_attach_active", False):
+            return
+        log_info(
+            "startup_memory_planned_attach_skipped",
+            reason=str(skip_reason or "")[:220],
+            path=str(path or "")[:400],
+        )
+        lst = getattr(self, "_startup_memory_planned_attach_skipped_log", None)
+        if not isinstance(lst, list):
+            lst = []
+            self._startup_memory_planned_attach_skipped_log = lst
+        lst.append({"reason": str(skip_reason or ""), "path": str(path or "")})
+
+    def _destination_planning_overlay_replay_persisted_only(self, ctx: str) -> int:
+        """Replay unresolved proposed/allocation queues + visible allocation descendants (no reconcile/hydrate)."""
+        with self._destination_materialize_profile_span("lite_replay_unresolved_proposed_overlay"):
+            n_prop = self._replay_unresolved_proposed_overlay(ctx, "")
+        with self._destination_materialize_profile_span("lite_replay_unresolved_allocation_overlay"):
+            n_alloc = self._replay_unresolved_allocation_overlay(ctx, "")
+        exp_paths = self._destination_expanded_paths_for_planning_bind()
+        with self._destination_materialize_profile_span("lite_apply_visible_destination_allocation_descendants"):
+            self._apply_visible_destination_allocation_descendants(destination_expanded_paths=exp_paths)
+        self._schedule_refresh_destination_tree_indicators()
+        self._set_tree_status_message("destination", "Destination preview updated.", loading=False)
+        return int(n_prop + n_alloc)
+
+    def _apply_destination_planning_overlays_body_local_first_edit(
+        self,
+        reason,
+        *,
+        allow_defer=True,
+        prefer_chunked_projection=False,
+        narrow_restore_real_snapshot=False,
+        force_authoritative_bind=False,
+    ):
+        """Narrow overlay replay for user edits (bind-scoped); avoids full materialize gates."""
+        r = str(reason or "")
+        self._destination_planned_chain_overlay_relax = True
+        try:
+            self._cancel_destination_future_async_projection(r or "local_first_edit")
+            n = self._destination_planning_overlay_replay_persisted_only(r)
+            self._bump_destination_materialized_overlay_fingerprint(
+                phase="local_first_edit",
+                first_render_path=str(r)[:120],
+            )
+            log_info("local_first_edit_overlay_pass_complete", reason=r[:200], overlay_replay_rows=int(n))
+            return int(n)
+        finally:
+            self._destination_planned_chain_overlay_relax = False
+
+    def _apply_destination_planning_overlays_body_memory_truth_startup(
+        self,
+        reason,
+        *,
+        allow_defer=True,
+        prefer_chunked_projection=False,
+        narrow_restore_real_snapshot=False,
+        force_authoritative_bind=False,
+    ):
+        """Attach persisted planned/proposed/allocation overlays without full-tree gates or reconcile storms."""
+        r = str(reason or "")
+        self._startup_memory_planned_attach_skipped_log = []
+        log_info(
+            "startup_memory_planned_attach_begin",
+            reason=r[:200],
+            planned_moves_count=len(self.planned_moves or []),
+            proposed_folders_count=len(self.proposed_folders or []),
+        )
+        self._startup_memory_planned_attach_active = True
+        self._destination_planned_chain_overlay_relax = True
+        try:
+            try:
+                self._destination_prune_invalid_unresolved_replay_parent_paths(
+                    context=f"memory_truth_startup:{str(reason or '')[:80]}"
+                )
+            except Exception:
+                pass
+            self._cancel_destination_future_async_projection(r or "memory_truth_startup")
+            ctx = r or "startup_planned_workspace_memory_truth"
+            n = self._destination_planning_overlay_replay_persisted_only(ctx)
+            self._bump_destination_materialized_overlay_fingerprint(
+                phase="startup_planned_workspace_memory_truth",
+                first_render_path="memory_truth_startup_lite",
+            )
+            try:
+                vp, _av = self._destination_enumerate_visible_planned_paths_and_all_visible()
+                attached_n = int(len(vp))
+            except Exception:
+                attached_n = -1
+            skipped_n = len(getattr(self, "_startup_memory_planned_attach_skipped_log", None) or [])
+            log_info(
+                "startup_memory_planned_attach_complete",
+                reason=r[:200],
+                attached_planned_rows=int(attached_n),
+                overlay_replay_rows=int(n),
+                skipped_planned_rows=int(skipped_n),
+            )
+            return int(n)
+        finally:
+            self._startup_memory_planned_attach_active = False
+            self._destination_planned_chain_overlay_relax = False
+
     def _apply_destination_planning_overlays_body(
         self,
         reason,
@@ -47644,6 +47815,22 @@ class MainWindow(QMainWindow):
         narrow_restore_real_snapshot=False,
         force_authoritative_bind=False,
     ):
+        if str(reason or "").startswith("startup_planned_workspace_memory_truth"):
+            return self._apply_destination_planning_overlays_body_memory_truth_startup(
+                reason,
+                allow_defer=allow_defer,
+                prefer_chunked_projection=prefer_chunked_projection,
+                narrow_restore_real_snapshot=narrow_restore_real_snapshot,
+                force_authoritative_bind=force_authoritative_bind,
+            )
+        if str(reason or "").startswith("local_first_edit_"):
+            return self._apply_destination_planning_overlays_body_local_first_edit(
+                reason,
+                allow_defer=allow_defer,
+                prefer_chunked_projection=prefer_chunked_projection,
+                narrow_restore_real_snapshot=narrow_restore_real_snapshot,
+                force_authoritative_bind=force_authoritative_bind,
+            )
         if self._destination_user_scroll_interaction_active():
             log_info(
                 "destination_scroll_forensic_overlay_body_during_scroll",

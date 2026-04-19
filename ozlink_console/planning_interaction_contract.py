@@ -24,6 +24,8 @@ Call sites that schedule destination overlay / materialize passes should use rea
 
 from __future__ import annotations
 
+_LOCAL_FIRST_EDIT_PREFIX = "local_first_edit_"
+
 _LOCAL_FIRST_DEFERRED_MATERIALIZE_REASONS: frozenset[str] = frozenset(
     (
         "planned_item_moved",
@@ -32,8 +34,15 @@ _LOCAL_FIRST_DEFERRED_MATERIALIZE_REASONS: frozenset[str] = frozenset(
 
 
 def is_local_first_deferred_materialize_reason(reason: str) -> bool:
-    """True when the idle/deferred materialize pass is a follow-up to a direct user planning edit."""
+    """True when the idle/deferred materialize pass is a follow-up to a direct user planning edit.
+
+    Recognizes explicit reasons (e.g. ``planned_item_moved``) and any ``local_first_edit_*`` idle pass,
+    including: rename, assign, unassign, retarget, cut/paste, proposed folder create/remove — use
+    ``local_first_edit_<action>`` when scheduling deferred overlay.
+    """
     r = str(reason or "").strip()
     if r in _LOCAL_FIRST_DEFERRED_MATERIALIZE_REASONS:
+        return True
+    if r.startswith(_LOCAL_FIRST_EDIT_PREFIX):
         return True
     return False
