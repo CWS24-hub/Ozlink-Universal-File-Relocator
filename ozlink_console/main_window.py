@@ -7920,6 +7920,7 @@ class MainWindow(QMainWindow):
                             batch,
                             f"source_projection_deferred_{combined_reason}",
                             delay_ms=50,
+                            subtree_scope="roots_only",
                         )
                         if (time.perf_counter() - t_budget) * 1000.0 >= _chunk_budget_ms:
                             break
