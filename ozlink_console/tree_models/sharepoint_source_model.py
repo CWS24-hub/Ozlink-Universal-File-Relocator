@@ -92,7 +92,10 @@ class SharePointSourceTreeModel(QAbstractItemModel):
     def _node(self, index: QModelIndex) -> Optional[_Node]:
         if not index.isValid():
             return None
-        return index.internalPointer()
+        ptr = index.internalPointer()
+        # Stale indices (e.g. after structural changes between queued work and apply) may expose a
+        # non-node internal id; never treat as :class:`_Node`.
+        return ptr if isinstance(ptr, _Node) else None
 
     def index(self, row: int, column: int, parent: QModelIndex) -> QModelIndex:
         if column < 0 or column >= EXPLORER_COLUMN_COUNT or row < 0:

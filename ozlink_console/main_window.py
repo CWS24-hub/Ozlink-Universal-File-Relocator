@@ -24905,7 +24905,7 @@ class MainWindow(QMainWindow):
         work_items: list[tuple[Any, dict, str]] = []
         skipped_relationship_unchanged = [0]
 
-        def _apply_one_source_projection_row(subtree_row, subtree_data, eval_index):
+        def _apply_one_source_projection_row(subtree_row, subtree_data, eval_index, subtree_path: str = ""):
             if isinstance(subtree_row, QModelIndex):
                 self._apply_tree_item_visual_state(
                     None, subtree_data, source_relationship_index=eval_index
@@ -24916,7 +24916,22 @@ class MainWindow(QMainWindow):
                         p.clear()
                         p.update(repl)
 
-                    source_model.update_payload_for_index(subtree_row, _mut)
+                    ix = subtree_row.siblingAtColumn(0) if subtree_row.column() != 0 else subtree_row
+                    _live = getattr(source_model, "is_index_live", None)
+                    if callable(_live) and not _live(ix):
+                        _key = str(subtree_path or "").strip() or self._canonical_source_projection_path(
+                            self._tree_item_path(subtree_data)
+                        )
+                        _find = getattr(source_model, "find_index_for_canonical_source_path", None)
+                        if _key and callable(_find):
+                            _fresh = _find(_key)
+                            if _fresh.isValid():
+                                ix = _fresh.siblingAtColumn(0) if _fresh.column() != 0 else _fresh
+                                if not _live(ix):
+                                    return
+                        else:
+                            return
+                    source_model.update_payload_for_index(ix, _mut)
             else:
                 self._apply_tree_item_visual_state(
                     subtree_row, subtree_data, source_relationship_index=eval_index
@@ -25032,7 +25047,7 @@ class MainWindow(QMainWindow):
                                     return
                                 continue
                             self._source_projection_row_relationship_sig[_sp] = rel_sig
-                        _apply_one_source_projection_row(row, data, eval_index)
+                        _apply_one_source_projection_row(row, data, eval_index, _sp)
                         i += 1
                         step_at[0] = i
                         if i < len(work_items) and (i % min_rows_per_slice) != 0:
@@ -25062,7 +25077,7 @@ class MainWindow(QMainWindow):
                         skipped_relationship_unchanged[0] += 1
                         continue
                     self._source_projection_row_relationship_sig[subtree_path] = rel_sig
-                _apply_one_source_projection_row(subtree_row, subtree_data, eval_index)
+                _apply_one_source_projection_row(subtree_row, subtree_data, eval_index, subtree_path)
                 if subtree_path:
                     refreshed_paths.add(subtree_path)
                 refreshed_count += 1
