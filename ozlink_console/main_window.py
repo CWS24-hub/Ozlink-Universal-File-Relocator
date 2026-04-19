@@ -3389,6 +3389,12 @@ class MainWindow(QMainWindow):
         # No-progress / interaction backoff for replay+fixpoint (reduces same-thread thrash).
         self._destination_replay_no_progress_streak_proposed: int = 0
         self._destination_replay_no_progress_streak_allocation: int = 0
+        # Suppression reschedule backoff (ms, doubled per schedule; reset on replay progress).
+        self._destination_replay_drain_backoff_ms_proposed: int = 0
+        self._destination_replay_drain_backoff_ms_allocation: int = 0
+        self._destination_replay_suppression_stall_cycles_proposed: int = 0
+        self._destination_replay_suppression_stall_cycles_allocation: int = 0
+        self._destination_replay_watchdog_mono: Any = None  # deque[float] of schedule monotonic times
         self._destination_fixpoint_no_progress_streak: int = 0
         self._destination_interaction_throttle_log_mono: float = 0.0
         self._destination_future_descendant_index_signature = None
@@ -51172,28 +51178,105 @@ class MainWindow(QMainWindow):
             lambda: self._process_destination_restore_materialization_queue(reason, trigger_path=trigger_path),
         )
 
+    def _destination_replay_drain_backoff_base_ms(self) -> int:
+        raw = str(os.environ.get("OZLINK_REPLAY_DRAIN_BACKOFF_BASE_MS", "") or "").strip()
+        if raw:
+            try:
+                return max(20, min(3000, int(raw)))
+            except ValueError:
+                pass
+        return 80
+
+    def _destination_replay_drain_backoff_cap_ms(self) -> int:
+        raw = str(os.environ.get("OZLINK_REPLAY_DRAIN_BACKOFF_CAP_MS", "") or "").strip()
+        if raw:
+            try:
+                return max(100, min(30_000, int(raw)))
+            except ValueError:
+                pass
+        return 4000
+
+    def _destination_replay_reset_drain_backoff(self, kind: str) -> None:
+        setattr(self, f"_destination_replay_drain_backoff_ms_{kind}", 0)
+
+    def _destination_replay_take_drain_backoff_ms(self, kind: str) -> int:
+        v = int(getattr(self, f"_destination_replay_drain_backoff_ms_{kind}", 0) or 0)
+        base = self._destination_replay_drain_backoff_base_ms()
+        cap = self._destination_replay_drain_backoff_cap_ms()
+        if v <= 0:
+            return base
+        return min(v, cap)
+
+    def _destination_replay_bump_drain_backoff(self, kind: str) -> None:
+        attr = f"_destination_replay_drain_backoff_ms_{kind}"
+        cur = int(getattr(self, attr, 0) or 0)
+        base = self._destination_replay_drain_backoff_base_ms()
+        cap = self._destination_replay_drain_backoff_cap_ms()
+        if cur <= 0:
+            cur = base
+        setattr(self, attr, min(int(cur) * 2, cap))
+
+    def _destination_replay_watchdog_on_schedule(self, kind: str, queue_size: int) -> None:
+        dq = getattr(self, "_destination_replay_watchdog_mono", None)
+        if not isinstance(dq, deque):
+            dq = deque(maxlen=64)
+            self._destination_replay_watchdog_mono = dq
+        now = time.monotonic()
+        dq.append(now)
+        try:
+            win = float(os.environ.get("OZLINK_REPLAY_WATCHDOG_WINDOW_SEC", "") or 1.0)
+        except ValueError:
+            win = 1.0
+        win = max(0.15, min(10.0, win))
+        try:
+            max_ev = int(os.environ.get("OZLINK_REPLAY_WATCHDOG_MAX_EVENTS", "") or 20)
+        except ValueError:
+            max_ev = 20
+        max_ev = max(5, min(200, max_ev))
+        while dq and dq[0] < now - win:
+            dq.popleft()
+        if len(dq) >= max_ev:
+            log_info(
+                "destination_replay_watchdog_triggered",
+                events_per_sec=round(len(dq) / max(win, 0.01), 2),
+                queue_size=int(queue_size),
+                replay_kind=str(kind)[:16],
+                window_sec=round(win, 3),
+            )
+
     def _schedule_unresolved_replay_drain_after_budget_suppression(
         self,
         *,
         replay_kind: str,
         remaining_queue_size: int,
         trigger_path: str = "",
+        backoff_reason: str = "budget_suppression",
     ) -> None:
         if int(remaining_queue_size or 0) <= 0:
             return
+        rk = str(replay_kind or "").strip().lower()
+        if rk not in ("proposed", "allocation"):
+            rk = "proposed"
+        self._destination_replay_watchdog_on_schedule(rk, int(remaining_queue_size))
         log_info(
             "destination_replay_rescheduled_after_suppression",
             replay_kind=str(replay_kind or "")[:20],
             remaining_queue_size=int(remaining_queue_size),
         )
-        delay_ms = max(0, int(getattr(self, "_restore_queue_tick_delay_ms", 45) or 45))
-        raw = str(os.environ.get("OZLINK_REPLAY_DRAIN_SUPPRESSION_DELAY_MS", "") or "").strip()
-        if raw:
+        delay_ms = self._destination_replay_take_drain_backoff_ms(rk)
+        raw_floor = str(os.environ.get("OZLINK_REPLAY_DRAIN_SUPPRESSION_DELAY_MS", "") or "").strip()
+        if raw_floor:
             try:
-                delay_ms = max(0, min(5000, int(raw)))
+                delay_ms = max(delay_ms, max(0, min(5000, int(raw_floor))))
             except ValueError:
                 pass
-        rk = str(replay_kind or "").strip().lower()
+        self._destination_replay_bump_drain_backoff(rk)
+        log_info(
+            "destination_replay_backoff_scheduled",
+            delay_ms=int(delay_ms),
+            reason=str(backoff_reason or "")[:80],
+            replay_kind=rk,
+        )
 
         def _go() -> None:
             if getattr(self, "_application_shutting_down", False):
@@ -51426,8 +51509,11 @@ class MainWindow(QMainWindow):
                         queue_size=len(pending_candidates),
                     )
 
+            queue_size_before = int(self._unresolved_proposed_queue_size() or 0)
+
             parent_budget = 0
             raw_budget = os.environ.get("OZLINK_RESTORE_REPLAY_PARENT_BUDGET", "").strip()
+            explicit_env_budget = bool(raw_budget)
             if raw_budget:
                 try:
                     parent_budget = max(0, int(raw_budget))
@@ -51471,6 +51557,24 @@ class MainWindow(QMainWindow):
                         parent_budget = min(int(parent_budget), 8)
             except Exception:
                 pass
+            if pending_candidates:
+                if explicit_env_budget and parent_budget <= 0:
+                    log_info(
+                        "destination_replay_skipped_zero_budget",
+                        replay_kind="proposed",
+                        reason=str(reason)[:120],
+                        note="OZLINK_RESTORE_REPLAY_PARENT_BUDGET_explicit_zero",
+                    )
+                    self._schedule_unresolved_replay_drain_after_budget_suppression(
+                        replay_kind="proposed",
+                        remaining_queue_size=int(self._unresolved_proposed_queue_size() or 0),
+                        trigger_path=trigger_path,
+                        backoff_reason="zero_budget",
+                    )
+                    return 0
+                parent_budget = max(1, int(parent_budget))
+            if str(reason or "").strip() == "replay_budget_resume":
+                max_slice_ms = min(int(max_slice_ms), 12)
             budget_exhausted = False
             for proposed_folder in pending_candidates:
                 if slice_timer.elapsed() > max_slice_ms:
@@ -51487,7 +51591,35 @@ class MainWindow(QMainWindow):
                 if parent_item is not None:
                     applied_count += self._apply_proposed_children_to_item(parent_item)
 
+            q_after = int(self._unresolved_proposed_queue_size() or 0)
+            stalled = False
+            try:
+                stall_n = int(os.environ.get("OZLINK_REPLAY_STALL_CYCLES", "") or 8)
+            except ValueError:
+                stall_n = 8
+            stall_n = max(3, min(50, stall_n))
+            if (
+                budget_exhausted
+                and applied_count == 0
+                and len(processed_parent_paths) == 0
+                and q_after >= queue_size_before
+            ):
+                cyc = int(getattr(self, "_destination_replay_suppression_stall_cycles_proposed", 0) or 0) + 1
+                self._destination_replay_suppression_stall_cycles_proposed = cyc
+                if cyc >= stall_n:
+                    log_info(
+                        "destination_replay_stalled_no_progress",
+                        queue_size=int(q_after),
+                        cycles=int(cyc),
+                        replay_kind="proposed",
+                    )
+                    stalled = True
+            else:
+                if applied_count > 0 or q_after < queue_size_before or len(processed_parent_paths) > 0:
+                    self._destination_replay_suppression_stall_cycles_proposed = 0
+
             if applied_count > 0:
+                self._destination_replay_reset_drain_backoff("proposed")
                 self._log_restore_phase(
                     "unresolved_proposed_replay_applied",
                     reason=reason,
@@ -51525,16 +51657,18 @@ class MainWindow(QMainWindow):
                             remaining_queue_size=self._unresolved_proposed_queue_size(),
                             note="deeper_proposed_parents_may_not_run_until_scheduled_replay_tick",
                         )
-                    self._schedule_destination_restore_materialization_queue(
-                        "replay_budget",
-                        trigger_path=trigger_path,
-                        delay_ms=self._restore_queue_tick_delay_ms,
-                    )
-                    self._schedule_unresolved_replay_drain_after_budget_suppression(
-                        replay_kind="proposed",
-                        remaining_queue_size=int(self._unresolved_proposed_queue_size() or 0),
-                        trigger_path=trigger_path,
-                    )
+                    if not stalled:
+                        self._schedule_destination_restore_materialization_queue(
+                            "replay_budget",
+                            trigger_path=trigger_path,
+                            delay_ms=self._restore_queue_tick_delay_ms,
+                        )
+                        self._schedule_unresolved_replay_drain_after_budget_suppression(
+                            replay_kind="proposed",
+                            remaining_queue_size=int(self._unresolved_proposed_queue_size() or 0),
+                            trigger_path=trigger_path,
+                            backoff_reason="budget_suppression",
+                        )
 
             try:
                 if applied_count > 0:
@@ -51613,8 +51747,11 @@ class MainWindow(QMainWindow):
                         queue_size=len(pending_moves),
                     )
 
+            queue_size_before = int(self._unresolved_allocation_queue_size() or 0)
+
             parent_budget = 0
             raw_budget = os.environ.get("OZLINK_RESTORE_REPLAY_PARENT_BUDGET", "").strip()
+            explicit_env_budget = bool(raw_budget)
             if raw_budget:
                 try:
                     parent_budget = max(0, int(raw_budget))
@@ -51658,6 +51795,24 @@ class MainWindow(QMainWindow):
                         parent_budget = min(int(parent_budget), 8)
             except Exception:
                 pass
+            if pending_moves:
+                if explicit_env_budget and parent_budget <= 0:
+                    log_info(
+                        "destination_replay_skipped_zero_budget",
+                        replay_kind="allocation",
+                        reason=str(reason)[:120],
+                        note="OZLINK_RESTORE_REPLAY_PARENT_BUDGET_explicit_zero",
+                    )
+                    self._schedule_unresolved_replay_drain_after_budget_suppression(
+                        replay_kind="allocation",
+                        remaining_queue_size=int(self._unresolved_allocation_queue_size() or 0),
+                        trigger_path=trigger_path,
+                        backoff_reason="zero_budget",
+                    )
+                    return 0
+                parent_budget = max(1, int(parent_budget))
+            if str(reason or "").strip() == "replay_budget_resume":
+                max_slice_ms = min(int(max_slice_ms), 12)
             budget_exhausted = False
             for move in pending_moves:
                 if slice_timer.elapsed() > max_slice_ms:
@@ -51674,7 +51829,35 @@ class MainWindow(QMainWindow):
                 if parent_item is not None:
                     applied_count += self._apply_allocation_children_to_item(parent_item)
 
+            q_after = int(self._unresolved_allocation_queue_size() or 0)
+            stalled = False
+            try:
+                stall_n = int(os.environ.get("OZLINK_REPLAY_STALL_CYCLES", "") or 8)
+            except ValueError:
+                stall_n = 8
+            stall_n = max(3, min(50, stall_n))
+            if (
+                budget_exhausted
+                and applied_count == 0
+                and len(processed_parent_paths) == 0
+                and q_after >= queue_size_before
+            ):
+                cyc = int(getattr(self, "_destination_replay_suppression_stall_cycles_allocation", 0) or 0) + 1
+                self._destination_replay_suppression_stall_cycles_allocation = cyc
+                if cyc >= stall_n:
+                    log_info(
+                        "destination_replay_stalled_no_progress",
+                        queue_size=int(q_after),
+                        cycles=int(cyc),
+                        replay_kind="allocation",
+                    )
+                    stalled = True
+            else:
+                if applied_count > 0 or q_after < queue_size_before or len(processed_parent_paths) > 0:
+                    self._destination_replay_suppression_stall_cycles_allocation = 0
+
             if applied_count > 0:
+                self._destination_replay_reset_drain_backoff("allocation")
                 self._log_restore_phase(
                     "destination_replay_projection_complete",
                     reason=reason,
@@ -51700,16 +51883,18 @@ class MainWindow(QMainWindow):
                         processed_parent_paths=len(processed_parent_paths),
                         queue_size=self._unresolved_allocation_queue_size(),
                     )
-                    self._schedule_destination_restore_materialization_queue(
-                        "replay_budget",
-                        trigger_path=trigger_path,
-                        delay_ms=self._restore_queue_tick_delay_ms,
-                    )
-                    self._schedule_unresolved_replay_drain_after_budget_suppression(
-                        replay_kind="allocation",
-                        remaining_queue_size=int(self._unresolved_allocation_queue_size() or 0),
-                        trigger_path=trigger_path,
-                    )
+                    if not stalled:
+                        self._schedule_destination_restore_materialization_queue(
+                            "replay_budget",
+                            trigger_path=trigger_path,
+                            delay_ms=self._restore_queue_tick_delay_ms,
+                        )
+                        self._schedule_unresolved_replay_drain_after_budget_suppression(
+                            replay_kind="allocation",
+                            remaining_queue_size=int(self._unresolved_allocation_queue_size() or 0),
+                            trigger_path=trigger_path,
+                            backoff_reason="budget_suppression",
+                        )
 
             try:
                 if applied_count > 0:
