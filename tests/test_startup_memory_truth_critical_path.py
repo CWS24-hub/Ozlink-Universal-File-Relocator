@@ -1,8 +1,9 @@
-"""Regression: startup memory-truth must not block ``startup_memory_visible_tree_ready`` on heavy replay."""
+"""Regression: startup memory-truth presents full saved workspace in one go before background refine."""
 
 from __future__ import annotations
 
 import contextlib
+import os
 import time
 from unittest.mock import MagicMock, patch
 
@@ -35,6 +36,8 @@ def _minimal_mw_for_memory_truth_body():
     mw._log_restore_exception = lambda *a, **k: None
     mw._safe_invoke = lambda _n, fn: fn()
     mw._destination_startup_memory_workspace_building = False
+    mw._count_destination_model_non_placeholder_nodes = lambda: 120
+    mw._destination_user_scroll_interaction_active = lambda: False
     return mw
 
 
@@ -58,13 +61,14 @@ def _memory_truth_timer_queue():
 
 
 def test_visible_tree_ready_before_background_replay_and_refine():
-    """Critical path logs ``startup_memory_visible_tree_ready`` before replay and refine hooks."""
+    """Sync replay builds workspace; ``startup_memory_visible_tree_ready`` precedes background refine."""
     mw = _minimal_mw_for_memory_truth_body()
     seq: list[str] = []
 
     def capture(msg: str, **_kwargs):
         if isinstance(msg, str) and (
             msg.startswith("startup_memory_")
+            or msg.startswith("startup_background_")
             or msg.startswith("destination_phase_timing")
             or msg.startswith("destination_")
         ):
@@ -78,18 +82,19 @@ def test_visible_tree_ready_before_background_replay_and_refine():
 
     mw._destination_planning_overlay_replay_persisted_only = counting_replay
 
-    with patch("ozlink_console.main_window.log_info", side_effect=capture):
-        with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
-            with _memory_truth_timer_queue() as drain:
-                MainWindow._apply_destination_planning_overlays_body_memory_truth_startup(
-                    mw,
-                    "startup_planned_workspace_memory_truth",
-                )
-                assert "startup_memory_visible_tree_ready" in seq
-                assert replay_calls[0] == 0
-                assert "startup_memory_background_refine_begin" not in seq
-                drain()
-    assert seq.index("startup_memory_visible_tree_ready") < seq.index("startup_memory_background_refine_begin")
+    with patch.dict(os.environ, {"OZLINK_STARTUP_BACKGROUND_REFINE_GRACE_MS": "120"}, clear=False):
+        with patch("ozlink_console.main_window.log_info", side_effect=capture):
+            with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
+                with _memory_truth_timer_queue() as drain:
+                    MainWindow._apply_destination_planning_overlays_body_memory_truth_startup(
+                        mw,
+                        "startup_planned_workspace_memory_truth",
+                    )
+                    assert "startup_memory_visible_tree_ready" in seq
+                    assert replay_calls[0] == 1
+                    assert "startup_background_refine_begin" not in seq
+                    drain()
+    assert seq.index("startup_memory_visible_tree_ready") < seq.index("startup_background_refine_begin")
     assert replay_calls[0] == 1
     mw._startup_memory_truth_deferred_finish.assert_called_once()
 
@@ -102,22 +107,23 @@ def test_log_tokens_no_materialize_before_visible():
     def capture(msg: str, **_kwargs):
         msgs.append(str(msg))
 
-    with patch("ozlink_console.main_window.log_info", side_effect=capture):
-        with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
-            with _memory_truth_timer_queue() as drain:
-                MainWindow._apply_destination_planning_overlays_body_memory_truth_startup(
-                    mw,
-                    "startup_planned_workspace_memory_truth",
-                )
-                vis = msgs.index("startup_memory_visible_tree_ready")
-                for i in range(vis):
-                    assert "materialize_destination_future_model" not in msgs[i]
-                    assert "destination_future_model_materialize" not in msgs[i]
-                drain()
+    with patch.dict(os.environ, {"OZLINK_STARTUP_BACKGROUND_REFINE_GRACE_MS": "120"}, clear=False):
+        with patch("ozlink_console.main_window.log_info", side_effect=capture):
+            with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
+                with _memory_truth_timer_queue() as drain:
+                    MainWindow._apply_destination_planning_overlays_body_memory_truth_startup(
+                        mw,
+                        "startup_planned_workspace_memory_truth",
+                    )
+                    vis = msgs.index("startup_memory_visible_tree_ready")
+                    for i in range(vis):
+                        assert "materialize_destination_future_model" not in msgs[i]
+                        assert "destination_future_model_materialize" not in msgs[i]
+                    drain()
 
 
 def test_sync_critical_path_completes_under_threshold_ms():
-    """The synchronous body (through ``visible_tree_ready``) must stay sub-second; heavy work is deferred."""
+    """The synchronous body (through ``visible_tree_ready``) must stay sub-second; deferred refine follows timers."""
     mw = _minimal_mw_for_memory_truth_body()
 
     def slow_replay(*_a, **_k):
@@ -126,20 +132,21 @@ def test_sync_critical_path_completes_under_threshold_ms():
 
     mw._destination_planning_overlay_replay_persisted_only = slow_replay
 
-    with _memory_truth_timer_queue() as drain:
-        t0 = time.perf_counter()
-        with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
-            MainWindow._apply_destination_planning_overlays_body_memory_truth_startup(
-                mw,
-                "startup_planned_workspace_memory_truth",
-            )
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
-        assert elapsed_ms < 500.0
-        drain()
+    with patch.dict(os.environ, {"OZLINK_STARTUP_BACKGROUND_REFINE_GRACE_MS": "120"}, clear=False):
+        with _memory_truth_timer_queue() as drain:
+            t0 = time.perf_counter()
+            with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
+                MainWindow._apply_destination_planning_overlays_body_memory_truth_startup(
+                    mw,
+                    "startup_planned_workspace_memory_truth",
+                )
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            assert elapsed_ms < 500.0
+            drain()
 
 
-def test_bounded_replay_invocations_before_after_ready():
-    """Replay runs at most once per startup pass; not on the synchronous pre-ready path."""
+def test_bounded_replay_invocations_single_sync_pass():
+    """Replay runs once synchronously for one-go presentation; deferred path does not replay again."""
     mw = _minimal_mw_for_memory_truth_body()
     n = [0]
 
@@ -149,46 +156,48 @@ def test_bounded_replay_invocations_before_after_ready():
 
     mw._destination_planning_overlay_replay_persisted_only = count
 
-    with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
-        with _memory_truth_timer_queue() as drain:
-            MainWindow._apply_destination_planning_overlays_body_memory_truth_startup(
-                mw,
-                "startup_planned_workspace_memory_truth",
-            )
-            assert n[0] == 0
-            drain()
-    assert n[0] == 1
-
-
-def test_background_refine_after_visible_tree_ready_log_order():
-    """``startup_memory_background_refine_begin`` must follow ``startup_memory_visible_tree_ready`` in log order."""
-    mw = _minimal_mw_for_memory_truth_body()
-    ordered: list[str] = []
-
-    def capture(msg: str, **_kwargs):
-        if msg in (
-            "startup_memory_visible_tree_ready",
-            "startup_memory_background_refine_begin",
-        ):
-            ordered.append(msg)
-
-    with patch("ozlink_console.main_window.log_info", side_effect=capture):
+    with patch.dict(os.environ, {"OZLINK_STARTUP_BACKGROUND_REFINE_GRACE_MS": "120"}, clear=False):
         with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
             with _memory_truth_timer_queue() as drain:
                 MainWindow._apply_destination_planning_overlays_body_memory_truth_startup(
                     mw,
                     "startup_planned_workspace_memory_truth",
                 )
-                assert ordered == ["startup_memory_visible_tree_ready"]
+                assert n[0] == 1
                 drain()
+    assert n[0] == 1
+
+
+def test_background_refine_after_visible_tree_ready_log_order():
+    """``startup_background_refine_begin`` follows ``startup_memory_visible_tree_ready`` after grace drain."""
+    mw = _minimal_mw_for_memory_truth_body()
+    ordered: list[str] = []
+
+    def capture(msg: str, **_kwargs):
+        if msg in (
+            "startup_memory_visible_tree_ready",
+            "startup_background_refine_begin",
+        ):
+            ordered.append(msg)
+
+    with patch.dict(os.environ, {"OZLINK_STARTUP_BACKGROUND_REFINE_GRACE_MS": "120"}, clear=False):
+        with patch("ozlink_console.main_window.log_info", side_effect=capture):
+            with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
+                with _memory_truth_timer_queue() as drain:
+                    MainWindow._apply_destination_planning_overlays_body_memory_truth_startup(
+                        mw,
+                        "startup_planned_workspace_memory_truth",
+                    )
+                    assert ordered == ["startup_memory_visible_tree_ready"]
+                    drain()
     assert ordered == [
         "startup_memory_visible_tree_ready",
-        "startup_memory_background_refine_begin",
+        "startup_background_refine_begin",
     ]
 
 
-def test_post_startup_workspace_building_cleared_and_idle_hooks():
-    """After deferred chain, workspace-building clears; deferred finish and snapshot hook run once (settle)."""
+def test_post_startup_workspace_building_cleared_before_deferred_refine():
+    """Workspace is usable after sync presentation; deferred refine runs after grace timers."""
     mw = _minimal_mw_for_memory_truth_body()
 
     def real_deferred(_ctx, _reason, _n, _exp_len):
@@ -196,20 +205,21 @@ def test_post_startup_workspace_building_cleared_and_idle_hooks():
 
     mw._startup_memory_truth_deferred_finish = real_deferred
 
-    with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
-        with _memory_truth_timer_queue() as drain:
-            MainWindow._apply_destination_planning_overlays_body_memory_truth_startup(
-                mw,
-                "startup_planned_workspace_memory_truth",
-            )
-            assert mw._destination_startup_memory_workspace_building is True
-            drain()
-    assert mw._destination_startup_memory_workspace_building is False
+    with patch.dict(os.environ, {"OZLINK_STARTUP_BACKGROUND_REFINE_GRACE_MS": "120"}, clear=False):
+        with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
+            with _memory_truth_timer_queue() as drain:
+                MainWindow._apply_destination_planning_overlays_body_memory_truth_startup(
+                    mw,
+                    "startup_planned_workspace_memory_truth",
+                )
+                assert mw._destination_startup_memory_workspace_building is False
+                assert mw._destination_startup_memory_phase == "memory_presented"
+                drain()
     mw._mark_destination_tree_snapshot_dirty_after_injection.assert_called_once()
 
 
-def test_outer_overlay_returns_before_replay_runs():
-    """``_apply_destination_planning_overlays`` for memory-truth returns before replay executes."""
+def test_outer_overlay_returns_after_sync_replay():
+    """Memory-truth body runs sync replay before returning; refine is timer-deferred."""
     mw = _minimal_mw_for_memory_truth_body()
     phases: list[str] = []
 
@@ -224,18 +234,105 @@ def test_outer_overlay_returns_before_replay_runs():
 
     mw._destination_planning_overlay_replay_persisted_only = tag_replay
 
-    with patch.object(MainWindow, "_apply_destination_planning_overlays_body", outer_body):
-        with patch("ozlink_console.main_window._shutdown_mutation_skip_for_host", lambda *_a, **_k: False):
-            with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
-                with patch("ozlink_console.main_window.is_dev_mode", lambda: False):
-                    with _memory_truth_timer_queue() as drain:
-                        MainWindow._apply_destination_planning_overlays(
-                            mw,
-                            "startup_planned_workspace_memory_truth",
-                            allow_defer=True,
-                            prefer_chunked_projection=False,
-                        )
-                        assert phases == ["body_enter", "body_exit"]
-                        assert "replay" not in phases
-                        drain()
-    assert "replay" in phases
+    with patch.dict(os.environ, {"OZLINK_STARTUP_BACKGROUND_REFINE_GRACE_MS": "120"}, clear=False):
+        with patch.object(MainWindow, "_apply_destination_planning_overlays_body", outer_body):
+            with patch("ozlink_console.main_window._shutdown_mutation_skip_for_host", lambda *_a, **_k: False):
+                with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
+                    with patch("ozlink_console.main_window.is_dev_mode", lambda: False):
+                        with _memory_truth_timer_queue() as drain:
+                            MainWindow._apply_destination_planning_overlays(
+                                mw,
+                                "startup_planned_workspace_memory_truth",
+                                allow_defer=True,
+                                prefer_chunked_projection=False,
+                            )
+                            assert phases == ["body_enter", "replay", "body_exit"]
+                            drain()
+
+
+def test_graph_descendant_paused_logs_and_resumes_on_scroll_idle():
+    """Graph descendant apply defers to scroll idle instead of immediate timer(0) reschedule."""
+    mw = MainWindow.__new__(MainWindow)
+    mw._application_shutting_down = False
+    mw._destination_descendant_apply_paused_for_finalize_alloc = False
+    mw._destination_descendant_apply_tick_running = False
+    mw._destination_descendant_apply_state = {"graph_walk": True}
+    mw._destination_descendant_apply_queue = None
+    mw._destination_descendant_apply_inline_drain = False
+    mw._destination_planning_model = MagicMock()
+    mw._destination_planning_model.begin_coalesce_destination_structure_signal = None
+    mw._destination_planning_model.end_coalesce_destination_structure_signal = None
+    calls = []
+
+    def scroll_on():
+        calls.append("scroll_active")
+        return True
+
+    mw._destination_user_scroll_interaction_active = scroll_on
+    mw._destination_descendant_apply_drain_note_graph_tick_end = lambda *a, **k: None
+    mw._destination_descendant_apply_drain_finalize_graph_walk_tick_slice = lambda *a, **k: None
+    idle_started = []
+
+    class _T:
+        def start(self, ms):
+            idle_started.append(ms)
+
+    mw._destination_tree_scroll_idle_timer = _T()
+    paused_msgs: list[str] = []
+
+    def cap_info(msg, **_k):
+        if msg == "background_graph_descendant_paused_for_interaction":
+            paused_msgs.append(msg)
+
+    with patch("ozlink_console.main_window.log_info", side_effect=cap_info):
+        MainWindow._run_destination_descendant_apply_tick_body(mw)
+    assert paused_msgs == ["background_graph_descendant_paused_for_interaction"]
+    assert mw._destination_descendant_apply_deferred_for_scroll_resume is True
+    assert idle_started and idle_started[0] >= 120
+
+
+def test_snapshot_drain_deferred_when_scroll_active():
+    mw = MainWindow.__new__(MainWindow)
+    mw._application_shutting_down = False
+    mw._destination_snapshot_capture_drain_depth = 0
+    mw._destination_descendant_apply_paused_for_finalize_alloc = False
+    mw._destination_descendant_apply_tick_running = False
+    mw._destination_user_scroll_interaction_active = lambda: True
+    logged = []
+
+    def cap(msg, **_k):
+        if msg == "background_snapshot_drain_paused_for_interaction":
+            logged.append(msg)
+
+    idle_ms = []
+
+    class _T:
+        def start(self, ms):
+            idle_ms.append(ms)
+
+    mw._destination_tree_scroll_idle_timer = _T()
+    with patch("ozlink_console.main_window.log_info", side_effect=cap):
+        MainWindow._destination_finalize_inflight_descendant_apply_for_snapshot_capture(mw)
+    assert logged == ["background_snapshot_drain_paused_for_interaction"]
+    assert mw._destination_snapshot_drain_deferred_for_scroll is True
+    assert idle_ms[0] >= 120
+
+
+def test_scroll_idle_resumes_descendant_and_clears_flag():
+    mw = MainWindow.__new__(MainWindow)
+    mw._destination_descendant_apply_deferred_for_scroll_resume = True
+    mw._destination_snapshot_drain_deferred_for_scroll = False
+    sched = []
+
+    def sched_tick():
+        sched.append("tick")
+
+    mw._schedule_destination_descendant_apply_tick = sched_tick
+    mw._destination_reconcile_pended_after_scroll = None
+    mw._destination_global_planned_reconcile_pended_after_scroll = None
+    mw._destination_materialize_pended_for_scroll_reason = ""
+    mw._destination_materialize_pended_for_scroll_kwargs = {}
+    mw._destination_indicator_refresh_deferred_for_scroll = False
+    MainWindow._destination_on_destination_tree_scroll_idle(mw)
+    assert mw._destination_descendant_apply_deferred_for_scroll_resume is False
+    assert sched == ["tick"]

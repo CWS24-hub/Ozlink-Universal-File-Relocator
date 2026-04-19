@@ -2959,6 +2959,16 @@ class MainWindow(QMainWindow):
         self._destination_startup_promotion_scope_drive_id: str = ""
         # While memory-truth startup is still attaching / deferred refinement — coalesce forced live snapshot churn.
         self._destination_startup_memory_workspace_building: bool = False
+        # memory_presenting → memory_presented → background_refining (startup planned workspace UX contract).
+        self._destination_startup_memory_phase: str = ""
+        self._startup_memory_presentation_wall_t0: float = 0.0
+        self._startup_memory_presentation_row_count: int = -1
+        self._startup_memory_sync_present_ms: int = 0
+        self._startup_memory_sync_expand_affordances_done: bool = False
+        self._startup_background_refine_pending: dict[str, Any] | None = None
+        self._destination_background_refine_paused_for_interaction: bool = False
+        self._destination_snapshot_drain_deferred_for_scroll: bool = False
+        self._destination_descendant_apply_deferred_for_scroll_resume: bool = False
         # After first Graph root bind merge (or shallow reset) for destination — overlay teardown may run.
         self._destination_startup_snapshot_preservation_applied: bool = False
         # SharePoint source: recursive session snapshot mounted before Graph root bind (Phase 1 shell).
@@ -37749,11 +37759,22 @@ class MainWindow(QMainWindow):
                 pass
             self._destination_post_tick_deferred_boundary_log("drain_deferred_because_tick_running")
             return
+        shutting = bool(getattr(self, "_application_shutting_down", False))
+        if not shutting and self._destination_user_scroll_interaction_active():
+            self._destination_snapshot_drain_deferred_for_scroll = True
+            log_info(
+                "background_snapshot_drain_paused_for_interaction",
+                reason="destination_scroll_active",
+            )
+            t_idle = getattr(self, "_destination_tree_scroll_idle_timer", None)
+            if t_idle is not None:
+                idle_ms = max(120, int(getattr(self, "_destination_tree_scroll_idle_ms", 280) or 280))
+                t_idle.start(idle_ms)
+            return
         self._destination_snapshot_capture_drain_depth = 1
         self._destination_snapshot_capture_drain_active = True
         self._destination_descendant_apply_drain_slice_log_counter = 0
         t0 = time.perf_counter()
-        shutting = bool(getattr(self, "_application_shutting_down", False))
         shutdown_deadline_s = float(self._snapshot_capture_shutdown_drain_deadline_s()) if shutting else 0.0
         dq0 = getattr(self, "_destination_descendant_apply_queue", None)
         q0 = len(dq0) if dq0 else 0
@@ -39072,10 +39093,14 @@ class MainWindow(QMainWindow):
             and _scroll_fn()
         ):
             log_info(
-                "startup_lifecycle_temp_live_descendant_injected_deferred_due_to_interaction",
+                "background_graph_descendant_paused_for_interaction",
                 reason="destination_tree_scroll_active",
             )
-            self._schedule_destination_descendant_apply_tick()
+            self._destination_descendant_apply_deferred_for_scroll_resume = True
+            t_idle = getattr(self, "_destination_tree_scroll_idle_timer", None)
+            if t_idle is not None:
+                idle_ms = max(120, int(getattr(self, "_destination_tree_scroll_idle_ms", 280) or 280))
+                t_idle.start(idle_ms)
             self._destination_descendant_apply_drain_note_graph_tick_end("graph_scroll_deferred")
             return
         if (
@@ -48003,35 +48028,100 @@ class MainWindow(QMainWindow):
 
         _walk(QModelIndex())
 
-    def _startup_memory_truth_foreground_replay_phase(self, ctx: str, reason: str, exp_bind: set[str]) -> None:
-        """Replay unresolved overlays + expand-affordance hints after ``startup_memory_visible_tree_ready`` (not on sync critical path)."""
+    def _schedule_startup_memory_background_refine(
+        self,
+        ctx: str,
+        reason: str,
+        exp_bind: set[str],
+        overlay_replay_rows: int,
+        presentation_t0: float,
+    ) -> None:
+        """After one-go memory presentation, wait grace + quiet UI before audits / fingerprint (not hot path)."""
         r = str(reason or "")
+        raw_grace = str(os.environ.get("OZLINK_STARTUP_BACKGROUND_REFINE_GRACE_MS", "") or "").strip()
+        try:
+            grace_ms = max(120, min(8000, int(raw_grace))) if raw_grace else 450
+        except ValueError:
+            grace_ms = 450
+        self._startup_background_refine_pending = {
+            "ctx": ctx,
+            "reason": r,
+            "exp_bind": set(exp_bind) if exp_bind else set(),
+            "overlay_rows": int(overlay_replay_rows),
+            "presentation_t0": float(presentation_t0),
+        }
         log_info(
-            "startup_memory_background_refine_begin",
+            "startup_background_refine_grace_period_begin",
+            grace_ms=int(grace_ms),
             reason=r[:200],
             expanded_path_closure_count=len(exp_bind),
         )
-        n = 0
-        try:
-            n = int(
-                self._destination_planning_overlay_replay_persisted_only(
-                    ctx, destination_expanded_paths=exp_bind
-                )
-            )
-        except Exception as exc:
-            self._log_restore_exception("startup_memory_truth_foreground_replay_phase", exc)
-        try:
-            self._startup_memory_mark_saved_descendant_expand_affordances()
-        except Exception as exc:
-            self._log_restore_exception("startup_memory_truth_mark_expand_affordance", exc)
+        QTimer.singleShot(
+            int(grace_ms),
+            lambda: self._safe_invoke(
+                "startup_background_refine_grace_elapsed",
+                self._maybe_start_startup_background_refine_after_grace,
+            ),
+        )
 
-        def _finish() -> None:
+    def _maybe_start_startup_background_refine_after_grace(self) -> None:
+        pend = getattr(self, "_startup_background_refine_pending", None)
+        if not isinstance(pend, dict):
+            return
+        _was_paused = bool(getattr(self, "_destination_background_refine_paused_for_interaction", False))
+        if self._destination_user_scroll_interaction_active():
+            self._destination_background_refine_paused_for_interaction = True
+            log_info(
+                "startup_background_refine_paused_for_interaction",
+                reason=str(pend.get("reason") or "")[:200],
+            )
+            t_idle = getattr(self, "_destination_tree_scroll_idle_timer", None)
+            if t_idle is not None:
+                idle_ms = max(120, int(getattr(self, "_destination_tree_scroll_idle_ms", 280) or 280))
+                t_idle.start(idle_ms)
+            # Real backoff — not immediate singleShot(0) retry churn while scroll continues.
+            QTimer.singleShot(
+                max(420, int(getattr(self, "_destination_tree_scroll_idle_ms", 280) or 280)),
+                lambda: self._safe_invoke(
+                    "startup_background_refine_retry_after_quiet",
+                    self._maybe_start_startup_background_refine_after_grace,
+                ),
+            )
+            return
+        if _was_paused:
+            log_info(
+                "startup_background_refine_resumed_after_quiet_window",
+                reason=str(pend.get("reason") or "")[:200],
+            )
+        self._destination_background_refine_paused_for_interaction = False
+        ctx = str(pend.get("ctx") or "")
+        r = str(pend.get("reason") or "")
+        exp_bind = pend.get("exp_bind") or set()
+        n = int(pend.get("overlay_rows") or 0)
+        t0 = float(pend.get("presentation_t0") or time.perf_counter())
+        self._startup_background_refine_pending = None
+        self._destination_startup_memory_phase = "background_refining"
+        _after_ms = int((time.perf_counter() - t0) * 1000)
+        ws_rows = int(getattr(self, "_startup_memory_presentation_row_count", -1) or -1)
+        _sync_ms = int(getattr(self, "_startup_memory_sync_present_ms", 0) or 0)
+        log_info(
+            "startup_background_refine_begin",
+            reason=r[:200],
+            expanded_path_closure_count=len(exp_bind),
+        )
+        log_info(
+            "startup_memory_presentation_summary",
+            memory_present_ms=int(_sync_ms),
+            workspace_visible_rows=int(ws_rows),
+            background_refine_started_after_ms=int(_after_ms),
+        )
+
+        def _tail() -> None:
             try:
                 self._startup_memory_truth_deferred_finish(ctx, r, int(n), len(exp_bind))
             except Exception as exc:
                 self._log_restore_exception("startup_memory_truth_deferred_finish", exc)
             finally:
-                self._destination_startup_memory_workspace_building = False
                 log_info("startup_memory_truth_materialize_released", reason=str(r)[:200])
                 log_info("startup_snapshot_capture_released_after_startup_settle")
                 try:
@@ -48041,7 +48131,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
 
-        QTimer.singleShot(100, lambda: self._safe_invoke("startup_memory_truth_deferred_finish", _finish))
+        QTimer.singleShot(0, lambda: self._safe_invoke("startup_memory_truth_deferred_finish_tail", _tail))
 
     def _startup_memory_truth_deferred_finish(
         self, ctx: str, reason: str, overlay_replay_rows: int, expanded_path_closure_count: int
@@ -48062,7 +48152,8 @@ class MainWindow(QMainWindow):
             overlay_replay_rows=int(overlay_replay_rows),
         )
         ens_n, _ens_miss = self._startup_memory_truth_ensure_missing_intended_paths()
-        self._startup_memory_mark_saved_descendant_expand_affordances()
+        if not bool(getattr(self, "_startup_memory_sync_expand_affordances_done", False)):
+            self._startup_memory_mark_saved_descendant_expand_affordances()
         self._bump_destination_materialized_overlay_fingerprint(
             phase="startup_planned_workspace_memory_truth",
             first_render_path="memory_truth_startup_deferred",
@@ -48280,17 +48371,28 @@ class MainWindow(QMainWindow):
     ):
         """Attach persisted planned/proposed/allocation overlays without full-tree gates or reconcile storms.
 
-        **Visible-tree first**: replay + expand-path bind only on the hot path so the tree can paint; chain-ensure,
-        full-workspace audit, and fingerprint bump run on a short defer (see ``_startup_memory_truth_deferred_finish``).
+        **One-go presentation**: unresolved replay + expanded-path bind runs synchronously so the saved workspace
+        is fully visible before any background refine (audits / fingerprint / chain-ensure deferred — see
+        :meth:`_schedule_startup_memory_background_refine`).
         """
         r = str(reason or "")
         self._startup_memory_planned_attach_skipped_log = []
+        self._startup_memory_sync_expand_affordances_done = False
+        _t_pres = time.perf_counter()
+        log_info(
+            "startup_memory_presenting_begin",
+            reason=r[:200],
+            planned_moves_count=len(self.planned_moves or []),
+            proposed_folders_count=len(self.proposed_folders or []),
+        )
         log_info(
             "startup_memory_planned_attach_begin",
             reason=r[:200],
             planned_moves_count=len(self.planned_moves or []),
             proposed_folders_count=len(self.proposed_folders or []),
         )
+        self._destination_startup_memory_phase = "memory_presenting"
+        self._startup_memory_presentation_wall_t0 = float(_t_pres)
         self._startup_memory_planned_attach_active = True
         self._destination_planned_chain_overlay_relax = True
         self._destination_startup_memory_workspace_building = True
@@ -48314,22 +48416,52 @@ class MainWindow(QMainWindow):
                 QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
             except Exception:
                 pass
+            n = 0
+            try:
+                n = int(
+                    self._destination_planning_overlay_replay_persisted_only(
+                        ctx, destination_expanded_paths=exp_bind
+                    )
+                )
+            except Exception as exc:
+                self._log_restore_exception("memory_truth_startup_sync_workspace_replay", exc)
+            try:
+                self._startup_memory_mark_saved_descendant_expand_affordances()
+                self._startup_memory_sync_expand_affordances_done = True
+            except Exception as exc:
+                self._log_restore_exception("startup_memory_truth_mark_expand_affordance", exc)
+            _present_ms = int((time.perf_counter() - _t_pres) * 1000)
+            self._startup_memory_sync_present_ms = int(_present_ms)
+            ws_rows = -1
+            try:
+                ws_rows = int(self._count_destination_model_non_placeholder_nodes())
+            except Exception:
+                pass
+            self._startup_memory_presentation_row_count = int(ws_rows)
+            log_info(
+                "startup_memory_presenting_complete",
+                reason=r[:200],
+                elapsed_ms=int(_present_ms),
+                overlay_replay_rows=int(n),
+                expanded_path_closure_count=len(exp_bind),
+            )
+            log_info(
+                "startup_memory_workspace_fully_visible",
+                reason=r[:200],
+                workspace_visible_rows=int(ws_rows),
+                overlay_replay_rows=int(n),
+            )
             log_info(
                 "startup_memory_visible_tree_ready",
                 reason=r[:200],
-                overlay_replay_rows=0,
+                overlay_replay_rows=int(n),
                 expanded_path_closure_count=len(exp_bind),
-                deferred_overlay_replay_scheduled=True,
+                deferred_background_refine_scheduled=True,
             )
-
-            def _run_replay_phase() -> None:
-                try:
-                    self._startup_memory_truth_foreground_replay_phase(ctx, r, exp_bind)
-                except Exception as exc:
-                    self._log_restore_exception("startup_memory_truth_foreground_replay_phase", exc)
-                    self._destination_startup_memory_workspace_building = False
-
-            QTimer.singleShot(0, lambda: self._safe_invoke("startup_memory_truth_foreground_replay_phase", _run_replay_phase))
+            self._destination_startup_memory_phase = "memory_presented"
+            # Saved workspace is visible; allow snapshot capture — background refine (audits) follows later.
+            self._destination_startup_memory_workspace_building = False
+            self._schedule_startup_memory_background_refine(ctx, r, exp_bind, int(n), float(_t_pres))
             return 0
         except Exception:
             self._destination_startup_memory_workspace_building = False
@@ -48928,6 +49060,33 @@ class MainWindow(QMainWindow):
         if getattr(self, "_destination_indicator_refresh_deferred_for_scroll", False):
             self._destination_indicator_refresh_deferred_for_scroll = False
             self._schedule_refresh_destination_tree_indicators()
+        if getattr(self, "_destination_descendant_apply_deferred_for_scroll_resume", False):
+            self._destination_descendant_apply_deferred_for_scroll_resume = False
+            log_info(
+                "startup_background_refine_resumed_after_quiet_window",
+                work_kind="graph_descendant_apply",
+            )
+            try:
+                self._schedule_destination_descendant_apply_tick()
+            except Exception as exc:
+                self._log_restore_exception("destination_descendant_apply_after_scroll_idle", exc)
+        if getattr(self, "_destination_snapshot_drain_deferred_for_scroll", False):
+            self._destination_snapshot_drain_deferred_for_scroll = False
+            log_info(
+                "startup_background_refine_resumed_after_quiet_window",
+                work_kind="snapshot_capture_drain",
+            )
+
+            def _retry_snapshot_drain() -> None:
+                try:
+                    self._destination_finalize_inflight_descendant_apply_for_snapshot_capture()
+                except Exception as exc:
+                    self._log_restore_exception("snapshot_capture_drain_after_scroll_idle", exc)
+
+            QTimer.singleShot(
+                0,
+                lambda: self._safe_invoke("snapshot_capture_drain_after_scroll_idle", _retry_snapshot_drain),
+            )
 
     def _refresh_destination_tree_indicators(self):
         _dsp_i = getattr(self, "_dest_scroll_profiler", None)
