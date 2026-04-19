@@ -108,6 +108,7 @@ from ozlink_console.destination_startup_snapshot_roots import (
     sanitize_destination_startup_snapshot_top_level,
     select_validated_destination_startup_snapshot,
 )
+from ozlink_console.branding import apply_window_icon
 from ozlink_console.dev_mode import is_dev_mode
 from ozlink_console.logger import (
     flush_logger,
@@ -2875,6 +2876,7 @@ class MainWindow(QMainWindow):
 
         self._base_window_title = "Ozlink IT – SharePoint File Relocation Console"
         self.setWindowTitle(self._base_window_title)
+        apply_window_icon(self)
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         self.resize(1600, 980)
 

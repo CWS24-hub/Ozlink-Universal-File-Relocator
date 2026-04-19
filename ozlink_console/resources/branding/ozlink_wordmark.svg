@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Ozlink IT horizontal wordmark (dialogs, splash); app chrome uses ozlink_app_icon.svg -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 160" width="512" height="160">
+  <rect width="512" height="160" fill="#ffffff"/>
+  <rect x="16" y="24" width="72" height="112" rx="18" fill="#1e293b" stroke="#34d399" stroke-width="4"/>
+  <circle cx="40" cy="56" r="8" fill="#34d399"/>
+  <circle cx="64" cy="56" r="8" fill="#34d399"/>
+  <circle cx="40" cy="80" r="8" fill="#34d399"/>
+  <circle cx="64" cy="80" r="8" fill="#34d399"/>
+  <circle cx="52" cy="104" r="8" fill="#34d399"/>
+  <path d="M40 64 H64 M40 88 H64 M52 88 V96" stroke="#34d399" stroke-width="4" stroke-linecap="round"/>
+  <text x="108" y="118" font-family="Segoe UI, Arial, Helvetica, sans-serif" font-size="92" font-weight="700" fill="#152238">ZLINK</text>
+  <rect x="380" y="36" width="112" height="88" rx="16" fill="#2563eb"/>
+  <text x="436" y="104" font-family="Segoe UI, Arial, Helvetica, sans-serif" font-size="56" font-weight="700" fill="#ffffff" text-anchor="middle">IT</text>
+  <text x="256" y="152" font-family="Segoe UI, Arial, Helvetica, sans-serif" font-size="22" fill="#3b82f6" text-anchor="middle" letter-spacing="0.15em">COMPUTERS, IT &amp; NETWORKING</text>
+</svg>

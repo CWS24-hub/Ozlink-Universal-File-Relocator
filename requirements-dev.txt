@@ -1,2 +1,4 @@
 # Optional: pip install -r requirements-dev.txt
 pytest>=8.0
+# For scripts/generate_branding_assets.py (ICO + visibility metrics)
+Pillow>=10.0

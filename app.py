@@ -22,6 +22,7 @@ from ozlink_console.logger import (
 )
 from ozlink_console.paths import ensure_app_storage_directories
 from ozlink_console.dev_mode import apply_cli_dev_flag
+from ozlink_console.branding import apply_application_branding
 from ozlink_console.main_window import MainWindow
 
 
@@ -168,6 +169,7 @@ def run_app():
     _install_global_exception_hooks()
     _install_native_crash_capture()
     app = QApplication(sys.argv)
+    apply_application_branding(app)
     app.setApplicationName("Ozlink IT – SharePoint File Relocation Console")
     app.setOrganizationName("Ozlink IT")
     log_trace("app", "run_app_start", argv_excerpt=" ".join(sys.argv[:8])[:400])
