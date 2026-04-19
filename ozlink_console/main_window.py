@@ -27144,10 +27144,7 @@ class MainWindow(QMainWindow):
         """After background_hydration: one overlay pass + deferred indicator refresh (see startup UI phases)."""
         reasons = list(getattr(self, "_destination_startup_deferred_overlay_reasons", None) or [])
         n = len(reasons)
-        if n and (
-            self._startup_post_visible_heavy_work_blocked()
-            or self._destination_full_tree_authority_walk_in_progress()
-        ):
+        if n and self._startup_post_visible_heavy_work_blocked():
             self._destination_startup_deferred_overlay_reasons = reasons
             try:
                 miss_audit = self._startup_memory_full_workspace_audit_run()
@@ -48202,12 +48199,11 @@ class MainWindow(QMainWindow):
         return dt < float(self._startup_post_visible_heavy_work_grace_sec())
 
     def _destination_indicator_refresh_startup_or_authority_blocked(self) -> bool:
-        """Large indicator walks must not run during post-visible recovery or full-tree authority walk."""
-        if self._destination_full_tree_authority_walk_in_progress():
-            return True
-        if self._startup_post_visible_heavy_work_blocked():
-            return True
-        return False
+        """Defer full indicator walks only during post-visible grace (not during full-tree snapshot walk).
+
+        Full-library walk does not block memory/planning indicator updates on already-visible rows.
+        """
+        return bool(self._startup_post_visible_heavy_work_blocked())
 
     def _startup_memory_minimal_replay_progress_snapshot(self, audit: dict[str, Any] | None = None) -> dict[str, Any]:
         """Workspace missing counts come from ``audit`` when provided (same round as loop header) to avoid extra audit passes."""
@@ -48272,8 +48268,6 @@ class MainWindow(QMainWindow):
             max_rounds = max(1, min(512, int(raw_max))) if raw_max else 1
         except ValueError:
             max_rounds = 1
-        if self._destination_full_tree_authority_walk_in_progress():
-            max_rounds = min(int(max_rounds), 1)
         total_prop = 0
         total_alloc = 0
         self._startup_memory_minimal_replay_active = True
@@ -48559,36 +48553,6 @@ class MainWindow(QMainWindow):
                 ),
             )
             return
-        if self._destination_full_tree_authority_walk_in_progress():
-            try:
-                miss_audit = self._startup_memory_full_workspace_audit_run()
-            except Exception:
-                miss_audit = {}
-            log_info(
-                "startup_background_refine_blocked_post_visible_grace",
-                reason=str(pend.get("reason") or "")[:200],
-                time_since_visible_tree_ready_sec=round(self._startup_memory_visible_tree_ready_elapsed_sec(), 3),
-                post_visible_grace_sec=float(self._startup_post_visible_heavy_work_grace_sec()),
-                full_tree_authority_walk_in_progress=True,
-                post_visible_grace_blocked=bool(self._startup_post_visible_heavy_work_blocked()),
-                blocked_primary_reason="full_tree_authority_walk",
-                unresolved_proposed_queue=int(self._unresolved_proposed_queue_size() or 0),
-                unresolved_allocation_queue=int(self._unresolved_allocation_queue_size() or 0),
-                unresolved_proposed_parents=int(len(getattr(self, "unresolved_proposed_by_parent_path", None) or {})),
-                unresolved_allocation_parents=int(
-                    len(getattr(self, "unresolved_allocations_by_parent_path", None) or {})
-                ),
-                missing_visible_planned_rows=int(miss_audit.get("missing_visible_planned_rows", 0) or 0),
-                missing_visible_proposed_folders=int(miss_audit.get("missing_visible_proposed_folders", 0) or 0),
-            )
-            QTimer.singleShot(
-                500,
-                lambda: self._safe_invoke(
-                    "startup_background_refine_retry_after_full_tree_authority",
-                    self._maybe_start_startup_background_refine_after_grace,
-                ),
-            )
-            return
         if _was_paused:
             log_info(
                 "startup_background_refine_resumed_after_quiet_window",
@@ -48609,6 +48573,19 @@ class MainWindow(QMainWindow):
             reason=r[:200],
             expanded_path_closure_count=len(exp_bind),
         )
+        if self._destination_full_tree_authority_walk_in_progress():
+            log_info(
+                "startup_live_authority_refine_still_deferred",
+                replay_class="live_authority_refine",
+                note="full_library_snapshot_walk_in_progress_memory_completion_replay_still_runs",
+                full_tree_authority_walk_in_progress=True,
+                unresolved_proposed_queue=int(self._unresolved_proposed_queue_size() or 0),
+                unresolved_allocation_queue=int(self._unresolved_allocation_queue_size() or 0),
+                unresolved_proposed_parents=int(len(getattr(self, "unresolved_proposed_by_parent_path", None) or {})),
+                unresolved_allocation_parents=int(
+                    len(getattr(self, "unresolved_allocations_by_parent_path", None) or {})
+                ),
+            )
         log_info(
             "startup_memory_presentation_summary",
             memory_present_ms=int(_sync_ms),
@@ -52742,7 +52719,7 @@ class MainWindow(QMainWindow):
                     note="restore_materialization_queue_replay_budget",
                 )
                 return
-            if self._destination_full_tree_authority_walk_in_progress() or self._startup_post_visible_heavy_work_blocked():
+            if self._startup_post_visible_heavy_work_blocked():
                 try:
                     miss_audit = self._startup_memory_full_workspace_audit_run()
                 except Exception:
@@ -52756,11 +52733,11 @@ class MainWindow(QMainWindow):
                     full_tree_authority_walk_in_progress=bool(
                         self._destination_full_tree_authority_walk_in_progress()
                     ),
-                    post_visible_grace_blocked=bool(self._startup_post_visible_heavy_work_blocked()),
+                    post_visible_grace_blocked=True,
                     time_since_visible_tree_ready_sec=round(self._startup_memory_visible_tree_ready_elapsed_sec(), 3),
                     missing_visible_planned_rows=int(miss_audit.get("missing_visible_planned_rows", 0) or 0),
                     missing_visible_proposed_folders=int(miss_audit.get("missing_visible_proposed_folders", 0) or 0),
-                    note="restore_materialization_queue_replay_budget_authority_or_grace",
+                    note="restore_materialization_queue_replay_budget_post_visible_grace",
                 )
                 return
         delay = self._restore_queue_tick_delay_ms if delay_ms is None else max(0, int(delay_ms))
@@ -52898,34 +52875,13 @@ class MainWindow(QMainWindow):
         )
 
     def _replay_unresolved_drain_after_suppression_run(self, rk: str, trigger_path: str) -> None:
-        """Timer entry for replay_budget_resume: interaction/authority/grace gates before running overlay replay."""
+        """Timer entry for replay_budget_resume: post-visible grace only — memory replay is not starved by full-tree walk."""
         if getattr(self, "_application_shutting_down", False):
             return
         rks = str(rk or "").strip().lower() or "proposed"
         if rks not in ("proposed", "allocation"):
             rks = "proposed"
         tp = str(trigger_path or "")
-        if self._destination_full_tree_authority_walk_in_progress():
-            log_info(
-                "startup_replay_resume_blocked_by_full_tree_walk",
-                replay_kind=rks[:20],
-                trigger_path_excerpt=str(self.normalize_memory_path(tp))[:240],
-                time_since_visible_tree_ready_sec=round(self._startup_memory_visible_tree_ready_elapsed_sec(), 3),
-                unresolved_proposed_queue=int(self._unresolved_proposed_queue_size() or 0),
-                unresolved_allocation_queue=int(self._unresolved_allocation_queue_size() or 0),
-                unresolved_proposed_parents=int(len(getattr(self, "unresolved_proposed_by_parent_path", None) or {})),
-                unresolved_allocation_parents=int(
-                    len(getattr(self, "unresolved_allocations_by_parent_path", None) or {})
-                ),
-            )
-            QTimer.singleShot(
-                2000,
-                lambda: self._safe_invoke(
-                    f"unresolved_replay_drain_retry_full_tree_{rks}",
-                    lambda: self._replay_unresolved_drain_after_suppression_run(rks, tp),
-                ),
-            )
-            return
         if self._startup_post_visible_heavy_work_blocked():
             log_info(
                 "startup_replay_resume_blocked_post_visible_grace",
@@ -52948,10 +52904,57 @@ class MainWindow(QMainWindow):
                 ),
             )
             return
+        ft_active = bool(self._destination_full_tree_authority_walk_in_progress())
+        snap_before = self._startup_memory_minimal_replay_progress_snapshot()
+        if ft_active:
+            log_info(
+                "startup_memory_completion_tick_allowed_during_full_tree_walk",
+                replay_kind=rks[:20],
+                replay_class="memory_completion",
+                trigger_path_excerpt=str(self.normalize_memory_path(tp))[:240],
+                full_tree_authority_walk_in_progress=True,
+                snapshot_before=snap_before,
+            )
         if rks == "allocation":
             self._replay_unresolved_allocation_overlay("replay_budget_resume", trigger_path=tp)
         else:
             self._replay_unresolved_proposed_overlay("replay_budget_resume", trigger_path=tp)
+        try:
+            QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        except Exception:
+            pass
+        snap_after = self._startup_memory_minimal_replay_progress_snapshot()
+        try:
+            vf_b = int(snap_before.get("visible_future_branch_count", -1) or -1)
+            vf_a = int(snap_after.get("visible_future_branch_count", -1) or -1)
+            vf_delta = int(vf_a - vf_b) if vf_b >= 0 and vf_a >= 0 else 0
+        except Exception:
+            vf_delta = 0
+        log_info(
+            "startup_memory_completion_tick_progress",
+            replay_kind=rks[:20],
+            replay_class="memory_completion",
+            full_tree_authority_walk_in_progress=ft_active,
+            snapshot_before=snap_before,
+            snapshot_after=snap_after,
+            visible_future_branch_delta=int(vf_delta),
+            time_since_visible_tree_ready_sec=round(self._startup_memory_visible_tree_ready_elapsed_sec(), 3),
+        )
+        q_rem = int(self._unresolved_proposed_queue_size() or 0) + int(self._unresolved_allocation_queue_size() or 0)
+        if (
+            ft_active
+            and q_rem > 0
+            and not self._startup_memory_minimal_replay_meaningful_progress(snap_before, snap_after)
+        ):
+            log_info(
+                "startup_memory_completion_tick_stopped_no_meaningful_progress",
+                replay_kind=rks[:20],
+                replay_class="memory_completion",
+                full_tree_authority_walk_in_progress=True,
+                remaining_total_queue=int(q_rem),
+                snapshot_before=snap_before,
+                snapshot_after=snap_after,
+            )
 
     def _process_destination_restore_materialization_queue(self, reason, trigger_path=""):
         if getattr(self, "_destination_restore_materialization_user_paused", False):
