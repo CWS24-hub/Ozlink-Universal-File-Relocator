@@ -52,6 +52,8 @@ def _minimal_mw_for_memory_truth_body():
     }
     mw._replay_unresolved_proposed_overlay = lambda *a, **k: 0
     mw._replay_unresolved_allocation_overlay = lambda *a, **k: 0
+    mw._unresolved_proposed_queue_size = lambda: 0
+    mw._unresolved_allocation_queue_size = lambda: 0
     return mw
 
 
@@ -409,6 +411,8 @@ def test_minimal_replay_complete_log_before_visible_tree_ready():
         }
 
     mw._startup_memory_full_workspace_audit_run = audit
+    mw._unresolved_proposed_queue_size = lambda: 1
+    mw._unresolved_allocation_queue_size = lambda: 1
     seq: list[str] = []
 
     def capture(msg: str, **_kwargs):
@@ -468,8 +472,8 @@ def test_heavy_persisted_replay_blocked_while_minimal_replay_flag_active():
     assert "startup_memory_minimal_replay_heavy_path_blocked" in logged
 
 
-def test_minimal_replay_stalls_within_bounded_rounds():
-    """Minimal replay does not spin unbounded when unresolved replay makes no progress."""
+def test_minimal_replay_runs_until_max_rounds_when_queues_still_nonempty():
+    """Zero overlay progress does not end minimal replay early; max_rounds caps the loop."""
     mw = _minimal_mw_for_memory_truth_body()
     mw._startup_memory_full_workspace_audit_run = lambda: {
         "present_visible_planned_rows": 0,
@@ -482,6 +486,8 @@ def test_minimal_replay_stalls_within_bounded_rounds():
         "present_visible_proposed_folders": 0,
         "visible_planned_enumeration_count": 0,
     }
+    mw._unresolved_proposed_queue_size = lambda: 1
+    mw._unresolved_allocation_queue_size = lambda: 1
     prop_calls = [0]
     alloc_calls = [0]
 
@@ -498,7 +504,7 @@ def test_minimal_replay_stalls_within_bounded_rounds():
 
     with patch.dict(
         os.environ,
-        {"OZLINK_STARTUP_BACKGROUND_REFINE_GRACE_MS": "120", "OZLINK_STARTUP_MINIMAL_REPLAY_MAX_ROUNDS": "96"},
+        {"OZLINK_STARTUP_BACKGROUND_REFINE_GRACE_MS": "120", "OZLINK_STARTUP_MINIMAL_REPLAY_MAX_ROUNDS": "8"},
         clear=False,
     ):
         with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
@@ -508,5 +514,151 @@ def test_minimal_replay_stalls_within_bounded_rounds():
                     "startup_planned_workspace_memory_truth",
                 )
                 drain()
-    assert prop_calls[0] == 3
-    assert alloc_calls[0] == 3
+    assert prop_calls[0] == 8
+    assert alloc_calls[0] == 8
+
+
+def test_minimal_replay_exits_when_unresolved_queues_empty():
+    """When both unresolved queues are drained, minimal replay stops even if audit still shows gaps."""
+    mw = _minimal_mw_for_memory_truth_body()
+    mw._startup_memory_full_workspace_audit_run = lambda: {
+        "present_visible_planned_rows": 0,
+        "missing_visible_planned_rows": 3,
+        "missing_visible_proposed_folders": 0,
+        "missing_planned_paths": ["x"],
+        "missing_proposed_paths": [],
+        "expected_total_persisted_planned_rows": 24,
+        "expected_total_persisted_proposed_folders": 8,
+        "present_visible_proposed_folders": 0,
+        "visible_planned_enumeration_count": 0,
+    }
+    mw._unresolved_proposed_queue_size = lambda: 0
+    mw._unresolved_allocation_queue_size = lambda: 0
+    prop_calls = [0]
+    alloc_calls = [0]
+
+    def _no_prop(*_a, **_k):
+        prop_calls[0] += 1
+        return 0
+
+    def _no_alloc(*_a, **_k):
+        alloc_calls[0] += 1
+        return 0
+
+    mw._replay_unresolved_proposed_overlay = _no_prop
+    mw._replay_unresolved_allocation_overlay = _no_alloc
+    logged: list[tuple[str, dict]] = []
+
+    def cap(msg: str, **kwargs):
+        logged.append((msg, kwargs))
+
+    with patch.dict(os.environ, {"OZLINK_STARTUP_BACKGROUND_REFINE_GRACE_MS": "120"}, clear=False):
+        with patch("ozlink_console.main_window.log_info", side_effect=cap):
+            with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
+                with _memory_truth_timer_queue() as drain:
+                    MainWindow._apply_destination_planning_overlays_body_memory_truth_startup(
+                        mw,
+                        "startup_planned_workspace_memory_truth",
+                    )
+                    drain()
+    assert prop_calls[0] == 0
+    assert alloc_calls[0] == 0
+    exit_msgs = [k for m, k in logged if m == "startup_memory_minimal_replay_exit_reason"]
+    assert any(k.get("reason") == "queues_empty" for k in exit_msgs)
+
+
+def test_workspace_audit_missing_zero_before_visible_tree_ready_when_converged():
+    """``startup_memory_visible_tree_ready`` receives zero missing counts after minimal replay completes the audit."""
+    mw = _minimal_mw_for_memory_truth_body()
+    audit_calls = [0]
+
+    def audit():
+        audit_calls[0] += 1
+        if audit_calls[0] == 1:
+            return {
+                "present_visible_planned_rows": 0,
+                "missing_visible_planned_rows": 1,
+                "missing_visible_proposed_folders": 0,
+                "missing_planned_paths": ["Root3\\Deep\\Chain\\Leaf"],
+                "missing_proposed_paths": [],
+                "expected_total_persisted_planned_rows": 24,
+                "expected_total_persisted_proposed_folders": 8,
+                "present_visible_proposed_folders": 0,
+                "visible_planned_enumeration_count": 0,
+            }
+        return {
+            "present_visible_planned_rows": 24,
+            "missing_visible_planned_rows": 0,
+            "missing_visible_proposed_folders": 0,
+            "missing_planned_paths": [],
+            "missing_proposed_paths": [],
+            "expected_total_persisted_planned_rows": 24,
+            "expected_total_persisted_proposed_folders": 8,
+            "present_visible_proposed_folders": 8,
+            "visible_planned_enumeration_count": 32,
+        }
+
+    mw._startup_memory_full_workspace_audit_run = audit
+    mw._unresolved_proposed_queue_size = lambda: 1
+    mw._unresolved_allocation_queue_size = lambda: 1
+    vis_kw: dict = {}
+
+    def cap(msg: str, **kwargs):
+        if msg == "startup_memory_visible_tree_ready":
+            vis_kw.clear()
+            vis_kw.update(kwargs)
+
+    with patch.dict(os.environ, {"OZLINK_STARTUP_BACKGROUND_REFINE_GRACE_MS": "120"}, clear=False):
+        with patch("ozlink_console.main_window.log_info", side_effect=cap):
+            with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
+                with _memory_truth_timer_queue() as drain:
+                    MainWindow._apply_destination_planning_overlays_body_memory_truth_startup(
+                        mw,
+                        "startup_planned_workspace_memory_truth",
+                    )
+                    drain()
+    assert vis_kw.get("missing_visible_planned_rows") == 0
+    assert vis_kw.get("missing_visible_proposed_folders") == 0
+    assert vis_kw.get("persisted_workspace_audit_complete") is True
+
+
+def test_minimal_replay_logs_progress_each_round_when_replay_runs():
+    """Progress logs appear for each round; exit_reason max_rounds when cap hit with work remaining."""
+    mw = _minimal_mw_for_memory_truth_body()
+    mw._startup_memory_full_workspace_audit_run = lambda: {
+        "present_visible_planned_rows": 0,
+        "missing_visible_planned_rows": 2,
+        "missing_visible_proposed_folders": 0,
+        "missing_planned_paths": ["a"],
+        "missing_proposed_paths": [],
+        "expected_total_persisted_planned_rows": 24,
+        "expected_total_persisted_proposed_folders": 8,
+        "present_visible_proposed_folders": 0,
+        "visible_planned_enumeration_count": 0,
+    }
+    mw._unresolved_proposed_queue_size = lambda: 1
+    mw._unresolved_allocation_queue_size = lambda: 1
+    progress: list[str] = []
+    exits: list[str] = []
+
+    def cap(msg: str, **kwargs):
+        if msg == "startup_memory_minimal_replay_progress":
+            progress.append(msg)
+        if msg == "startup_memory_minimal_replay_exit_reason":
+            exits.append(str(kwargs.get("reason", "")))
+
+    with patch.dict(
+        os.environ,
+        {"OZLINK_STARTUP_BACKGROUND_REFINE_GRACE_MS": "120", "OZLINK_STARTUP_MINIMAL_REPLAY_MAX_ROUNDS": "4"},
+        clear=False,
+    ):
+        with patch("ozlink_console.main_window.log_info", side_effect=cap):
+            with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
+                with _memory_truth_timer_queue() as drain:
+                    MainWindow._apply_destination_planning_overlays_body_memory_truth_startup(
+                        mw,
+                        "startup_planned_workspace_memory_truth",
+                    )
+                    drain()
+    assert len(progress) == 4
+    assert exits == ["max_rounds"]

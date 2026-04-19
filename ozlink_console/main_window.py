@@ -47978,30 +47978,59 @@ class MainWindow(QMainWindow):
         """Bounded foreground replay: unresolved proposed/allocation queues only (no full persisted replay).
 
         Does not run :meth:`_apply_visible_destination_allocation_descendants`, materialize, or full overlay body.
-        Stops when :meth:`_startup_memory_full_workspace_audit_run` reports no missing persisted rows, or after a
-        fixed round cap (with stall detection).
+        Exits when the full-workspace audit is clean, when both unresolved queues are empty (no replay work left),
+        or when ``max_rounds`` is reached. Zero overlay progress in a round does not imply completion — replay may
+        return 0 while queues still hold unresolved entries (time/budget slices).
         """
         c = str(ctx or "startup_planned_workspace_memory_truth")
         r = str(reason or "")
         mr_reason = f"{c}:startup_memory_minimal_replay"
         raw_max = str(os.environ.get("OZLINK_STARTUP_MINIMAL_REPLAY_MAX_ROUNDS", "") or "").strip()
         try:
-            max_rounds = max(8, min(512, int(raw_max))) if raw_max else 96
+            max_rounds = max(1, min(512, int(raw_max))) if raw_max else 96
         except ValueError:
             max_rounds = 96
         total_prop = 0
         total_alloc = 0
         self._startup_memory_minimal_replay_active = True
         try:
-            stall = 0
             replay_rounds_executed = 0
             for round_i in range(max_rounds):
                 audit = self._startup_memory_full_workspace_audit_run()
                 miss_pl = int(audit.get("missing_visible_planned_rows", 0) or 0)
                 miss_pr = int(audit.get("missing_visible_proposed_folders", 0) or 0)
                 if miss_pl == 0 and miss_pr == 0:
+                    log_info(
+                        "startup_memory_minimal_replay_exit_reason",
+                        reason="complete",
+                        minimal_replay_rounds_executed=int(replay_rounds_executed),
+                        max_rounds_cap=int(max_rounds),
+                    )
                     return {
                         "complete": True,
+                        "exit_reason": "complete",
+                        "rounds": int(replay_rounds_executed),
+                        "n_prop": int(total_prop),
+                        "n_alloc": int(total_alloc),
+                        "audit": audit,
+                    }
+                qp = int(self._unresolved_proposed_queue_size() or 0)
+                qa = int(self._unresolved_allocation_queue_size() or 0)
+                queues_empty = qp == 0 and qa == 0
+                if queues_empty:
+                    log_info(
+                        "startup_memory_minimal_replay_exit_reason",
+                        reason="queues_empty",
+                        minimal_replay_rounds_executed=int(replay_rounds_executed),
+                        unresolved_proposed_queue=0,
+                        unresolved_allocation_queue=0,
+                        missing_visible_planned_rows=int(miss_pl),
+                        missing_visible_proposed_folders=int(miss_pr),
+                        max_rounds_cap=int(max_rounds),
+                    )
+                    return {
+                        "complete": False,
+                        "exit_reason": "queues_empty",
                         "rounds": int(replay_rounds_executed),
                         "n_prop": int(total_prop),
                         "n_alloc": int(total_alloc),
@@ -48017,15 +48046,31 @@ class MainWindow(QMainWindow):
                 replay_rounds_executed += 1
                 total_prop += n_prop
                 total_alloc += n_alloc
-                if n_prop == 0 and n_alloc == 0:
-                    stall += 1
-                    if stall >= 3:
-                        break
-                else:
-                    stall = 0
+                qp_after = int(self._unresolved_proposed_queue_size() or 0)
+                qa_after = int(self._unresolved_allocation_queue_size() or 0)
+                log_info(
+                    "startup_memory_minimal_replay_progress",
+                    round=int(round_i),
+                    n_prop=int(n_prop),
+                    n_alloc=int(n_alloc),
+                    queues_empty=bool(qp_after == 0 and qa_after == 0),
+                    missing_planned=int(miss_pl),
+                    missing_visible_proposed_folders=int(miss_pr),
+                    unresolved_proposed_queue=int(qp_after),
+                    unresolved_allocation_queue=int(qa_after),
+                )
             audit_final = self._startup_memory_full_workspace_audit_run()
+            log_info(
+                "startup_memory_minimal_replay_exit_reason",
+                reason="max_rounds",
+                minimal_replay_rounds_executed=int(replay_rounds_executed),
+                max_rounds_cap=int(max_rounds),
+                missing_visible_planned_rows=int(audit_final.get("missing_visible_planned_rows", 0) or 0),
+                missing_visible_proposed_folders=int(audit_final.get("missing_visible_proposed_folders", 0) or 0),
+            )
             return {
                 "complete": False,
+                "exit_reason": "max_rounds",
                 "rounds": int(replay_rounds_executed),
                 "n_prop": int(total_prop),
                 "n_alloc": int(total_alloc),
