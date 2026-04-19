@@ -255,6 +255,7 @@ from ozlink_console.transfer_job_runner import (
 )
 from ozlink_console.paths import manifest_folder_copy_logical_path, normalize_manifest_path
 from ozlink_console import destination_authority_contract
+from ozlink_console import planning_interaction_contract
 from ozlink_console import destination_forensic_audit as dest_forensic
 from ozlink_console.destination_path_bridge import (
     is_internal_planning_root_semantic_path,
@@ -3128,6 +3129,7 @@ class MainWindow(QMainWindow):
         # Throttle destination_visible_path_lookup restore-phase diagnostics (key -> monotonic time).
         self._destination_visible_path_lookup_log_ts: dict[str, float] = {}
         self._destination_bind_scope_paths: Optional[set[str]] = None
+        self._destination_planned_move_materialize_bind_scope: Optional[set[str]] = None
         self._source_projection_row_relationship_sig: dict[str, str] = {}
         self._source_projection_refresh_eval_plan_sig: str = ""
         # >0 while code holds stale destination QModelIndex rows or runs graph refresh loops that
@@ -16755,14 +16757,20 @@ class MainWindow(QMainWindow):
             self._destination_bind_scope_paths = (
                 set(self._destination_drfws_affected_paths) if self._destination_drfws_affected_paths else None
             )
+        elif planning_interaction_contract.is_local_first_deferred_materialize_reason(reason):
+            _pms = getattr(self, "_destination_planned_move_materialize_bind_scope", None)
+            self._destination_bind_scope_paths = set(_pms) if _pms else None
         else:
             self._destination_bind_scope_paths = None
+        _allow_defer = planning_interaction_contract.is_local_first_deferred_materialize_reason(reason)
         try:
             applied_count = self._apply_destination_planning_overlays(
-                reason, allow_defer=False, prefer_chunked_projection=True
+                reason, allow_defer=_allow_defer, prefer_chunked_projection=True
             )
         finally:
             self._destination_bind_scope_paths = None
+            if planning_interaction_contract.is_local_first_deferred_materialize_reason(reason):
+                self._destination_planned_move_materialize_bind_scope = None
         self._destination_deferred_reconcile_burst_pending = False
         if _probe:
             log_info(
@@ -58285,10 +58293,16 @@ class MainWindow(QMainWindow):
             incremental_lightweight=False,
             move_origin=move_origin,
         )  # return ignored; heavy persist uses full deferred refresh elsewhere
-        self._schedule_deferred_destination_materialization("planned_item_moved", delay_ms=220)
         _moved_narrow = self._expand_source_projection_paths_with_parents(
             self._collect_source_projection_paths_for_move_networks(move, rewritten_related)
         )
+        _pm_scope: set[str] = set()
+        for _p in (old_proj, new_proj, target_path, current_projection_path, target_projection_path):
+            _c = self._canonical_destination_projection_path(str(_p or "")) or self.normalize_memory_path(str(_p or "").strip())
+            if _c:
+                _pm_scope.add(_c)
+        self._destination_planned_move_materialize_bind_scope = _pm_scope or None
+        self._schedule_deferred_destination_materialization("planned_item_moved", delay_ms=220)
         self._persist_planning_change("planned_item_moved", source_projection_paths=_moved_narrow)
         if from_manual_planning_drag and move is not None:
             old_parent_path = self._destination_parent_path(current_projection_path)
