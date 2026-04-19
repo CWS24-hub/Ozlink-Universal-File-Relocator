@@ -48051,6 +48051,12 @@ class MainWindow(QMainWindow):
             "presentation_t0": float(presentation_t0),
         }
         log_info(
+            "startup_memory_background_refine_queued",
+            reason=r[:200],
+            grace_ms=int(grace_ms),
+            expanded_path_closure_count=len(exp_bind),
+        )
+        log_info(
             "startup_background_refine_grace_period_begin",
             grace_ms=int(grace_ms),
             reason=r[:200],
@@ -48097,7 +48103,6 @@ class MainWindow(QMainWindow):
         ctx = str(pend.get("ctx") or "")
         r = str(pend.get("reason") or "")
         exp_bind = pend.get("exp_bind") or set()
-        n = int(pend.get("overlay_rows") or 0)
         t0 = float(pend.get("presentation_t0") or time.perf_counter())
         self._startup_background_refine_pending = None
         self._destination_startup_memory_phase = "background_refining"
@@ -48117,8 +48122,27 @@ class MainWindow(QMainWindow):
         )
 
         def _tail() -> None:
+            n_replay = 0
             try:
-                self._startup_memory_truth_deferred_finish(ctx, r, int(n), len(exp_bind))
+                log_info(
+                    "startup_memory_replay_deferred_to_background",
+                    reason=str(r)[:200],
+                    expanded_path_closure_count=len(exp_bind),
+                )
+                n_replay = int(
+                    self._destination_planning_overlay_replay_persisted_only(
+                        ctx, destination_expanded_paths=exp_bind
+                    )
+                )
+            except Exception as exc:
+                self._log_restore_exception("startup_memory_background_workspace_replay", exc)
+            try:
+                self._startup_memory_mark_saved_descendant_expand_affordances()
+                self._startup_memory_sync_expand_affordances_done = True
+            except Exception as exc:
+                self._log_restore_exception("startup_memory_truth_mark_expand_affordance", exc)
+            try:
+                self._startup_memory_truth_deferred_finish(ctx, r, int(n_replay), len(exp_bind))
             except Exception as exc:
                 self._log_restore_exception("startup_memory_truth_deferred_finish", exc)
             finally:
@@ -48371,9 +48395,9 @@ class MainWindow(QMainWindow):
     ):
         """Attach persisted planned/proposed/allocation overlays without full-tree gates or reconcile storms.
 
-        **One-go presentation**: unresolved replay + expanded-path bind runs synchronously so the saved workspace
-        is fully visible before any background refine (audits / fingerprint / chain-ensure deferred — see
-        :meth:`_schedule_startup_memory_background_refine`).
+        **Foreground**: queue reset, prune, projection cancel, expanded-path closure for bind — fast path to
+        ``startup_memory_visible_tree_ready``. Heavy :meth:`_destination_planning_overlay_replay_persisted_only`
+        runs only after grace in :meth:`_maybe_start_startup_background_refine_after_grace` (not on UI thread hot path).
         """
         r = str(reason or "")
         self._startup_memory_planned_attach_skipped_log = []
@@ -48417,19 +48441,6 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             n = 0
-            try:
-                n = int(
-                    self._destination_planning_overlay_replay_persisted_only(
-                        ctx, destination_expanded_paths=exp_bind
-                    )
-                )
-            except Exception as exc:
-                self._log_restore_exception("memory_truth_startup_sync_workspace_replay", exc)
-            try:
-                self._startup_memory_mark_saved_descendant_expand_affordances()
-                self._startup_memory_sync_expand_affordances_done = True
-            except Exception as exc:
-                self._log_restore_exception("startup_memory_truth_mark_expand_affordance", exc)
             _present_ms = int((time.perf_counter() - _t_pres) * 1000)
             self._startup_memory_sync_present_ms = int(_present_ms)
             ws_rows = -1
@@ -48442,19 +48453,21 @@ class MainWindow(QMainWindow):
                 "startup_memory_presenting_complete",
                 reason=r[:200],
                 elapsed_ms=int(_present_ms),
-                overlay_replay_rows=int(n),
+                overlay_replay_rows=0,
+                note="persisted_replay_deferred_to_background",
                 expanded_path_closure_count=len(exp_bind),
             )
             log_info(
                 "startup_memory_workspace_fully_visible",
                 reason=r[:200],
                 workspace_visible_rows=int(ws_rows),
-                overlay_replay_rows=int(n),
+                overlay_replay_rows=0,
+                note="session_snapshot_and_queues_ready_persisted_replay_follows_background",
             )
             log_info(
                 "startup_memory_visible_tree_ready",
                 reason=r[:200],
-                overlay_replay_rows=int(n),
+                overlay_replay_rows=0,
                 expanded_path_closure_count=len(exp_bind),
                 deferred_background_refine_scheduled=True,
             )

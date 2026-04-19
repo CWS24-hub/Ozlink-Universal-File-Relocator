@@ -1,4 +1,4 @@
-"""Regression: startup memory-truth presents full saved workspace in one go before background refine."""
+"""Regression: startup memory-truth presents the memory-restored tree fast; persisted replay runs after grace."""
 
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ def _memory_truth_timer_queue():
 
 
 def test_visible_tree_ready_before_background_replay_and_refine():
-    """Sync replay builds workspace; ``startup_memory_visible_tree_ready`` precedes background refine."""
+    """``startup_memory_visible_tree_ready`` precedes replay and ``startup_background_refine_begin``."""
     mw = _minimal_mw_for_memory_truth_body()
     seq: list[str] = []
 
@@ -91,12 +91,36 @@ def test_visible_tree_ready_before_background_replay_and_refine():
                         "startup_planned_workspace_memory_truth",
                     )
                     assert "startup_memory_visible_tree_ready" in seq
-                    assert replay_calls[0] == 1
+                    assert replay_calls[0] == 0
                     assert "startup_background_refine_begin" not in seq
                     drain()
+    assert seq.index("startup_memory_visible_tree_ready") < seq.index("startup_memory_replay_deferred_to_background")
     assert seq.index("startup_memory_visible_tree_ready") < seq.index("startup_background_refine_begin")
     assert replay_calls[0] == 1
     mw._startup_memory_truth_deferred_finish.assert_called_once()
+
+
+def test_replay_not_on_foreground_startup_path():
+    """Persisted overlay replay must not run during the synchronous memory presentation body."""
+    mw = _minimal_mw_for_memory_truth_body()
+    replay_calls = [0]
+
+    def counting_replay(*_a, **_k):
+        replay_calls[0] += 1
+        return 1
+
+    mw._destination_planning_overlay_replay_persisted_only = counting_replay
+
+    with patch.dict(os.environ, {"OZLINK_STARTUP_BACKGROUND_REFINE_GRACE_MS": "120"}, clear=False):
+        with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
+            with _memory_truth_timer_queue() as drain:
+                MainWindow._apply_destination_planning_overlays_body_memory_truth_startup(
+                    mw,
+                    "startup_planned_workspace_memory_truth",
+                )
+                assert replay_calls[0] == 0
+                drain()
+    assert replay_calls[0] >= 1
 
 
 def test_log_tokens_no_materialize_before_visible():
@@ -145,8 +169,8 @@ def test_sync_critical_path_completes_under_threshold_ms():
             drain()
 
 
-def test_bounded_replay_invocations_single_sync_pass():
-    """Replay runs once synchronously for one-go presentation; deferred path does not replay again."""
+def test_bounded_replay_invocations_background_only():
+    """Replay runs once in the deferred tail after grace, not on the foreground presentation path."""
     mw = _minimal_mw_for_memory_truth_body()
     n = [0]
 
@@ -163,7 +187,7 @@ def test_bounded_replay_invocations_single_sync_pass():
                     mw,
                     "startup_planned_workspace_memory_truth",
                 )
-                assert n[0] == 1
+                assert n[0] == 0
                 drain()
     assert n[0] == 1
 
@@ -197,7 +221,7 @@ def test_background_refine_after_visible_tree_ready_log_order():
 
 
 def test_post_startup_workspace_building_cleared_before_deferred_refine():
-    """Workspace is usable after sync presentation; deferred refine runs after grace timers."""
+    """Workspace is usable after foreground presentation; snapshot dirty follows deferred tail."""
     mw = _minimal_mw_for_memory_truth_body()
 
     def real_deferred(_ctx, _reason, _n, _exp_len):
@@ -218,8 +242,8 @@ def test_post_startup_workspace_building_cleared_before_deferred_refine():
     mw._mark_destination_tree_snapshot_dirty_after_injection.assert_called_once()
 
 
-def test_outer_overlay_returns_after_sync_replay():
-    """Memory-truth body runs sync replay before returning; refine is timer-deferred."""
+def test_outer_overlay_returns_before_background_replay():
+    """Memory-truth body returns before persisted replay; replay runs in deferred tail after grace."""
     mw = _minimal_mw_for_memory_truth_body()
     phases: list[str] = []
 
@@ -246,8 +270,9 @@ def test_outer_overlay_returns_after_sync_replay():
                                 allow_defer=True,
                                 prefer_chunked_projection=False,
                             )
-                            assert phases == ["body_enter", "replay", "body_exit"]
+                            assert phases == ["body_enter", "body_exit"]
                             drain()
+                            assert phases == ["body_enter", "body_exit", "replay"]
 
 
 def test_graph_descendant_paused_logs_and_resumes_on_scroll_idle():
