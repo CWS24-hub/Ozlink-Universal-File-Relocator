@@ -58249,6 +58249,109 @@ class MainWindow(QMainWindow):
                 return True
         return False
 
+    def _destination_drag_same_logical_planned_item(
+        self,
+        child_node_data: dict,
+        move_index: int | None,
+        move,
+        inherited_move,
+    ) -> bool:
+        """True when a destination row represents the same planned/inherited allocation as the drag payload."""
+        mi, m_row, inh = self._resolve_planned_move_for_destination_node(child_node_data or {})
+        if inherited_move is not None and inh is not None:
+            if inh is inherited_move:
+                return True
+            sp_h = self._canonical_source_projection_path((inh or {}).get("source_path", "") or "")
+            sp_i = self._canonical_source_projection_path((inherited_move or {}).get("source_path", "") or "")
+            if sp_h and sp_i and sp_h == sp_i:
+                return True
+        if move is not None:
+            if move_index is not None and mi is not None and int(mi) == int(move_index):
+                return True
+            if m_row is not None and m_row is move:
+                return True
+            if m_row is not None:
+                k0 = str(self._allocation_move_key(move) or "").strip().casefold()
+                k1 = str(self._allocation_move_key(m_row) or "").strip().casefold()
+                if k0 and k1 and k0 == k1:
+                    return True
+                s0 = self._canonical_source_projection_path(move.get("source_path", "") or "")
+                s1 = self._canonical_source_projection_path(m_row.get("source_path", "") or "")
+                if s0 and s1 and s0 == s1 and mi is not None and move_index is not None and int(mi) == int(move_index):
+                    return True
+        return False
+
+    def _destination_planned_drag_name_taken_by_different_item(
+        self,
+        parent_item,
+        target_projection_path: str,
+        *,
+        move_index: int | None,
+        move,
+        inherited_move,
+    ) -> bool:
+        """True if another *different* logical planned item already occupies target_projection_path under parent."""
+        if isinstance(parent_item, QModelIndex):
+            model = getattr(self, "destination_planning_model", None)
+            if model is None:
+                return False
+            par = parent_item if parent_item.isValid() else QModelIndex()
+            normalized_target = self.normalize_memory_path(target_projection_path)
+            rows = model.rowCount(par)
+            for r in range(rows):
+                cix = model.index(r, 0, par)
+                child_data = cix.data(Qt.UserRole) or {}
+                child_path = child_data.get("item_path") or child_data.get("display_path") or ""
+                if not self._paths_equivalent(child_path, normalized_target, "destination"):
+                    continue
+                id_excerpt = ""
+                try:
+                    if move is not None:
+                        id_excerpt = str(self._allocation_move_key(move) or "")[:260]
+                    elif inherited_move is not None:
+                        id_excerpt = str(self._allocation_move_key(inherited_move) or "")[:260]
+                except Exception:
+                    pass
+                log_info(
+                    "drag_move_self_collision_detected",
+                    item_identity=id_excerpt,
+                    target_path=str(target_projection_path)[:400],
+                )
+                if self._destination_drag_same_logical_planned_item(
+                    child_data, move_index, move, inherited_move
+                ):
+                    log_info("drag_move_self_collision_allowed", reason="same_logical_item")
+                    return False
+                log_info("drag_move_duplicate_blocked", reason="different_item_same_name")
+                return True
+            return False
+        normalized_target = self.normalize_memory_path(target_projection_path)
+        for index in range(parent_item.childCount()):
+            child = parent_item.child(index)
+            child_data = child.data(0, Qt.UserRole) or {}
+            child_path = child_data.get("item_path") or child_data.get("display_path") or ""
+            if not self._paths_equivalent(child_path, normalized_target, "destination"):
+                continue
+            id_excerpt = ""
+            try:
+                if move is not None:
+                    id_excerpt = str(self._allocation_move_key(move) or "")[:260]
+                elif inherited_move is not None:
+                    id_excerpt = str(self._allocation_move_key(inherited_move) or "")[:260]
+            except Exception:
+                pass
+            log_info(
+                "drag_move_self_collision_detected",
+                item_identity=id_excerpt,
+                target_path=str(target_projection_path)[:400],
+            )
+            if self._destination_drag_same_logical_planned_item(child_data, move_index, move, inherited_move):
+                log_info("drag_move_self_collision_allowed", reason="same_logical_item")
+                return False
+            log_info("drag_move_duplicate_blocked", reason="different_item_same_name")
+            return True
+        return False
+
     def _begin_inline_proposed_folder_creation(self, destination_node, parent_item):
         if isinstance(parent_item, QModelIndex):
             return self._begin_inline_proposed_folder_creation_index(destination_node, parent_item)
@@ -58770,7 +58873,13 @@ class MainWindow(QMainWindow):
             return False
 
         target_parent_item = self._find_visible_destination_item_by_path(target_path)
-        if target_parent_item is not None and self._destination_path_exists_under_parent(target_parent_item, target_projection_path):
+        if target_parent_item is not None and self._destination_planned_drag_name_taken_by_different_item(
+            target_parent_item,
+            target_projection_path,
+            move_index=move_index,
+            move=move,
+            inherited_move=inherited_move,
+        ):
             QMessageBox.information(
                 self,
                 "Move Planned Item",
