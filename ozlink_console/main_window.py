@@ -23663,6 +23663,22 @@ class MainWindow(QMainWindow):
             return False, "site_key_mismatch_session_vs_snapshot"
         return True, "identity_ok"
 
+    def _pending_session_source_snapshot_drive_match(self, drive_id: str) -> bool:
+        """True when pending session workspace snapshots include a source root whose data matches ``drive_id``."""
+        did = str(drive_id or "").strip()
+        if not did:
+            return False
+        for snap in list((getattr(self, "_pending_session_tree_snapshots", {}) or {}).get("source") or []):
+            if not isinstance(snap, dict):
+                continue
+            d = snap.get("data")
+            if not isinstance(d, dict):
+                continue
+            sd = str(d.get("drive_id") or "").strip()
+            if sd and sd.casefold() == did.casefold():
+                return True
+        return False
+
     def _source_loading_placeholder_shell_preservation_guard(self, message: str) -> tuple[bool, dict]:
         """If True, ``set_tree_placeholder`` must not call ``set_empty_library_message`` (full model reset).
 
@@ -23680,6 +23696,8 @@ class MainWindow(QMainWindow):
         shell = getattr(self, "_draft_shell_state", None)
         state = shell if isinstance(shell, SessionState) else SessionState()
         ssk = str(getattr(state, "SelectedSourceSiteKey", "") or "").strip()
+        startup_shell_seen = bool(getattr(self, "_source_startup_snapshot_mount_seen", False))
+        pending_snap_match = self._pending_session_source_snapshot_drive_match(pending_did or cur_did)
 
         forensic: dict = {
             "shell_preservation_guard_active": False,
@@ -23689,12 +23707,14 @@ class MainWindow(QMainWindow):
             "mount_drive_id_suffix": mount_did[-16:] if len(mount_did) > 16 else mount_did,
             "pending_drive_id_suffix": pending_did[-16:] if len(pending_did) > 16 else pending_did,
             "current_drive_id_suffix": cur_did[-16:] if len(cur_did) > 16 else cur_did,
+            "startup_shell_seen": startup_shell_seen,
+            "pending_session_snapshot_match": pending_snap_match,
         }
 
         if self._planning_browse_mode("source") != "sharepoint":
             forensic["action_taken"] = "not_sharepoint_browse_mode"
             return False, forensic
-        if not getattr(self, "_source_startup_snapshot_mount_seen", False):
+        if not (startup_shell_seen or pending_snap_match):
             forensic["action_taken"] = "no_startup_shell_flag"
             return False, forensic
         if force_replace:
@@ -23703,15 +23723,19 @@ class MainWindow(QMainWindow):
         if not loading_msg:
             forensic["action_taken"] = "non_loading_placeholder"
             return False, forensic
-        if not mount_did:
-            forensic["action_taken"] = "mount_drive_unknown"
-            return False, forensic
 
         same_drive = False
-        if pending_did:
-            same_drive = mount_did.casefold() == pending_did.casefold()
-        elif cur_did:
-            same_drive = mount_did.casefold() == cur_did.casefold()
+        if startup_shell_seen:
+            if not mount_did:
+                forensic["action_taken"] = "mount_drive_unknown"
+                return False, forensic
+            if pending_did:
+                same_drive = mount_did.casefold() == pending_did.casefold()
+            elif cur_did:
+                same_drive = mount_did.casefold() == cur_did.casefold()
+        else:
+            same_drive = bool(pending_snap_match)
+
         if not same_drive:
             forensic["action_taken"] = "drive_identity_mismatch"
             return False, forensic
@@ -24054,7 +24078,25 @@ class MainWindow(QMainWindow):
                 if panel_key == "destination"
                 else {}
             )
-            self.set_tree_placeholder(panel_key, "Loading root content...")
+            _skip_source_loading_placeholder = (
+                panel_key == "source"
+                and not force_refresh
+                and (
+                    getattr(self, "_source_startup_snapshot_mount_seen", False)
+                    or self._pending_session_source_snapshot_drive_match(drive_id)
+                )
+            )
+            if _skip_source_loading_placeholder:
+                self._log_restore_phase(
+                    "root_load placeholder_skipped_source_snapshot_shell",
+                    panel_key=panel_key,
+                    request_signature=request_signature,
+                    drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+                    snapshot_mount_seen=bool(getattr(self, "_source_startup_snapshot_mount_seen", False)),
+                    pending_session_snapshot=bool(self._pending_session_source_snapshot_drive_match(drive_id)),
+                )
+            else:
+                self.set_tree_placeholder(panel_key, "Loading root content...")
             if panel_key == "destination":
                 _after_ph = self._destination_forensic_destination_model_counts()
                 log_info(
@@ -24072,12 +24114,28 @@ class MainWindow(QMainWindow):
             self._log_library_restore_step("load_root_step_05_placeholder_exit", panel_key=panel_key)
 
             self._log_library_restore_step("load_root_step_06_context_enter", panel_key=panel_key)
-            # SharePoint real structure must come from live Graph on each library bind; restore/session
-            # flags must not substitute disk cache for the authoritative folder list.
+            # SharePoint: live Graph remains authoritative after startup; for source, allow disk cache
+            # for first paint when a snapshot shell or pending session snapshot targets this drive so the
+            # worker returns quickly and merges non-destructively in _apply_root_payload_to_source_model_view.
             use_cache_only = False
-            if (
-                getattr(self, "_memory_restore_in_progress", False) or getattr(self, "_suppress_autosave", False)
-            ) and self.graph.has_cached_drive_root_children(drive_id):
+            _mem_restore = getattr(self, "_memory_restore_in_progress", False) or getattr(
+                self, "_suppress_autosave", False
+            )
+            _has_root_cache = self.graph.has_cached_drive_root_children(drive_id)
+            if panel_key == "source" and not force_refresh and _has_root_cache:
+                if (
+                    getattr(self, "_source_startup_snapshot_mount_seen", False)
+                    or _mem_restore
+                    or self._pending_session_source_snapshot_drive_match(drive_id)
+                ):
+                    use_cache_only = True
+                    self._log_restore_phase(
+                        "sharepoint_root_load_cache_first_paint",
+                        panel_key=panel_key,
+                        drive_id_suffix=str(drive_id)[-16:],
+                        note="graph_authority_deferred_after_startup_shell",
+                    )
+            elif _mem_restore and _has_root_cache:
                 self._log_restore_phase(
                     "sharepoint_root_load_live_graph_required",
                     panel_key=panel_key,
@@ -33410,10 +33468,18 @@ class MainWindow(QMainWindow):
                 self._planning_browse_mode("source") == "sharepoint"
                 and bool(getattr(self, "_source_startup_snapshot_mount_seen", False))
             )
+            mount_did = str(getattr(self, "_source_snapshot_mount_drive_id", "") or "").strip()
+            single_row_snapshot_shell = (
+                snap_preserving
+                and pre_df == 1
+                and bool(mount_did)
+                and bool(pending_drive)
+                and mount_did.casefold() == pending_drive.casefold()
+            )
             shell_merge_eligible = (
                 self._planning_browse_mode("source") == "sharepoint"
                 and not force_replace
-                and (snap_preserving or pre_df > 1)
+                and (snap_preserving or pre_df > 1 or single_row_snapshot_shell)
             )
             if not items:
                 if shell_merge_eligible:
@@ -33997,8 +34063,17 @@ class MainWindow(QMainWindow):
                     self._schedule_safe_timer(220, "source_root_prime_retry", self._prime_source_root_children_after_snapshot)
             elif not getattr(self, "_memory_restore_in_progress", False):
                 self._refresh_source_projection("source_projection_root_bind_applied")
-            if not restored_runtime_snapshot:
+            if not restored_runtime_snapshot and not getattr(
+                self, "_source_startup_snapshot_mount_seen", False
+            ):
                 self._start_source_restore_materialization()
+            elif not restored_runtime_snapshot and getattr(
+                self, "_source_startup_snapshot_mount_seen", False
+            ):
+                self._log_restore_phase(
+                    "source_restore_materialization_deferred_snapshot_shell",
+                    reason="startup_snapshot_first_paint",
+                )
         else:
             self._destination_lifecycle_trace_TEMP(
                 fn="_refresh_tree_ui_after_root_bind",
