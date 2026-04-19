@@ -47974,6 +47974,157 @@ class MainWindow(QMainWindow):
             "visible_planned_enumeration_count": len(all_visible),
         }
 
+    def _startup_memory_coerce_proposed_folder_record(self, pf: Any) -> Optional[ProposedFolder]:
+        if isinstance(pf, ProposedFolder):
+            return pf
+        if isinstance(pf, dict):
+            try:
+                return ProposedFolder.from_dict(pf)
+            except Exception:
+                return None
+        return None
+
+    def _startup_memory_audit_canonical_destination_for_planned_move(self, move: dict) -> str:
+        """Same canonical destination string as :meth:`_startup_memory_full_workspace_audit_run` for a move."""
+        if not isinstance(move, dict):
+            return ""
+        graph_auth = destination_authority_contract.graph_owns_visible_real_destination_structure(self)
+        proj = self._allocation_projection_path(move)
+        if not proj:
+            return ""
+        if graph_auth:
+            proj = self._canonical_destination_path_with_visible_library_anchor(proj) or proj
+        c = self._canonical_destination_projection_path(proj) or self.normalize_memory_path(proj)
+        return str(c).strip() if c else ""
+
+    def _startup_memory_audit_canonical_destination_for_proposed_record(self, pf: Any) -> str:
+        """Same canonical destination as full-workspace audit for a proposed folder record."""
+        pfo = self._startup_memory_coerce_proposed_folder_record(pf)
+        if pfo is None:
+            return ""
+        graph_auth = destination_authority_contract.graph_owns_visible_real_destination_structure(self)
+        raw = self._proposed_destination_path(pfo)
+        if not raw:
+            return ""
+        adj = raw
+        if graph_auth:
+            adj = self._canonical_destination_path_with_visible_library_anchor(raw) or raw
+        c = self._canonical_destination_projection_path(adj) or self.normalize_memory_path(adj)
+        return str(c).strip() if c else ""
+
+    def _startup_memory_parent_prefix_paths(self, full_path: str) -> list[str]:
+        """Strict ancestor folder paths for ``full_path`` (canonical), e.g. A\\B\\C -> [A, A\\B]."""
+        s = str(full_path or "").strip().replace("/", "\\")
+        if not s:
+            return []
+        canon = self._canonical_destination_projection_path(s) or self.normalize_memory_path(s) or s
+        parts = [p for p in str(canon).replace("/", "\\").split("\\") if p]
+        if len(parts) <= 1:
+            return []
+        return ["\\".join(parts[:i]) for i in range(1, len(parts))]
+
+    def _startup_memory_minimal_replay_prefix_visible_in_model(self, prefix: str) -> bool:
+        raw = str(prefix or "").strip()
+        if not raw:
+            return True
+        try:
+            hit = self._find_visible_destination_item_by_path(raw)
+            return hit is not None and getattr(hit, "isValid", lambda: False)()
+        except Exception:
+            return False
+
+    def _startup_memory_minimal_replay_seed_unresolved_from_audit(
+        self, audit: dict[str, Any], *, seed_reason: str
+    ) -> tuple[int, int]:
+        """Enqueue unresolved proposed/allocation replay work for persisted rows still missing from the visible model.
+
+        Unresolved queues are not guaranteed to list every persisted path (rebuild/prune/slice gaps). This pass
+        re-attaches :attr:`planned_moves` / :attr:`proposed_folders` to the replay queues using the same canonical
+        paths as the startup audit, plus parent-prefix rows when the parent folder is not yet visible.
+        """
+        paths_seeded = 0
+        prefixes_added = 0
+        dedupe: set[str] = set()
+        planned_moves = getattr(self, "planned_moves", None) or []
+        proposed_list = getattr(self, "proposed_folders", None) or []
+
+        def _take(key: str) -> bool:
+            if key in dedupe:
+                return False
+            dedupe.add(key)
+            return True
+
+        for mp in list(audit.get("missing_planned_paths") or []):
+            mp_s = str(mp or "").strip()
+            if not mp_s:
+                continue
+            mp_cf = mp_s.casefold()
+            for move in planned_moves:
+                if not isinstance(move, dict):
+                    continue
+                canon = self._startup_memory_audit_canonical_destination_for_planned_move(move)
+                if not canon or canon.casefold() != mp_cf:
+                    continue
+                mk = f"plan_dest:{self._allocation_move_key(move)}"
+                if not _take(mk):
+                    continue
+                self._queue_unresolved_allocation(move, seed_reason)
+                paths_seeded += 1
+            for pfx in self._startup_memory_parent_prefix_paths(mp_s):
+                if self._startup_memory_minimal_replay_prefix_visible_in_model(pfx):
+                    continue
+                pfx_cf = pfx.casefold()
+                for move in planned_moves:
+                    if not isinstance(move, dict):
+                        continue
+                    ap = self._allocation_parent_path(move)
+                    if not ap or ap.casefold() != pfx_cf:
+                        continue
+                    mk = f"plan_pfx:{pfx_cf}:{self._allocation_move_key(move)}"
+                    if not _take(mk):
+                        continue
+                    self._queue_unresolved_allocation(move, seed_reason)
+                    prefixes_added += 1
+
+        for mpp in list(audit.get("missing_proposed_paths") or []):
+            mpp_s = str(mpp or "").strip()
+            if not mpp_s:
+                continue
+            mpp_cf = mpp_s.casefold()
+            for pf_raw in proposed_list:
+                pf = self._startup_memory_coerce_proposed_folder_record(pf_raw)
+                if pf is None:
+                    continue
+                canon = self._startup_memory_audit_canonical_destination_for_proposed_record(pf)
+                if not canon or canon.casefold() != mpp_cf:
+                    continue
+                mk = f"prop_dest:{self._proposed_folder_key(pf)}"
+                if not _take(mk):
+                    continue
+                self._queue_unresolved_proposed_folder(pf, seed_reason)
+                paths_seeded += 1
+            for pfx in self._startup_memory_parent_prefix_paths(mpp_s):
+                if self._startup_memory_minimal_replay_prefix_visible_in_model(pfx):
+                    continue
+                pfx_cf = pfx.casefold()
+                for pf_raw in proposed_list:
+                    pf = self._startup_memory_coerce_proposed_folder_record(pf_raw)
+                    if pf is None:
+                        continue
+                    pp_path = self._proposed_parent_path(pf)
+                    if not pp_path:
+                        continue
+                    pn = self._canonical_destination_projection_path(pp_path) or self.normalize_memory_path(pp_path) or pp_path
+                    if str(pn).strip().casefold() != pfx_cf:
+                        continue
+                    mk = f"prop_pfx:{pfx_cf}:{self._proposed_folder_key(pf)}"
+                    if not _take(mk):
+                        continue
+                    self._queue_unresolved_proposed_folder(pf, seed_reason)
+                    prefixes_added += 1
+
+        return int(paths_seeded), int(prefixes_added)
+
     def _startup_memory_minimal_replay_pass(self, ctx: str, reason: str) -> dict[str, Any]:
         """Bounded foreground replay: unresolved proposed/allocation queues only (no full persisted replay).
 
@@ -48014,6 +48165,19 @@ class MainWindow(QMainWindow):
                         "n_alloc": int(total_alloc),
                         "audit": audit,
                     }
+                seed_reason = f"{mr_reason}:seed"
+                ps, pfx = self._startup_memory_minimal_replay_seed_unresolved_from_audit(
+                    audit, seed_reason=seed_reason
+                )
+                log_info(
+                    "startup_memory_minimal_replay_seed_paths",
+                    paths_seeded=int(ps),
+                    prefixes_added=int(pfx),
+                    round=int(round_i),
+                    missing_visible_planned_rows=int(miss_pl),
+                    missing_visible_proposed_folders=int(miss_pr),
+                    seed_reason_excerpt=str(seed_reason)[:200],
+                )
                 qp = int(self._unresolved_proposed_queue_size() or 0)
                 qa = int(self._unresolved_allocation_queue_size() or 0)
                 queues_empty = qp == 0 and qa == 0

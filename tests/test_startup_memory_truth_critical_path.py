@@ -8,11 +8,14 @@ import os
 import time
 from unittest.mock import MagicMock, patch
 
+from ozlink_console import destination_authority_contract
 from ozlink_console.main_window import MainWindow
 
 
 def _minimal_mw_for_memory_truth_body():
     mw = MainWindow.__new__(MainWindow)
+    mw.unresolved_proposed_by_parent_path = {}
+    mw.unresolved_allocations_by_parent_path = {}
     mw._startup_memory_planned_attach_skipped_log = []
     mw.planned_moves = [
         {
@@ -52,8 +55,6 @@ def _minimal_mw_for_memory_truth_body():
     }
     mw._replay_unresolved_proposed_overlay = lambda *a, **k: 0
     mw._replay_unresolved_allocation_overlay = lambda *a, **k: 0
-    mw._unresolved_proposed_queue_size = lambda: 0
-    mw._unresolved_allocation_queue_size = lambda: 0
     return mw
 
 
@@ -620,6 +621,81 @@ def test_workspace_audit_missing_zero_before_visible_tree_ready_when_converged()
     assert vis_kw.get("missing_visible_planned_rows") == 0
     assert vis_kw.get("missing_visible_proposed_folders") == 0
     assert vis_kw.get("persisted_workspace_audit_complete") is True
+
+
+def test_minimal_replay_seeds_queues_for_deep_persisted_paths_before_visible_ready():
+    """When audit lists missing planned rows, seeding re-queues persisted moves so replay can finish with zero missing."""
+    mw = _minimal_mw_for_memory_truth_body()
+    mw._reset_unresolved_proposed_queue = lambda: None
+    mw._reset_unresolved_allocation_queue = lambda: None
+    deep = "Root3\\Deep\\A\\Leaf"
+    mw.planned_moves = [
+        {
+            "source_path": "s1",
+            "destination_path": deep,
+            "destination": {"id": "d1", "name": "Leaf"},
+        }
+    ]
+    mw.proposed_folders = []
+    audit_calls = [0]
+
+    def audit():
+        audit_calls[0] += 1
+        if audit_calls[0] == 1:
+            return {
+                "present_visible_planned_rows": 0,
+                "missing_visible_planned_rows": 1,
+                "missing_visible_proposed_folders": 0,
+                "missing_planned_paths": [deep],
+                "missing_proposed_paths": [],
+                "expected_total_persisted_planned_rows": 1,
+                "expected_total_persisted_proposed_folders": 0,
+                "present_visible_proposed_folders": 0,
+                "visible_planned_enumeration_count": 0,
+            }
+        return {
+            "present_visible_planned_rows": 1,
+            "missing_visible_planned_rows": 0,
+            "missing_visible_proposed_folders": 0,
+            "missing_planned_paths": [],
+            "missing_proposed_paths": [],
+            "expected_total_persisted_planned_rows": 1,
+            "expected_total_persisted_proposed_folders": 0,
+            "present_visible_proposed_folders": 0,
+            "visible_planned_enumeration_count": 1,
+        }
+
+    mw._startup_memory_full_workspace_audit_run = audit
+    mw._startup_memory_audit_canonical_destination_for_planned_move = (
+        lambda _m: deep if isinstance(_m, dict) and _m.get("source_path") == "s1" else ""
+    )
+    mw._allocation_parent_path = lambda _m: "Root3\\Deep\\A" if isinstance(_m, dict) else ""
+    mw._allocation_projection_path = lambda _m: deep if isinstance(_m, dict) else ""
+    mw._destination_unresolved_replay_parent_path_structurally_invalid = lambda *_a, **_k: (False, "")
+    mw._destination_invalid_unresolved_parent_previously_pruned = lambda *_a, **_k: False
+    mw._find_visible_destination_item_by_path = lambda *_a, **_k: None
+    vis_kw: dict = {}
+    seeded: list[dict] = []
+
+    def capture(msg: str, **kwargs):
+        if msg == "startup_memory_visible_tree_ready":
+            vis_kw.update(kwargs)
+        if msg == "startup_memory_minimal_replay_seed_paths":
+            seeded.append(dict(kwargs))
+
+    with patch.object(destination_authority_contract, "graph_owns_visible_real_destination_structure", return_value=False):
+        with patch.dict(os.environ, {"OZLINK_STARTUP_BACKGROUND_REFINE_GRACE_MS": "120"}, clear=False):
+            with patch("ozlink_console.main_window.log_info", side_effect=capture):
+                with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
+                    with _memory_truth_timer_queue() as drain:
+                        MainWindow._apply_destination_planning_overlays_body_memory_truth_startup(
+                            mw,
+                            "startup_planned_workspace_memory_truth",
+                        )
+                        drain()
+    assert vis_kw.get("missing_visible_planned_rows") == 0
+    assert vis_kw.get("persisted_workspace_audit_complete") is True
+    assert seeded and int(seeded[0].get("paths_seeded", 0) or 0) >= 1
 
 
 def test_minimal_replay_logs_progress_each_round_when_replay_runs():
