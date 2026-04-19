@@ -47992,6 +47992,46 @@ class MainWindow(QMainWindow):
 
         _walk(QModelIndex())
 
+    def _startup_memory_truth_foreground_replay_phase(self, ctx: str, reason: str, exp_bind: set[str]) -> None:
+        """Replay unresolved overlays + expand-affordance hints after ``startup_memory_visible_tree_ready`` (not on sync critical path)."""
+        r = str(reason or "")
+        log_info(
+            "startup_memory_background_refine_begin",
+            reason=r[:200],
+            expanded_path_closure_count=len(exp_bind),
+        )
+        n = 0
+        try:
+            n = int(
+                self._destination_planning_overlay_replay_persisted_only(
+                    ctx, destination_expanded_paths=exp_bind
+                )
+            )
+        except Exception as exc:
+            self._log_restore_exception("startup_memory_truth_foreground_replay_phase", exc)
+        try:
+            self._startup_memory_mark_saved_descendant_expand_affordances()
+        except Exception as exc:
+            self._log_restore_exception("startup_memory_truth_mark_expand_affordance", exc)
+
+        def _finish() -> None:
+            try:
+                self._startup_memory_truth_deferred_finish(ctx, r, int(n), len(exp_bind))
+            except Exception as exc:
+                self._log_restore_exception("startup_memory_truth_deferred_finish", exc)
+            finally:
+                self._destination_startup_memory_workspace_building = False
+                log_info("startup_memory_truth_materialize_released", reason=str(r)[:200])
+                log_info("startup_snapshot_capture_released_after_startup_settle")
+                try:
+                    self._mark_destination_tree_snapshot_dirty_after_injection(
+                        reason="startup_memory_truth_settled"
+                    )
+                except Exception:
+                    pass
+
+        QTimer.singleShot(100, lambda: self._safe_invoke("startup_memory_truth_deferred_finish", _finish))
+
     def _startup_memory_truth_deferred_finish(
         self, ctx: str, reason: str, overlay_replay_rows: int, expanded_path_closure_count: int
     ) -> None:
@@ -48235,10 +48275,6 @@ class MainWindow(QMainWindow):
             self._cancel_destination_future_async_projection(r or "memory_truth_startup")
             ctx = r or "startup_planned_workspace_memory_truth"
             exp_bind = self._destination_startup_memory_expanded_paths_for_bind()
-            n = self._destination_planning_overlay_replay_persisted_only(
-                ctx, destination_expanded_paths=exp_bind
-            )
-            self._startup_memory_mark_saved_descendant_expand_affordances()
             log_info("startup_memory_truth_materialize_deferred_until_visible_tree_ready", reason=r[:200])
             try:
                 QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
@@ -48247,28 +48283,20 @@ class MainWindow(QMainWindow):
             log_info(
                 "startup_memory_visible_tree_ready",
                 reason=r[:200],
-                overlay_replay_rows=int(n),
+                overlay_replay_rows=0,
                 expanded_path_closure_count=len(exp_bind),
+                deferred_overlay_replay_scheduled=True,
             )
 
-            def _finish() -> None:
+            def _run_replay_phase() -> None:
                 try:
-                    self._startup_memory_truth_deferred_finish(ctx, r, int(n), len(exp_bind))
+                    self._startup_memory_truth_foreground_replay_phase(ctx, r, exp_bind)
                 except Exception as exc:
-                    self._log_restore_exception("startup_memory_truth_deferred_finish", exc)
-                finally:
+                    self._log_restore_exception("startup_memory_truth_foreground_replay_phase", exc)
                     self._destination_startup_memory_workspace_building = False
-                    log_info("startup_memory_truth_materialize_released", reason=str(r)[:200])
-                    log_info("startup_snapshot_capture_released_after_startup_settle")
-                    try:
-                        self._mark_destination_tree_snapshot_dirty_after_injection(
-                            reason="startup_memory_truth_settled"
-                        )
-                    except Exception:
-                        pass
 
-            QTimer.singleShot(100, lambda: self._safe_invoke("startup_memory_truth_deferred_finish", _finish))
-            return int(n)
+            QTimer.singleShot(0, lambda: self._safe_invoke("startup_memory_truth_foreground_replay_phase", _run_replay_phase))
+            return 0
         except Exception:
             self._destination_startup_memory_workspace_building = False
             raise
