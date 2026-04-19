@@ -20609,7 +20609,8 @@ class MainWindow(QMainWindow):
         """Re-run phase-4 when the first invoke ran before the destination tree was ready."""
         if not getattr(self, "_memory_restore_in_progress", False):
             return
-        if not getattr(self, "_restore_destination_overlay_pending", False):
+        _persisted_planning = bool(getattr(self, "planned_moves", None) or getattr(self, "proposed_folders", None))
+        if not getattr(self, "_restore_destination_overlay_pending", False) and not _persisted_planning:
             return
         if self._restore_abort_active():
             return
@@ -20642,8 +20643,12 @@ class MainWindow(QMainWindow):
                 return
             if self._planning_browse_mode("destination") != "local":
                 self._destination_merge_planning_bootstrap_folder_paths_if_needed(phase="post_login_restore_phase4")
-            if not self._restore_destination_overlay_pending:
-                self._log_restore_phase("phase4_destination_overlay skipped", reason="no proposed folders pending")
+            _persisted_planning = bool(getattr(self, "planned_moves", None) or getattr(self, "proposed_folders", None))
+            if not self._restore_destination_overlay_pending and not _persisted_planning:
+                self._log_restore_phase(
+                    "phase4_destination_overlay skipped",
+                    reason="no_unresolved_replay_or_persisted_planning",
+                )
                 self._finalize_memory_restore_if_ready("phase4_no_overlay_pending")
                 return
 
@@ -20678,12 +20683,22 @@ class MainWindow(QMainWindow):
                 applied_count = 0
                 if getattr(self, "_sharepoint_lazy_mode", False):
                     self._sync_restore_destination_overlay_pending_from_unresolved_queues()
+                    if self.planned_moves or self.proposed_folders:
+                        applied_count += self._apply_destination_planning_overlays(
+                            "phase4_destination_overlay_lazy_memory_truth",
+                            allow_defer=True,
+                            prefer_chunked_projection=True,
+                            narrow_restore_real_snapshot=getattr(
+                                self, "_restore_narrow_destination_future_snapshot_once", False
+                            ),
+                        )
                     self._log_restore_phase(
                         "phase4_destination_overlay skipped",
                         reason="lazy_mode_uses_restore_queue",
                         top_level_count=self._planning_tree_top_level_count(dest_tree),
                         queue_size=self._unresolved_proposed_queue_size(),
                         allocation_queue_size=self._unresolved_allocation_queue_size(),
+                        memory_truth_overlay_applied_count=int(applied_count),
                     )
                     self._finalize_memory_restore_if_ready("phase4_lazy_mode_queue")
                     return
@@ -26825,12 +26840,40 @@ class MainWindow(QMainWindow):
         )
         self._destination_schedule_startup_first_interactable_log()
         self._schedule_provisional_startup_hydration_timer()
+        if self.planned_moves or self.proposed_folders:
+            QTimer.singleShot(
+                0,
+                lambda: self._safe_invoke(
+                    "startup_planned_workspace_memory_truth_tick",
+                    self._run_startup_planned_workspace_memory_overlay_pass,
+                ),
+            )
         return True
+
+    def _run_startup_planned_workspace_memory_overlay_pass(self) -> None:
+        """Attach persisted planned moves / proposed rows as soon as the shell is visible (before Graph-heavy hydration)."""
+        if self._planning_browse_mode("destination") == "local":
+            return
+        if not (self.planned_moves or self.proposed_folders):
+            return
+        try:
+            self._apply_destination_planning_overlays(
+                "startup_planned_workspace_memory_truth",
+                allow_defer=True,
+                prefer_chunked_projection=True,
+            )
+        except Exception as exc:
+            self._log_restore_exception("startup_planned_workspace_memory_truth", exc)
 
     def _destination_startup_should_defer_heavy_destination_work(self) -> bool:
         """True while the cached snapshot is interactive but shallow hydration has not finished."""
         ph = str(getattr(self, "_destination_startup_ui_phase", "") or "")
         return ph in ("cached_only", "hydrating", "restore_minimal_complete")
+
+    def _destination_overlay_reason_is_startup_planned_memory_truth(self, reason: str) -> bool:
+        """Session memory is the startup truth for planned rows; these passes must not wait for background hydration."""
+        r = str(reason or "")
+        return r.startswith("startup_planned_workspace_memory_truth") or r.startswith("phase4_destination_overlay")
 
     def _destination_startup_heavy_work_allowed(self) -> bool:
         """Large overlay / graph-id finalize passes run only in background_hydration (or when startup is inactive)."""
@@ -47203,7 +47246,11 @@ class MainWindow(QMainWindow):
             or bool(force_authoritative_bind)
             or self._destination_materialize_requires_authoritative_hard_flush(r)
         )
-        if not _early_force_auth and self._destination_startup_should_defer_heavy_destination_work():
+        if (
+            not _early_force_auth
+            and self._destination_startup_should_defer_heavy_destination_work()
+            and not self._destination_overlay_reason_is_startup_planned_memory_truth(r)
+        ):
             if getattr(self, "_destination_startup_deferred_overlay_reasons", None) is None:
                 self._destination_startup_deferred_overlay_reasons = []
             self._destination_startup_deferred_overlay_reasons.append(r[:300])
