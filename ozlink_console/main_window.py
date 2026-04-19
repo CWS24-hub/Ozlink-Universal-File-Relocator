@@ -2973,6 +2973,8 @@ class MainWindow(QMainWindow):
         self._startup_memory_interactive_ready: bool = True
         # Monotonic time when ``startup_memory_visible_tree_ready`` was logged (0 = not yet).
         self._startup_memory_visible_tree_ready_mono: float = 0.0
+        # Planned canonical paths (casefold) structurally invalid for container traversal — excluded from startup completeness.
+        self._startup_memory_invalid_planned_cf: set[str] = set()
         self._startup_background_refine_pending: dict[str, Any] | None = None
         self._destination_background_refine_paused_for_interaction: bool = False
         self._destination_snapshot_drain_deferred_for_scroll: bool = False
@@ -27004,7 +27006,7 @@ class MainWindow(QMainWindow):
             self._apply_destination_planning_overlays(
                 "startup_planned_workspace_memory_truth",
                 allow_defer=True,
-                prefer_chunked_projection=False,
+                prefer_chunked_projection=True,
             )
         except Exception as exc:
             self._log_restore_exception("startup_planned_workspace_memory_truth", exc)
@@ -47973,9 +47975,12 @@ class MainWindow(QMainWindow):
         return out
 
     def _startup_memory_full_workspace_audit_run(self) -> dict[str, Any]:
-        """Startup completeness vs the full persisted planned/proposed payload (not the narrow intended subset)."""
+        """Startup completeness vs structurally valid persisted planned/proposed paths (invalid chains excluded)."""
         graph_auth = destination_authority_contract.graph_owns_visible_real_destination_structure(self)
+        planned_paths_all: list[str] = []
         planned_paths: list[str] = []
+        _inv_logged = 0
+        _inv_cap = 16
         for move in getattr(self, "planned_moves", None) or []:
             if not isinstance(move, dict):
                 continue
@@ -47985,8 +47990,29 @@ class MainWindow(QMainWindow):
             if graph_auth:
                 proj = self._canonical_destination_path_with_visible_library_anchor(proj) or proj
             c = self._canonical_destination_projection_path(proj) or self.normalize_memory_path(proj)
-            if c:
-                planned_paths.append(c)
+            if not c:
+                continue
+            planned_paths_all.append(c)
+            inv, rsn = self._destination_structural_path_chain_invalid_for_container_parent(c)
+            if inv:
+                self._startup_memory_invalid_planned_cf.add(str(c).strip().casefold())
+                if _inv_logged < _inv_cap:
+                    _inv_logged += 1
+                    log_info(
+                        "startup_memory_invalid_exact_target_excluded_from_completeness",
+                        original_intended_path=str(c)[:500],
+                        invalid_reason=str(rsn or "")[:120],
+                        downgraded_target="",
+                        counts_toward_startup_completeness=False,
+                    )
+                    log_info(
+                        "startup_memory_completeness_row_invalid_terminal_chain",
+                        original_intended_path=str(c)[:500],
+                        reason=str(rsn or "")[:120],
+                    )
+                continue
+            planned_paths.append(c)
+        proposed_paths_all: list[str] = []
         proposed_paths: list[str] = []
         for pf in getattr(self, "proposed_folders", None) or []:
             raw = self._proposed_destination_path(pf)
@@ -47996,8 +48022,29 @@ class MainWindow(QMainWindow):
             if graph_auth:
                 adj = self._canonical_destination_path_with_visible_library_anchor(raw) or raw
             c = self._canonical_destination_projection_path(adj) or self.normalize_memory_path(adj)
-            if c:
-                proposed_paths.append(c)
+            if not c:
+                continue
+            proposed_paths_all.append(c)
+            inv_pf, rsn_pf = self._destination_structural_path_chain_invalid_for_container_parent(c)
+            if inv_pf:
+                self._startup_memory_invalid_planned_cf.add(str(c).strip().casefold())
+                if _inv_logged < _inv_cap:
+                    _inv_logged += 1
+                    log_info(
+                        "startup_memory_invalid_exact_target_excluded_from_completeness",
+                        original_intended_path=str(c)[:500],
+                        invalid_reason=str(rsn_pf or "")[:120],
+                        row_kind="proposed_folder",
+                        downgraded_target="",
+                        counts_toward_startup_completeness=False,
+                    )
+                    log_info(
+                        "startup_memory_completeness_row_invalid_terminal_chain",
+                        original_intended_path=str(c)[:500],
+                        reason=str(rsn_pf or "")[:120],
+                    )
+                continue
+            proposed_paths.append(c)
         _vp, all_visible = self._destination_enumerate_visible_planned_paths_and_all_visible()
         del _vp
         all_cf = {str(p or "").strip().casefold() for p in all_visible if str(p or "").strip()}
@@ -48008,6 +48055,10 @@ class MainWindow(QMainWindow):
         return {
             "expected_total_persisted_planned_rows": len(planned_paths),
             "expected_total_persisted_proposed_folders": len(proposed_paths),
+            "persisted_total_planned_rows_raw_including_invalid": len(planned_paths_all),
+            "persisted_total_proposed_rows_raw_including_invalid": len(proposed_paths_all),
+            "startup_memory_planned_rows_excluded_invalid_structure": max(0, len(planned_paths_all) - len(planned_paths)),
+            "startup_memory_proposed_rows_excluded_invalid_structure": max(0, len(proposed_paths_all) - len(proposed_paths)),
             "present_visible_planned_rows": int(pres_pl),
             "present_visible_proposed_folders": int(pres_pr),
             "missing_visible_planned_rows": len(miss_pl),
@@ -48718,7 +48769,12 @@ class MainWindow(QMainWindow):
 
     def _startup_memory_visible_planned_audit_run(self) -> dict[str, Any]:
         """Compare persisted intended targets to visible planned rows; used for startup completeness logging."""
-        intended = self._destination_collect_intended_workspace_target_canonical_paths()
+        raw_intended = self._destination_collect_intended_workspace_target_canonical_paths()
+        intended = []
+        for p in raw_intended:
+            inv, _ = self._destination_structural_path_chain_invalid_for_container_parent(p)
+            if not inv:
+                intended.append(p)
         vp, _av = self._destination_enumerate_visible_planned_paths_and_all_visible()
         icf = {str(p or "").strip().casefold() for p in intended if str(p or "").strip()}
         vpf = {str(p or "").strip().casefold() for p in vp if str(p or "").strip()}
@@ -48733,7 +48789,12 @@ class MainWindow(QMainWindow):
             if graph_auth:
                 adj = self._canonical_destination_path_with_visible_library_anchor(raw) or raw
             c = self._canonical_destination_projection_path(adj) or self.normalize_memory_path(adj)
-            if c and c.casefold() not in vpf:
+            if not c:
+                continue
+            inv_c, _ = self._destination_structural_path_chain_invalid_for_container_parent(c)
+            if inv_c:
+                continue
+            if c.casefold() not in vpf:
                 proposed_missing.append(c)
         return {
             "expected_visible_planned_rows": len(intended),
@@ -48747,7 +48808,12 @@ class MainWindow(QMainWindow):
 
     def _startup_memory_truth_ensure_missing_intended_paths(self) -> tuple[int, list[str]]:
         """Second pass: bind planned chains for persisted targets still absent from visible planned rows."""
-        intended = self._destination_collect_intended_workspace_target_canonical_paths()
+        raw_intended = self._destination_collect_intended_workspace_target_canonical_paths()
+        intended = []
+        for p in raw_intended:
+            inv, _ = self._destination_structural_path_chain_invalid_for_container_parent(p)
+            if not inv:
+                intended.append(p)
         if not intended:
             return 0, []
         ensured = 0
@@ -52941,10 +53007,19 @@ class MainWindow(QMainWindow):
             time_since_visible_tree_ready_sec=round(self._startup_memory_visible_tree_ready_elapsed_sec(), 3),
         )
         q_rem = int(self._unresolved_proposed_queue_size() or 0) + int(self._unresolved_allocation_queue_size() or 0)
+        try:
+            au_mem = self._startup_memory_full_workspace_audit_run()
+            startup_memory_completeness_done = (
+                int(au_mem.get("missing_visible_planned_rows", 0) or 0) == 0
+                and int(au_mem.get("missing_visible_proposed_folders", 0) or 0) == 0
+            )
+        except Exception:
+            startup_memory_completeness_done = False
         if (
             ft_active
             and q_rem > 0
             and not self._startup_memory_minimal_replay_meaningful_progress(snap_before, snap_after)
+            and not startup_memory_completeness_done
         ):
             log_info(
                 "startup_memory_completion_tick_stopped_no_meaningful_progress",
@@ -52954,6 +53029,7 @@ class MainWindow(QMainWindow):
                 remaining_total_queue=int(q_rem),
                 snapshot_before=snap_before,
                 snapshot_after=snap_after,
+                note="no_structural_progress_while_startup_completeness_not_yet_satisfied",
             )
 
     def _process_destination_restore_materialization_queue(self, reason, trigger_path=""):
