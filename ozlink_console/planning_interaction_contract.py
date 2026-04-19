@@ -24,6 +24,8 @@ Call sites that schedule destination overlay / materialize passes should use rea
 
 from __future__ import annotations
 
+from typing import Iterable
+
 _LOCAL_FIRST_EDIT_PREFIX = "local_first_edit_"
 
 _LOCAL_FIRST_DEFERRED_MATERIALIZE_REASONS: frozenset[str] = frozenset(
@@ -51,9 +53,23 @@ def _strip_deferred_planning_reason_prefix(reason: str) -> str:
     return r
 
 
+def _planning_reason_segments(reason: str) -> list[str]:
+    """Split combined reasons (``__`` from deferred refresh) so narrow/local-first tokens are still detected."""
+    r = _strip_deferred_planning_reason_prefix(reason)
+    if not r:
+        return []
+    if "__" in r:
+        return [p.strip() for p in r.split("__") if str(p).strip()]
+    return [r]
+
+
 def is_narrow_planned_item_move_overlay_reason(reason: str) -> bool:
     """True for planned-move follow-ups that must use narrow replay, not full destination materialize."""
-    return _strip_deferred_planning_reason_prefix(reason) in _NARROW_PLANNED_ITEM_MOVE_OVERLAY_REASONS
+    for seg in _planning_reason_segments(reason):
+        s = _strip_deferred_planning_reason_prefix(seg)
+        if s in _NARROW_PLANNED_ITEM_MOVE_OVERLAY_REASONS:
+            return True
+    return False
 
 
 def is_local_first_deferred_materialize_reason(reason: str) -> bool:
@@ -62,10 +78,19 @@ def is_local_first_deferred_materialize_reason(reason: str) -> bool:
     Recognizes explicit reasons (e.g. ``planned_item_moved``) and any ``local_first_edit_*`` idle pass,
     including: rename, assign, unassign, retarget, cut/paste, proposed folder create/remove — use
     ``local_first_edit_<action>`` when scheduling deferred overlay.
+
+    Also recognizes tokens inside ``deferred_<a>__<b>`` combined reasons from coalesced refresh queues.
     """
-    r = _strip_deferred_planning_reason_prefix(reason)
-    if r in _LOCAL_FIRST_DEFERRED_MATERIALIZE_REASONS:
-        return True
-    if r.startswith(_LOCAL_FIRST_EDIT_PREFIX):
-        return True
+    for seg in _planning_reason_segments(reason):
+        s = _strip_deferred_planning_reason_prefix(seg)
+        if s in _LOCAL_FIRST_DEFERRED_MATERIALIZE_REASONS:
+            return True
+        if s.startswith(_LOCAL_FIRST_EDIT_PREFIX):
+            return True
     return False
+
+
+def deferred_refresh_reasons_are_all_incremental(reasons: Iterable[str], incremental: frozenset[str]) -> bool:
+    """True when every queued deferred refresh reason is incremental-only (safe to skip full destination finalize)."""
+    rs = [str(r) for r in (reasons or []) if str(r).strip()]
+    return bool(rs) and all(r in incremental for r in rs)

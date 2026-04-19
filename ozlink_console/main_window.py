@@ -7492,17 +7492,26 @@ class MainWindow(QMainWindow):
             )
 
     def _deferred_planning_refresh_compute_skip_full_and_overlay_decision(self, reasons, combined_reason):
-        """Shared skip/overlay flags for deferred planning refresh (inner + graph_ids chunk driver)."""
+        """Shared skip/overlay flags for deferred planning refresh (inner + graph_ids chunk driver).
+
+        When several incremental reasons coalesce (e.g. ``planning_change_lightweight`` + manual drag),
+        we must keep ``skip_full_destination_future_model`` true and avoid escalating overlay backlog
+        into a broad destination finalize — that path treated narrowed bind scope like a full replay and
+        collapsed most visible planned rows (see narrow overlay routing + ``deferred_*__*`` reason parsing).
+        """
         _manual_drag_only = (
             len(reasons) == 1
             and bool(reasons)
             and str(reasons[0] or "") == "planned_item_moved_manual_drag"
         )
-        skip_full_destination_future_model = (
-            len(reasons) == 1
-            and bool(reasons)
-            and reasons[0] in _INCREMENTAL_DEFERRED_PLANNING_REFRESH_REASONS
+        # Coalesced queues join multiple reasons with "__"; every incremental-only reason must still
+        # skip full destination finalize — otherwise a drag follow-up merged with
+        # planning_change_lightweight ran a broad materialize path and collapsed visible planned rows.
+        _all_incremental_only = planning_interaction_contract.deferred_refresh_reasons_are_all_incremental(
+            reasons,
+            _INCREMENTAL_DEFERRED_PLANNING_REFRESH_REASONS,
         )
+        skip_full_destination_future_model = bool(_all_incremental_only)
         if _manual_drag_only:
             skip_full_destination_future_model = True
         if reasons == ["graph_ids_resolved_from_sharepoint_paths"]:
@@ -7516,7 +7525,9 @@ class MainWindow(QMainWindow):
         overlay_backlog = int(self._unresolved_proposed_queue_size() or 0) + int(
             self._unresolved_allocation_queue_size() or 0
         )
-        if overlay_backlog > 0 and not _manual_drag_only:
+        # Do not force broad destination overlay for backlog when the batch is still incremental-only
+        # (narrow drag-move follow-up must not escalate to full-tree rebuild).
+        if overlay_backlog > 0 and not _manual_drag_only and not _all_incremental_only:
             skip_full_destination_future_model = False
             if is_dev_mode():
                 log_info(
@@ -48216,20 +48227,43 @@ class MainWindow(QMainWindow):
         try:
             self._cancel_destination_future_async_projection(r or "local_first_edit")
             n = self._destination_planning_overlay_replay_persisted_only(r)
-            self._bump_destination_materialized_overlay_fingerprint(
-                phase="local_first_edit",
-                first_render_path=str(r)[:120],
-            )
+            _collapse = False
             if _drag_delta and _vp_before >= 0:
                 try:
                     _vp1, _ = self._destination_enumerate_visible_planned_paths_and_all_visible()
-                    log_info(
-                        "drag_move_visible_planned_delta",
-                        before=int(_vp_before),
-                        after=int(len(_vp1)),
+                    _va = len(_vp1)
+                    _delta = int(_vp_before) - int(_va)
+                    _scope = getattr(self, "_destination_bind_scope_paths", None) or getattr(
+                        self, "_destination_planned_move_materialize_bind_scope", None
                     )
+                    _paths = sorted(list(_scope))[:64] if _scope else []
+                    log_info(
+                        "drag_move_visible_workspace_preserve_check",
+                        visible_planned_before=int(_vp_before),
+                        visible_planned_after=int(_va),
+                        delta=int(_delta),
+                        affected_scope_paths=_paths,
+                        reason_excerpt=str(r)[:200],
+                    )
+                    if _vp_before >= 64 and (
+                        _va < int(_vp_before * 0.75)
+                        or _delta > max(48, int(_vp_before * 0.12))
+                    ):
+                        _collapse = True
+                        log_error(
+                            "drag_move_visible_workspace_collapse_detected",
+                            visible_planned_before=int(_vp_before),
+                            visible_planned_after=int(_va),
+                            reason="unexpected_broad_loss",
+                            reason_excerpt=str(r)[:200],
+                        )
                 except Exception:
                     pass
+            if not _collapse:
+                self._bump_destination_materialized_overlay_fingerprint(
+                    phase="local_first_edit",
+                    first_render_path=str(r)[:120],
+                )
             log_info("local_first_edit_overlay_pass_complete", reason=r[:200], overlay_replay_rows=int(n))
             return int(n)
         finally:
@@ -48329,6 +48363,10 @@ class MainWindow(QMainWindow):
                 narrow_restore_real_snapshot=narrow_restore_real_snapshot,
                 force_authoritative_bind=force_authoritative_bind,
             )
+        # Narrow planned-item moves must never fall through to full destination materialize. Coalesced
+        # deferred refresh uses ``deferred_<a>__<b>`` reasons; :func:`planning_interaction_contract.is_narrow_planned_item_move_overlay_reason`
+        # matches move tokens inside those combined strings (regression: merged refresh ran broad
+        # finalize and collapsed thousands of visible planned rows after drag).
         if planning_interaction_contract.is_narrow_planned_item_move_overlay_reason(str(reason or "")):
             _rn = str(reason or "")
             _base = (
