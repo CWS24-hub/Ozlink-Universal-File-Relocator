@@ -2944,6 +2944,10 @@ class MainWindow(QMainWindow):
         self._destination_provisional_startup_status_message = ""
         # Two-phase startup: paint cached snapshot first (cached_only), then expand/hydrate/refresh off the hot path.
         self._destination_startup_ui_phase: str = "inactive"
+        # While cached_only / hydrating: defer overlay materialize + indicator passes (flushed by orchestrator or graph bind).
+        self._destination_startup_deferred_overlay_reasons: list[str] = []
+        self._destination_startup_indicator_refresh_pending_after_cached: bool = False
+        self._destination_startup_first_interactable_logged: bool = False
         # TEMP: set when a deep snapshot was painted; used to log any later model reset/clear.
         self._destination_startup_snapshot_mount_seen = False
         # Drive id for the library whose session snapshot was mounted (loading placeholder must not wipe it).
@@ -26721,31 +26725,88 @@ class MainWindow(QMainWindow):
             phase=str(phase)[:80],
             note="expand_hydrate_refresh_deferred_to_phase2",
         )
+        log_info(
+            "cached_only_started",
+            phase=str(phase)[:80],
+            root_rows=len(roots),
+            snapshot_nodes=int(node_ct),
+            note="heavy_destination_followups_deferred_until_interaction_or_idle_fallback",
+        )
+        self._destination_schedule_startup_first_interactable_log()
         self._schedule_provisional_startup_hydration_timer()
         return True
 
+    def _destination_startup_should_defer_heavy_destination_work(self) -> bool:
+        """True while the cached snapshot is interactive but shallow hydration has not finished."""
+        ph = str(getattr(self, "_destination_startup_ui_phase", "") or "")
+        return ph in ("cached_only", "hydrating")
+
+    def _destination_schedule_startup_first_interactable_log(self) -> None:
+        """Log once after the next event-loop tick (first paint / selection should be possible)."""
+
+        def _go() -> None:
+            if getattr(self, "_destination_startup_first_interactable_logged", False):
+                return
+            self._destination_startup_first_interactable_logged = True
+            log_info(
+                "startup_first_interactable",
+                startup_ui_phase=str(getattr(self, "_destination_startup_ui_phase", "") or ""),
+                provisional_applied=bool(getattr(self, "_destination_provisional_startup_applied", False)),
+            )
+
+        QTimer.singleShot(0, lambda: self._safe_invoke("startup_first_interactable", _go))
+
+    def _destination_flush_startup_deferred_followups(self) -> None:
+        """After leaving cached_only/hydrating: one overlay pass + deferred indicator refresh."""
+        reasons = getattr(self, "_destination_startup_deferred_overlay_reasons", None) or []
+        self._destination_startup_deferred_overlay_reasons = []
+        n = len(reasons)
+        if n:
+            log_info("startup_hydration_step_begin", step="flush_deferred_overlays", backlog=n)
+            try:
+                self._apply_destination_planning_overlays(
+                    f"startup_hydration_flush_deferred_overlays:{n}",
+                    allow_defer=True,
+                )
+            except Exception as exc:
+                self._log_restore_exception("startup_hydration_flush_deferred_overlays", exc)
+            log_info("startup_hydration_step_end", step="flush_deferred_overlays", backlog=n)
+        if getattr(self, "_destination_startup_indicator_refresh_pending_after_cached", False):
+            self._destination_startup_indicator_refresh_pending_after_cached = False
+            log_info("startup_hydration_step_begin", step="flush_deferred_indicators")
+            try:
+                self._schedule_refresh_destination_tree_indicators(delay_ms=30)
+            except Exception as exc:
+                self._log_restore_exception("startup_hydration_flush_deferred_indicators", exc)
+            log_info("startup_hydration_step_end", step="flush_deferred_indicators")
+
     def _schedule_provisional_startup_hydration_timer(self) -> None:
-        """Defer phase-2 hydration so first paint stays responsive (timer + user interaction also trigger)."""
+        """Safety-net only: do not hydrate on a short delay after paint (that caused immediate heavy follow-up).
+
+        Primary triggers: destination tree scroll / selection (first interactivity). Idle fallback is long
+        so the cached tree stays usable without a background storm seconds after launch.
+        """
         if str(getattr(self, "_destination_startup_ui_phase", "") or "") != "cached_only":
             return
-        raw = str(os.environ.get("OZLINK_PROVISIONAL_STARTUP_HYDRATION_DELAY_MS", "") or "").strip()
-        delay_ms = 900
+        raw = str(os.environ.get("OZLINK_PROVISIONAL_STARTUP_HYDRATION_IDLE_FALLBACK_MS", "") or "").strip()
+        delay_ms = 120_000
         if raw:
             try:
-                delay_ms = max(0, min(60_000, int(raw)))
+                delay_ms = max(0, min(600_000, int(raw)))
             except ValueError:
                 pass
 
         def _kick() -> None:
-            self._destination_maybe_begin_provisional_startup_hydration(reason="timer_after_cached_paint")
+            self._destination_maybe_begin_provisional_startup_hydration(reason="idle_fallback_after_cached_paint")
 
-        QTimer.singleShot(delay_ms, lambda: self._safe_invoke("provisional_startup_hydration_timer", _kick))
+        QTimer.singleShot(delay_ms, lambda: self._safe_invoke("provisional_startup_hydration_idle_fallback_timer", _kick))
 
     def _destination_maybe_begin_provisional_startup_hydration(self, *, reason: str) -> None:
         """Run phase-2 hydration once: expand paths, hydrate allocations, branch refresh (after cached_only paint)."""
         if str(getattr(self, "_destination_startup_ui_phase", "") or "") != "cached_only":
             return
         self._destination_startup_ui_phase = "hydrating"
+        log_info("startup_hydration_started", reason=str(reason or "")[:160])
         log_info(
             "destination_provisional_startup_phase2_hydration_begin",
             reason=str(reason or "")[:160],
@@ -26757,6 +26818,11 @@ class MainWindow(QMainWindow):
         finally:
             self._destination_startup_ui_phase = "hydrated"
             log_info("destination_provisional_startup_phase2_hydration_complete", reason=str(reason or "")[:160])
+            try:
+                self._destination_flush_startup_deferred_followups()
+            except Exception as exc:
+                self._log_restore_exception("destination_startup_orchestrator_flush", exc)
+            log_info("startup_hydration_completed", reason=str(reason or "")[:160])
 
     def _destination_run_provisional_startup_hydration_body(self) -> None:
         snaps = list((getattr(self, "_pending_session_tree_snapshots", {}) or {}).get("destination") or []) or list(
@@ -26764,18 +26830,36 @@ class MainWindow(QMainWindow):
         )
         if not snaps:
             return
-        snap_exp = self._snapshot_refresh_targets_from_snapshot("destination", snaps)
+        log_info("startup_hydration_step_begin", step="snapshot_targets_from_session")
+        try:
+            snap_exp = self._snapshot_refresh_targets_from_snapshot("destination", snaps)
+        finally:
+            log_info("startup_hydration_step_end", step="snapshot_targets_from_session")
         if snap_exp:
+            log_info("startup_hydration_step_begin", step="restore_expanded_destination_paths")
             try:
                 self._restore_expanded_destination_paths(snap_exp)
             except Exception as exc:
                 self._log_restore_exception("destination_provisional_snapshot_expand", exc)
+            finally:
+                log_info("startup_hydration_step_end", step="restore_expanded_destination_paths")
+            log_info("startup_hydration_step_begin", step="hydrate_destination_allocations_for_expanded_paths_model")
             try:
                 self._hydrate_destination_allocations_for_expanded_paths_model(snap_exp)
             except Exception as exc:
                 self._log_restore_exception("destination_provisional_snapshot_hydrate", exc)
-        self._destination_prune_pending_snapshot_branch_refresh_after_provisional_mount(snaps)
-        self._schedule_snapshot_branch_refresh("destination", delay_ms=120)
+            finally:
+                log_info("startup_hydration_step_end", step="hydrate_destination_allocations_for_expanded_paths_model")
+        log_info("startup_hydration_step_begin", step="prune_pending_snapshot_branch_refresh")
+        try:
+            self._destination_prune_pending_snapshot_branch_refresh_after_provisional_mount(snaps)
+        finally:
+            log_info("startup_hydration_step_end", step="prune_pending_snapshot_branch_refresh")
+        log_info("startup_hydration_step_begin", step="schedule_snapshot_branch_refresh")
+        try:
+            self._schedule_snapshot_branch_refresh("destination", delay_ms=120)
+        finally:
+            log_info("startup_hydration_step_end", step="schedule_snapshot_branch_refresh")
 
     def _destination_payload_from_graph_item(self, item):
         prefix = "Folder" if item.get("is_folder") else "File"
@@ -26953,6 +27037,11 @@ class MainWindow(QMainWindow):
                 )
                 self._destination_provisional_startup_applied = False
                 self._destination_startup_ui_phase = "inactive"
+                if not hasattr(self, "_destination_startup_deferred_overlay_reasons"):
+                    self._destination_startup_deferred_overlay_reasons = []
+                else:
+                    self._destination_startup_deferred_overlay_reasons.clear()
+                self._destination_startup_indicator_refresh_pending_after_cached = False
                 return
             if self._planning_browse_mode("destination") != "local":
                 sorted_items = sorted(
@@ -27000,6 +27089,35 @@ class MainWindow(QMainWindow):
                 _fc_pre = self._destination_forensic_destination_model_counts()
                 self._destination_provisional_startup_applied = False
                 self._destination_startup_ui_phase = "inactive"
+                if not hasattr(self, "_destination_startup_deferred_overlay_reasons"):
+                    self._destination_startup_deferred_overlay_reasons = []
+                _def_ov_ct = len(self._destination_startup_deferred_overlay_reasons)
+                self._destination_startup_deferred_overlay_reasons.clear()
+                _ind_pend = bool(getattr(self, "_destination_startup_indicator_refresh_pending_after_cached", False))
+                self._destination_startup_indicator_refresh_pending_after_cached = False
+                if _def_ov_ct:
+                    log_info(
+                        "startup_deferred_followups_flushing_after_graph_bind",
+                        deferred_overlay_backlog=_def_ov_ct,
+                    )
+                    QTimer.singleShot(
+                        0,
+                        lambda n=_def_ov_ct: self._safe_invoke(
+                            "startup_flush_deferred_overlays_after_graph_bind",
+                            lambda: self._apply_destination_planning_overlays(
+                                f"startup_graph_bind_flush_deferred:{n}",
+                                allow_defer=True,
+                            ),
+                        ),
+                    )
+                if _ind_pend:
+                    QTimer.singleShot(
+                        0,
+                        lambda: self._safe_invoke(
+                            "startup_flush_deferred_indicators_after_graph_bind",
+                            lambda: self._schedule_refresh_destination_tree_indicators(delay_ms=30),
+                        ),
+                    )
                 did_shell = did_shell_early
                 self._destination_sharepoint_root_graph_bound_drive_id = did_shell
                 merge_stats: dict | None = None
@@ -46839,6 +46957,23 @@ class MainWindow(QMainWindow):
             self._destination_chunk_planned_workspace_fixpoint = False
         else:
             self._destination_fixpoint_slice_continuations = 0
+        _early_force_auth = (
+            bool(_shutdown_pre_save)
+            or bool(force_authoritative_bind)
+            or self._destination_materialize_requires_authoritative_hard_flush(r)
+        )
+        if not _early_force_auth and self._destination_startup_should_defer_heavy_destination_work():
+            if getattr(self, "_destination_startup_deferred_overlay_reasons", None) is None:
+                self._destination_startup_deferred_overlay_reasons = []
+            self._destination_startup_deferred_overlay_reasons.append(r[:300])
+            log_info(
+                "startup_heavy_work_deferred_due_to_phase",
+                kind="destination_planning_overlays",
+                reason=r[:220],
+                startup_ui_phase=str(getattr(self, "_destination_startup_ui_phase", "") or ""),
+                backlog=len(self._destination_startup_deferred_overlay_reasons),
+            )
+            return 0
         if getattr(self, "_destination_quiet_startup_overlay_structural_suppress", False):
             rr = str(r or "")
             _quiet_overlay_block = (
@@ -47767,6 +47902,14 @@ class MainWindow(QMainWindow):
             tree = getattr(self, "destination_tree_widget", None)
             if tree is None:
                 return
+            if self._destination_startup_should_defer_heavy_destination_work():
+                self._destination_startup_indicator_refresh_pending_after_cached = True
+                log_info(
+                    "startup_heavy_work_deferred_due_to_phase",
+                    kind="refresh_destination_tree_indicators",
+                    startup_ui_phase=str(getattr(self, "_destination_startup_ui_phase", "") or ""),
+                )
+                return
             if self._destination_user_scroll_interaction_active():
                 self._destination_indicator_refresh_deferred_for_scroll = True
                 t_idle = getattr(self, "_destination_tree_scroll_idle_timer", None)
@@ -47839,6 +47982,14 @@ class MainWindow(QMainWindow):
                 )
 
     def _schedule_refresh_destination_tree_indicators(self, delay_ms=50):
+        if self._destination_startup_should_defer_heavy_destination_work():
+            self._destination_startup_indicator_refresh_pending_after_cached = True
+            log_info(
+                "startup_heavy_work_deferred_due_to_phase",
+                kind="schedule_destination_tree_indicators",
+                startup_ui_phase=str(getattr(self, "_destination_startup_ui_phase", "") or ""),
+            )
+            return
         if self._destination_user_scroll_interaction_active():
             self._destination_indicator_refresh_deferred_for_scroll = True
             t_idle = getattr(self, "_destination_tree_scroll_idle_timer", None)

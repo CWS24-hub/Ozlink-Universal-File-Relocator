@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from PySide6.QtCore import QModelIndex, Qt
 from PySide6.QtWidgets import QApplication, QTreeView
@@ -73,6 +73,27 @@ def _provisional_startup_test_mw_with_snapshot():
     mw._safe_invoke = lambda _name, fn: fn()
     mw._schedule_provisional_startup_hydration_timer = lambda: None
     return mw, dm
+
+
+def test_cold_start_cached_tree_is_mounted_without_immediate_heavy_hydration():
+    """Regression: cached destination tree mounts; expand/hydrate/branch-refresh stay off the provisional stack."""
+    os.environ.pop("OZLINK_PROVISIONAL_DESTINATION_STARTUP", None)
+    app = QApplication.instance() or QApplication([])
+    mw, dm = _provisional_startup_test_mw_with_snapshot()
+    mw._restore_expanded_destination_paths = MagicMock()
+    mw._hydrate_destination_allocations_for_expanded_paths_model = MagicMock()
+    mw._schedule_snapshot_branch_refresh = MagicMock()
+
+    ok = MainWindow._destination_apply_provisional_session_snapshot_if_eligible(mw, phase="test")
+    assert ok is True
+    assert mw._destination_provisional_startup_applied is True
+    assert getattr(mw, "_destination_startup_ui_phase", "") == "cached_only"
+    assert dm.rowCount(QModelIndex()) == 1
+
+    mw._restore_expanded_destination_paths.assert_not_called()
+    mw._hydrate_destination_allocations_for_expanded_paths_model.assert_not_called()
+    mw._schedule_snapshot_branch_refresh.assert_not_called()
+    _ = app
 
 
 def test_provisional_startup_mount_does_not_immediately_trigger_heavy_hydration():
@@ -235,6 +256,59 @@ def test_root_graph_bind_merges_matching_provisional_id_to_live():
     assert pl.get("workspace_row_state") == WORKSPACE_ROW_STATE_LIVE_CONFIRMED
     assert pl.get("overlay_keep") == "x"
     assert mw._destination_provisional_startup_applied is False
+    _ = app
+
+
+def test_startup_heavy_destination_work_is_gated_while_cached_only():
+    """Regression: overlay materialize + indicator scheduling are deferred while cached_only / hydrating."""
+    mw = MainWindow.__new__(MainWindow)
+    mw._planning_browse_mode = lambda k: "sharepoint" if k == "destination" else "local"
+    mw._destination_tree_model_view = True
+    mw.destination_planning_model = MagicMock()
+    mw.destination_tree_widget = QTreeView()
+    mw._destination_startup_ui_phase = "cached_only"
+    mw._destination_startup_deferred_overlay_reasons = []
+    mw._destination_startup_indicator_refresh_pending_after_cached = False
+    mw._destination_shutdown_pre_save_overlay_flush = False
+
+    with patch.object(MainWindow, "_destination_materialize_requires_authoritative_hard_flush", return_value=False):
+        with patch.object(MainWindow, "_on_destination_state_mutation", MagicMock()) as mut:
+            with patch.object(MainWindow, "_apply_destination_planning_overlays_body", MagicMock()) as body:
+                r = MainWindow._apply_destination_planning_overlays(mw, "unit_test_overlay_gate")
+                assert r == 0
+                body.assert_not_called()
+                mut.assert_not_called()
+    assert mw._destination_startup_deferred_overlay_reasons
+    assert "unit_test_overlay_gate" in mw._destination_startup_deferred_overlay_reasons[0]
+
+    mw._destination_indicator_refresh_timer = MagicMock()
+    MainWindow._schedule_refresh_destination_tree_indicators(mw, delay_ms=50)
+    mw._destination_indicator_refresh_timer.start.assert_not_called()
+    assert mw._destination_startup_indicator_refresh_pending_after_cached is True
+
+
+def test_startup_hydration_can_begin_later_without_losing_state():
+    """Regression: explicit hydration after cached_only completes; model rows remain; phase advances (no starvation)."""
+    os.environ.pop("OZLINK_PROVISIONAL_DESTINATION_STARTUP", None)
+    app = QApplication.instance() or QApplication([])
+    mw, dm = _provisional_startup_test_mw_with_snapshot()
+    mw._restore_expanded_destination_paths = MagicMock()
+    mw._hydrate_destination_allocations_for_expanded_paths_model = MagicMock()
+    mw._destination_prune_pending_snapshot_branch_refresh_after_provisional_mount = MagicMock()
+    mw._schedule_snapshot_branch_refresh = MagicMock()
+    mw._snapshot_refresh_targets_from_snapshot = MagicMock(return_value={"p1"})
+    mw._destination_startup_deferred_overlay_reasons = ["prior_deferred"]
+    mw._destination_startup_indicator_refresh_pending_after_cached = True
+
+    with patch.object(MainWindow, "_apply_destination_planning_overlays", MagicMock(return_value=0)) as ov:
+        assert MainWindow._destination_apply_provisional_session_snapshot_if_eligible(mw, phase="test") is True
+        assert getattr(mw, "_destination_startup_ui_phase", "") == "cached_only"
+        MainWindow._destination_maybe_begin_provisional_startup_hydration(mw, reason="explicit_unit")
+        assert getattr(mw, "_destination_startup_ui_phase", "") == "hydrated"
+        assert dm.rowCount(QModelIndex()) == 1
+        mw._restore_expanded_destination_paths.assert_called_once()
+        mw._hydrate_destination_allocations_for_expanded_paths_model.assert_called_once()
+        ov.assert_called()
     _ = app
 
 
