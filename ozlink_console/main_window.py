@@ -2979,6 +2979,8 @@ class MainWindow(QMainWindow):
         self._startup_visible_snapshot_bound: bool = False
         self._startup_refinement_in_progress: bool = False
         self._startup_refinement_complete: bool = False
+        # Until startup refinement finishes: synchronous destination overlay + full replay (no source-gate / throttling).
+        self._startup_destination_eager_full_memory: bool = False
         self._startup_background_refine_pending: dict[str, Any] | None = None
         self._destination_background_refine_paused_for_interaction: bool = False
         self._destination_snapshot_drain_deferred_for_scroll: bool = False
@@ -16757,6 +16759,11 @@ class MainWindow(QMainWindow):
         return False
 
     def _should_defer_destination_materialization(self, reason):
+        r = str(reason or "")
+        if getattr(self, "_startup_destination_eager_full_memory", False) and (
+            r.startswith("startup_planned_workspace_memory_truth") or r.startswith("phase4_destination_overlay")
+        ):
+            return False
         if planning_interaction_contract.is_local_first_deferred_materialize_reason(str(reason or "")):
             return False
         destination_tree = getattr(self, "destination_tree_widget", None)
@@ -16799,6 +16806,8 @@ class MainWindow(QMainWindow):
         time and produced logs like `destination_future_model_materialize_deferred` with
         `waiting_for_source_restore` + large `source_restore_queue_size` while loads were idle.
         """
+        if getattr(self, "_startup_destination_eager_full_memory", False):
+            return False
         skip = {
             "destination_expand_all_full_tree",
             "destination_root_error_fallback",
@@ -21013,10 +21022,11 @@ class MainWindow(QMainWindow):
                 if getattr(self, "_sharepoint_lazy_mode", False):
                     self._sync_restore_destination_overlay_pending_from_unresolved_queues()
                     if self.planned_moves or self.proposed_folders:
+                        _eager_startup = bool(getattr(self, "_startup_destination_eager_full_memory", False))
                         applied_count += self._apply_destination_planning_overlays(
                             "phase4_destination_overlay_lazy_memory_truth",
-                            allow_defer=True,
-                            prefer_chunked_projection=True,
+                            allow_defer=not _eager_startup,
+                            prefer_chunked_projection=not _eager_startup,
                             narrow_restore_real_snapshot=getattr(
                                 self, "_restore_narrow_destination_future_snapshot_once", False
                             ),
@@ -21041,10 +21051,11 @@ class MainWindow(QMainWindow):
                 if not getattr(self, "_sharepoint_lazy_mode", False):
                     # Prefer chunked projection/bind during restore to avoid long UI
                     # blocking "merge/materialize" work on the main thread.
+                    _eager_startup = bool(getattr(self, "_startup_destination_eager_full_memory", False))
                     applied_count += self._apply_destination_planning_overlays(
                         "phase4_destination_overlay",
-                        allow_defer=True,
-                        prefer_chunked_projection=True,
+                        allow_defer=not _eager_startup,
+                        prefer_chunked_projection=not _eager_startup,
                         narrow_restore_real_snapshot=getattr(
                             self, "_restore_narrow_destination_future_snapshot_once", False
                         ),
@@ -27486,7 +27497,7 @@ class MainWindow(QMainWindow):
         return True
 
     def _run_startup_planned_workspace_memory_overlay_pass(self) -> None:
-        """Queue overlay scheduling after snapshot-first paint; does not synchronously replay rows for visibility."""
+        """Apply destination planning overlays immediately after snapshot bind (eager startup memory pass)."""
         if self._planning_browse_mode("destination") == "local":
             return
         if not (self.planned_moves or self.proposed_folders):
@@ -27494,8 +27505,8 @@ class MainWindow(QMainWindow):
         try:
             self._apply_destination_planning_overlays(
                 "startup_planned_workspace_memory_truth",
-                allow_defer=True,
-                prefer_chunked_projection=True,
+                allow_defer=False,
+                prefer_chunked_projection=False,
             )
         except Exception as exc:
             self._log_restore_exception("startup_planned_workspace_memory_truth", exc)
@@ -48089,6 +48100,7 @@ class MainWindow(QMainWindow):
         if (
             not bool(force_authoritative_bind)
             and not bool(_shutdown_pre_save)
+            and not getattr(self, "_startup_destination_eager_full_memory", False)
             and self._destination_user_scroll_interaction_active()
         ):
             _prior = str(getattr(self, "_destination_materialize_pended_for_scroll_reason", "") or "")
@@ -48800,6 +48812,7 @@ class MainWindow(QMainWindow):
         self._destination_startup_memory_workspace_building = False
         self._startup_memory_visible_tree_ready_mono = float(time.monotonic())
         self._destination_startup_memory_phase = "memory_presented"
+        self._startup_destination_eager_full_memory = True
         log_info(
             "startup_visible_snapshot_bound",
             contract=c[:120],
@@ -48851,6 +48864,8 @@ class MainWindow(QMainWindow):
 
     def _startup_post_visible_heavy_work_blocked(self) -> bool:
         """True immediately after visible-tree-ready: defer heavy overlay/replay/indicator work."""
+        if getattr(self, "_startup_destination_eager_full_memory", False):
+            return False
         dt = self._startup_memory_visible_tree_ready_elapsed_sec()
         if dt < 0.0:
             return False
@@ -48926,6 +48941,8 @@ class MainWindow(QMainWindow):
             max_rounds = max(1, min(512, int(raw_max))) if raw_max else 1
         except ValueError:
             max_rounds = 1
+        if getattr(self, "_startup_destination_eager_full_memory", False):
+            max_rounds = max(max_rounds, 512)
         total_prop = 0
         total_alloc = 0
         self._startup_memory_minimal_replay_active = True
@@ -48933,7 +48950,11 @@ class MainWindow(QMainWindow):
             _ft_busy = self._destination_full_tree_authority_walk_in_progress()
             log_info(
                 "startup_foreground_overlay_blocked",
-                note="startup_memory_minimal_replay_critical_section",
+                note=(
+                    "startup_memory_eager_synchronous_overlay"
+                    if getattr(self, "_startup_destination_eager_full_memory", False)
+                    else "startup_memory_minimal_replay_critical_section"
+                ),
                 max_rounds_cap=int(max_rounds),
                 full_tree_authority_walk_in_progress=bool(_ft_busy),
                 unresolved_proposed_parents=int(
@@ -49425,6 +49446,7 @@ class MainWindow(QMainWindow):
                     pass
                 self._startup_refinement_in_progress = False
                 self._startup_refinement_complete = True
+                self._startup_destination_eager_full_memory = False
                 log_info("startup_refinement_complete", reason=str(r)[:200])
 
         QTimer.singleShot(0, lambda: self._safe_invoke("startup_memory_truth_deferred_finish_tail", _tail))
@@ -53967,8 +53989,9 @@ class MainWindow(QMainWindow):
             slice_timer = QElapsedTimer()
             slice_timer.start()
 
-            startup_replay_unbounded = bool(getattr(self, "_startup_memory_replay_unbounded", False))
-            if getattr(self, "_startup_memory_minimal_replay_active", False):
+            _eager_mem = bool(getattr(self, "_startup_destination_eager_full_memory", False))
+            startup_replay_unbounded = bool(getattr(self, "_startup_memory_replay_unbounded", False)) or _eager_mem
+            if getattr(self, "_startup_memory_minimal_replay_active", False) and not _eager_mem:
                 startup_replay_unbounded = False
             if startup_replay_unbounded:
                 log_info(
@@ -54023,7 +54046,10 @@ class MainWindow(QMainWindow):
                         except Exception:
                             pass
                 try:
-                    if self._destination_user_scroll_interaction_active():
+                    if (
+                        not _eager_mem
+                        and self._destination_user_scroll_interaction_active()
+                    ):
                         max_slice_ms = min(int(max_slice_ms), 10)
                         if parent_budget > 0:
                             parent_budget = min(int(parent_budget), 8)
@@ -54045,7 +54071,11 @@ class MainWindow(QMainWindow):
                         )
                         return 0
                     parent_budget = max(1, int(parent_budget))
-            if (not startup_replay_unbounded) and str(reason or "").strip() == "replay_budget_resume":
+            if (
+                (not startup_replay_unbounded)
+                and (not _eager_mem)
+                and str(reason or "").strip() == "replay_budget_resume"
+            ):
                 max_slice_ms = min(int(max_slice_ms), 12)
             budget_exhausted = False
             for proposed_folder in pending_candidates:
@@ -54256,8 +54286,9 @@ class MainWindow(QMainWindow):
             slice_timer = QElapsedTimer()
             slice_timer.start()
 
-            startup_replay_unbounded = bool(getattr(self, "_startup_memory_replay_unbounded", False))
-            if getattr(self, "_startup_memory_minimal_replay_active", False):
+            _eager_mem_alloc = bool(getattr(self, "_startup_destination_eager_full_memory", False))
+            startup_replay_unbounded = bool(getattr(self, "_startup_memory_replay_unbounded", False)) or _eager_mem_alloc
+            if getattr(self, "_startup_memory_minimal_replay_active", False) and not _eager_mem_alloc:
                 startup_replay_unbounded = False
             if startup_replay_unbounded:
                 log_info(
@@ -54312,7 +54343,10 @@ class MainWindow(QMainWindow):
                         except Exception:
                             pass
                 try:
-                    if self._destination_user_scroll_interaction_active():
+                    if (
+                        not _eager_mem_alloc
+                        and self._destination_user_scroll_interaction_active()
+                    ):
                         max_slice_ms = min(int(max_slice_ms), 10)
                         if parent_budget > 0:
                             parent_budget = min(int(parent_budget), 8)
@@ -54334,7 +54368,11 @@ class MainWindow(QMainWindow):
                         )
                         return 0
                     parent_budget = max(1, int(parent_budget))
-            if (not startup_replay_unbounded) and str(reason or "").strip() == "replay_budget_resume":
+            if (
+                (not startup_replay_unbounded)
+                and (not _eager_mem_alloc)
+                and str(reason or "").strip() == "replay_budget_resume"
+            ):
                 max_slice_ms = min(int(max_slice_ms), 12)
             budget_exhausted = False
             for move in pending_moves:
