@@ -3036,6 +3036,7 @@ class MainWindow(QMainWindow):
         self._pending_destination_library_root = None
         self._source_projection_refresh_scheduled = False
         self._source_projection_refresh_context = ("", "")
+        self._source_projection_refresh_subtree_scope = "full"
         self._source_projection_refresh_paths = set()
         self._source_projection_refresh_coalesce_events = 0
         self._destination_mz_coalesce_epoch_id = 0
@@ -7008,6 +7009,16 @@ class MainWindow(QMainWindow):
                         column=idx.column(),
                     )
                 tree.expand(idx)
+                pl_expand = idx.data(Qt.UserRole) or {}
+                lazy_path = str(pl_expand.get("item_path") or pl_expand.get("display_path") or "").strip()
+                if lazy_path and self.planned_moves:
+                    self._schedule_source_projection_refresh_for_paths(
+                        [lazy_path],
+                        "source_projection_lazy_expand",
+                        trigger_path=lazy_path,
+                        delay_ms=0,
+                        subtree_scope="roots_only",
+                    )
             else:
                 log_trace(
                     "ui",
@@ -25016,10 +25027,100 @@ class MainWindow(QMainWindow):
             roots_segs.append(sp)
         return sorted(roots, key=lambda x: (len(segs_map[x]), x))
 
+    def _find_source_snapshot_branch_for_canonical_path(self, canonical_cf: str) -> dict | None:
+        """Return the snapshot branch dict for *canonical_cf* under pending session source roots, if any."""
+        if not canonical_cf:
+            return None
+        roots = list((getattr(self, "_pending_session_tree_snapshots", {}) or {}).get("source") or [])
+
+        def walk(nodes: list) -> dict | None:
+            for snap in nodes or []:
+                if not isinstance(snap, dict):
+                    continue
+                data = snap.get("data") or {}
+                if data.get("placeholder"):
+                    continue
+                p = self._canonical_source_projection_path(
+                    str(data.get("item_path") or data.get("display_path") or "").strip()
+                )
+                if p == canonical_cf:
+                    return snap
+                ch = snap.get("children") or []
+                if ch:
+                    hit = walk(ch)
+                    if hit is not None:
+                        return hit
+            return None
+
+        return walk(roots)
+
+    def _source_branch_child_structure_fingerprint_from_snapshot(self, branch: dict | None) -> str:
+        keys: list[str] = []
+        for c in list((branch or {}).get("children") or []):
+            if not isinstance(c, dict):
+                continue
+            d = c.get("data") or {}
+            if d.get("placeholder"):
+                continue
+            did = str(d.get("drive_id") or d.get("library_id") or "").strip().casefold()
+            iid = str(d.get("id") or "").strip().casefold()
+            keys.append(f"{did}|{iid}")
+        keys.sort()
+        return ":".join(keys)
+
+    def _source_branch_child_structure_fingerprint_from_model(self, parent_ix: QModelIndex) -> str | None:
+        model = getattr(self, "source_sharepoint_model", None)
+        if model is None or parent_ix is None or not parent_ix.isValid():
+            return None
+        ix = parent_ix.siblingAtColumn(0) if parent_ix.column() != 0 else parent_ix
+        keys: list[str] = []
+        n = model.rowCount(ix)
+        for r in range(n):
+            cix = model.index(r, 0, ix)
+            d = cix.data(Qt.UserRole) or {}
+            if d.get("placeholder"):
+                continue
+            did = str(d.get("drive_id") or d.get("library_id") or "").strip().casefold()
+            iid = str(d.get("id") or "").strip().casefold()
+            keys.append(f"{did}|{iid}")
+        keys.sort()
+        return ":".join(keys)
+
+    def _source_branch_fingerprint_matches_snapshot_shell(self, canonical_path: str, item) -> bool:
+        snap_branch = self._find_source_snapshot_branch_for_canonical_path(canonical_path)
+        if snap_branch is None:
+            return False
+        if not isinstance(item, QModelIndex) or not item.isValid():
+            return False
+        snap_fp = self._source_branch_child_structure_fingerprint_from_snapshot(snap_branch)
+        mod_fp = self._source_branch_child_structure_fingerprint_from_model(item)
+        if mod_fp is None:
+            return False
+        return snap_fp == mod_fp
+
     def _refresh_source_projection_for_paths(
-        self, paths, phase_name, trigger_path="", *, source_perf_move_origin=""
+        self,
+        paths,
+        phase_name,
+        trigger_path="",
+        *,
+        source_perf_move_origin="",
+        subtree_scope: Literal["full", "roots_only"] = "full",
     ):
         _expand_pending = getattr(self, "_expand_all_pending", None) or {}
+        if str(phase_name or "") == "source_projection_restore_complete":
+            log_info(
+                "source_projection_skipped_startup",
+                phase=str(phase_name or ""),
+                subtree_scope=str(subtree_scope or ""),
+            )
+            self._log_restore_phase(
+                "source_projection_deferred_lazy",
+                trigger_path=self.normalize_memory_path(trigger_path),
+                reason="restore_complete_phase_disabled",
+                subtree_scope=str(subtree_scope or ""),
+            )
+            return
         if _expand_pending.get("source"):
             self._source_projection_refresh_paths.update(paths or [])
             self._schedule_source_projection_refresh_for_paths(
@@ -25027,6 +25128,7 @@ class MainWindow(QMainWindow):
                 phase_name,
                 trigger_path=trigger_path,
                 delay_ms=350,
+                subtree_scope=subtree_scope,
             )
             return
         tree = getattr(self, "source_tree_widget", None)
@@ -25123,6 +25225,17 @@ class MainWindow(QMainWindow):
             for source_path in subtree_roots:
                 item = item_map.get(source_path)
                 if item is None:
+                    continue
+                if subtree_scope == "roots_only":
+                    subtree_data = dict(self._source_tree_row_payload(item))
+                    if subtree_data.get("placeholder"):
+                        continue
+                    subtree_path = self._canonical_source_projection_path(self._tree_item_path(subtree_data))
+                    if subtree_path and subtree_path in seen_paths:
+                        continue
+                    if subtree_path:
+                        seen_paths.add(subtree_path)
+                    work_items.append((item, subtree_data, subtree_path or ""))
                     continue
                 for subtree_row in self._iter_source_tree_subtree_rows(item):
                     subtree_data = dict(self._source_tree_row_payload(subtree_row))
@@ -25295,7 +25408,9 @@ class MainWindow(QMainWindow):
                 **{k: int(v) for k, v in lookup_stats.items()},
             )
 
-    def _schedule_source_projection_refresh_for_paths(self, paths, phase_name, trigger_path="", delay_ms=250):
+    def _schedule_source_projection_refresh_for_paths(
+        self, paths, phase_name, trigger_path="", delay_ms=250, *, subtree_scope: Literal["full", "roots_only"] = "full"
+    ):
         _ev = 0
         for path in paths or []:
             normalized_path = self._canonical_source_projection_path(path)
@@ -25306,11 +25421,17 @@ class MainWindow(QMainWindow):
             getattr(self, "_source_projection_refresh_coalesce_events", 0) or 0
         ) + max(1, _ev)
         self._source_projection_refresh_context = (phase_name, self.normalize_memory_path(trigger_path))
+        prev_scope = getattr(self, "_source_projection_refresh_subtree_scope", "full")
+        merged_scope: Literal["full", "roots_only"] = (
+            "full" if (prev_scope == "full" or subtree_scope == "full") else "roots_only"
+        )
+        self._source_projection_refresh_subtree_scope = merged_scope
         if self._source_projection_refresh_scheduled:
             log_info(
                 "source_projection_refresh_coalesced",
                 merged_event_count=int(getattr(self, "_source_projection_refresh_coalesce_events", 0) or 0),
                 phase_excerpt=str(phase_name or "")[:120],
+                subtree_scope=str(merged_scope),
             )
             return
 
@@ -25322,22 +25443,30 @@ class MainWindow(QMainWindow):
             phase, queued_trigger_path = self._source_projection_refresh_context
             queued_paths = set(self._source_projection_refresh_paths)
             self._source_projection_refresh_paths.clear()
+            run_scope: Literal["full", "roots_only"] = getattr(
+                self, "_source_projection_refresh_subtree_scope", "full"
+            )
+            self._source_projection_refresh_subtree_scope = "full"
             if self._expand_all_pending.get("source"):
                 self._source_projection_refresh_paths.update(queued_paths)
+                self._source_projection_refresh_subtree_scope = run_scope
                 self._schedule_source_projection_refresh_for_paths(
                     queued_paths,
                     phase,
                     queued_trigger_path,
                     delay_ms=350,
+                    subtree_scope=run_scope,
                 )
                 return
             if getattr(self, "_memory_restore_in_progress", False):
                 self._source_projection_refresh_paths.update(queued_paths)
+                self._source_projection_refresh_subtree_scope = run_scope
                 self._schedule_source_projection_refresh_for_paths(
                     queued_paths,
                     phase,
                     queued_trigger_path,
                     delay_ms=350,
+                    subtree_scope=run_scope,
                 )
                 return
             roots = self._minimal_descendant_cover_paths(set(queued_paths))
@@ -25346,7 +25475,9 @@ class MainWindow(QMainWindow):
                     root,
                     reason=f"schedule_source_projection_refresh:{str(phase or '')[:64]}",
                 )
-            self._refresh_source_projection_for_paths(queued_paths, phase, trigger_path=queued_trigger_path)
+            self._refresh_source_projection_for_paths(
+                queued_paths, phase, trigger_path=queued_trigger_path, subtree_scope=run_scope
+            )
             log_info(
                 "source_projection_refresh_executed",
                 merged_event_count=int(getattr(self, "_source_projection_refresh_coalesce_events", 0) or 0),
@@ -26107,6 +26238,7 @@ class MainWindow(QMainWindow):
                     visible_paths,
                     "source_projection_post_restore_root_bind",
                     delay_ms=80,
+                    subtree_scope="roots_only",
                 )
             self._log_restore_phase(
                 "source_restore_materialization_skipped",
@@ -26284,6 +26416,42 @@ class MainWindow(QMainWindow):
                     QApplication.processEvents()
                 continue
 
+            if isinstance(item, QModelIndex) and self._source_branch_fingerprint_matches_snapshot_shell(
+                source_path, item
+            ):
+                log_info(
+                    "source_branch_noop_due_to_fingerprint",
+                    source_path=source_path,
+                    reason=str(reason or ""),
+                )
+                self._log_restore_phase(
+                    "source_restore_branch_skipped",
+                    source_path=source_path,
+                    normalized_source_path=source_path,
+                    queue_size=len(queue),
+                    branch_depth=self._source_branch_depth(source_path),
+                    already_loaded=False,
+                    loaded_successfully=False,
+                    projection_refresh_invoked=False,
+                    reason=f"{reason}_fingerprint_matches_snapshot_shell",
+                    trigger_path=self.normalize_memory_path(trigger_path),
+                    verbose=True,
+                )
+                if drained % 40 == 0:
+                    QApplication.processEvents()
+                continue
+
+            snap_branch = self._find_source_snapshot_branch_for_canonical_path(source_path)
+            if snap_branch is not None:
+                mod_fp = self._source_branch_child_structure_fingerprint_from_model(item)
+                snap_fp = self._source_branch_child_structure_fingerprint_from_snapshot(snap_branch)
+                if mod_fp is not None and snap_fp != mod_fp:
+                    log_info(
+                        "source_branch_delta_detected",
+                        source_path=source_path,
+                        reason=str(reason or ""),
+                    )
+
             self._log_restore_phase(
                 "source_restore_branch_expand_requested",
                 source_path=source_path,
@@ -26301,12 +26469,15 @@ class MainWindow(QMainWindow):
 
         if not queue:
             if self._source_projection_refresh_pending:
-                source_projection_paths = set(self._build_source_materialization_paths())
-                source_projection_paths.update(self._collect_visible_source_relationship_paths())
-                self._schedule_source_projection_refresh_for_paths(
-                    source_projection_paths,
-                    "source_projection_restore_complete",
-                    trigger_path=trigger_path,
+                log_info(
+                    "source_projection_skipped_startup",
+                    phase="source_projection_restore_complete",
+                    reason="decoupled_from_materialization_queue_drain",
+                )
+                log_info(
+                    "source_projection_deferred_lazy",
+                    pending_cleared=True,
+                    trigger_path=self.normalize_memory_path(trigger_path),
                 )
                 self._source_projection_refresh_pending = False
             self._log_restore_phase(
