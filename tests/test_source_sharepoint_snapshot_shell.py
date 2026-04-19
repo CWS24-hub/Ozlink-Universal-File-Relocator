@@ -389,6 +389,35 @@ class SourceSharePointSnapshotShellTests(unittest.TestCase):
         self.assertFalse(sup)
         self.assertEqual(info["action_taken"], "site_key_mismatch_session_vs_selector")
 
+    def test_guard_non_loading_message_preserves_when_pending_snapshot_matches_drive(self):
+        """Placeholder text must not disable shell preservation when snapshot + drive match."""
+        _app()
+        w = _identity_window(drive_id="drive-NL")
+        w._planning_browse_mode = MainWindow._planning_browse_mode.__get__(w, MainWindow)
+        w._pending_session_tree_snapshots = {"source": [{"data": {"drive_id": "drive-NL"}}]}
+        w.pending_root_drive_ids = {"source": "drive-NL"}
+        w._source_sharepoint_root_force_replace = False
+        w._source_startup_snapshot_mount_seen = False
+        w._source_snapshot_shell_prearmed = False
+        sup, info = MainWindow._source_loading_placeholder_shell_preservation_guard(
+            w, "Review the current source folders before continuing."
+        )
+        self.assertTrue(sup)
+        self.assertEqual(info["action_taken"], "suppress_destructive_placeholder_instructional")
+
+    def test_guard_generic_non_loading_message_preserves_when_shell_prearmed(self):
+        _app()
+        w = _identity_window(drive_id="drive-G")
+        w._planning_browse_mode = MainWindow._planning_browse_mode.__get__(w, MainWindow)
+        w._pending_session_tree_snapshots = {"source": [{"data": {"drive_id": "drive-G"}}]}
+        w.pending_root_drive_ids = {"source": "drive-G"}
+        w._source_sharepoint_root_force_replace = False
+        w._source_startup_snapshot_mount_seen = False
+        w._source_snapshot_shell_prearmed = True
+        sup, info = MainWindow._source_loading_placeholder_shell_preservation_guard(w, "Pick folders to plan moves.")
+        self.assertTrue(sup)
+        self.assertEqual(info["action_taken"], "suppress_destructive_placeholder_snapshot_shell")
+
     def test_no_duplicate_path_keys_after_mount(self):
         _app()
         tree = QTreeView()

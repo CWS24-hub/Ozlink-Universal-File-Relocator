@@ -22845,6 +22845,19 @@ class MainWindow(QMainWindow):
                 suppress, forensic = self._source_loading_placeholder_shell_preservation_guard(message)
                 if suppress:
                     after_fc = self._source_forensic_model_node_counts()
+                    if not msg_s.lower().startswith("loading"):
+                        log_info(
+                            "source_placeholder_blocked_non_loading_message",
+                            message_excerpt=msg_s[:160],
+                            instructional_placeholder=bool(forensic.get("instructional_placeholder")),
+                            action_taken=str(forensic.get("action_taken") or ""),
+                        )
+                        log_info(
+                            "source_destructive_reset_blocked_non_loading",
+                            message_excerpt=msg_s[:160],
+                            mount_drive_id_suffix=str(forensic.get("mount_drive_id_suffix") or ""),
+                            pending_drive_id_suffix=str(forensic.get("pending_drive_id_suffix") or ""),
+                        )
                     if bool(forensic.get("pending_session_snapshot_match")) or bool(
                         forensic.get("snapshot_shell_prearmed")
                     ):
@@ -23751,11 +23764,13 @@ class MainWindow(QMainWindow):
     def _source_loading_placeholder_shell_preservation_guard(self, message: str) -> tuple[bool, dict]:
         """If True, ``set_tree_placeholder`` must not call ``set_empty_library_message`` (full model reset).
 
-        Used for loading-state transitions (e.g. ``Loading root content…``) while a Phase 1 startup shell
-        is already mounted for the same library as the pending root bind.
+        Snapshot shell preservation depends on snapshot/prearm state and drive identity match, not on
+        placeholder message text (e.g. instructional prompts may replace ``Loading…`` during startup).
         """
         msg_s = str(message or "").strip()
-        loading_msg = msg_s.lower().startswith("loading")
+        msg_l = msg_s.lower()
+        loading_msg = msg_l.startswith("loading")
+        instructional_placeholder = "review the current source" in msg_l
         mount_did = str(getattr(self, "_source_snapshot_mount_drive_id", "") or "").strip()
         pending_did = str((getattr(self, "pending_root_drive_ids", None) or {}).get("source") or "").strip()
         cur = self._current_source_library_identity_tuple()
@@ -23783,6 +23798,8 @@ class MainWindow(QMainWindow):
             "startup_shell_seen": startup_shell_seen,
             "pending_session_snapshot_match": pending_snap_match,
             "snapshot_shell_prearmed": prearmed,
+            "loading_style_placeholder": loading_msg,
+            "instructional_placeholder": instructional_placeholder,
         }
 
         if self._planning_browse_mode("source") != "sharepoint":
@@ -23793,9 +23810,6 @@ class MainWindow(QMainWindow):
             return False, forensic
         if force_replace:
             forensic["action_taken"] = "force_replace_pending"
-            return False, forensic
-        if not loading_msg:
-            forensic["action_taken"] = "non_loading_placeholder"
             return False, forensic
 
         same_drive = False
@@ -23824,7 +23838,12 @@ class MainWindow(QMainWindow):
 
         forensic["identity_match"] = True
         forensic["shell_preservation_guard_active"] = True
-        forensic["action_taken"] = "suppress_destructive_placeholder"
+        if loading_msg:
+            forensic["action_taken"] = "suppress_destructive_placeholder"
+        elif instructional_placeholder:
+            forensic["action_taken"] = "suppress_destructive_placeholder_instructional"
+        else:
+            forensic["action_taken"] = "suppress_destructive_placeholder_snapshot_shell"
         return True, forensic
 
     def _startup_tree_snapshot_node_limit(self):
