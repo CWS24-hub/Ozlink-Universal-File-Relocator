@@ -10138,15 +10138,28 @@ class MainWindow(QMainWindow):
         Uses force-live only while :attr:`_destination_save_in_progress` or shutdown so startup restore paths
         never block the UI thread on a full model walk.
         """
-        if getattr(self, "_destination_startup_memory_workspace_building", False) and not getattr(
-            self, "_application_shutting_down", False
-        ):
+        _save_or_shutdown = bool(getattr(self, "_destination_save_in_progress", False)) or bool(
+            getattr(self, "_application_shutting_down", False)
+        )
+        if getattr(self, "_destination_startup_memory_workspace_building", False) and not _save_or_shutdown:
+            log_info(
+                "snapshot_capture_skipped",
+                phase="force_live_preflight",
+                skip_reason="startup_memory_workspace_building",
+                save_in_progress=False,
+            )
             log_info("startup_snapshot_capture_deferred", reason="startup_memory_tree_still_building")
             rs = getattr(self, "_runtime_session_tree_snapshots", None)
             if isinstance(rs, dict) and isinstance(rs.get("destination"), list):
                 return list(rs["destination"])
             return []
         if not self._destination_force_live_snapshot_allowed():
+            log_info(
+                "snapshot_capture_skipped",
+                phase="force_live_preflight",
+                skip_reason="force_live_not_allowed_outside_save_or_shutdown",
+                save_in_progress=bool(getattr(self, "_destination_save_in_progress", False)),
+            )
             rs = getattr(self, "_runtime_session_tree_snapshots", None)
             if isinstance(rs, dict) and isinstance(rs.get("destination"), list):
                 return list(rs["destination"])
@@ -10177,10 +10190,110 @@ class MainWindow(QMainWindow):
                 model_non_placeholder_nodes=int(mod_n),
                 difference=diff,
             )
+            if getattr(self, "_destination_startup_memory_workspace_building", False):
+                log_info(
+                    "snapshot_capture_partial",
+                    phase="force_live_preflight",
+                    note="captured_during_startup_workspace_building_save_allowed",
+                    snapshot_recursive_nodes=int(snap_n),
+                    model_non_placeholder_nodes=int(mod_n),
+                )
             return fresh
         finally:
             self._destination_session_snapshot_force_live_once = False
             self._destination_runtime_snapshot_force_refresh_during_tick = False
+
+    def _planning_memory_nonempty(self) -> bool:
+        return bool(getattr(self, "planned_moves", None) or getattr(self, "proposed_folders", None))
+
+    def _count_planned_workspace_rows_in_destination_snapshot_roots(self, roots: list) -> int:
+        """Recursive count of planned-workspace rows in persisted snapshot JSON (for save validation)."""
+
+        def walk(snap: dict) -> int:
+            if not isinstance(snap, dict):
+                return 0
+            n = 0
+            data = snap.get("data")
+            if isinstance(data, dict) and destination_payload_is_planned_workspace_row(data):
+                n += 1
+            for ch in list(snap.get("children") or []):
+                if isinstance(ch, dict):
+                    n += walk(ch)
+            return n
+
+        total = 0
+        for root in roots or []:
+            if isinstance(root, dict):
+                total += walk(root)
+        return int(total)
+
+    def _count_planned_and_proposed_rows_in_destination_model(self) -> tuple[int, int]:
+        """Return (planned_workspace_row_count, proposed_row_count) in the live destination planning model."""
+        planned_n = 0
+        proposed_n = 0
+        dm = getattr(self, "destination_planning_model", None)
+        if dm is None:
+            return 0, 0
+        try:
+            for ix in dm.iter_depth_first():
+                pl = ix.data(Qt.UserRole) or {}
+                if not isinstance(pl, dict) or pl.get("placeholder"):
+                    continue
+                if destination_payload_is_planned_workspace_row(pl):
+                    planned_n += 1
+                if self.is_proposed_destination_node(pl):
+                    proposed_n += 1
+        except Exception:
+            return 0, 0
+        return int(planned_n), int(proposed_n)
+
+    def _log_destination_snapshot_persist_validation(self, state: SessionState, *, phase: str = "draft_save") -> None:
+        """Compare session destination snapshot to live model; log mismatches (persistence contract)."""
+        try:
+            roots = list(getattr(state, "DestinationTreeSnapshot", []) or [])
+            snap_n = int(self._count_tree_snapshot_nodes(roots))
+            snap_planned = int(self._count_planned_workspace_rows_in_destination_snapshot_roots(roots))
+            mod_n = int(self._count_destination_model_non_placeholder_nodes())
+            mod_planned, mod_prop = self._count_planned_and_proposed_rows_in_destination_model()
+            pm = len(getattr(self, "planned_moves", None) or [])
+            pf = len(getattr(self, "proposed_folders", None) or [])
+            log_info(
+                "snapshot_persist_validation",
+                phase=str(phase)[:120],
+                session_destination_snapshot_recursive_nodes=int(snap_n),
+                live_model_non_placeholder_nodes=int(mod_n),
+                snapshot_planned_workspace_rows=int(snap_planned),
+                live_model_planned_workspace_rows=int(mod_planned),
+                live_model_proposed_rows_visible=int(mod_prop),
+                planned_moves_list_count=int(pm),
+                proposed_folders_list_count=int(pf),
+            )
+            if (pm > 0 or pf > 0) and snap_n <= 0 and not roots:
+                log_info(
+                    "snapshot_planning_mismatch_detected",
+                    phase=str(phase)[:120],
+                    mismatch_reason="planning_lists_nonempty_but_destination_snapshot_empty",
+                    planned_moves_list_count=int(pm),
+                    proposed_folders_list_count=int(pf),
+                )
+            elif mod_n >= 0 and snap_n >= 0 and mod_n != snap_n:
+                log_info(
+                    "snapshot_planning_mismatch_detected",
+                    phase=str(phase)[:120],
+                    mismatch_reason="non_placeholder_count_differs_from_snapshot_recursive_count",
+                    live_model_non_placeholder_nodes=int(mod_n),
+                    session_destination_snapshot_recursive_nodes=int(snap_n),
+                )
+            if snap_planned >= 0 and mod_planned >= 0 and snap_planned != mod_planned:
+                log_info(
+                    "snapshot_planning_mismatch_detected",
+                    phase=str(phase)[:120],
+                    mismatch_reason="planned_workspace_row_count_snapshot_vs_model",
+                    snapshot_planned_workspace_rows=int(snap_planned),
+                    live_model_planned_workspace_rows=int(mod_planned),
+                )
+        except Exception as exc:
+            self._log_restore_exception("destination_snapshot_persist_validation", exc)
 
     def _build_current_draft_shell_state(self, *, include_workspace_ui: bool = False):
         state = SessionState()
@@ -10211,19 +10324,35 @@ class MainWindow(QMainWindow):
                 ),
             }
         )
-        if (
+        _need_dest_refresh = bool(
             _dest_persist is None
             and (not include_workspace_ui)
-            and getattr(self, "_destination_tree_snapshot_dirty_for_persist", False)
             and hasattr(self, "source_tree_widget")
-        ):
+            and (
+                getattr(self, "_destination_tree_snapshot_dirty_for_persist", False)
+                or self._planning_memory_nonempty()
+            )
+        )
+        if _need_dest_refresh:
             if getattr(self, "_destination_startup_memory_workspace_building", False):
+                log_info(
+                    "snapshot_capture_partial",
+                    phase="draft_shell_partial_refresh",
+                    reason="startup_memory_tree_still_building",
+                    planning_lists_nonempty=bool(self._planning_memory_nonempty()),
+                )
                 log_info(
                     "startup_snapshot_capture_deferred",
                     reason="startup_memory_tree_still_building",
                     context="draft_shell_partial_refresh",
                 )
             elif getattr(self, "_destination_descendant_apply_tick_running", False):
+                log_info(
+                    "snapshot_capture_partial",
+                    phase="draft_shell_partial_refresh",
+                    reason="destination_descendant_tick_running",
+                    planning_lists_nonempty=bool(self._planning_memory_nonempty()),
+                )
                 log_info(
                     "destination_snapshot_saved_from_stale_cache",
                     context="draft_shell_partial_refresh_deferred_tick",
@@ -10236,6 +10365,8 @@ class MainWindow(QMainWindow):
                     "destination_snapshot_refreshed_from_live_model",
                     trigger="draft_shell_partial_refresh_include_workspace_ui_false",
                     top_level_nodes=len(workspace_tree_snapshots["destination"]),
+                    planning_lists_nonempty=bool(self._planning_memory_nonempty()),
+                    dirty_flag=bool(getattr(self, "_destination_tree_snapshot_dirty_for_persist", False)),
                 )
                 self._destination_tree_snapshot_dirty_for_persist = False
 
@@ -12048,6 +12179,10 @@ class MainWindow(QMainWindow):
             self._draft_shell_state = state
             self._draft_shell_raw = state.to_dict()
             self.active_draft_session_id = state.DraftId
+            try:
+                self._log_destination_snapshot_persist_validation(state, phase="draft_save")
+            except Exception as exc:
+                self._log_restore_exception("draft_save_snapshot_validation", exc)
             allocation_rows = self._build_memory_allocation_rows()
             proposed_rows = self._build_memory_proposed_folders()
             allow_empty_overwrite = bool(force)
@@ -22907,6 +23042,13 @@ class MainWindow(QMainWindow):
             if getattr(self, "_destination_descendant_apply_tick_running", False) and not _force_live:
                 self._post_tick_descendant_drain_pending = True
                 self._destination_post_tick_deferred_boundary_log("snapshot_capture_deferred_tick_running")
+                log_info(
+                    "snapshot_capture_skipped",
+                    phase="capture_tree_items_snapshot",
+                    skip_reason="destination_descendant_tick_running_without_force_live",
+                    force_live=bool(_force_live),
+                    save_in_progress=bool(getattr(self, "_destination_save_in_progress", False)),
+                )
                 if getattr(self, "_destination_tree_snapshot_dirty_for_persist", False):
                     log_info(
                         "destination_snapshot_saved_from_stale_cache",
@@ -56482,6 +56624,12 @@ class MainWindow(QMainWindow):
         ``payload`` is reserved for diagnostics; timers remain an optional safety net (see
         :meth:`_schedule_destination_overlay_source_projection_invariant`).
         """
+        if isinstance(payload, dict):
+            _surf = str(payload.get("surface") or "")
+            if _surf in ("planned_moves", "proposed_folders"):
+                self._mark_destination_tree_snapshot_dirty_after_injection(
+                    reason=f"planning_list_mutation:{str(reason or '')[:160]}"
+                )
         _ = payload
         if int(getattr(self, "_overlay_invariant_suppress_depth", 0) or 0) > 0:
             if not getattr(self, "_disable_overlay_invariant_timer_for_test", False):
