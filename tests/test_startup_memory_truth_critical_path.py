@@ -1,5 +1,7 @@
-"""Regression: startup contract emits ``startup_memory_visible_tree_ready`` after snapshot ``reset_nested``;
-minimal replay, overlay attach, and audits run only in the deferred tail after grace."""
+"""Regression: ``startup_memory_visible_tree_ready`` follows snapshot ``reset_nested`` (readiness = bind only).
+
+Deferred tail may run recovery replay only when the snapshot is not authoritative; otherwise audits stay
+background-only and graph chain-ensure is skipped for visibility."""
 
 from __future__ import annotations
 
@@ -212,6 +214,103 @@ def test_bounded_replay_invocations_background_only():
                 assert n[0] == 0
                 drain()
     assert n[0] == 1
+
+
+def test_broad_replay_skipped_when_snapshot_contract_bound():
+    """With snapshot-bound + provisional + nonempty model, defer tail skips whole-tree minimal/persisted replay."""
+    mw = _minimal_mw_for_memory_truth_body()
+    # Provisional startup already emitted ``startup_memory_visible_tree_ready`` — avoid re-emit overwriting flags.
+    mw._startup_memory_visible_tree_ready_mono = 1.0
+    mw._startup_visible_snapshot_bound = True
+    mw._destination_provisional_startup_applied = True
+    replay_calls = [0]
+
+    def counting_replay(*_a, **_k):
+        replay_calls[0] += 1
+        return 42
+
+    mw._destination_planning_overlay_replay_persisted_only = counting_replay
+    minimal_calls = [0]
+    real_minimal = MainWindow._startup_memory_minimal_replay_pass
+
+    def count_minimal(self, *a, **k):
+        minimal_calls[0] += 1
+        return real_minimal(self, *a, **k)
+
+    seq: list[str] = []
+
+    def capture(msg: str, **_kwargs):
+        if isinstance(msg, str):
+            seq.append(msg)
+
+    with patch.dict(os.environ, {"OZLINK_STARTUP_BACKGROUND_REFINE_GRACE_MS": "120"}, clear=False):
+        with patch.object(MainWindow, "_startup_memory_minimal_replay_pass", count_minimal):
+            with patch("ozlink_console.main_window.log_info", side_effect=capture):
+                with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
+                    with _memory_truth_timer_queue() as drain:
+                        MainWindow._apply_destination_planning_overlays_body_memory_truth_startup(
+                            mw,
+                            "startup_planned_workspace_memory_truth",
+                        )
+                        drain()
+    assert replay_calls[0] == 0
+    assert minimal_calls[0] == 0
+    assert "startup_broad_replay_skipped_snapshot_contract" in seq
+    assert "startup_snapshot_used_without_replay" in seq
+    assert "replay_skipped_no_change" in seq
+
+
+def test_deferred_finish_skips_graph_chain_ensure_when_snapshot_suppresses_replay():
+    """Graph chain-ensure is recovery-only; suppressed when snapshot already bound the visible workspace."""
+    mw = _minimal_mw_for_memory_truth_body()
+    mw._startup_memory_sync_expand_affordances_done = True
+    mw._bump_destination_materialized_overlay_fingerprint = MagicMock()
+    with patch.object(MainWindow, "_startup_memory_truth_ensure_missing_intended_paths") as ens:
+        MainWindow._startup_memory_truth_deferred_finish(
+            mw, "ctx", "startup_planned_workspace_memory_truth", 0, 0, startup_replay_suppressed=True
+        )
+        ens.assert_not_called()
+    with patch.object(
+        MainWindow,
+        "_startup_memory_truth_ensure_missing_intended_paths",
+        return_value=(0, []),
+    ) as ens:
+        MainWindow._startup_memory_truth_deferred_finish(
+            mw, "ctx", "startup_planned_workspace_memory_truth", 0, 0, startup_replay_suppressed=False
+        )
+        ens.assert_called_once()
+
+
+def test_broad_replay_forced_when_env_set():
+    """OZLINK_STARTUP_FORCE_BROAD_REPLAY overrides skip and runs persisted overlay replay."""
+    mw = _minimal_mw_for_memory_truth_body()
+    mw._startup_memory_visible_tree_ready_mono = 1.0
+    mw._startup_visible_snapshot_bound = True
+    mw._destination_provisional_startup_applied = True
+    replay_calls = [0]
+
+    def counting_replay(*_a, **_k):
+        replay_calls[0] += 1
+        return 1
+
+    mw._destination_planning_overlay_replay_persisted_only = counting_replay
+
+    with patch.dict(
+        os.environ,
+        {
+            "OZLINK_STARTUP_BACKGROUND_REFINE_GRACE_MS": "120",
+            "OZLINK_STARTUP_FORCE_BROAD_REPLAY": "1",
+        },
+        clear=False,
+    ):
+        with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
+            with _memory_truth_timer_queue() as drain:
+                MainWindow._apply_destination_planning_overlays_body_memory_truth_startup(
+                    mw,
+                    "startup_planned_workspace_memory_truth",
+                )
+                drain()
+    assert replay_calls[0] == 1
 
 
 def test_background_refine_after_visible_tree_ready_log_order():

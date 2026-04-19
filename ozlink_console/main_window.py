@@ -27159,7 +27159,7 @@ class MainWindow(QMainWindow):
         return True
 
     def _run_startup_planned_workspace_memory_overlay_pass(self) -> None:
-        """Attach persisted planned moves / proposed rows as soon as the shell is visible (before Graph-heavy hydration)."""
+        """Queue overlay scheduling after snapshot-first paint; does not synchronously replay rows for visibility."""
         if self._planning_browse_mode("destination") == "local":
             return
         if not (self.planned_moves or self.proposed_folders):
@@ -48413,7 +48413,11 @@ class MainWindow(QMainWindow):
         root_rows: int,
         contract: str,
     ) -> None:
-        """Emit startup contract logs: snapshot shell is visible and browsable; replay/audit/refine deferred."""
+        """Emit ``startup_memory_visible_tree_ready`` once snapshot rows are bound (``reset_nested`` / contract).
+
+        Readiness is **only** snapshot bind + emit — not replay, not audits, not overlay materialization. Deferred
+        background work may run recovery replay when the snapshot is not authoritative for the UI.
+        """
         if float(getattr(self, "_startup_memory_visible_tree_ready_mono", 0.0) or 0.0) > 0.0:
             return
         c = str(contract or "").strip()
@@ -48471,7 +48475,7 @@ class MainWindow(QMainWindow):
         )
 
     def _schedule_startup_memory_refinement_after_snapshot_bind(self) -> None:
-        """Queue replay/overlay/audit when there is no planned/proposed tick (snapshot-only restore)."""
+        """Queue deferred background tail when there is no planned/proposed overlay tick (snapshot-only restore)."""
         if self._planning_browse_mode("destination") == "local":
             return
         r = "startup_planned_workspace_memory_truth"
@@ -48776,6 +48780,34 @@ class MainWindow(QMainWindow):
 
         _walk(QModelIndex())
 
+    def _startup_snapshot_suppresses_startup_replay(self) -> bool:
+        """True when DestinationTreeSnapshot was bound via reset_nested and contract is snapshot_bound.
+
+        In that case startup must not run minimal/persisted replay or graph chain-ensure for *visibility* — the
+        remembered workspace is already rendered. Recovery (replay + ensure) runs only when this returns False,
+        e.g. missing/empty snapshot roots, no drive match, planning present but model empty, or
+        ``OZLINK_STARTUP_FORCE_BROAD_REPLAY``.
+        """
+        raw = str(os.environ.get("OZLINK_STARTUP_FORCE_BROAD_REPLAY", "") or "").strip().lower()
+        if raw in ("1", "true", "yes", "on"):
+            return False
+        if not bool(getattr(self, "_startup_visible_snapshot_bound", False)):
+            return False
+        if not bool(getattr(self, "_destination_provisional_startup_applied", False)):
+            return False
+        has_planning = bool(getattr(self, "planned_moves", None) or getattr(self, "proposed_folders", None))
+        try:
+            n_nodes = int(self._count_destination_model_non_placeholder_nodes())
+        except Exception:
+            n_nodes = -1
+        if has_planning and n_nodes <= 0:
+            return False
+        return True
+
+    def _startup_skip_broad_replay_after_snapshot_contract(self) -> bool:
+        """Compatibility alias for :meth:`_startup_snapshot_suppresses_startup_replay`."""
+        return self._startup_snapshot_suppresses_startup_replay()
+
     def _schedule_startup_memory_background_refine(
         self,
         ctx: str,
@@ -48892,58 +48924,114 @@ class MainWindow(QMainWindow):
             self._startup_refinement_in_progress = True
             n_min_total = 0
             n_persisted = 0
+            suppress_startup_replay = self._startup_snapshot_suppresses_startup_replay()
             try:
                 log_info(
                     "startup_memory_replay_deferred_to_background",
                     reason=str(r)[:200],
                     expanded_path_closure_count=len(exp_bind),
+                    startup_snapshot_suppresses_replay=bool(suppress_startup_replay),
                 )
-                try:
-                    self._reset_unresolved_proposed_queue()
-                    self._reset_unresolved_allocation_queue()
-                except Exception:
-                    pass
-                try:
-                    self._destination_prune_invalid_unresolved_replay_parent_paths(
-                        context=f"memory_truth_startup_background:{str(r)[:80]}"
-                    )
-                except Exception:
-                    pass
-                log_info("startup_memory_truth_materialize_deferred_until_visible_tree_ready", reason=str(r)[:200])
-                self._cancel_destination_future_async_projection(r or "memory_truth_startup")
-                min_rep = self._startup_memory_minimal_replay_pass(ctx, r)
-                n_min_total = int(min_rep.get("n_prop", 0) or 0) + int(min_rep.get("n_alloc", 0) or 0)
-                audit_after = min_rep.get("audit") or self._startup_memory_full_workspace_audit_run()
-                miss_pl_a = int(audit_after.get("missing_visible_planned_rows", 0) or 0)
-                miss_pr_a = int(audit_after.get("missing_visible_proposed_folders", 0) or 0)
-                persisted_complete = miss_pl_a == 0 and miss_pr_a == 0
-                if persisted_complete:
+                if suppress_startup_replay:
+                    try:
+                        ws_n = int(self._count_destination_model_non_placeholder_nodes())
+                    except Exception:
+                        ws_n = -1
                     log_info(
-                        "startup_memory_minimal_replay_complete",
-                        present_visible_planned_rows=int(audit_after.get("present_visible_planned_rows", 0) or 0),
-                        missing_visible_planned_rows=0,
-                        missing_visible_proposed_folders=0,
-                        minimal_replay_rounds=int(min_rep.get("rounds", 0) or 0),
-                        lite_overlay_rows=int(n_min_total),
-                    )
-                else:
-                    miss_paths: list[str] = []
-                    miss_paths.extend(list(audit_after.get("missing_planned_paths") or [])[:48])
-                    miss_paths.extend(list(audit_after.get("missing_proposed_paths") or [])[:32])
-                    log_info(
-                        "startup_memory_incomplete_after_minimal_replay",
+                        "startup_snapshot_used_without_replay",
                         reason=str(r)[:200],
-                        missing_visible_planned_rows=int(miss_pl_a),
-                        missing_visible_proposed_folders=int(miss_pr_a),
-                        minimal_replay_rounds=int(min_rep.get("rounds", 0) or 0),
-                        lite_overlay_rows=int(n_min_total),
-                        missing=miss_paths[:64],
+                        workspace_visible_rows=int(ws_n),
+                        replay_trigger_reason="none",
+                        replay_scope_size=0,
                     )
-                n_persisted = int(
-                    self._destination_planning_overlay_replay_persisted_only(
-                        ctx, destination_expanded_paths=exp_bind
+                    log_info(
+                        "replay_skipped_no_change",
+                        reason=str(r)[:200],
+                        replay_trigger_reason="none",
+                        note="snapshot_authoritative_startup_visibility_not_replay_gated",
                     )
-                )
+                    log_info(
+                        "startup_broad_replay_skipped_snapshot_contract",
+                        reason=str(r)[:200],
+                        note="phase2_incremental_graph_reconcile_only_no_global_startup_sweep",
+                        visible_snapshot_bound=bool(getattr(self, "_startup_visible_snapshot_bound", False)),
+                        provisional_startup_applied=bool(getattr(self, "_destination_provisional_startup_applied", False)),
+                        workspace_visible_rows=int(ws_n),
+                    )
+                    try:
+                        self._destination_prune_invalid_unresolved_replay_parent_paths(
+                            context=f"memory_truth_startup_background:{str(r)[:80]}"
+                        )
+                    except Exception:
+                        pass
+                    log_info(
+                        "startup_memory_truth_materialize_deferred_until_visible_tree_ready",
+                        reason=str(r)[:200],
+                        broad_replay_skipped=True,
+                    )
+                    self._cancel_destination_future_async_projection(r or "memory_truth_startup")
+                else:
+                    log_info(
+                        "startup_replay_recovery_begin",
+                        reason=str(r)[:200],
+                        replay_trigger_reason="recovery_snapshot_contract_incomplete",
+                        note="fallback_minimal_and_persisted_overlay_when_snapshot_not_authoritative_for_ui",
+                    )
+                    try:
+                        self._reset_unresolved_proposed_queue()
+                        self._reset_unresolved_allocation_queue()
+                    except Exception:
+                        pass
+                    try:
+                        self._destination_prune_invalid_unresolved_replay_parent_paths(
+                            context=f"memory_truth_startup_background:{str(r)[:80]}"
+                        )
+                    except Exception:
+                        pass
+                    log_info("startup_memory_truth_materialize_deferred_until_visible_tree_ready", reason=str(r)[:200])
+                    self._cancel_destination_future_async_projection(r or "memory_truth_startup")
+                    min_rep = self._startup_memory_minimal_replay_pass(ctx, r)
+                    n_min_total = int(min_rep.get("n_prop", 0) or 0) + int(min_rep.get("n_alloc", 0) or 0)
+                    audit_after = min_rep.get("audit") or self._startup_memory_full_workspace_audit_run()
+                    miss_pl_a = int(audit_after.get("missing_visible_planned_rows", 0) or 0)
+                    miss_pr_a = int(audit_after.get("missing_visible_proposed_folders", 0) or 0)
+                    persisted_complete = miss_pl_a == 0 and miss_pr_a == 0
+                    if persisted_complete:
+                        log_info(
+                            "startup_memory_minimal_replay_complete",
+                            present_visible_planned_rows=int(audit_after.get("present_visible_planned_rows", 0) or 0),
+                            missing_visible_planned_rows=0,
+                            missing_visible_proposed_folders=0,
+                            minimal_replay_rounds=int(min_rep.get("rounds", 0) or 0),
+                            lite_overlay_rows=int(n_min_total),
+                        )
+                    else:
+                        miss_paths: list[str] = []
+                        miss_paths.extend(list(audit_after.get("missing_planned_paths") or [])[:48])
+                        miss_paths.extend(list(audit_after.get("missing_proposed_paths") or [])[:32])
+                        log_info(
+                            "startup_memory_incomplete_after_minimal_replay",
+                            reason=str(r)[:200],
+                            missing_visible_planned_rows=int(miss_pl_a),
+                            missing_visible_proposed_folders=int(miss_pr_a),
+                            minimal_replay_rounds=int(min_rep.get("rounds", 0) or 0),
+                            lite_overlay_rows=int(n_min_total),
+                            missing=miss_paths[:64],
+                        )
+                    n_persisted = int(
+                        self._destination_planning_overlay_replay_persisted_only(
+                            ctx, destination_expanded_paths=exp_bind
+                        )
+                    )
+                    _scope = int(n_min_total) + int(n_persisted)
+                    log_info(
+                        "startup_replay_recovery_applied",
+                        reason=str(r)[:200],
+                        replay_trigger_reason="recovery_snapshot_contract_incomplete",
+                        replay_scope_size=int(_scope),
+                        minimal_overlay_rows=int(n_min_total),
+                        persisted_overlay_rows=int(n_persisted),
+                    )
             except Exception as exc:
                 self._log_restore_exception("startup_memory_background_workspace_replay", exc)
             try:
@@ -48953,7 +49041,11 @@ class MainWindow(QMainWindow):
                 self._log_restore_exception("startup_memory_truth_mark_expand_affordance", exc)
             try:
                 self._startup_memory_truth_deferred_finish(
-                    ctx, r, int(n_min_total) + int(n_persisted), len(exp_bind)
+                    ctx,
+                    r,
+                    int(n_min_total) + int(n_persisted),
+                    len(exp_bind),
+                    startup_replay_suppressed=bool(suppress_startup_replay),
                 )
             except Exception as exc:
                 self._log_restore_exception("startup_memory_truth_deferred_finish", exc)
@@ -48973,24 +49065,49 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, lambda: self._safe_invoke("startup_memory_truth_deferred_finish_tail", _tail))
 
     def _startup_memory_truth_deferred_finish(
-        self, ctx: str, reason: str, overlay_replay_rows: int, expanded_path_closure_count: int
+        self,
+        ctx: str,
+        reason: str,
+        overlay_replay_rows: int,
+        expanded_path_closure_count: int,
+        *,
+        startup_replay_suppressed: bool = False,
     ) -> None:
-        """Heavy startup memory-truth follow-up: chain ensure, full audit, fingerprint (after visible tree pass)."""
+        """Post-startup follow-up: optional graph chain-ensure (recovery only), audits as background validation, fingerprint.
+
+        When ``startup_replay_suppressed`` (snapshot-bound provisional startup), skips graph projection chain-ensure —
+        visibility is already satisfied by ``DestinationTreeSnapshot`` + ``reset_nested``; audits remain logging-only.
+        """
         del ctx  # reserved for tracing
         r = str(reason or "")
+        if startup_replay_suppressed:
+            log_info(
+                "startup_memory_truth_deferred_finish_snapshot_authority",
+                reason=r[:200],
+                expanded_path_closure_count=int(expanded_path_closure_count),
+                overlay_replay_rows=int(overlay_replay_rows),
+                replay_trigger_reason="none",
+                note="chain_ensure_skipped_snapshot_authoritative_audits_background_only",
+            )
         log_info(
             "startup_memory_visible_planned_audit_begin",
             reason=r[:200],
             expanded_path_closure_count=int(expanded_path_closure_count),
             chain_ensure_attempts=0,
-            note="deferred_phase_before_chain_ensure",
+            note="deferred_phase_before_chain_ensure"
+            if not startup_replay_suppressed
+            else "background_validation_only_no_readiness_gate",
         )
         log_info(
             "startup_memory_full_workspace_audit_begin",
             reason=r[:200],
             overlay_replay_rows=int(overlay_replay_rows),
+            startup_replay_suppressed=bool(startup_replay_suppressed),
         )
-        ens_n, _ens_miss = self._startup_memory_truth_ensure_missing_intended_paths()
+        if startup_replay_suppressed:
+            ens_n, _ens_miss = 0, []
+        else:
+            ens_n, _ens_miss = self._startup_memory_truth_ensure_missing_intended_paths()
         if not bool(getattr(self, "_startup_memory_sync_expand_affordances_done", False)):
             self._startup_memory_mark_saved_descendant_expand_affordances()
         self._bump_destination_materialized_overlay_fingerprint(
@@ -49230,10 +49347,13 @@ class MainWindow(QMainWindow):
         narrow_restore_real_snapshot=False,
         force_authoritative_bind=False,
     ):
-        """Schedule background refinement only. ``startup_memory_visible_tree_ready`` fires after ``reset_nested`` (provisional snapshot), not here.
+        """Schedule deferred background tail only — never synchronous replay for visibility.
 
-        Replay, overlay attach, audits, and projection cancel run after grace in
-        :meth:`_maybe_start_startup_background_refine_after_grace` (see deferred ``_tail``).
+        ``startup_memory_visible_tree_ready`` is emitted from :meth:`_emit_startup_memory_snapshot_contract_ready`
+        immediately after ``reset_nested`` with persisted ``DestinationTreeSnapshot``; this path does not attach
+        planning rows for visibility. After grace, :meth:`_maybe_start_startup_background_refine_after_grace` may
+        run recovery replay only when :meth:`_startup_snapshot_suppresses_startup_replay` is false; otherwise
+        audits and fingerprint run as background validation without global replay or graph chain-ensure for display.
         """
         r = str(reason or "")
         self._startup_memory_planned_attach_skipped_log = []
