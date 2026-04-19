@@ -2942,6 +2942,8 @@ class MainWindow(QMainWindow):
         # Option 3 Phase 1: session tree snapshot applied to the planning model before Graph root bind.
         self._destination_provisional_startup_applied = False
         self._destination_provisional_startup_status_message = ""
+        # Two-phase startup: paint cached snapshot first (cached_only), then expand/hydrate/refresh off the hot path.
+        self._destination_startup_ui_phase: str = "inactive"
         # TEMP: set when a deep snapshot was painted; used to log any later model reset/clear.
         self._destination_startup_snapshot_mount_seen = False
         # Drive id for the library whose session snapshot was mounted (loading placeholder must not wipe it).
@@ -26713,6 +26715,55 @@ class MainWindow(QMainWindow):
             snapshot_nodes=int(node_ct),
             workspace_row_state="cached_provisional_and_planned_only_under_stamp",
         )
+        self._destination_startup_ui_phase = "cached_only"
+        log_info(
+            "destination_provisional_startup_phase1_cached_only",
+            phase=str(phase)[:80],
+            note="expand_hydrate_refresh_deferred_to_phase2",
+        )
+        self._schedule_provisional_startup_hydration_timer()
+        return True
+
+    def _schedule_provisional_startup_hydration_timer(self) -> None:
+        """Defer phase-2 hydration so first paint stays responsive (timer + user interaction also trigger)."""
+        if str(getattr(self, "_destination_startup_ui_phase", "") or "") != "cached_only":
+            return
+        raw = str(os.environ.get("OZLINK_PROVISIONAL_STARTUP_HYDRATION_DELAY_MS", "") or "").strip()
+        delay_ms = 900
+        if raw:
+            try:
+                delay_ms = max(0, min(60_000, int(raw)))
+            except ValueError:
+                pass
+
+        def _kick() -> None:
+            self._destination_maybe_begin_provisional_startup_hydration(reason="timer_after_cached_paint")
+
+        QTimer.singleShot(delay_ms, lambda: self._safe_invoke("provisional_startup_hydration_timer", _kick))
+
+    def _destination_maybe_begin_provisional_startup_hydration(self, *, reason: str) -> None:
+        """Run phase-2 hydration once: expand paths, hydrate allocations, branch refresh (after cached_only paint)."""
+        if str(getattr(self, "_destination_startup_ui_phase", "") or "") != "cached_only":
+            return
+        self._destination_startup_ui_phase = "hydrating"
+        log_info(
+            "destination_provisional_startup_phase2_hydration_begin",
+            reason=str(reason or "")[:160],
+        )
+        try:
+            self._destination_run_provisional_startup_hydration_body()
+        except Exception as exc:
+            self._log_restore_exception("destination_provisional_startup_hydration_body", exc)
+        finally:
+            self._destination_startup_ui_phase = "hydrated"
+            log_info("destination_provisional_startup_phase2_hydration_complete", reason=str(reason or "")[:160])
+
+    def _destination_run_provisional_startup_hydration_body(self) -> None:
+        snaps = list((getattr(self, "_pending_session_tree_snapshots", {}) or {}).get("destination") or []) or list(
+            (getattr(self, "_runtime_session_tree_snapshots", {}) or {}).get("destination") or []
+        )
+        if not snaps:
+            return
         snap_exp = self._snapshot_refresh_targets_from_snapshot("destination", snaps)
         if snap_exp:
             try:
@@ -26725,7 +26776,6 @@ class MainWindow(QMainWindow):
                 self._log_restore_exception("destination_provisional_snapshot_hydrate", exc)
         self._destination_prune_pending_snapshot_branch_refresh_after_provisional_mount(snaps)
         self._schedule_snapshot_branch_refresh("destination", delay_ms=120)
-        return True
 
     def _destination_payload_from_graph_item(self, item):
         prefix = "Folder" if item.get("is_folder") else "File"
@@ -26902,6 +26952,7 @@ class MainWindow(QMainWindow):
                     extra="empty",
                 )
                 self._destination_provisional_startup_applied = False
+                self._destination_startup_ui_phase = "inactive"
                 return
             if self._planning_browse_mode("destination") != "local":
                 sorted_items = sorted(
@@ -26948,6 +26999,7 @@ class MainWindow(QMainWindow):
                     nodes_before = 0
                 _fc_pre = self._destination_forensic_destination_model_counts()
                 self._destination_provisional_startup_applied = False
+                self._destination_startup_ui_phase = "inactive"
                 did_shell = did_shell_early
                 self._destination_sharepoint_root_graph_bound_drive_id = did_shell
                 merge_stats: dict | None = None
@@ -47648,6 +47700,10 @@ class MainWindow(QMainWindow):
 
     def _destination_note_destination_tree_scroll_activity(self) -> None:
         """Mark destination tree as under user scroll; coalesce deferred UI passes until idle."""
+        try:
+            self._destination_maybe_begin_provisional_startup_hydration(reason="destination_tree_scroll")
+        except Exception:
+            pass
         grace_s = max(0.12, float(getattr(self, "_destination_tree_scroll_grace_s", 0.22) or 0.22))
         self._destination_tree_scroll_activity_until = time.monotonic() + grace_s
         t_idle = getattr(self, "_destination_tree_scroll_idle_timer", None)
@@ -55626,6 +55682,11 @@ class MainWindow(QMainWindow):
             if self._root_tree_bind_in_progress:
                 self._log_restore_phase("tree_selection_change_skipped", panel_key=panel_key, reason="root_tree_bind_in_progress")
                 return
+            if panel_key == "destination":
+                try:
+                    self._destination_maybe_begin_provisional_startup_hydration(reason="destination_tree_selection")
+                except Exception:
+                    pass
 
             if self._planning_browse_mode(panel_key) == "local":
                 tree = self.source_local_fs_tree if panel_key == "source" else self.destination_local_fs_tree
