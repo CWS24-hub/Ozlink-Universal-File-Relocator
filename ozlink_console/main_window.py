@@ -2967,6 +2967,8 @@ class MainWindow(QMainWindow):
         self._startup_memory_sync_expand_affordances_done: bool = False
         # Foreground startup: lite unresolved-queue replay only; blocks heavy persisted replay entry.
         self._startup_memory_minimal_replay_active: bool = False
+        # During minimal replay only: lift worker slice/parent budgets in unresolved overlay replay (not materialize).
+        self._startup_memory_replay_unbounded: bool = False
         self._startup_background_refine_pending: dict[str, Any] | None = None
         self._destination_background_refine_paused_for_interaction: bool = False
         self._destination_snapshot_drain_deferred_for_scroll: bool = False
@@ -48144,6 +48146,7 @@ class MainWindow(QMainWindow):
         total_prop = 0
         total_alloc = 0
         self._startup_memory_minimal_replay_active = True
+        self._startup_memory_replay_unbounded = True
         try:
             replay_rounds_executed = 0
             for round_i in range(max_rounds):
@@ -48242,6 +48245,7 @@ class MainWindow(QMainWindow):
             }
         finally:
             self._startup_memory_minimal_replay_active = False
+            self._startup_memory_replay_unbounded = False
 
     def _startup_memory_mark_saved_descendant_expand_affordances(self) -> None:
         """Folders with persisted rows strictly underneath must show an expand arrow before Graph/materialize."""
@@ -52793,69 +52797,87 @@ class MainWindow(QMainWindow):
 
             queue_size_before = int(self._unresolved_proposed_queue_size() or 0)
 
-            parent_budget = 0
-            raw_budget = os.environ.get("OZLINK_RESTORE_REPLAY_PARENT_BUDGET", "").strip()
-            explicit_env_budget = bool(raw_budget)
-            if raw_budget:
-                try:
-                    parent_budget = max(0, int(raw_budget))
-                except ValueError:
-                    parent_budget = 0
-            elif self._destination_restore_replay_reason_uses_worker_budget(reason):
-                parent_budget = 64
-
             processed_parent_paths: set[str] = set()
             slice_timer = QElapsedTimer()
             slice_timer.start()
-            raw_slice_ms = os.environ.get("OZLINK_RESTORE_REPLAY_MAX_MS", "").strip()
-            if raw_slice_ms:
-                try:
-                    max_slice_ms = max(4, min(80, int(raw_slice_ms)))
-                except ValueError:
-                    max_slice_ms = 12
+
+            startup_replay_unbounded = bool(getattr(self, "_startup_memory_replay_unbounded", False))
+            if startup_replay_unbounded:
+                log_info(
+                    "startup_memory_replay_unbounded_mode_enabled",
+                    queue_size=int(queue_size_before),
+                    replay_kind="proposed",
+                )
+                n_cand = len(pending_candidates)
+                uniq_pp = (
+                    len({self._proposed_parent_path(pf) for pf in pending_candidates})
+                    if pending_candidates
+                    else 0
+                )
+                parent_budget = max(4096, uniq_pp, n_cand, int(queue_size_before))
+                max_slice_ms = 120_000
+                explicit_env_budget = False
             else:
-                max_slice_ms = 36 if self._destination_restore_replay_reason_uses_worker_budget(reason) else 24
-            if self._destination_restore_replay_reason_uses_worker_budget(reason) and str(trigger_path or "").strip():
-                tp = self.normalize_memory_path(str(trigger_path).strip()).casefold()
-                if tp:
+                parent_budget = 0
+                raw_budget = os.environ.get("OZLINK_RESTORE_REPLAY_PARENT_BUDGET", "").strip()
+                explicit_env_budget = bool(raw_budget)
+                if raw_budget:
                     try:
-                        ui = self._capture_workspace_tree_state()
-                        exp = ui.get("destination_expanded_paths") or set()
-                        sel = str(ui.get("destination_selected_path") or "")
-                        if self._destination_visible_subtree_merge_priority(tp, exp, sel) > 0:
-                            max_slice_ms = min(80, max_slice_ms + 12)
-                            log_info(
-                                "destination_replay_slice_budget_visible_boost",
-                                replay_kind="proposed",
-                                trigger_path_excerpt=str(tp)[:240],
-                                max_slice_ms=max_slice_ms,
-                            )
-                    except Exception:
-                        pass
-            try:
-                if self._destination_user_scroll_interaction_active():
-                    max_slice_ms = min(int(max_slice_ms), 10)
-                    if parent_budget > 0:
-                        parent_budget = min(int(parent_budget), 8)
-            except Exception:
-                pass
-            if pending_candidates:
-                if explicit_env_budget and parent_budget <= 0:
-                    log_info(
-                        "destination_replay_skipped_zero_budget",
-                        replay_kind="proposed",
-                        reason=str(reason)[:120],
-                        note="OZLINK_RESTORE_REPLAY_PARENT_BUDGET_explicit_zero",
-                    )
-                    self._schedule_unresolved_replay_drain_after_budget_suppression(
-                        replay_kind="proposed",
-                        remaining_queue_size=int(self._unresolved_proposed_queue_size() or 0),
-                        trigger_path=trigger_path,
-                        backoff_reason="zero_budget",
-                    )
-                    return 0
-                parent_budget = max(1, int(parent_budget))
-            if str(reason or "").strip() == "replay_budget_resume":
+                        parent_budget = max(0, int(raw_budget))
+                    except ValueError:
+                        parent_budget = 0
+                elif self._destination_restore_replay_reason_uses_worker_budget(reason):
+                    parent_budget = 64
+
+                raw_slice_ms = os.environ.get("OZLINK_RESTORE_REPLAY_MAX_MS", "").strip()
+                if raw_slice_ms:
+                    try:
+                        max_slice_ms = max(4, min(80, int(raw_slice_ms)))
+                    except ValueError:
+                        max_slice_ms = 12
+                else:
+                    max_slice_ms = 36 if self._destination_restore_replay_reason_uses_worker_budget(reason) else 24
+                if self._destination_restore_replay_reason_uses_worker_budget(reason) and str(trigger_path or "").strip():
+                    tp = self.normalize_memory_path(str(trigger_path).strip()).casefold()
+                    if tp:
+                        try:
+                            ui = self._capture_workspace_tree_state()
+                            exp = ui.get("destination_expanded_paths") or set()
+                            sel = str(ui.get("destination_selected_path") or "")
+                            if self._destination_visible_subtree_merge_priority(tp, exp, sel) > 0:
+                                max_slice_ms = min(80, max_slice_ms + 12)
+                                log_info(
+                                    "destination_replay_slice_budget_visible_boost",
+                                    replay_kind="proposed",
+                                    trigger_path_excerpt=str(tp)[:240],
+                                    max_slice_ms=max_slice_ms,
+                                )
+                        except Exception:
+                            pass
+                try:
+                    if self._destination_user_scroll_interaction_active():
+                        max_slice_ms = min(int(max_slice_ms), 10)
+                        if parent_budget > 0:
+                            parent_budget = min(int(parent_budget), 8)
+                except Exception:
+                    pass
+                if pending_candidates:
+                    if explicit_env_budget and parent_budget <= 0:
+                        log_info(
+                            "destination_replay_skipped_zero_budget",
+                            replay_kind="proposed",
+                            reason=str(reason)[:120],
+                            note="OZLINK_RESTORE_REPLAY_PARENT_BUDGET_explicit_zero",
+                        )
+                        self._schedule_unresolved_replay_drain_after_budget_suppression(
+                            replay_kind="proposed",
+                            remaining_queue_size=int(self._unresolved_proposed_queue_size() or 0),
+                            trigger_path=trigger_path,
+                            backoff_reason="zero_budget",
+                        )
+                        return 0
+                    parent_budget = max(1, int(parent_budget))
+            if (not startup_replay_unbounded) and str(reason or "").strip() == "replay_budget_resume":
                 max_slice_ms = min(int(max_slice_ms), 12)
             budget_exhausted = False
             for proposed_folder in pending_candidates:
@@ -53031,69 +53053,87 @@ class MainWindow(QMainWindow):
 
             queue_size_before = int(self._unresolved_allocation_queue_size() or 0)
 
-            parent_budget = 0
-            raw_budget = os.environ.get("OZLINK_RESTORE_REPLAY_PARENT_BUDGET", "").strip()
-            explicit_env_budget = bool(raw_budget)
-            if raw_budget:
-                try:
-                    parent_budget = max(0, int(raw_budget))
-                except ValueError:
-                    parent_budget = 0
-            elif self._destination_restore_replay_reason_uses_worker_budget(reason):
-                parent_budget = 64
-
             processed_parent_paths: set[str] = set()
             slice_timer = QElapsedTimer()
             slice_timer.start()
-            raw_slice_ms = os.environ.get("OZLINK_RESTORE_REPLAY_MAX_MS", "").strip()
-            if raw_slice_ms:
-                try:
-                    max_slice_ms = max(4, min(80, int(raw_slice_ms)))
-                except ValueError:
-                    max_slice_ms = 12
+
+            startup_replay_unbounded = bool(getattr(self, "_startup_memory_replay_unbounded", False))
+            if startup_replay_unbounded:
+                log_info(
+                    "startup_memory_replay_unbounded_mode_enabled",
+                    queue_size=int(queue_size_before),
+                    replay_kind="allocation",
+                )
+                n_mov = len(pending_moves)
+                uniq_ap = (
+                    len({self._allocation_parent_path(mv) for mv in pending_moves})
+                    if pending_moves
+                    else 0
+                )
+                parent_budget = max(4096, uniq_ap, n_mov, int(queue_size_before))
+                max_slice_ms = 120_000
+                explicit_env_budget = False
             else:
-                max_slice_ms = 36 if self._destination_restore_replay_reason_uses_worker_budget(reason) else 24
-            if self._destination_restore_replay_reason_uses_worker_budget(reason) and str(trigger_path or "").strip():
-                tp = self.normalize_memory_path(str(trigger_path).strip()).casefold()
-                if tp:
+                parent_budget = 0
+                raw_budget = os.environ.get("OZLINK_RESTORE_REPLAY_PARENT_BUDGET", "").strip()
+                explicit_env_budget = bool(raw_budget)
+                if raw_budget:
                     try:
-                        ui = self._capture_workspace_tree_state()
-                        exp = ui.get("destination_expanded_paths") or set()
-                        sel = str(ui.get("destination_selected_path") or "")
-                        if self._destination_visible_subtree_merge_priority(tp, exp, sel) > 0:
-                            max_slice_ms = min(80, max_slice_ms + 12)
-                            log_info(
-                                "destination_replay_slice_budget_visible_boost",
-                                replay_kind="allocation",
-                                trigger_path_excerpt=str(tp)[:240],
-                                max_slice_ms=max_slice_ms,
-                            )
-                    except Exception:
-                        pass
-            try:
-                if self._destination_user_scroll_interaction_active():
-                    max_slice_ms = min(int(max_slice_ms), 10)
-                    if parent_budget > 0:
-                        parent_budget = min(int(parent_budget), 8)
-            except Exception:
-                pass
-            if pending_moves:
-                if explicit_env_budget and parent_budget <= 0:
-                    log_info(
-                        "destination_replay_skipped_zero_budget",
-                        replay_kind="allocation",
-                        reason=str(reason)[:120],
-                        note="OZLINK_RESTORE_REPLAY_PARENT_BUDGET_explicit_zero",
-                    )
-                    self._schedule_unresolved_replay_drain_after_budget_suppression(
-                        replay_kind="allocation",
-                        remaining_queue_size=int(self._unresolved_allocation_queue_size() or 0),
-                        trigger_path=trigger_path,
-                        backoff_reason="zero_budget",
-                    )
-                    return 0
-                parent_budget = max(1, int(parent_budget))
-            if str(reason or "").strip() == "replay_budget_resume":
+                        parent_budget = max(0, int(raw_budget))
+                    except ValueError:
+                        parent_budget = 0
+                elif self._destination_restore_replay_reason_uses_worker_budget(reason):
+                    parent_budget = 64
+
+                raw_slice_ms = os.environ.get("OZLINK_RESTORE_REPLAY_MAX_MS", "").strip()
+                if raw_slice_ms:
+                    try:
+                        max_slice_ms = max(4, min(80, int(raw_slice_ms)))
+                    except ValueError:
+                        max_slice_ms = 12
+                else:
+                    max_slice_ms = 36 if self._destination_restore_replay_reason_uses_worker_budget(reason) else 24
+                if self._destination_restore_replay_reason_uses_worker_budget(reason) and str(trigger_path or "").strip():
+                    tp = self.normalize_memory_path(str(trigger_path).strip()).casefold()
+                    if tp:
+                        try:
+                            ui = self._capture_workspace_tree_state()
+                            exp = ui.get("destination_expanded_paths") or set()
+                            sel = str(ui.get("destination_selected_path") or "")
+                            if self._destination_visible_subtree_merge_priority(tp, exp, sel) > 0:
+                                max_slice_ms = min(80, max_slice_ms + 12)
+                                log_info(
+                                    "destination_replay_slice_budget_visible_boost",
+                                    replay_kind="allocation",
+                                    trigger_path_excerpt=str(tp)[:240],
+                                    max_slice_ms=max_slice_ms,
+                                )
+                        except Exception:
+                            pass
+                try:
+                    if self._destination_user_scroll_interaction_active():
+                        max_slice_ms = min(int(max_slice_ms), 10)
+                        if parent_budget > 0:
+                            parent_budget = min(int(parent_budget), 8)
+                except Exception:
+                    pass
+                if pending_moves:
+                    if explicit_env_budget and parent_budget <= 0:
+                        log_info(
+                            "destination_replay_skipped_zero_budget",
+                            replay_kind="allocation",
+                            reason=str(reason)[:120],
+                            note="OZLINK_RESTORE_REPLAY_PARENT_BUDGET_explicit_zero",
+                        )
+                        self._schedule_unresolved_replay_drain_after_budget_suppression(
+                            replay_kind="allocation",
+                            remaining_queue_size=int(self._unresolved_allocation_queue_size() or 0),
+                            trigger_path=trigger_path,
+                            backoff_reason="zero_budget",
+                        )
+                        return 0
+                    parent_budget = max(1, int(parent_budget))
+            if (not startup_replay_unbounded) and str(reason or "").strip() == "replay_budget_resume":
                 max_slice_ms = min(int(max_slice_ms), 12)
             budget_exhausted = False
             for move in pending_moves:

@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 from ozlink_console import destination_authority_contract
 from ozlink_console.main_window import MainWindow
+from ozlink_console.models import ProposedFolder
 
 
 def _minimal_mw_for_memory_truth_body():
@@ -696,6 +697,71 @@ def test_minimal_replay_seeds_queues_for_deep_persisted_paths_before_visible_rea
     assert vis_kw.get("missing_visible_planned_rows") == 0
     assert vis_kw.get("persisted_workspace_audit_complete") is True
     assert seeded and int(seeded[0].get("paths_seeded", 0) or 0) >= 1
+
+
+def test_startup_unbounded_replay_applies_many_parents_per_overlay_pass():
+    """With ``_startup_memory_replay_unbounded``, unresolved proposed replay is not limited to one parent per call."""
+    mw = MainWindow.__new__(MainWindow)
+    mw._memory_restore_in_progress = False
+    mw._suppress_selector_change_handlers = False
+    mw._log_restore_phase = lambda *a, **k: None
+    mw._schedule_destination_restore_materialization_queue = lambda *a, **k: None
+    mw._schedule_unresolved_replay_drain_after_budget_suppression = lambda *a, **k: None
+    mw._restore_queue_tick_delay_ms = 80
+    mw.destination_tree_widget = object()
+    mw.unresolved_proposed_by_parent_path = {}
+    mw.unresolved_allocations_by_parent_path = {}
+    for i in range(12):
+        pp = f"Root\\P{i}"
+        pf = ProposedFolder(FolderName=f"Folder{i}", DestinationPath="", ParentPath=pp)
+        mw.unresolved_proposed_by_parent_path[pp] = {f"sk{i}": pf}
+
+    apply_ops: list[int] = []
+
+    def apply_children(_parent_item):
+        apply_ops.append(1)
+        return 1
+
+    mw._apply_proposed_children_to_item = apply_children
+    ix = MagicMock()
+    ix.isValid = lambda: True
+    mw._ensure_destination_projection_path = lambda _p: ix
+    mw._destination_user_scroll_interaction_active = lambda: False
+    mw._count_visible_destination_future_state_nodes = lambda: 0
+
+    with patch.object(MainWindow, "_planning_tree_top_level_count", lambda _self, _t: 3):
+        with patch.dict(os.environ, {"OZLINK_RESTORE_REPLAY_PARENT_BUDGET": "1"}, clear=False):
+            mw._startup_memory_replay_unbounded = True
+            n = MainWindow._replay_unresolved_proposed_overlay(mw, "z:startup_memory_minimal_replay", "")
+    assert n == 12
+    assert len(apply_ops) == 12
+
+    mw2 = MainWindow.__new__(MainWindow)
+    mw2._memory_restore_in_progress = False
+    mw2._suppress_selector_change_handlers = False
+    mw2._log_restore_phase = lambda *a, **k: None
+    mw2._schedule_destination_restore_materialization_queue = lambda *a, **k: None
+    mw2._schedule_unresolved_replay_drain_after_budget_suppression = lambda *a, **k: None
+    mw2._restore_queue_tick_delay_ms = 80
+    mw2.destination_tree_widget = object()
+    mw2.unresolved_proposed_by_parent_path = dict(mw.unresolved_proposed_by_parent_path)
+    mw2.unresolved_allocations_by_parent_path = {}
+    apply_b: list[int] = []
+
+    def apply_children_b(_parent_item):
+        apply_b.append(1)
+        return 1
+
+    mw2._apply_proposed_children_to_item = apply_children_b
+    mw2._ensure_destination_projection_path = lambda _p: ix
+    mw2._destination_user_scroll_interaction_active = lambda: False
+    mw2._count_visible_destination_future_state_nodes = lambda: 0
+
+    with patch.object(MainWindow, "_planning_tree_top_level_count", lambda _self, _t: 3):
+        with patch.dict(os.environ, {"OZLINK_RESTORE_REPLAY_PARENT_BUDGET": "1"}, clear=False):
+            mw2._startup_memory_replay_unbounded = False
+            MainWindow._replay_unresolved_proposed_overlay(mw2, "z:startup_memory_minimal_replay", "")
+    assert len(apply_b) == 1
 
 
 def test_minimal_replay_logs_progress_each_round_when_replay_runs():
