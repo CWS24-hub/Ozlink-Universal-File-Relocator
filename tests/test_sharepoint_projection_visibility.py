@@ -18,6 +18,9 @@ def test_apply_destination_planning_overlays_body_runs_proactive_before_try_skip
         _destination_suppress_steady_materialize_skip_once = False
         _destination_incremental_merge_in_progress = False
 
+        def _destination_user_scroll_interaction_active(self):
+            return False
+
         def _schedule_proactive_graph_parent_chains_for_unresolved_overlays(self, *, reason: str) -> int:
             order.append("proactive")
             return 0

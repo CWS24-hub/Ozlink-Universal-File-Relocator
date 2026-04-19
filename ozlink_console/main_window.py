@@ -2947,6 +2947,8 @@ class MainWindow(QMainWindow):
         # While cached_only / hydrating: defer overlay materialize + indicator passes (flushed by orchestrator or graph bind).
         self._destination_startup_deferred_overlay_reasons: list[str] = []
         self._destination_startup_indicator_refresh_pending_after_cached: bool = False
+        # Deferred graph-IDs planning refresh until background_hydration (see _graph_ids_deferred_planning_refresh_begin_chunked).
+        self._destination_deferred_graph_ids_refresh_pending: dict | None = None
         self._destination_startup_first_interactable_logged: bool = False
         # TEMP: set when a deep snapshot was painted; used to log any later model reset/clear.
         self._destination_startup_snapshot_mount_seen = False
@@ -3871,6 +3873,24 @@ class MainWindow(QMainWindow):
         if self._planning_workspace_is_busy():
             return True
         return False
+
+    def _workspace_ui_persist_defer_reason(self) -> str:
+        """Short machine-readable reason for :meth:`_workspace_ui_persist_should_defer` (logging only)."""
+        if getattr(self, "_memory_restore_in_progress", False):
+            return "restore_in_progress"
+        if getattr(self, "_restore_finalization_deferred_active", False):
+            return "restore_finalization_deferred"
+        if getattr(self, "_destination_chunked_bind_state", None) is not None:
+            return "destination_chunked_bind"
+        if getattr(self, "_destination_future_bind_sync_active", False):
+            return "destination_future_bind_sync"
+        if getattr(self, "_destination_future_projection_async_state", None) is not None:
+            return "destination_future_projection_async"
+        if getattr(self, "_destination_snapshot_chunked_restore_active", False):
+            return "destination_snapshot_chunked_restore"
+        if self._planning_workspace_is_busy():
+            return "planning_workspace_busy"
+        return "unknown"
 
     def _start_session_keepalive(self):
         timer = getattr(self, "_session_keepalive_timer", None)
@@ -7570,6 +7590,19 @@ class MainWindow(QMainWindow):
                 merged_reason_count=int(len(prev_r)),
             )
             return
+        if (
+            "graph_ids_resolved_from_sharepoint_paths" in list(reasons or [])
+            and not self._destination_startup_heavy_work_allowed()
+        ):
+            self._destination_merge_deferred_graph_ids_refresh_pending(reasons, combined_reason, paths_list)
+            pend = getattr(self, "_destination_deferred_graph_ids_refresh_pending", None) or {}
+            log_info(
+                "graph_ids_overlay_queued_until_background_hydration",
+                startup_ui_phase=str(getattr(self, "_destination_startup_ui_phase", "") or "")[:40],
+                merged_reason_count=len(list(pend.get("reasons") or [])),
+                pending_path_count=len(list(pend.get("source_paths") or [])),
+            )
+            return
         log_info(
             "graph_ids_deferred_planning_refresh_chunk_path_entered",
             combined_reason=str(combined_reason)[:220],
@@ -8407,6 +8440,11 @@ class MainWindow(QMainWindow):
                 log_info(
                     "Workspace UI persist deferred (restore or materialisation active).",
                     workspace_ui_persist_deferred=True,
+                )
+                log_info(
+                    "draft_save_deferred",
+                    reason="workspace_ui_persist_defer",
+                    detail=self._workspace_ui_persist_defer_reason(),
                 )
                 return
             self._save_draft_shell(force=True, include_workspace_ui=True)
@@ -11835,22 +11873,41 @@ class MainWindow(QMainWindow):
 
     def _save_draft_shell(self, *, force: bool = False, include_workspace_ui: bool = False):
         if self.memory_manager is None:
+            log_info("draft_save_skipped", reason="no_memory_manager", force=bool(force))
             return False
 
         if self._memory_restore_in_progress:
             if not force:
                 log_info("Draft save suppressed while restore is in progress.", autosave_suppressed=True)
+                log_info(
+                    "draft_save_skipped",
+                    reason="restore_in_progress",
+                    suppression_flag="memory_restore_in_progress",
+                    force=bool(force),
+                )
                 return False
             log_info("Forced draft save allowed while restore is still in progress.", autosave_forced=True)
 
         if self._suppress_autosave and not force:
             log_info("Draft save suppressed until restore completes.", autosave_suppressed=True)
+            log_info(
+                "draft_save_skipped",
+                reason="suppress_autosave",
+                suppression_flag="suppress_autosave",
+                force=bool(force),
+            )
             return False
 
         try:
             if not self._ensure_active_draft_session():
+                log_info("draft_save_skipped", reason="no_active_draft_session", force=bool(force))
                 return False
 
+            log_info(
+                "draft_save_attempt",
+                force=bool(force),
+                include_workspace_ui=bool(include_workspace_ui),
+            )
             self._destination_save_in_progress = True
             self._destination_draft_save_destination_snapshot_override = None
             try:
@@ -11913,6 +11970,12 @@ class MainWindow(QMainWindow):
             proposed_rows = self._build_memory_proposed_folders()
             allow_empty_overwrite = bool(force)
             _t_mem = time.perf_counter() if _shut else None
+            log_info(
+                "draft_save_executed",
+                force=bool(force),
+                include_workspace_ui=bool(include_workspace_ui),
+                draft_id=str(getattr(state, "DraftId", "") or "")[:80],
+            )
             self.memory_manager.save_allocations(
                 allocation_rows,
                 allow_empty=allow_empty_overwrite or self._restored_allocation_count == 0,
@@ -11926,6 +11989,13 @@ class MainWindow(QMainWindow):
                 draft_id=state.DraftId,
                 fingerprint=state.SessionFingerprint,
                 status="Healthy",
+            )
+            log_info(
+                "draft_save_success",
+                timestamp=time.time(),
+                draft_id=str(getattr(state, "DraftId", "") or "")[:80],
+                force=bool(force),
+                include_workspace_ui=bool(include_workspace_ui),
             )
             if _shut and include_workspace_ui:
                 try:
@@ -17039,6 +17109,21 @@ class MainWindow(QMainWindow):
                 400,
                 lambda d=did: self._safe_invoke(
                     "destination_full_tree_retry_after_bind_sync",
+                    self._ensure_sharepoint_destination_full_tree_worker_scheduled,
+                    d,
+                ),
+            )
+            return
+        if not self._destination_startup_full_tree_worker_allowed() and not _shell_waiting_authority:
+            self._log_restore_phase(
+                "destination_full_tree_deferred_startup_phase",
+                drive_id_suffix=did[-16:] if len(did) > 16 else did,
+                startup_ui_phase=str(getattr(self, "_destination_startup_ui_phase", "") or "")[:40],
+            )
+            QTimer.singleShot(
+                420,
+                lambda d=did: self._safe_invoke(
+                    "destination_full_tree_retry_after_startup_phase",
                     self._ensure_sharepoint_destination_full_tree_worker_scheduled,
                     d,
                 ),
@@ -26739,7 +26824,113 @@ class MainWindow(QMainWindow):
     def _destination_startup_should_defer_heavy_destination_work(self) -> bool:
         """True while the cached snapshot is interactive but shallow hydration has not finished."""
         ph = str(getattr(self, "_destination_startup_ui_phase", "") or "")
-        return ph in ("cached_only", "hydrating")
+        return ph in ("cached_only", "hydrating", "restore_minimal_complete")
+
+    def _destination_startup_heavy_work_allowed(self) -> bool:
+        """Large overlay / graph-id finalize passes run only in background_hydration (or when startup is inactive)."""
+        ph = str(getattr(self, "_destination_startup_ui_phase", "") or "")
+        if ph in ("", "inactive"):
+            return True
+        return ph == "background_hydration"
+
+    def _destination_startup_full_tree_worker_allowed(self) -> bool:
+        """Full-library worker is deferred only during the earliest startup phases (before minimal restore completes)."""
+        ph = str(getattr(self, "_destination_startup_ui_phase", "") or "")
+        if ph in ("", "inactive"):
+            return True
+        return ph not in ("cached_only", "hydrating")
+
+    def _destination_merge_deferred_graph_ids_refresh_pending(
+        self, reasons: list | None, combined_reason: str, paths_list: list[str]
+    ) -> None:
+        prev = getattr(self, "_destination_deferred_graph_ids_refresh_pending", None)
+        paths_clean = sorted({str(p).strip() for p in (paths_list or []) if str(p or "").strip()})
+        if not isinstance(prev, dict):
+            self._destination_deferred_graph_ids_refresh_pending = {
+                "reasons": list(reasons or []),
+                "combined_reason": str(combined_reason or ""),
+                "source_paths": list(paths_clean),
+            }
+            return
+        seen = set(str(p) for p in (prev.get("source_paths") or []))
+        for p in paths_clean:
+            if p not in seen:
+                prev.setdefault("source_paths", []).append(p)
+                seen.add(p)
+        pr = list(prev.get("reasons") or [])
+        for r in list(reasons or []):
+            if r not in pr:
+                pr.append(r)
+        prev["reasons"] = pr
+        prev["combined_reason"] = "__".join(pr) if pr else str(combined_reason or "")
+
+    def _destination_flush_pending_graph_ids_planning_refresh(self) -> None:
+        pending = getattr(self, "_destination_deferred_graph_ids_refresh_pending", None)
+        if not isinstance(pending, dict):
+            return
+        if not self._destination_startup_heavy_work_allowed():
+            return
+        if getattr(self, "_graph_ids_deferred_planning_refresh_chunk_state", None) is not None:
+            return
+        self._destination_deferred_graph_ids_refresh_pending = None
+        reasons = list(pending.get("reasons") or [])
+        combined = str(pending.get("combined_reason") or "")
+        paths = sorted({str(p).strip() for p in (pending.get("source_paths") or []) if str(p or "").strip()})
+        if not reasons and not paths:
+            return
+        log_info(
+            "graph_ids_deferred_planning_refresh_flush_after_background_hydration",
+            reason_count=len(reasons),
+            source_projection_path_count=len(paths),
+        )
+        self._graph_ids_deferred_planning_refresh_begin_chunked(reasons, combined, paths)
+
+    def _destination_enter_background_hydration_and_flush_deferred(self, *, reason: str) -> None:
+        if getattr(self, "_application_shutting_down", False):
+            return
+        self._destination_startup_ui_phase = "background_hydration"
+        log_info("background_hydration_started", reason=str(reason or "")[:200])
+        log_info(
+            "destination_provisional_startup_phase3_background_hydration",
+            reason=str(reason or "")[:200],
+        )
+        try:
+            self._destination_flush_startup_deferred_followups()
+        except Exception as exc:
+            self._log_restore_exception("destination_startup_orchestrator_flush", exc)
+        try:
+            self._destination_flush_pending_graph_ids_planning_refresh()
+        except Exception as exc:
+            self._log_restore_exception("destination_flush_pending_graph_ids_planning_refresh", exc)
+        log_info("startup_hydration_completed", reason=str(reason or "")[:200])
+
+    def _destination_schedule_background_hydration_after_minimal_restore(self, *, reason: str) -> None:
+        raw = str(os.environ.get("OZLINK_STARTUP_BACKGROUND_HYDRATION_DELAY_MS", "") or "").strip()
+        delay_ms = 350
+        if raw:
+            try:
+                delay_ms = max(0, min(300_000, int(raw)))
+            except ValueError:
+                pass
+        log_info(
+            "restore_minimal_complete",
+            reason=str(reason or "")[:200],
+            next_phase_delay_ms=int(delay_ms),
+            note="background_hydration_follows_for_heavy_destination_work",
+        )
+        log_info(
+            "destination_provisional_startup_phase2_restore_minimal_complete",
+            reason=str(reason or "")[:200],
+            background_hydration_delay_ms=int(delay_ms),
+        )
+
+        def _go() -> None:
+            self._destination_enter_background_hydration_and_flush_deferred(reason=str(reason or ""))
+
+        QTimer.singleShot(
+            delay_ms,
+            lambda: self._safe_invoke("destination_background_hydration_transition", _go),
+        )
 
     def _destination_schedule_startup_first_interactable_log(self) -> None:
         """Log once after the next event-loop tick (first paint / selection should be possible)."""
@@ -26757,7 +26948,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, lambda: self._safe_invoke("startup_first_interactable", _go))
 
     def _destination_flush_startup_deferred_followups(self) -> None:
-        """After leaving cached_only/hydrating: one overlay pass + deferred indicator refresh."""
+        """After background_hydration: one overlay pass + deferred indicator refresh (see startup UI phases)."""
         reasons = getattr(self, "_destination_startup_deferred_overlay_reasons", None) or []
         self._destination_startup_deferred_overlay_reasons = []
         n = len(reasons)
@@ -26816,13 +27007,9 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._log_restore_exception("destination_provisional_startup_hydration_body", exc)
         finally:
-            self._destination_startup_ui_phase = "hydrated"
+            self._destination_startup_ui_phase = "restore_minimal_complete"
             log_info("destination_provisional_startup_phase2_hydration_complete", reason=str(reason or "")[:160])
-            try:
-                self._destination_flush_startup_deferred_followups()
-            except Exception as exc:
-                self._log_restore_exception("destination_startup_orchestrator_flush", exc)
-            log_info("startup_hydration_completed", reason=str(reason or "")[:160])
+            self._destination_schedule_background_hydration_after_minimal_restore(reason=str(reason or "")[:160])
 
     def _destination_run_provisional_startup_hydration_body(self) -> None:
         snaps = list((getattr(self, "_pending_session_tree_snapshots", {}) or {}).get("destination") or []) or list(
@@ -29993,6 +30180,54 @@ class MainWindow(QMainWindow):
         idle_diag = self._destination_true_idle_diagnostics()
         log_info("destination_true_idle_state", phase="reconcile_idle_flush_poll", wait_tick=ticks, **idle_diag)
         if not self._destination_is_truly_idle():
+            u_prop = int(idle_diag.get("unresolved_proposed", 0) or 0)
+            u_alloc = int(idle_diag.get("unresolved_allocation", 0) or 0)
+            if dep.get("_non_idle_flush_t0") is None:
+                dep["_non_idle_flush_t0"] = time.perf_counter()
+            t_block0 = float(dep.get("_non_idle_flush_t0") or time.perf_counter())
+            elapsed = time.perf_counter() - t_block0
+            fb_ticks = 28
+            fb_secs = 2.8
+            raw_fb_ticks = str(os.environ.get("OZLINK_RECONCILE_IDLE_FALLBACK_TICKS", "") or "").strip()
+            raw_fb_secs = str(os.environ.get("OZLINK_RECONCILE_IDLE_FALLBACK_SECS", "") or "").strip()
+            if raw_fb_ticks:
+                try:
+                    fb_ticks = max(1, int(raw_fb_ticks))
+                except ValueError:
+                    pass
+            if raw_fb_secs:
+                try:
+                    fb_secs = max(0.2, float(raw_fb_secs))
+                except ValueError:
+                    pass
+            if (u_prop > 0 or u_alloc > 0) and (ticks >= fb_ticks or elapsed >= fb_secs):
+                log_info(
+                    "reconcile_forced_flush_fallback_triggered",
+                    reason="prolonged_non_idle",
+                    unresolved_proposed=u_prop,
+                    unresolved_allocation=u_alloc,
+                    wait_ticks=ticks,
+                    wait_elapsed_sec=round(elapsed, 3),
+                )
+                run_eta = bool(dep.get("run_eta", True))
+                gate_ok = bool(dep.get("gate_already_verified", True))
+                skip_def = bool(dep.get("_skip_overlay_queue_defer", False))
+                self._destination_global_reconcile_overlay_deferred = None
+                log_info(
+                    "destination_reconcile_global_deferred_overlay_queue_cleared",
+                    wait_ticks=ticks,
+                    forced_idle_fallback=True,
+                )
+                mark = bool(getattr(self, "_destination_overlay_terminal_reconcile_completion_pending", False))
+                self._destination_overlay_terminal_reconcile_completion_pending = False
+                self._destination_reconcile_all_planned_parents_after_graph_update(
+                    gate_already_verified=gate_ok,
+                    run_exact_target_after=run_eta,
+                    _skip_overlay_queue_defer=skip_def,
+                    _request_overlay_terminal_completion_mark=mark,
+                    _bypass_true_idle_gate=True,
+                )
+                return
             log_info(
                 "reconcile_blocked_not_idle",
                 phase="reconcile_idle_flush_wait",
@@ -50937,6 +51172,40 @@ class MainWindow(QMainWindow):
             lambda: self._process_destination_restore_materialization_queue(reason, trigger_path=trigger_path),
         )
 
+    def _schedule_unresolved_replay_drain_after_budget_suppression(
+        self,
+        *,
+        replay_kind: str,
+        remaining_queue_size: int,
+        trigger_path: str = "",
+    ) -> None:
+        if int(remaining_queue_size or 0) <= 0:
+            return
+        log_info(
+            "destination_replay_rescheduled_after_suppression",
+            replay_kind=str(replay_kind or "")[:20],
+            remaining_queue_size=int(remaining_queue_size),
+        )
+        delay_ms = max(0, int(getattr(self, "_restore_queue_tick_delay_ms", 45) or 45))
+        raw = str(os.environ.get("OZLINK_REPLAY_DRAIN_SUPPRESSION_DELAY_MS", "") or "").strip()
+        if raw:
+            try:
+                delay_ms = max(0, min(5000, int(raw)))
+            except ValueError:
+                pass
+        rk = str(replay_kind or "").strip().lower()
+
+        def _go() -> None:
+            if getattr(self, "_application_shutting_down", False):
+                return
+            if rk == "allocation":
+                self._replay_unresolved_allocation_overlay("replay_budget_resume", trigger_path=trigger_path)
+            else:
+                self._replay_unresolved_proposed_overlay("replay_budget_resume", trigger_path=trigger_path)
+
+        safe = f"unresolved_replay_drain_after_suppression_{rk or 'proposed'}"
+        QTimer.singleShot(delay_ms, lambda: self._safe_invoke(safe, _go))
+
     def _process_destination_restore_materialization_queue(self, reason, trigger_path=""):
         if getattr(self, "_destination_restore_materialization_user_paused", False):
             return
@@ -51261,6 +51530,11 @@ class MainWindow(QMainWindow):
                         trigger_path=trigger_path,
                         delay_ms=self._restore_queue_tick_delay_ms,
                     )
+                    self._schedule_unresolved_replay_drain_after_budget_suppression(
+                        replay_kind="proposed",
+                        remaining_queue_size=int(self._unresolved_proposed_queue_size() or 0),
+                        trigger_path=trigger_path,
+                    )
 
             try:
                 if applied_count > 0:
@@ -51430,6 +51704,11 @@ class MainWindow(QMainWindow):
                         "replay_budget",
                         trigger_path=trigger_path,
                         delay_ms=self._restore_queue_tick_delay_ms,
+                    )
+                    self._schedule_unresolved_replay_drain_after_budget_suppression(
+                        replay_kind="allocation",
+                        remaining_queue_size=int(self._unresolved_allocation_queue_size() or 0),
+                        trigger_path=trigger_path,
                     )
 
             try:

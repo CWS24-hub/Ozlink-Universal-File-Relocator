@@ -94,6 +94,12 @@ class _SharePointAuthoritativeMaterializeHost:
         self._destination_future_model_pending_after_source_restore = False
         self._expand_all_pending = {"source": False, "destination": False}
 
+    def _destination_startup_should_defer_heavy_destination_work(self) -> bool:
+        return False
+
+    def _destination_user_scroll_interaction_active(self) -> bool:
+        return False
+
     def _planning_browse_mode(self, key: str) -> str:
         return "graph" if key == "destination" else "local"
 

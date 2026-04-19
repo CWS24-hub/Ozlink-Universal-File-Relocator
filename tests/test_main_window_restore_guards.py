@@ -112,6 +112,15 @@ class _MaterializeSkipHost:
     def _should_defer_destination_materialization(self, _reason) -> bool:
         return False
 
+    def _destination_materialize_requires_authoritative_hard_flush(self, _reason: str) -> bool:
+        return False
+
+    def _destination_startup_should_defer_heavy_destination_work(self) -> bool:
+        return False
+
+    def _destination_user_scroll_interaction_active(self) -> bool:
+        return False
+
     def _destination_expanded_paths_for_planning_bind(self):
         return []
 

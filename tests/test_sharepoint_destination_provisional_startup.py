@@ -118,9 +118,10 @@ def test_provisional_startup_mount_does_not_immediately_trigger_heavy_hydration(
     _ = app
 
 
-def test_startup_hydration_begins_after_cached_only_phase():
+def test_startup_hydration_begins_after_cached_only_phase(monkeypatch):
     """Invariant: hydration is deferred from phase-1 paint, then runs when explicitly advanced — not stuck in cached_only."""
     os.environ.pop("OZLINK_PROVISIONAL_DESTINATION_STARTUP", None)
+    monkeypatch.setenv("OZLINK_STARTUP_BACKGROUND_HYDRATION_DELAY_MS", "0")
     app = QApplication.instance() or QApplication([])
     mw, _dm = _provisional_startup_test_mw_with_snapshot()
     restore_m = MagicMock()
@@ -142,7 +143,8 @@ def test_startup_hydration_begins_after_cached_only_phase():
 
     MainWindow._destination_maybe_begin_provisional_startup_hydration(mw, reason="explicit_unit")
 
-    assert getattr(mw, "_destination_startup_ui_phase", "") == "hydrated"
+    app.processEvents()
+    assert getattr(mw, "_destination_startup_ui_phase", "") == "background_hydration"
     restore_m.assert_called_once()
     hydrate_m.assert_called_once()
     prune_m.assert_called_once()
@@ -287,9 +289,10 @@ def test_startup_heavy_destination_work_is_gated_while_cached_only():
     assert mw._destination_startup_indicator_refresh_pending_after_cached is True
 
 
-def test_startup_hydration_can_begin_later_without_losing_state():
+def test_startup_hydration_can_begin_later_without_losing_state(monkeypatch):
     """Regression: explicit hydration after cached_only completes; model rows remain; phase advances (no starvation)."""
     os.environ.pop("OZLINK_PROVISIONAL_DESTINATION_STARTUP", None)
+    monkeypatch.setenv("OZLINK_STARTUP_BACKGROUND_HYDRATION_DELAY_MS", "0")
     app = QApplication.instance() or QApplication([])
     mw, dm = _provisional_startup_test_mw_with_snapshot()
     mw._restore_expanded_destination_paths = MagicMock()
@@ -304,7 +307,8 @@ def test_startup_hydration_can_begin_later_without_losing_state():
         assert MainWindow._destination_apply_provisional_session_snapshot_if_eligible(mw, phase="test") is True
         assert getattr(mw, "_destination_startup_ui_phase", "") == "cached_only"
         MainWindow._destination_maybe_begin_provisional_startup_hydration(mw, reason="explicit_unit")
-        assert getattr(mw, "_destination_startup_ui_phase", "") == "hydrated"
+        app.processEvents()
+        assert getattr(mw, "_destination_startup_ui_phase", "") == "background_hydration"
         assert dm.rowCount(QModelIndex()) == 1
         mw._restore_expanded_destination_paths.assert_called_once()
         mw._hydrate_destination_allocations_for_expanded_paths_model.assert_called_once()
