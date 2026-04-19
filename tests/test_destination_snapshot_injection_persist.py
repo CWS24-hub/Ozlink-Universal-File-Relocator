@@ -460,5 +460,133 @@ class DestinationStartupSnapshotAuthorityHandoffTests(unittest.TestCase):
         self.assertTrue(w._destination_startup_descendant_queue_completed_logged)
 
 
+class DestinationInjectionSnapshotPersistenceRegressionTests(unittest.TestCase):
+    """Regression: injection → dirty → runtime refresh; workspace UI save → SessionState snapshot."""
+
+    def test_destination_injection_marks_dirty_and_refreshes_runtime_snapshot(self):
+        """
+        Runtime invariant: after marking dirty due to injection, refreshing the runtime destination
+        snapshot must log the dirty-injection trigger and store the live capture (including injected rows).
+        """
+        w = MainWindow.__new__(MainWindow)
+        w._destination_descendant_apply_tick_running = False
+        w._workspace_ui_snapshot_dirty_panels = set()
+        w._runtime_session_tree_snapshots = {"destination": [{"text": "stale_root"}], "source": []}
+        injected = [
+            {
+                "text": "Root",
+                "data": {"item_path": r"Root3\Lib\InjectedSubtree"},
+                "children": [
+                    {
+                        "text": "InjectedLeaf",
+                        "data": {"item_path": r"Root3\Lib\InjectedSubtree\InjectedLeaf"},
+                        "children": [],
+                    }
+                ],
+            }
+        ]
+
+        def _cap(panel: str):
+            if panel == "destination":
+                return list(injected)
+            return []
+
+        w._capture_tree_items_snapshot = _cap
+
+        with patch("ozlink_console.main_window.log_info") as m_log:
+            MainWindow._mark_destination_tree_snapshot_dirty_after_injection(
+                w, reason="unit_test_allocation_descendant_injection"
+            )
+        topics = [c.args[0] for c in m_log.call_args_list if c.args]
+        self.assertIn("destination_snapshot_marked_dirty_after_injection", topics)
+        self.assertTrue(w._destination_tree_snapshot_dirty_for_persist)
+
+        with patch("ozlink_console.main_window.log_info") as m_log:
+            out = MainWindow._refresh_runtime_tree_snapshot(w, "destination")
+        refreshed_topics = [c.args[0] for c in m_log.call_args_list if c.args]
+        self.assertIn("destination_snapshot_refreshed_from_live_model", refreshed_topics)
+        refresh_call = next(
+            c for c in m_log.call_args_list if c.args and c.args[0] == "destination_snapshot_refreshed_from_live_model"
+        )
+        self.assertEqual(refresh_call.kwargs.get("trigger"), "runtime_session_cache_refresh_after_dirty_injection")
+
+        self.assertEqual(out, injected)
+        self.assertEqual(w._runtime_session_tree_snapshots["destination"], injected)
+        flat = str(w._runtime_session_tree_snapshots["destination"])
+        self.assertIn("InjectedSubtree", flat)
+        self.assertIn("InjectedLeaf", flat)
+
+    def test_destination_injection_persists_to_session_state_on_workspace_ui_save(self):
+        """
+        Persistence invariant: _save_draft_shell(..., include_workspace_ui=True) must force-live capture
+        (preflight) and persist that tree into SessionState.DestinationTreeSnapshot for save_session.
+        """
+        w = MainWindow.__new__(MainWindow)
+        w._destination_descendant_apply_tick_running = False
+        w._application_shutting_down = False
+        w._memory_restore_in_progress = False
+        w._suppress_autosave = False
+        w._workspace_ui_snapshot_dirty_panels = set()
+        w._runtime_session_tree_snapshots = {"destination": [], "source": []}
+        w.active_draft_session_id = "DRAFT-INJ-PERSIST"
+        w._draft_shell_state = SessionState(DraftId="DRAFT-INJ-PERSIST")
+        w._draft_shell_state.DestinationTreeSnapshot = [{"text": "stale_before_injection"}]
+        w.planning_inputs = {}
+        w.source_tree_widget = MagicMock()
+        w._capture_workspace_tree_state = MagicMock(
+            return_value={
+                "source_expanded_paths": set(),
+                "destination_expanded_paths": set(),
+                "source_selected_path": "",
+                "destination_selected_path": "",
+            }
+        )
+        w._panel_is_expanded_all = MagicMock(return_value=False)
+        w._planning_browse_mode = lambda panel: "browse"
+        w.current_session_context = {"user_role": "user", "operator_upn": "", "tenant_domain": ""}
+        w._plan_leaf_exclusions = set()
+        w._needs_review_dismissed_inherited_paths = set()
+        w.planned_moves = []
+        w.proposed_folders = []
+        w._restored_allocation_count = 0
+        w._restored_proposed_count = 0
+
+        injected = [
+            {
+                "text": "Root",
+                "data": {"item_path": r"Root3\Persisted\FromInjection"},
+                "children": [],
+            }
+        ]
+
+        def _cap(panel: str):
+            if panel == "destination":
+                return list(injected)
+            return [{"text": "src_root"}]
+
+        w._capture_tree_items_snapshot = _cap
+        w._count_tree_snapshot_nodes = lambda snaps: MainWindow._count_tree_snapshot_nodes(w, snaps)
+        w._count_destination_model_non_placeholder_nodes = MagicMock(return_value=3)
+
+        mm = MagicMock()
+        mm.paths = {"session": "C:\\tmp\\Draft-SessionState.json", "workspace_snapshot": "C:\\tmp\\WorkspaceSnapshot.json"}
+        mm.read_workspace_snapshot_optional = MagicMock(return_value=None)
+        w.memory_manager = mm
+
+        MainWindow._mark_destination_tree_snapshot_dirty_after_injection(w, reason="unit_test_allocation_descendant_injection")
+
+        with patch("ozlink_console.main_window.log_info"), patch.object(
+            MainWindow, "_persist_workspace_snapshot_file", MagicMock()
+        ):
+            ok = MainWindow._save_draft_shell(w, force=True, include_workspace_ui=True)
+
+        self.assertTrue(ok)
+        mm.save_session.assert_called_once()
+        saved = mm.save_session.call_args[0][0]
+        self.assertIsInstance(saved, SessionState)
+        self.assertEqual(list(saved.DestinationTreeSnapshot or []), injected)
+        self.assertIn("FromInjection", str(saved.DestinationTreeSnapshot))
+
+
 if __name__ == "__main__":
     unittest.main()
