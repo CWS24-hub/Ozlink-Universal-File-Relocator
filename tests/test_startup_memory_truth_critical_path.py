@@ -1,5 +1,5 @@
-"""Regression: startup memory-truth shows the full persisted workspace via bounded foreground minimal replay;
-full persisted replay (descendants apply, etc.) stays deferred until after grace."""
+"""Regression: startup contract emits ``startup_memory_visible_tree_ready`` after snapshot ``reset_nested``;
+minimal replay, overlay attach, and audits run only in the deferred tail after grace."""
 
 from __future__ import annotations
 
@@ -88,6 +88,8 @@ def test_visible_tree_ready_before_background_replay_and_refine():
         if isinstance(msg, str) and (
             msg.startswith("startup_memory_")
             or msg.startswith("startup_background_")
+            or msg.startswith("startup_visible_")
+            or msg.startswith("startup_refinement_")
             or msg.startswith("destination_phase_timing")
             or msg.startswith("destination_")
         ):
@@ -110,6 +112,7 @@ def test_visible_tree_ready_before_background_replay_and_refine():
                         "startup_planned_workspace_memory_truth",
                     )
                     assert "startup_memory_visible_tree_ready" in seq
+                    assert "startup_visible_snapshot_bound" in seq
                     assert replay_calls[0] == 0
                     assert "startup_background_refine_begin" not in seq
                     drain()
@@ -383,7 +386,7 @@ def test_scroll_idle_resumes_descendant_and_clears_flag():
 
 
 def test_minimal_replay_complete_log_before_visible_tree_ready():
-    """Persisted workspace audit is clean before ``startup_memory_visible_tree_ready`` when replay converges."""
+    """Visible-tree-ready is emitted before minimal replay completes (replay runs in deferred tail)."""
     mw = _minimal_mw_for_memory_truth_body()
     audit_calls = [0]
 
@@ -446,10 +449,9 @@ def test_minimal_replay_complete_log_before_visible_tree_ready():
                         mw,
                         "startup_planned_workspace_memory_truth",
                     )
-                    assert seq.index("startup_memory_minimal_replay_complete") < seq.index(
-                        "startup_memory_visible_tree_ready"
-                    )
+                    assert "startup_memory_visible_tree_ready" in seq
                     drain()
+    assert seq.index("startup_memory_visible_tree_ready") < seq.index("startup_memory_minimal_replay_complete")
 
 
 def test_foreground_no_allocation_descendants_apply_before_visible_tree_ready():
@@ -593,7 +595,7 @@ def test_minimal_replay_exits_when_unresolved_queues_empty():
 
 
 def test_workspace_audit_missing_zero_before_visible_tree_ready_when_converged():
-    """``startup_memory_visible_tree_ready`` receives zero missing counts after minimal replay completes the audit."""
+    """``startup_memory_visible_tree_ready`` defers audit counts (-1); convergence is logged after deferred replay."""
     mw = _minimal_mw_for_memory_truth_body()
     audit_calls = [0]
 
@@ -651,13 +653,14 @@ def test_workspace_audit_missing_zero_before_visible_tree_ready_when_converged()
                         "startup_planned_workspace_memory_truth",
                     )
                     drain()
-    assert vis_kw.get("missing_visible_planned_rows") == 0
-    assert vis_kw.get("missing_visible_proposed_folders") == 0
-    assert vis_kw.get("persisted_workspace_audit_complete") is True
+    assert vis_kw.get("missing_visible_planned_rows") == -1
+    assert vis_kw.get("missing_visible_proposed_folders") == -1
+    assert vis_kw.get("persisted_workspace_audit_complete") is False
+    assert vis_kw.get("refinement_deferred") is True
 
 
 def test_minimal_replay_seeds_queues_for_deep_persisted_paths_before_visible_ready():
-    """When audit lists missing planned rows, seeding re-queues persisted moves so replay can finish with zero missing."""
+    """When audit lists missing planned rows, seeding runs in deferred tail so replay can converge."""
     mw = _minimal_mw_for_memory_truth_body()
     mw._reset_unresolved_proposed_queue = lambda: None
     mw._reset_unresolved_allocation_queue = lambda: None
@@ -726,8 +729,7 @@ def test_minimal_replay_seeds_queues_for_deep_persisted_paths_before_visible_rea
                             "startup_planned_workspace_memory_truth",
                         )
                         drain()
-    assert vis_kw.get("missing_visible_planned_rows") == 0
-    assert vis_kw.get("persisted_workspace_audit_complete") is True
+    assert vis_kw.get("refinement_deferred") is True
     assert seeded and int(seeded[0].get("paths_seeded", 0) or 0) >= 1
 
 
