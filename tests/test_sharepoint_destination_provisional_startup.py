@@ -290,9 +290,16 @@ def test_startup_heavy_destination_work_is_gated_while_cached_only():
 
 
 def test_startup_hydration_can_begin_later_without_losing_state(monkeypatch):
-    """Regression: explicit hydration after cached_only completes; model rows remain; phase advances (no starvation)."""
+    """Explicit hydration after cached_only: rows preserved, phase reaches background_hydration, deferred work flushes.
+
+    Snapshot bind emits ``startup_memory_visible_tree_ready``; deferred overlay flush can be held behind
+    ``_startup_post_visible_heavy_work_blocked`` (post-visible grace). A single ``processEvents()`` does not
+    run a later retry timer, so grace is set to zero here to exercise the flush path without implying
+    synchronous overlay on the real hot path.
+    """
     os.environ.pop("OZLINK_PROVISIONAL_DESTINATION_STARTUP", None)
     monkeypatch.setenv("OZLINK_STARTUP_BACKGROUND_HYDRATION_DELAY_MS", "0")
+    monkeypatch.setenv("OZLINK_STARTUP_POST_VISIBLE_HEAVY_WORK_GRACE_SEC", "0")
     app = QApplication.instance() or QApplication([])
     mw, dm = _provisional_startup_test_mw_with_snapshot()
     mw._restore_expanded_destination_paths = MagicMock()
