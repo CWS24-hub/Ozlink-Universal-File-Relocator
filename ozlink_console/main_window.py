@@ -2988,6 +2988,8 @@ class MainWindow(QMainWindow):
         # SharePoint source: recursive session snapshot mounted before Graph root bind (Phase 1 shell).
         self._source_startup_snapshot_mount_seen: bool = False
         self._source_snapshot_mount_drive_id: str = ""
+        # Session JSON had SourceTreeSnapshot roots before first loading placeholder (login ordering).
+        self._source_snapshot_shell_prearmed: bool = False
         # Next live Graph root bind should replace (not merge) — e.g. force_refresh / explicit resync.
         self._source_sharepoint_root_force_replace: bool = False
         # Cached canonical path set (casefold) from session destination_tree_snapshot JSON.
@@ -10120,8 +10122,47 @@ class MainWindow(QMainWindow):
         self.planned_rows_by_parent_path = {}
         self._destination_pending_planned_reconcile_parent_paths = set()
         self._destination_tree_snapshot_dirty_for_persist = False
+        self._source_snapshot_shell_prearmed = False
         if refresh_ui:
             self.refresh_planned_moves_table()
+
+    def _draft_selected_source_library_id(self) -> str:
+        state = self._draft_shell_state if isinstance(self._draft_shell_state, SessionState) else SessionState()
+        return str(getattr(state, "SelectedSourceLibraryId", "") or "").strip()
+
+    def _early_hydrate_pending_session_source_snapshots_for_login(self) -> None:
+        """Populate pending source snapshot list from restored draft before any loading placeholder runs."""
+        if getattr(self, "memory_manager", None) is None:
+            return
+        try:
+            ts = self._session_workspace_tree_snapshots()
+        except Exception:
+            return
+        src = list(ts.get("source") or [])
+        if not src:
+            return
+        pending = dict(getattr(self, "_pending_session_tree_snapshots", {}) or {})
+        pending["source"] = list(src)
+        self._pending_session_tree_snapshots = pending
+        self._source_snapshot_shell_prearmed = True
+        draft_did = self._draft_selected_source_library_id()
+        if draft_did and not str((getattr(self, "pending_root_drive_ids", {}) or {}).get("source") or "").strip():
+            self.pending_root_drive_ids["source"] = draft_did
+        did_excerpt = ""
+        for snap in src:
+            if isinstance(snap, dict):
+                d = snap.get("data")
+                if isinstance(d, dict):
+                    did_excerpt = str(d.get("drive_id") or "").strip()
+                    if did_excerpt:
+                        break
+        log_info(
+            "source_snapshot_shell_prearmed",
+            phase="before_planning_loading_placeholders",
+            source_snapshot_roots=len(src),
+            drive_id_suffix=did_excerpt[-16:] if len(did_excerpt) > 16 else did_excerpt,
+            draft_selected_library_id_suffix=draft_did[-16:] if len(draft_did) > 16 else draft_did,
+        )
 
     def _finish_login_workspace_restore(self, *, role: str, had_login_error: bool):
         self._pending_login_restore_args = None
@@ -20007,6 +20048,12 @@ class MainWindow(QMainWindow):
                 role = "user"
             session_context["user_role"] = role
 
+            try:
+                self._init_memory_services()
+                self._early_hydrate_pending_session_source_snapshots_for_login()
+            except Exception as exc:
+                self._log_restore_exception("early_memory_for_source_snapshot_shell", exc)
+
             self.apply_role_visibility()
             self._set_planning_workspace_loading_state("Loading SharePoint...")
             self.switch_page("Planning Workspace")
@@ -22508,6 +22555,14 @@ class MainWindow(QMainWindow):
             for panel_key in ("source", "destination")
             if (tree_snapshots.get(panel_key) if panel_key != "destination" else dest_snaps)
         }
+        _src_sess_snaps = list((self._pending_session_tree_snapshots or {}).get("source") or [])
+        if _src_sess_snaps:
+            self._source_snapshot_shell_prearmed = True
+            log_info(
+                "source_snapshot_shell_prearmed",
+                phase="begin_session_workspace_ui_restore",
+                source_snapshot_roots=len(_src_sess_snaps),
+            )
         source_snapshot_targets = self._snapshot_refresh_targets_from_snapshot("source", self._pending_session_tree_snapshots.get("source", []))
         destination_snapshot_targets = self._snapshot_refresh_targets_from_snapshot("destination", self._pending_session_tree_snapshots.get("destination", []))
         dest_intent: set[str] = {
@@ -22790,6 +22845,20 @@ class MainWindow(QMainWindow):
                 suppress, forensic = self._source_loading_placeholder_shell_preservation_guard(message)
                 if suppress:
                     after_fc = self._source_forensic_model_node_counts()
+                    if bool(forensic.get("pending_session_snapshot_match")) or bool(
+                        forensic.get("snapshot_shell_prearmed")
+                    ):
+                        log_info(
+                            "source_placeholder_blocked_by_pending_snapshot",
+                            message_excerpt=msg_s[:160],
+                            pending_session_snapshot_match=bool(forensic.get("pending_session_snapshot_match")),
+                            snapshot_shell_prearmed=bool(forensic.get("snapshot_shell_prearmed")),
+                        )
+                        log_info(
+                            "source_destructive_reset_blocked",
+                            reason="pending_session_source_snapshot_or_prearm",
+                            message_excerpt=msg_s[:160],
+                        )
                     log_info(
                         "source_loading_placeholder_forensic",
                         before_count=int(before_fc.get("model_nodes_depth_first") or 0),
@@ -23697,7 +23766,11 @@ class MainWindow(QMainWindow):
         state = shell if isinstance(shell, SessionState) else SessionState()
         ssk = str(getattr(state, "SelectedSourceSiteKey", "") or "").strip()
         startup_shell_seen = bool(getattr(self, "_source_startup_snapshot_mount_seen", False))
-        pending_snap_match = self._pending_session_source_snapshot_drive_match(pending_did or cur_did)
+        draft_lib_did = self._draft_selected_source_library_id()
+        pending_snap_match = self._pending_session_source_snapshot_drive_match(
+            pending_did or cur_did or draft_lib_did
+        )
+        prearmed = bool(getattr(self, "_source_snapshot_shell_prearmed", False))
 
         forensic: dict = {
             "shell_preservation_guard_active": False,
@@ -23709,12 +23782,13 @@ class MainWindow(QMainWindow):
             "current_drive_id_suffix": cur_did[-16:] if len(cur_did) > 16 else cur_did,
             "startup_shell_seen": startup_shell_seen,
             "pending_session_snapshot_match": pending_snap_match,
+            "snapshot_shell_prearmed": prearmed,
         }
 
         if self._planning_browse_mode("source") != "sharepoint":
             forensic["action_taken"] = "not_sharepoint_browse_mode"
             return False, forensic
-        if not (startup_shell_seen or pending_snap_match):
+        if not (startup_shell_seen or pending_snap_match or prearmed):
             forensic["action_taken"] = "no_startup_shell_flag"
             return False, forensic
         if force_replace:
@@ -23734,7 +23808,11 @@ class MainWindow(QMainWindow):
             elif cur_did:
                 same_drive = mount_did.casefold() == cur_did.casefold()
         else:
-            same_drive = bool(pending_snap_match)
+            same_drive = bool(pending_snap_match) or (
+                prearmed
+                and bool(draft_lib_did)
+                and self._pending_session_source_snapshot_drive_match(draft_lib_did)
+            )
 
         if not same_drive:
             forensic["action_taken"] = "drive_identity_mismatch"
@@ -33466,20 +33544,35 @@ class MainWindow(QMainWindow):
             self._source_sharepoint_root_force_replace = False
             snap_preserving = (
                 self._planning_browse_mode("source") == "sharepoint"
-                and bool(getattr(self, "_source_startup_snapshot_mount_seen", False))
+                and (
+                    bool(getattr(self, "_source_startup_snapshot_mount_seen", False))
+                    or bool(getattr(self, "_source_snapshot_shell_prearmed", False))
+                    or self._pending_session_source_snapshot_drive_match(pending_drive)
+                )
             )
             mount_did = str(getattr(self, "_source_snapshot_mount_drive_id", "") or "").strip()
             single_row_snapshot_shell = (
                 snap_preserving
                 and pre_df == 1
-                and bool(mount_did)
                 and bool(pending_drive)
-                and mount_did.casefold() == pending_drive.casefold()
+                and (
+                    (bool(mount_did) and mount_did.casefold() == pending_drive.casefold())
+                    or self._pending_session_source_snapshot_drive_match(pending_drive)
+                )
             )
             shell_merge_eligible = (
                 self._planning_browse_mode("source") == "sharepoint"
                 and not force_replace
-                and (snap_preserving or pre_df > 1 or single_row_snapshot_shell)
+                and (
+                    snap_preserving
+                    or pre_df > 1
+                    or single_row_snapshot_shell
+                    or (
+                        bool(getattr(self, "_source_snapshot_shell_prearmed", False))
+                        and pre_df >= 1
+                        and self._pending_session_source_snapshot_drive_match(pending_drive)
+                    )
+                )
             )
             if not items:
                 if shell_merge_eligible:
@@ -33517,6 +33610,12 @@ class MainWindow(QMainWindow):
                 self._apply_tree_item_visual_state(None, pl)
                 payloads.append(pl)
             if shell_merge_eligible and hasattr(model, "merge_sharepoint_source_root_graph_children"):
+                log_info(
+                    "source_destructive_reset_blocked",
+                    reason="graph_root_merge_instead_of_replace",
+                    pre_nodes_depth_first=pre_df,
+                    graph_root_items=len(payloads),
+                )
                 log_info(
                     "source_startup_shell_before_graph_root_merge",
                     graph_root_items=len(payloads),
