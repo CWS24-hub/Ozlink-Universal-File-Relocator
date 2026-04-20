@@ -135,6 +135,11 @@ from ozlink_console.draft_import import (
     is_valid_migration_drive_id,
     load_migration_conflicts_for_review,
     validate_migrated_import_bundle,
+    user_message_for_import_blocked_exception,
+    user_message_for_import_bundle_classification_error,
+    user_message_for_legacy_identity_incomplete,
+    user_message_for_migrated_validation_error,
+    user_message_for_placeholder_drive_ids,
 )
 from ozlink_console.legacy_backup_migration import MigrationIdentityPreflight, migrate_legacy_backup_folder
 from ozlink_console.legacy_backup_migration.types import migration_identity_complete
@@ -13483,39 +13488,58 @@ class MainWindow(QMainWindow):
             if vr.ok:
                 return True
             err = (vr.error or "").strip()
+            friendly = user_message_for_migrated_validation_error(err)
             el = err.lower()
             if "rows_rejected" in el and "confirm" in el:
                 r = QMessageBox.question(
                     self,
                     "Import Draft",
-                    f"{err}\n\nDo you want to import this package anyway?",
+                    f"{friendly}\n\nDo you want to import this package anyway?",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                     QMessageBox.StandardButton.No,
                 )
                 if r == QMessageBox.StandardButton.Yes:
                     conf_r = True
                     continue
+                log_info(
+                    "migrated_package_restore_cancelled",
+                    reason="rows_rejected_confirmation_declined",
+                    folder=str(bundle_dir),
+                )
                 return False
             if "graph resolution disabled" in el or "offline" in el:
+                # Offline / skip-graph migrations require explicit confirmation (see validate_migrated_import_bundle).
                 r = QMessageBox.question(
                     self,
                     "Import Draft",
-                    f"{err}\n\nDo you want to import this package anyway?",
+                    f"{friendly}\n\nDo you want to import this package anyway?",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                     QMessageBox.StandardButton.No,
                 )
                 if r == QMessageBox.StandardButton.Yes:
                     conf_o = True
                     continue
+                log_info(
+                    "migrated_package_restore_cancelled",
+                    reason="offline_migration_confirmation_declined",
+                    folder=str(bundle_dir),
+                )
                 return False
-            QMessageBox.warning(self, "Import Draft", err or "Migrated package validation failed.")
+            QMessageBox.warning(self, "Import Draft", friendly or "Migrated package validation failed.")
+            log_info(
+                "migrated_package_restore_cancelled",
+                reason="validation_failed",
+                folder=str(bundle_dir),
+            )
             return False
 
     def _show_migration_preflight_result_dialog(self, report: dict[str, Any], output_folder: Path) -> bool:
         """Show migration summary; return True if user chooses to import the migrated folder."""
+        out_folder_s = str(Path(output_folder).resolve())
+        log_info("migration_report_dialog_shown", output_folder=out_folder_s)
         dlg = QDialog(self)
         dlg.setWindowTitle("Legacy migration")
-        dlg.resize(520, 380)
+        dlg.resize(640, 420)
         lay = QVBoxLayout(dlg)
         txt = QTextEdit()
         txt.setReadOnly(True)
@@ -13524,28 +13548,94 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         btn_cancel = QPushButton("Cancel")
         btn_open = QPushButton("Open report")
-        btn_restore = QPushButton("Import migrated backup")
+        btn_open_folder = QPushButton("Open migrated output folder")
+        btn_save = QPushButton("Save report as…")
+        btn_restore = QPushButton("Restore migrated backup")
         row.addWidget(btn_cancel)
         row.addStretch(1)
         row.addWidget(btn_open)
+        row.addWidget(btn_open_folder)
+        row.addWidget(btn_save)
         row.addWidget(btn_restore)
         lay.addLayout(row)
         out = {"go": False}
 
         def _open_report() -> None:
+            log_info("migration_report_open_requested", output_folder=out_folder_s)
             md = output_folder / "LegacyMigrationReport.md"
             js = output_folder / "LegacyMigrationReport.json"
             p = md if md.is_file() else js
             if p.is_file():
                 QDesktopServices.openUrl(QUrl.fromLocalFile(str(p.resolve())))
+            else:
+                QMessageBox.information(
+                    dlg,
+                    "Legacy migration",
+                    "No LegacyMigrationReport.md or LegacyMigrationReport.json was found in the output folder.",
+                )
+
+        def _open_folder() -> None:
+            log_info("migration_output_folder_open_requested", output_folder=out_folder_s)
+            if not output_folder.is_dir():
+                QMessageBox.warning(dlg, "Legacy migration", "The migrated output folder is not available.")
+                return
+            QDesktopServices.openUrl(QUrl.fromLocalFile(out_folder_s))
+
+        def _save_report_as() -> None:
+            log_info("migration_report_save_requested", output_folder=out_folder_s)
+            md = output_folder / "LegacyMigrationReport.md"
+            js = output_folder / "LegacyMigrationReport.json"
+            if md.is_file():
+                default_name = "LegacyMigrationReport.md"
+                chosen_src = md
+                filt = "Markdown report (*.md);;JSON report (*.json);;All files (*.*)"
+            elif js.is_file():
+                default_name = "LegacyMigrationReport.json"
+                chosen_src = js
+                filt = "JSON report (*.json);;Markdown report (*.md);;All files (*.*)"
+            else:
+                QMessageBox.information(
+                    dlg,
+                    "Legacy migration",
+                    "No LegacyMigrationReport.md or LegacyMigrationReport.json was found to save.",
+                )
+                return
+            dest, _sel = QFileDialog.getSaveFileName(
+                dlg,
+                "Save migration report as",
+                str(output_folder / default_name),
+                filt,
+            )
+            if not dest:
+                return
+            try:
+                _shutil.copy2(str(chosen_src), dest)
+                log_info("migration_report_saved", dest=str(Path(dest).resolve()))
+            except OSError as exc:
+                QMessageBox.warning(
+                    dlg,
+                    "Legacy migration",
+                    f"Could not save the migration report:\n{exc}",
+                )
 
         def _do_restore() -> None:
+            log_info("migrated_package_restore_confirmed", output_folder=out_folder_s)
             out["go"] = True
             dlg.accept()
 
+        def _on_dialog_finished(result: int) -> None:
+            if result == int(QDialog.DialogCode.Accepted) and out.get("go"):
+                return
+            log_info("legacy_import_preflight_cancelled_after_report", output_folder=out_folder_s)
+            log_info("migrated_package_restore_cancelled", output_folder=out_folder_s)
+
         btn_cancel.clicked.connect(dlg.reject)
         btn_open.clicked.connect(_open_report)
+        btn_open_folder.clicked.connect(_open_folder)
+        btn_save.clicked.connect(_save_report_as)
         btn_restore.clicked.connect(_do_restore)
+        btn_restore.setDefault(True)
+        dlg.finished.connect(_on_dialog_finished)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return False
         return bool(out["go"])
@@ -13633,6 +13723,8 @@ class MainWindow(QMainWindow):
                 bundle_dir = Path(source_folder)
                 source_description = source_folder
 
+            _legacy_mig_root: Path | None = None
+            _import_bundle_succeeded = False
             try:
                 kind, meta = classify_import_bundle(bundle_dir)
 
@@ -13640,7 +13732,7 @@ class MainWindow(QMainWindow):
                     QMessageBox.warning(
                         self,
                         "Import Draft",
-                        f"Invalid or incomplete draft bundle:\n{meta.get('error', 'unknown')}",
+                        user_message_for_import_bundle_classification_error(str(meta.get("error") or "unknown")),
                     )
                     return
 
@@ -13652,9 +13744,7 @@ class MainWindow(QMainWindow):
                         QMessageBox.warning(
                             self,
                             "Import Draft",
-                            "This legacy backup must be migrated before import. "
-                            "Select Source and Destination site/library in the planning header (resolved Microsoft 365 libraries), "
-                            "then try again.",
+                            user_message_for_legacy_identity_incomplete(),
                         )
                         return
                     if not (
@@ -13664,12 +13754,11 @@ class MainWindow(QMainWindow):
                         QMessageBox.warning(
                             self,
                             "Import Draft",
-                            "Migration requires non-placeholder Graph drive ids. "
-                            "Select real Source and Destination document libraries, then try again.",
+                            user_message_for_placeholder_drive_ids(),
                         )
                         return
                     mig_parent = Path(tempfile.mkdtemp(prefix="ozlink_legacy_mig_out_"))
-                    temp_dirs.append(mig_parent)
+                    _legacy_mig_root = mig_parent
                     log_info(
                         "legacy_import_preflight_started",
                         bundle=str(bundle_dir),
@@ -13692,6 +13781,11 @@ class MainWindow(QMainWindow):
                             error=str(res.error_message or "")[:400],
                             needs_identity=bool(getattr(res, "needs_identity_confirmation", False)),
                         )
+                        try:
+                            _shutil.rmtree(str(mig_parent), ignore_errors=True)
+                        except Exception:
+                            pass
+                        _legacy_mig_root = None
                         QMessageBox.warning(
                             self,
                             "Import Draft",
@@ -13715,8 +13809,14 @@ class MainWindow(QMainWindow):
                     self._migration_import_needs_review_rows = []
 
                 self.memory_manager.import_bundle(bundle_dir)
+                _import_bundle_succeeded = True
             finally:
                 _cleanup_import_temps()
+                if _import_bundle_succeeded and _legacy_mig_root is not None:
+                    try:
+                        _shutil.rmtree(str(_legacy_mig_root), ignore_errors=True)
+                    except Exception:
+                        pass
 
             self._import_ok_timing("after_bundle_import_io", _import_t0)
             self._import_rehydration_verify_pending = True
@@ -13807,7 +13907,12 @@ class MainWindow(QMainWindow):
             self._import_rehydration_verify_pending = False
             self._import_ok_trace("import_handler_exception", error=str(exc))
             log_error("Draft import failed.", error=str(exc), source=source_file if 'source_file' in locals() else source_folder)
-            QMessageBox.warning(self, "Import Draft", "Could not import the selected draft bundle.")
+            _blocked = user_message_for_import_blocked_exception(exc)
+            QMessageBox.warning(
+                self,
+                "Import Draft",
+                _blocked if _blocked else "Could not import the selected draft bundle.",
+            )
 
     def _workspace_reset_backup_dialog_dir(self):
         """Prefer ``Backups/WorkspaceReset``; fall back to ``Backups`` if older builds only wrote there."""

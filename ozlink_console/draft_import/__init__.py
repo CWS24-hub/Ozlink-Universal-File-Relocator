@@ -16,6 +16,13 @@ from ozlink_console.draft_import.migrated_validation import (
     validate_migrated_import_bundle,
 )
 from ozlink_console.draft_import.summary import build_migration_report_summary_lines, build_migration_report_summary_text
+from ozlink_console.draft_import.import_ux_messages import (
+    user_message_for_import_blocked_exception,
+    user_message_for_import_bundle_classification_error,
+    user_message_for_legacy_identity_incomplete,
+    user_message_for_migrated_validation_error,
+    user_message_for_placeholder_drive_ids,
+)
 
 __all__ = [
     "INVALID_UNKNOWN",
@@ -29,4 +36,9 @@ __all__ = [
     "classify_import_bundle",
     "load_migration_conflicts_for_review",
     "validate_migrated_import_bundle",
+    "user_message_for_import_blocked_exception",
+    "user_message_for_import_bundle_classification_error",
+    "user_message_for_legacy_identity_incomplete",
+    "user_message_for_migrated_validation_error",
+    "user_message_for_placeholder_drive_ids",
 ]
