@@ -48,6 +48,7 @@ def should_schedule_destination_full_tree(
     routine_followup: bool = False,
     delta_cursor_present: bool = False,
     bootstrap_complete: bool = False,
+    skeleton_first_bootstrap: bool = False,
 ) -> DestinationFullTreeScheduleDecision:
     """
     Returns whether the full-tree worker may be scheduled.
@@ -66,6 +67,7 @@ def should_schedule_destination_full_tree(
         "recovery": bool(recovery),
         "bootstrap": bool(bootstrap),
         "routine_followup": bool(routine_followup),
+        "skeleton_first_bootstrap": bool(skeleton_first_bootstrap),
     }
 
     if explicit_refresh or force_refresh:
@@ -89,7 +91,10 @@ def should_schedule_destination_full_tree(
     if routine_followup and delta_cursor_present and not delta_failed:
         base["decision"] = "suppressed"
         log_info("destination_full_tree_schedule_decision", **base)
-        log_info("destination_full_tree_schedule_suppressed_delta_mode", **base)
+        if skeleton_first_bootstrap:
+            log_info("destination_full_tree_schedule_suppressed_skeleton_first_bootstrap", **base)
+        else:
+            log_info("destination_full_tree_schedule_suppressed_delta_mode", **base)
         return DestinationFullTreeScheduleDecision(False, "suppressed_delta_mode", base)
 
     # Legacy / cautious default: allow when delta is not yet bootstrapped (no cursor).

@@ -4065,7 +4065,8 @@ class MainWindow(QMainWindow):
                 self._ensure_sharepoint_destination_full_tree_worker_scheduled(
                     drive_id,
                     schedule_reason="deferred_background_load_lazy_destination",
-                    bootstrap=True,
+                    routine_followup=True,
+                    skeleton_first_bootstrap=True,
                 )
             elif panel_key == "source" and drive_id:
                 self._schedule_full_count_with_restore_backoff(drive_id)
@@ -4078,7 +4079,8 @@ class MainWindow(QMainWindow):
                 self._ensure_sharepoint_destination_full_tree_worker_scheduled(
                     drive_id,
                     schedule_reason="deferred_background_timer_destination",
-                    bootstrap=True,
+                    routine_followup=True,
+                    skeleton_first_bootstrap=True,
                 )
                 return
 
@@ -4100,7 +4102,8 @@ class MainWindow(QMainWindow):
             self._ensure_sharepoint_destination_full_tree_worker_scheduled(
                 drive_id,
                 schedule_reason="deferred_background_run_destination",
-                bootstrap=True,
+                routine_followup=True,
+                skeleton_first_bootstrap=True,
             )
 
     def _refresh_tree_column_width(self, panel_key):
@@ -9288,6 +9291,233 @@ class MainWindow(QMainWindow):
         if dest:
             return dest
         return str((getattr(self, "pending_root_drive_ids", {}) or {}).get("destination") or "").strip()
+
+    def _persisted_destination_library_drive_id_from_session(self) -> str:
+        """Persisted session destination library Graph drive id only (no combo / pending fallbacks).
+
+        Used to avoid binding a stale combo index (e.g. first library in a partial site list) while the
+        saved library row is not present yet.
+        """
+        shell = getattr(self, "_draft_shell_state", None)
+        state = shell if isinstance(shell, SessionState) else SessionState()
+        return str(getattr(state, "SelectedDestinationLibraryId", "") or "").strip()
+
+    def _destination_library_selector_has_drive_id(self, library_selector, drive_id: str) -> bool:
+        if library_selector is None:
+            return False
+        did = str(drive_id or "").strip()
+        if not did:
+            return False
+        dcf = did.casefold()
+        try:
+            for i in range(int(library_selector.count() or 0)):
+                data = library_selector.itemData(i)
+                if isinstance(data, dict):
+                    pid = str(data.get("id") or data.get("drive_id") or "").strip()
+                    if pid and pid.casefold() == dcf:
+                        return True
+        except Exception:
+            return False
+        return False
+
+    def _destination_should_defer_or_block_wrong_library_bind(
+        self,
+        *,
+        selected_library: dict,
+        library_selector,
+    ) -> str:
+        """Return '' to proceed, 'deferred' to skip load until selector is ready, 'blocked' if wrong id known."""
+        intended = self._persisted_destination_library_drive_id_from_session()
+        if not intended:
+            return ""
+        sel_id = str(selected_library.get("id") or selected_library.get("drive_id") or "").strip()
+        if not sel_id:
+            return ""
+        if sel_id.casefold() == intended.casefold():
+            return ""
+        in_combo = self._destination_library_selector_has_drive_id(library_selector, intended)
+        if in_combo:
+            log_info(
+                "destination_wrong_library_bind_blocked",
+                selected_drive_suffix=sel_id[-16:] if len(sel_id) > 16 else sel_id,
+                intended_drive_suffix=intended[-16:] if len(intended) > 16 else intended,
+                selector_item_count=int(library_selector.count() if library_selector is not None else 0),
+            )
+            return "blocked"
+        log_info(
+            "destination_library_bind_deferred_selector_not_ready",
+            selected_drive_suffix=sel_id[-16:] if len(sel_id) > 16 else sel_id,
+            intended_drive_suffix=intended[-16:] if len(intended) > 16 else intended,
+            selector_item_count=int(library_selector.count() if library_selector is not None else 0),
+        )
+        return "deferred"
+
+    def _destination_sync_library_selector_to_persisted_intent(self, library_selector) -> None:
+        """After site library list (re)built, select persisted destination library or no selection."""
+        if library_selector is None:
+            return
+        intended = self._persisted_destination_library_drive_id_from_session()
+        library_selector.blockSignals(True)
+        try:
+            if not intended:
+                return
+            for i in range(int(library_selector.count() or 0)):
+                data = library_selector.itemData(i)
+                if not isinstance(data, dict):
+                    continue
+                pid = str(data.get("id") or data.get("drive_id") or "").strip()
+                if pid and pid.casefold() == intended.casefold():
+                    library_selector.setCurrentIndex(i)
+                    return
+            try:
+                library_selector.setCurrentIndex(-1)
+            except Exception:
+                pass
+        finally:
+            library_selector.blockSignals(False)
+
+    def _destination_schedule_skeleton_first_level_graph_child_loads(
+        self, drive_id: str, worker_id: Any, *, worker_tag: str = "post_root"
+    ) -> None:
+        """Load first-level Graph children for a single top-level folder (e.g. library root) without full-tree."""
+        if self._planning_browse_mode("destination") == "local":
+            log_info(
+                "destination_graph_skeleton_child_load_skipped",
+                reason="local_browse_mode",
+                worker_tag=str(worker_tag)[:80],
+                drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+            )
+            return
+        active_entry = self.root_load_workers.get("destination")
+        if not active_entry or active_entry.get("id") != worker_id:
+            log_info(
+                "destination_graph_skeleton_child_load_skipped",
+                reason="stale_root_worker_id",
+                worker_tag=str(worker_tag)[:80],
+                drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+            )
+            return
+        pend = str((self.pending_root_drive_ids or {}).get("destination") or "").strip()
+        if pend and str(drive_id or "").strip() and pend.casefold() != str(drive_id or "").strip().casefold():
+            log_info(
+                "destination_graph_skeleton_child_load_skipped",
+                reason="pending_drive_mismatch",
+                worker_tag=str(worker_tag)[:80],
+                pending_drive_suffix=pend[-16:] if len(pend) > 16 else pend,
+                drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+            )
+            return
+        model = getattr(self, "destination_planning_model", None)
+        if model is None:
+            log_info(
+                "destination_graph_skeleton_child_load_skipped",
+                reason="no_model",
+                worker_tag=str(worker_tag)[:80],
+            )
+            return
+        inv = QModelIndex()
+        try:
+            rc = int(model.rowCount(inv))
+        except Exception:
+            rc = 0
+        eligible: list[tuple[int, dict]] = []
+        for r in range(rc):
+            try:
+                ix = model.index(r, 0, inv)
+            except Exception:
+                continue
+            if not ix.isValid():
+                continue
+            pl = self._destination_model_index_user_role_dict(ix)
+            if not isinstance(pl, dict) or pl.get("placeholder"):
+                continue
+            if not self._destination_row_is_live_graph_structure(pl) or not pl.get("is_folder", True):
+                continue
+            if pl.get("children_loaded") or pl.get("load_failed"):
+                continue
+            eligible.append((r, pl))
+        if not eligible:
+            log_info(
+                "destination_graph_skeleton_child_load_skipped",
+                reason="no_eligible_top_level_folders",
+                worker_tag=str(worker_tag)[:80],
+                top_level_rows=int(rc),
+            )
+            return
+        tw = getattr(self, "destination_tree_widget", None)
+        targets: list[int] = []
+        if len(eligible) == 1:
+            targets = [eligible[0][0]]
+            log_info(
+                "destination_graph_skeleton_child_load_scheduled",
+                mode="single_top_level_folder",
+                folder_count=1,
+                drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+            )
+        else:
+            for r, _pl in eligible:
+                try:
+                    ix = model.index(r, 0, inv)
+                    if tw is not None and tw.isExpanded(ix):
+                        targets.append(r)
+                except Exception:
+                    continue
+            if not targets:
+                log_info(
+                    "destination_graph_skeleton_child_load_skipped",
+                    reason="multi_top_level_expand_to_load",
+                    worker_tag=str(worker_tag)[:80],
+                    eligible_top_level=len(eligible),
+                )
+                return
+            log_info(
+                "destination_graph_skeleton_child_load_scheduled",
+                mode="expanded_top_level_only",
+                folder_count=len(targets),
+                drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+            )
+        log_info(
+            "destination_graph_skeleton_first_level_bound",
+            drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+            target_row_count=len(targets),
+        )
+        for r in targets:
+            try:
+                ix = model.index(int(r), 0, inv)
+            except Exception:
+                continue
+            if not ix.isValid():
+                continue
+            log_info(
+                "destination_graph_skeleton_child_load_started",
+                row=int(r),
+                drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+            )
+            ok = self._request_graph_destination_children_load(
+                ix, reason="skeleton_first_level", trigger=f"graph_skeleton:{worker_tag}"
+            )
+            _payload = {
+                "row": int(r),
+                "queued_or_started": bool(ok),
+                "drive_id_suffix": str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+            }
+            if ok:
+                log_info("destination_graph_skeleton_child_load_completed", **_payload)
+            else:
+                log_info("destination_graph_skeleton_child_load_skipped", reason="queue_or_worker", **_payload)
+
+    def _destination_full_tree_worker_running_for_ui(self) -> bool:
+        w = getattr(self, "_destination_full_tree_worker", None)
+        try:
+            return w is not None and w.isRunning()
+        except Exception:
+            return False
+
+    def _destination_status_message_authority_pending_or_reconcile(self) -> tuple[str, bool]:
+        """Status when authority shell is pending: full-tree walking vs skeleton-first lazy loading."""
+        if self._destination_full_tree_worker_running_for_ui():
+            return "Destination library: reconciling full structure from Microsoft 365…", True
+        return "Destination library ready — live folders loading on demand.", False
 
     def _destination_startup_snapshot_identity_matches_active(self, active_drive_id: str) -> bool:
         m = str(getattr(self, "_destination_snapshot_mount_drive_id", "") or "").strip()
@@ -18629,6 +18859,7 @@ class MainWindow(QMainWindow):
         recovery: bool = False,
         delta_failed: bool = False,
         force_refresh: bool = False,
+        skeleton_first_bootstrap: bool = False,
     ) -> None:
         """Start (or keep) the full-library walk when SharePoint authority is required; retries past transient skips."""
         if getattr(self, "_application_shutting_down", False):
@@ -18723,6 +18954,7 @@ class MainWindow(QMainWindow):
                 self._destination_full_tree_ready()
                 and str(getattr(self, "_destination_full_tree_completed_drive_id", "") or "").strip() == did
             ),
+            skeleton_first_bootstrap=bool(skeleton_first_bootstrap),
         )
         if not _sched.allowed:
             return
@@ -18916,6 +19148,17 @@ class MainWindow(QMainWindow):
     def on_destination_full_tree_success(self, payload, worker_id):
         drive_id = payload.get("drive_id", "")
         if worker_id != self._active_destination_full_tree_worker_id or drive_id != self._destination_full_tree_requested_drive_id:
+            return
+        _bound_live = str(getattr(self, "_destination_sharepoint_root_graph_bound_drive_id", "") or "").strip()
+        _pend = str((self.pending_root_drive_ids or {}).get("destination") or "").strip()
+        _auth = _bound_live or _pend
+        if _auth and str(drive_id or "").strip() and _auth.casefold() != str(drive_id or "").strip().casefold():
+            log_info(
+                "destination_stale_full_tree_worker_ignored_wrong_drive",
+                active_drive_suffix=_auth[-16:] if len(_auth) > 16 else _auth,
+                payload_drive_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+                worker_id_suffix=str(worker_id)[:24],
+            )
             return
 
         snapshot_entries = []
@@ -22610,6 +22853,50 @@ class MainWindow(QMainWindow):
                         site_id_excerpt=site_id[:48],
                     )
                     libraries = []
+            # Destination: partial cached site["libraries"] can omit the saved library; refresh from Graph
+            # so restore does not leave the combo on index 0 (wrong library) while drive-id match fails.
+            if (
+                selector_group == "destination"
+                and libraries
+                and site_id
+                and self.graph is not None
+            ):
+                intended_dst = self._persisted_destination_library_drive_id_from_session()
+                if intended_dst:
+                    has_intended = any(
+                        isinstance(lib, dict)
+                        and str(lib.get("id") or lib.get("drive_id") or "").strip().casefold()
+                        == intended_dst.casefold()
+                        for lib in libraries
+                    )
+                    if not has_intended:
+                        try:
+                            self._startup_post_snapshot_trace_event(
+                                "list_site_drives_refresh_missing_persisted_library",
+                                selector_group="destination",
+                                site_id_excerpt=str(site_id)[:32],
+                                intended_drive_suffix=intended_dst[-16:] if len(intended_dst) > 16 else intended_dst,
+                            )
+                            _t_drv2 = time.perf_counter()
+                            drives2 = self.graph.list_site_drives(site_id)
+                            libraries = [
+                                self.graph.normalize_drive(drive)
+                                for drive in drives2
+                                if self.graph.is_usable_document_library(drive)
+                            ]
+                            selected_site["libraries"] = libraries
+                            self._startup_post_snapshot_trace_event(
+                                "list_site_drives_refresh_missing_persisted_library_exit",
+                                selector_group="destination",
+                                wall_ms=round((time.perf_counter() - _t_drv2) * 1000.0, 2),
+                                usable_library_count=len(libraries),
+                            )
+                        except Exception as exc:
+                            log_warn(
+                                "planning_library_selector_site_drives_refresh_failed",
+                                error=str(exc)[:500],
+                                site_id_excerpt=site_id[:48],
+                            )
 
         library_selector.blockSignals(True)
         try:
@@ -22624,8 +22911,10 @@ class MainWindow(QMainWindow):
         finally:
             library_selector.blockSignals(False)
 
-        if selector_group == "destination" and libraries:
-            self._maybe_schedule_legacy_snapshot_identity_inference_retry("destination_libraries_loaded")
+        if selector_group == "destination":
+            self._destination_sync_library_selector_to_persisted_intent(library_selector)
+            if libraries:
+                self._maybe_schedule_legacy_snapshot_identity_inference_retry("destination_libraries_loaded")
 
         return True
 
@@ -24879,11 +25168,8 @@ class MainWindow(QMainWindow):
         if not pending_paths:
             if panel_key == "destination":
                 if self._destination_tree_shows_authority_pending_shell():
-                    self._set_tree_status_message(
-                        panel_key,
-                        "Destination library: reconciling full structure from Microsoft 365…",
-                        loading=True,
-                    )
+                    _msg, _load = self._destination_status_message_authority_pending_or_reconcile()
+                    self._set_tree_status_message(panel_key, _msg, loading=_load)
                 elif self._destination_live_refresh_still_blocked():
                     self._set_tree_status_message(
                         panel_key,
@@ -25009,11 +25295,8 @@ class MainWindow(QMainWindow):
         else:
             if panel_key == "destination":
                 if self._destination_tree_shows_authority_pending_shell():
-                    self._set_tree_status_message(
-                        panel_key,
-                        "Destination library: reconciling full structure from Microsoft 365…",
-                        loading=True,
-                    )
+                    _msg_b, _load_b = self._destination_status_message_authority_pending_or_reconcile()
+                    self._set_tree_status_message(panel_key, _msg_b, loading=_load_b)
                 elif self._destination_live_refresh_still_blocked():
                     self._set_tree_status_message(
                         panel_key,
@@ -25396,6 +25679,26 @@ class MainWindow(QMainWindow):
                 self.handle_connect(allow_prompt_for_email=True, service_context=service_context)
                 self._log_library_restore_step("step_04b_auth_required_started", selector_group=selector_group)
                 return
+
+            if selector_group == "destination":
+                _dst_guard = self._destination_should_defer_or_block_wrong_library_bind(
+                    selected_library=selected_library,
+                    library_selector=library_selector,
+                )
+                if _dst_guard == "deferred":
+                    self.set_tree_placeholder(
+                        "destination",
+                        "Waiting for the saved destination library to appear in the list…",
+                    )
+                    self.update_selector_context_labels()
+                    return
+                if _dst_guard == "blocked":
+                    self.set_tree_placeholder(
+                        "destination",
+                        "Choose the destination library that matches your session — the current selection is not the saved destination drive.",
+                    )
+                    self.update_selector_context_labels()
+                    return
 
             self._log_library_restore_step("step_05_update_labels_enter", selector_group=selector_group)
             self.update_selector_context_labels()
@@ -26984,6 +27287,12 @@ class MainWindow(QMainWindow):
             display_label_preview=_labels,
             drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
         )
+        if destination_graph_delta_cursor_present(getattr(self, "graph", None), str(drive_id or "")):
+            log_info(
+                "destination_skeleton_first_bootstrap_ready",
+                drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+                delta_cursor_present=True,
+            )
 
         post_bind_top_item_name = ""
         post_bind_top_item_semantic_path = ""
@@ -27096,6 +27405,17 @@ class MainWindow(QMainWindow):
                 drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
                 note="after_refresh_tree_ui_after_root_bind",
             )
+            _wid = worker_id
+            _did = str(drive_id or "")
+            QTimer.singleShot(
+                0,
+                lambda: self._safe_invoke(
+                    "destination_skeleton_first_level_after_root",
+                    lambda w=_wid, d=_did: self._destination_schedule_skeleton_first_level_graph_child_loads(
+                        d, w, worker_tag="post_root_deferred"
+                    ),
+                ),
+            )
 
         pending_refresh_panels = self._pending_cache_refresh_panels if self._cache_refresh_restore_active else set()
         if self._cache_refresh_restore_active and panel_key in pending_refresh_panels:
@@ -27167,6 +27487,13 @@ class MainWindow(QMainWindow):
                 return
             if self.pending_root_drive_ids.get(panel_key) != drive_id:
                 self._log_restore_phase("root_worker_success stale_payload_skipped", panel_key=panel_key, drive_id=drive_id)
+                if panel_key == "destination":
+                    _pend = str((self.pending_root_drive_ids or {}).get("destination") or "").strip()
+                    log_info(
+                        "destination_stale_root_worker_ignored_wrong_drive",
+                        pending_drive_suffix=_pend[-16:] if len(_pend) > 16 else _pend,
+                        payload_drive_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+                    )
                 return
 
             items = payload.get("items", [])
@@ -30903,16 +31230,23 @@ class MainWindow(QMainWindow):
                     )
                 self._destination_require_deferred_full_materialize_once = not _merge_quiet
                 self._mark_destination_real_tree_snapshot_stale()
+                _delta_cursor_ok = destination_graph_delta_cursor_present(getattr(self, "graph", None), str(did_shell or ""))
                 if snap_preserving:
                     self._set_tree_status_message(
                         panel_key,
-                        "Destination library ready — live details sync in the background.",
+                        "Destination library ready — live folders loading on demand.",
                         loading=False,
                     )
                 elif _merge_quiet:
                     self._set_tree_status_message(
                         panel_key,
-                        "Destination library ready — live details sync in the background.",
+                        "Destination library ready — live folders loading on demand.",
+                        loading=False,
+                    )
+                elif _delta_cursor_ok:
+                    self._set_tree_status_message(
+                        panel_key,
+                        "Destination library ready — live folders loading on demand.",
                         loading=False,
                     )
                 else:
@@ -30936,7 +31270,8 @@ class MainWindow(QMainWindow):
                     self._ensure_sharepoint_destination_full_tree_worker_scheduled(
                         d_kick,
                         schedule_reason="authority_full_tree_kick_after_root_bind",
-                        bootstrap=True,
+                        routine_followup=True,
+                        skeleton_first_bootstrap=True,
                     )
 
                 QTimer.singleShot(0, lambda: self._safe_invoke("destination_authority_full_tree_kick", _kick_authority))
@@ -70840,11 +71175,8 @@ class MainWindow(QMainWindow):
         if status is not None:
             if panel_key == "destination":
                 if self._destination_tree_shows_authority_pending_shell():
-                    self._set_tree_status_message(
-                        panel_key,
-                        "Destination library: reconciling full structure from Microsoft 365…",
-                        loading=True,
-                    )
+                    _msg_e, _load_e = self._destination_status_message_authority_pending_or_reconcile()
+                    self._set_tree_status_message(panel_key, _msg_e, loading=_load_e)
                 elif self._destination_live_refresh_still_blocked():
                     self._set_tree_status_message(
                         panel_key,
