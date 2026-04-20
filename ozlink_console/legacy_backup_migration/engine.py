@@ -1241,6 +1241,8 @@ def migrate_legacy_backup_folder(
             encoding="utf-8",
         )
 
+    counts["skip_graph_resolution"] = bool(skip_graph_resolution)
+
     report = {
         "schema_version": 1,
         "migrated_utc": datetime.now(timezone.utc).isoformat(),

@@ -1412,9 +1412,13 @@ class MemoryManager:
         stamp = "ImportBefore_" + datetime.now().strftime("%Y%m%d-%H%M%S")
         qdir = self.quarantine / stamp
         qdir.mkdir(parents=True, exist_ok=True)
+        n_q = 0
         for path in self.paths.values():
             if path.exists():
                 shutil.copy2(path, qdir / path.name)
+                n_q += 1
+        log_info("import_memory_quarantine_created", quarantine_dir=str(qdir))
+        log_info("import_memory_quarantine_file_count", count=int(n_q), quarantine_dir=str(qdir))
 
         mapping = {
             "Draft-SessionState.json": self.paths["session"],

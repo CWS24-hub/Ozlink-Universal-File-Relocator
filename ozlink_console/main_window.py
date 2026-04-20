@@ -20,6 +20,8 @@ import math
 import uuid
 import weakref
 import zipfile
+import tempfile
+import shutil as _shutil
 import requests
 from datetime import datetime, timezone
 from pathlib import Path
@@ -120,6 +122,19 @@ from ozlink_console.logger import (
     thread_inventory_snapshot,
 )
 from ozlink_console.memory import MemoryManager, WORKSPACE_SNAPSHOT_SCHEMA_VERSION
+from ozlink_console.draft_import import (
+    INVALID_UNKNOWN,
+    MIGRATED_LEGACY_PACKAGE,
+    MODERN_EXPORT,
+    RAW_LEGACY_EXPORT,
+    build_migration_report_summary_text,
+    classify_import_bundle,
+    is_valid_migration_drive_id,
+    load_migration_conflicts_for_review,
+    validate_migrated_import_bundle,
+)
+from ozlink_console.legacy_backup_migration import MigrationIdentityPreflight, migrate_legacy_backup_folder
+from ozlink_console.legacy_backup_migration.types import migration_identity_complete
 from ozlink_console.version_info import APP_VERSION
 from ozlink_console.models import AllocationRow, ProposedFolder, SessionState, SubmissionBatch
 from ozlink_console.planning_selector_restore import library_combo_index_for_session_restore
@@ -3342,6 +3357,7 @@ class MainWindow(QMainWindow):
         self._workflow_not_planned_rows = []
         self._workflow_suggestion_rows = []
         self._workflow_needs_review_rows = []
+        self._migration_import_needs_review_rows: list[dict[str, Any]] = []
         self._needs_review_dismissed_inherited_paths: set[str] = set()
         self._submission_test_mode = False
         self._pending_login_email = ""
@@ -6379,7 +6395,12 @@ class MainWindow(QMainWindow):
         cb = getattr(self, "needs_review_show_inherited_checkbox", None)
         show_inherited = bool(cb is not None and cb.isChecked())
         dismissed = getattr(self, "_needs_review_dismissed_inherited_paths", None) or set()
-        conflict_types = {"duplicate_destination_projection", "proposed_branch_dependency", "weak_suggestion"}
+        conflict_types = {
+            "duplicate_destination_projection",
+            "proposed_branch_dependency",
+            "weak_suggestion",
+            "migration_live_duplicate_proposed_folder",
+        }
         n_inherited_not_dismissed = 0
         for r in all_rows:
             if not isinstance(r, dict) or str(r.get("review_type", "") or "").strip() != "inherited_mapping":
@@ -13376,6 +13397,135 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(delay_ms, _tick)
 
+    def _migration_identity_preflight_from_ui(self) -> MigrationIdentityPreflight:
+        inputs = getattr(self, "planning_inputs", None) or {}
+        src_site_w = inputs.get("Source Site")
+        dst_site_w = inputs.get("Destination Site")
+        src_lib_w = inputs.get("Source Library")
+        dst_lib_w = inputs.get("Destination Library")
+        src_site_d = src_site_w.currentData() if src_site_w is not None else None
+        dst_site_d = dst_site_w.currentData() if dst_site_w is not None else None
+        src_lib_d = src_lib_w.currentData() if src_lib_w is not None else None
+        dst_lib_d = dst_lib_w.currentData() if dst_lib_w is not None else None
+
+        def _site_key(site: Any) -> str:
+            if not isinstance(site, dict):
+                return ""
+            return str(site.get("site_key") or site.get("web_url") or site.get("id") or "").strip()
+
+        def _site_id(site: Any) -> str:
+            if not isinstance(site, dict):
+                return ""
+            return str(site.get("id") or "").strip()
+
+        src_drv = str(src_lib_d.get("id", "")).strip() if isinstance(src_lib_d, dict) else ""
+        dst_drv = str(dst_lib_d.get("id", "")).strip() if isinstance(dst_lib_d, dict) else ""
+        src_lib_disp = src_lib_w.currentText().strip() if src_lib_w is not None else ""
+        dst_lib_disp = dst_lib_w.currentText().strip() if dst_lib_w is not None else ""
+
+        anchor = ""
+        try:
+            anchor_path = self._destination_visible_library_anchor_canonical_path()
+            if anchor_path:
+                norm = str(anchor_path).replace("/", "\\").strip()
+                parts = [x for x in norm.split("\\") if x]
+                if parts:
+                    anchor = parts[-1]
+        except Exception:
+            anchor = ""
+
+        return MigrationIdentityPreflight(
+            source_site_key=_site_key(src_site_d),
+            source_site_id=_site_id(src_site_d),
+            source_drive_id=src_drv,
+            destination_site_key=_site_key(dst_site_d),
+            destination_site_id=_site_id(dst_site_d),
+            destination_drive_id=dst_drv,
+            source_library_display_name=src_lib_disp,
+            destination_library_display_name=dst_lib_disp,
+            visible_destination_anchor=anchor,
+        )
+
+    def _draft_import_validate_migrated_interactive(self, bundle_dir: Path) -> bool:
+        """Return True only if validation passes (optionally after user confirms rows_rejected / offline migration)."""
+        conf_r = False
+        conf_o = False
+        while True:
+            vr = validate_migrated_import_bundle(
+                bundle_dir,
+                user_confirmed_rows_rejected=conf_r,
+                user_confirmed_offline_migration=conf_o,
+            )
+            if vr.ok:
+                return True
+            err = (vr.error or "").strip()
+            el = err.lower()
+            if "rows_rejected" in el and "confirm" in el:
+                r = QMessageBox.question(
+                    self,
+                    "Import Draft",
+                    f"{err}\n\nDo you want to import this package anyway?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if r == QMessageBox.StandardButton.Yes:
+                    conf_r = True
+                    continue
+                return False
+            if "graph resolution disabled" in el or "offline" in el:
+                r = QMessageBox.question(
+                    self,
+                    "Import Draft",
+                    f"{err}\n\nDo you want to import this package anyway?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if r == QMessageBox.StandardButton.Yes:
+                    conf_o = True
+                    continue
+                return False
+            QMessageBox.warning(self, "Import Draft", err or "Migrated package validation failed.")
+            return False
+
+    def _show_migration_preflight_result_dialog(self, report: dict[str, Any], output_folder: Path) -> bool:
+        """Show migration summary; return True if user chooses to import the migrated folder."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Legacy migration")
+        dlg.resize(520, 380)
+        lay = QVBoxLayout(dlg)
+        txt = QTextEdit()
+        txt.setReadOnly(True)
+        txt.setPlainText(build_migration_report_summary_text(report))
+        lay.addWidget(txt)
+        row = QHBoxLayout()
+        btn_cancel = QPushButton("Cancel")
+        btn_open = QPushButton("Open report")
+        btn_restore = QPushButton("Import migrated backup")
+        row.addWidget(btn_cancel)
+        row.addStretch(1)
+        row.addWidget(btn_open)
+        row.addWidget(btn_restore)
+        lay.addLayout(row)
+        out = {"go": False}
+
+        def _open_report() -> None:
+            md = output_folder / "LegacyMigrationReport.md"
+            js = output_folder / "LegacyMigrationReport.json"
+            p = md if md.is_file() else js
+            if p.is_file():
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(p.resolve())))
+
+        def _do_restore() -> None:
+            out["go"] = True
+            dlg.accept()
+
+        btn_cancel.clicked.connect(dlg.reject)
+        btn_open.clicked.connect(_open_report)
+        btn_restore.clicked.connect(_do_restore)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return False
+        return bool(out["go"])
+
     def _show_non_modal_import_success_message(self, text: str) -> None:
         """Non-modal confirmation so the event loop keeps servicing timers (Graph enrichment, trees)."""
         box = QMessageBox(self)
@@ -13422,6 +13572,18 @@ class MainWindow(QMainWindow):
         self._import_ok_trace_import_t0 = _import_t0
         self._import_ok_trace_graph_tick_logged = False
         self._import_ok_trace("import_handler_enter")
+        source_file = ""
+        source_folder = ""
+        temp_dirs: list[Path] = []
+        source_description = ""
+
+        def _cleanup_import_temps() -> None:
+            for d in temp_dirs:
+                try:
+                    _shutil.rmtree(str(d), ignore_errors=True)
+                except Exception:
+                    pass
+
         try:
             source_file, _ = QFileDialog.getOpenFileName(
                 self,
@@ -13429,17 +13591,109 @@ class MainWindow(QMainWindow):
                 "",
                 "Draft Zip Bundle (*.zip)",
             )
-            source_folder = ""
+            bundle_dir: Path | None = None
             if source_file:
-                self.memory_manager.import_bundle_zip(Path(source_file))
+                td = Path(tempfile.mkdtemp(prefix="ozlink_draft_import_zip_"))
+                temp_dirs.append(td)
+                extract_root = td / "bundle"
+                extract_root.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(Path(source_file), "r") as zf:
+                    zf.extractall(extract_root)
+                bundle_dir = extract_root
                 source_description = source_file
             else:
                 source_folder = QFileDialog.getExistingDirectory(self, "Import Draft Bundle Folder")
                 if not source_folder:
                     self._import_ok_trace("import_handler_cancelled_no_folder")
                     return
-                self.memory_manager.import_bundle(Path(source_folder))
+                bundle_dir = Path(source_folder)
                 source_description = source_folder
+
+            try:
+                kind, meta = classify_import_bundle(bundle_dir)
+
+                if kind == INVALID_UNKNOWN:
+                    QMessageBox.warning(
+                        self,
+                        "Import Draft",
+                        f"Invalid or incomplete draft bundle:\n{meta.get('error', 'unknown')}",
+                    )
+                    return
+
+                self._migration_import_needs_review_rows = []
+
+                if kind == RAW_LEGACY_EXPORT:
+                    ident = self._migration_identity_preflight_from_ui()
+                    if not migration_identity_complete(ident):
+                        QMessageBox.warning(
+                            self,
+                            "Import Draft",
+                            "This legacy backup must be migrated before import. "
+                            "Select Source and Destination site/library in the planning header (resolved Microsoft 365 libraries), "
+                            "then try again.",
+                        )
+                        return
+                    if not (
+                        is_valid_migration_drive_id(ident.source_drive_id)
+                        and is_valid_migration_drive_id(ident.destination_drive_id)
+                    ):
+                        QMessageBox.warning(
+                            self,
+                            "Import Draft",
+                            "Migration requires non-placeholder Graph drive ids. "
+                            "Select real Source and Destination document libraries, then try again.",
+                        )
+                        return
+                    mig_parent = Path(tempfile.mkdtemp(prefix="ozlink_legacy_mig_out_"))
+                    temp_dirs.append(mig_parent)
+                    log_info(
+                        "legacy_import_preflight_started",
+                        bundle=str(bundle_dir),
+                        source_drive_suffix=str(ident.source_drive_id or "")[-16:],
+                        destination_drive_suffix=str(ident.destination_drive_id or "")[-16:],
+                    )
+                    connected = bool(self.current_session_context.get("connected"))
+                    graph = getattr(self, "graph", None)
+                    skip_g = not connected or (graph is None and connected)
+                    res = migrate_legacy_backup_folder(
+                        bundle_dir,
+                        mig_parent,
+                        identity=ident,
+                        graph=graph,
+                        skip_graph_resolution=skip_g,
+                    )
+                    if not res.ok:
+                        log_info(
+                            "legacy_import_preflight_failed",
+                            error=str(res.error_message or "")[:400],
+                            needs_identity=bool(getattr(res, "needs_identity_confirmation", False)),
+                        )
+                        QMessageBox.warning(
+                            self,
+                            "Import Draft",
+                            res.error_message or "Legacy migration preflight failed.",
+                        )
+                        return
+                    log_info("legacy_import_preflight_completed", output_folder=str(res.output_folder or ""))
+                    rep = res.report if isinstance(res.report, dict) else {}
+                    out_fold = res.output_folder
+                    if out_fold is None or not self._show_migration_preflight_result_dialog(rep, Path(out_fold)):
+                        return
+                    bundle_dir = Path(out_fold)
+
+                    kind = MIGRATED_LEGACY_PACKAGE
+
+                if kind == MIGRATED_LEGACY_PACKAGE:
+                    if not self._draft_import_validate_migrated_interactive(bundle_dir):
+                        return
+                    self._migration_import_needs_review_rows = load_migration_conflicts_for_review(bundle_dir)
+                elif kind == MODERN_EXPORT:
+                    self._migration_import_needs_review_rows = []
+
+                self.memory_manager.import_bundle(bundle_dir)
+            finally:
+                _cleanup_import_temps()
+
             self._import_ok_timing("after_bundle_import_io", _import_t0)
             self._import_rehydration_verify_pending = True
             self._import_tree_reload_retry_used = False
@@ -19254,6 +19508,10 @@ class MainWindow(QMainWindow):
 
         suggestion_rows.sort(key=lambda row: (-row["confidence"], row["source_path"].lower()))
         not_planned_rows.sort(key=lambda row: row["source_path"].lower())
+        mig_extra = list(getattr(self, "_migration_import_needs_review_rows", None) or [])
+        if mig_extra:
+            needs_review_rows.extend(mig_extra)
+
         needs_review_rows.sort(key=lambda row: (row["review_type"], row["source_path"].lower()))
 
         self._workflow_not_planned_rows = not_planned_rows
