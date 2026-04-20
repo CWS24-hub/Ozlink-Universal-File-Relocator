@@ -628,11 +628,76 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         nm = str(pl.get("name") or "").strip()
         return normalize_manifest_path(nm) if nm else ""
 
+    def _prune_foreign_top_level_roots_for_intended_identity(
+        self,
+        incoming_by_id: Dict[str, Dict[str, Any]],
+        *,
+        intended_drive_id: str,
+        intended_site_id: str,
+        strict_planned_root_identity: bool,
+    ) -> tuple[int, int]:
+        """Remove top-level hubs that cannot belong to the selected destination before Graph merge."""
+        inv = QModelIndex()
+        intended_d = str(intended_drive_id or "").strip()
+        intended_s = str(intended_site_id or "").strip()
+        if not intended_d and not intended_s and not strict_planned_root_identity:
+            return 0, 0
+        pruned = 0
+        pruned_missing = 0
+        for r in range(self.rowCount(inv) - 1, -1, -1):
+            pl = self.index(r, 0, inv).data(Qt.UserRole) or {}
+            if not isinstance(pl, dict) or pl.get("placeholder"):
+                continue
+            gid = str(pl.get("id") or "").strip()
+            if gid and gid in incoming_by_id:
+                continue
+            row_drive = str(pl.get("drive_id") or "").strip()
+            row_site = str(pl.get("site_id") or "").strip()
+            if intended_s and row_site and intended_s.casefold() != row_site.casefold():
+                self._remove_root_row(r)
+                pruned += 1
+                log_info(
+                    "destination_foreign_top_level_hub_pruned",
+                    reason="site_mismatch",
+                    row_site_suffix=row_site[-16:] if len(row_site) > 16 else row_site,
+                    intended_site_suffix=intended_s[-16:] if len(intended_s) > 16 else intended_s,
+                )
+                continue
+            if intended_d and row_drive and row_drive.casefold() != intended_d.casefold():
+                self._remove_root_row(r)
+                pruned += 1
+                log_info(
+                    "destination_foreign_top_level_hub_pruned",
+                    reason="drive_mismatch",
+                    row_drive_suffix=row_drive[-16:] if len(row_drive) > 16 else row_drive,
+                    intended_drive_suffix=intended_d[-16:] if len(intended_d) > 16 else intended_d,
+                )
+                continue
+            scaffold = (
+                destination_payload_is_planned_workspace_row(pl)
+                or destination_payload_workspace_row_state(pl) == WORKSPACE_ROW_STATE_PLANNED_ONLY
+                or destination_payload_workspace_row_state(pl) == WORKSPACE_ROW_STATE_CACHED_PROVISIONAL
+                or self._merge_preserves_root_row_without_graph_id(pl)
+            )
+            if scaffold and strict_planned_root_identity and intended_d:
+                if not row_drive or row_drive.casefold() != intended_d.casefold():
+                    self._remove_root_row(r)
+                    pruned_missing += 1
+                    log_info(
+                        "destination_foreign_top_level_hub_pruned_missing_identity",
+                        had_row_drive=bool(row_drive),
+                        intended_drive_suffix=intended_d[-16:] if len(intended_d) > 16 else intended_d,
+                    )
+        return pruned, pruned_missing
+
     def merge_sharepoint_library_root_graph_children(
         self,
         graph_payloads: List[Dict[str, Any]],
         *,
         enrich_only: bool = False,
+        intended_drive_id: str = "",
+        intended_site_id: str = "",
+        strict_planned_root_identity: bool = False,
     ) -> Dict[str, int]:
         """Merge live Graph root children into the existing tree without resetting the model.
 
@@ -644,7 +709,15 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         just because the shallow root listing omitted them.
         """
         inv = QModelIndex()
-        stats = {"updated": 0, "inserted": 0, "removed": 0, "skipped_planned": 0, "enrich_only": int(bool(enrich_only))}
+        stats = {
+            "updated": 0,
+            "inserted": 0,
+            "removed": 0,
+            "skipped_planned": 0,
+            "enrich_only": int(bool(enrich_only)),
+            "foreign_pruned": 0,
+            "foreign_pruned_missing_identity": 0,
+        }
 
         incoming: List[Dict[str, Any]] = [
             dict(p) for p in (graph_payloads or []) if isinstance(p, dict) and str(p.get("id") or "").strip()
@@ -656,6 +729,15 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             pk = self._merge_root_row_path_key(p)
             if pk and pk not in incoming_by_path:
                 incoming_by_path[pk] = p
+
+        fp, fpm = self._prune_foreign_top_level_roots_for_intended_identity(
+            incoming_by_id,
+            intended_drive_id=intended_drive_id,
+            intended_site_id=intended_site_id,
+            strict_planned_root_identity=strict_planned_root_identity,
+        )
+        stats["foreign_pruned"] = int(fp)
+        stats["foreign_pruned_missing_identity"] = int(fpm)
 
         used: set[str] = set()
         for r in range(self.rowCount(inv)):

@@ -2963,6 +2963,14 @@ class MainWindow(QMainWindow):
         self._destination_snapshot_mount_drive_id: str = ""
         # Last destination library drive id bound from the picker (detect library changes vs stale snapshot memory).
         self._destination_last_bound_library_drive_id: str = ""
+        # Last destination site identity bound for memory invalidation (see on_site_selector_changed).
+        self._destination_last_memory_site_id: str = ""
+        # After a destination site change, block provisional snapshot placeholder suppression until a valid library load.
+        self._destination_suppress_provisional_placeholder_preservation: bool = False
+        # After explicit destination site/library identity change: disable snapshot-preserving Graph merge until a clean bind.
+        self._destination_snap_preserving_disabled_due_to_identity_change: bool = False
+        # Drop planned rows without matching destination drive after explicit identity change until next valid library bind.
+        self._destination_strict_planning_identity_required: bool = False
         # Tracks which destination drive promoted semantic paths belong to (cleared on library change).
         self._destination_startup_promotion_scope_drive_id: str = ""
         # While memory-truth startup is still attaching / deferred refinement — coalesce forced live snapshot churn.
@@ -12108,6 +12116,13 @@ class MainWindow(QMainWindow):
         self._restored_proposed_count = len(proposed)
         self._sync_restore_destination_overlay_pending_from_unresolved_queues()
         self.refresh_planned_moves_table()
+        try:
+            self._destination_filter_restored_planning_against_session_identity(
+                session_state,
+                context="restore_memory_payload",
+            )
+        except Exception:
+            pass
         log_info(
             "Draft payload restored into runtime.",
             draft_id=self.active_draft_session_id,
@@ -14989,6 +15004,12 @@ class MainWindow(QMainWindow):
             return library.get("id", "")
         return ""
 
+    def _canonical_destination_site_identity_from_data(self, site: dict | None) -> str:
+        """Stable site key for destination identity (matches snapshot / gate comparisons)."""
+        if not isinstance(site, dict):
+            return ""
+        return str(site.get("id") or site.get("site_key") or site.get("web_url") or "").strip()
+
     def _current_selected_destination_site_id(self) -> str:
         """Graph site id for the current Destination Site selector (strict identity with snapshot site)."""
         if not hasattr(self, "planning_inputs"):
@@ -14997,9 +15018,251 @@ class MainWindow(QMainWindow):
         if selector is None:
             return ""
         site = selector.currentData()
-        if isinstance(site, dict):
-            return str(site.get("id") or site.get("site_key") or "").strip()
+        return self._canonical_destination_site_identity_from_data(site if isinstance(site, dict) else None)
+
+    def _planned_move_destination_drive_id(self, move) -> str:
+        if not isinstance(move, dict):
+            return ""
+        d = str(move.get("DestinationDriveId") or "").strip()
+        if d:
+            return d
+        dest = move.get("destination")
+        if isinstance(dest, dict):
+            return str(dest.get("drive_id") or "").strip()
         return ""
+
+    def _proposed_folder_destination_drive_id(self, pf) -> str:
+        if isinstance(pf, dict):
+            return str(pf.get("DestinationDriveId") or "").strip()
+        return str(getattr(pf, "DestinationDriveId", "") or "").strip()
+
+    def _destination_planned_row_matches_selected_identity(
+        self,
+        move,
+        *,
+        sel_drive: str,
+        sel_site: str,
+        strict: bool,
+    ) -> bool:
+        if not isinstance(move, dict):
+            return False
+        md = self._planned_move_destination_drive_id(move)
+        if md and sel_drive and md.casefold() != sel_drive.casefold():
+            return False
+        if strict and sel_drive and (not md):
+            return False
+        ms = str(move.get("DestinationSiteId") or move.get("destination_site_id") or "").strip()
+        if sel_site and ms and ms.casefold() != sel_site.casefold():
+            return False
+        return True
+
+    def _destination_proposed_row_matches_selected_identity(
+        self,
+        pf,
+        *,
+        sel_drive: str,
+        sel_site: str,
+        strict: bool,
+    ) -> bool:
+        md = self._proposed_folder_destination_drive_id(pf)
+        if md and sel_drive and md.casefold() != sel_drive.casefold():
+            return False
+        if strict and sel_drive and (not md):
+            return False
+        if isinstance(pf, dict):
+            ms = str(pf.get("DestinationSiteId") or pf.get("destination_site_id") or "").strip()
+        else:
+            ms = str(getattr(pf, "DestinationSiteId", "") or "").strip()
+        if sel_site and ms and ms.casefold() != sel_site.casefold():
+            return False
+        return True
+
+    def _destination_filter_planning_memory_to_selected_identity(self, *, context: str) -> tuple[int, int]:
+        """Drop planned_moves / proposed_folders that do not match the selected destination site/drive."""
+        if self._planning_browse_mode("destination") == "local":
+            return 0, 0
+        sel_drive = str(self._current_selected_destination_drive_id() or "").strip()
+        if not sel_drive:
+            sel_drive = str((getattr(self, "pending_root_drive_ids", None) or {}).get("destination") or "").strip()
+        sel_site = str(self._current_selected_destination_site_id() or "").strip()
+        strict = bool(getattr(self, "_destination_strict_planning_identity_required", False))
+        if not sel_drive and not strict:
+            return 0, 0
+        if strict and not sel_drive:
+            skipped_m = 0
+            kept_m: list = []
+            for m in list(self.planned_moves or []):
+                if self._planned_move_destination_drive_id(m):
+                    kept_m.append(m)
+                else:
+                    skipped_m += 1
+                    log_info(
+                        "destination_foreign_planning_row_skipped",
+                        kind="planned_move",
+                        context=str(context or "")[:160],
+                        strict=bool(strict),
+                        reason="strict_requires_destination_drive_on_row",
+                    )
+            if skipped_m:
+                self.planned_moves = kept_m
+            skipped_p = 0
+            kept_p: list = []
+            for pf in list(self.proposed_folders or []):
+                if self._proposed_folder_destination_drive_id(pf):
+                    kept_p.append(pf)
+                else:
+                    skipped_p += 1
+                    log_info(
+                        "destination_foreign_planning_row_skipped",
+                        kind="proposed_folder",
+                        context=str(context or "")[:160],
+                        strict=bool(strict),
+                        reason="strict_requires_destination_drive_on_row",
+                    )
+            if skipped_p:
+                self.proposed_folders = kept_p
+            return skipped_m, skipped_p
+        skipped_m = 0
+        kept_m: list = []
+        for m in list(self.planned_moves or []):
+            if self._destination_planned_row_matches_selected_identity(
+                m, sel_drive=sel_drive, sel_site=sel_site, strict=strict
+            ):
+                kept_m.append(m)
+                continue
+            skipped_m += 1
+            log_info(
+                "destination_foreign_planning_row_skipped",
+                kind="planned_move",
+                context=str(context or "")[:160],
+                strict=bool(strict),
+            )
+        if skipped_m:
+            self.planned_moves = kept_m
+        skipped_p = 0
+        kept_p: list = []
+        for pf in list(self.proposed_folders or []):
+            if self._destination_proposed_row_matches_selected_identity(
+                pf, sel_drive=sel_drive, sel_site=sel_site, strict=strict
+            ):
+                kept_p.append(pf)
+                continue
+            skipped_p += 1
+            log_info(
+                "destination_foreign_planning_row_skipped",
+                kind="proposed_folder",
+                context=str(context or "")[:160],
+                strict=bool(strict),
+            )
+        if skipped_p:
+            self.proposed_folders = kept_p
+        return skipped_m, skipped_p
+
+    def _destination_filter_restored_planning_against_session_identity(
+        self,
+        session_state: SessionState,
+        *,
+        context: str,
+    ) -> tuple[int, int]:
+        """Skip draft allocations whose destination drive/site do not match the restored session selection."""
+        exp_drive = str(getattr(session_state, "SelectedDestinationLibraryId", "") or "").strip()
+        exp_site = str(getattr(session_state, "SelectedDestinationSiteKey", "") or "").strip()
+        if not exp_drive and not exp_site:
+            return 0, 0
+        skipped_m = 0
+        kept_m: list = []
+        for m in list(self.planned_moves or []):
+            md = self._planned_move_destination_drive_id(m)
+            ok = True
+            if exp_drive and md and md.casefold() != exp_drive.casefold():
+                ok = False
+            if ok and exp_site:
+                ms = str((m or {}).get("DestinationSiteId") or (m or {}).get("destination_site_id") or "").strip()
+                if ms and ms.casefold() != exp_site.casefold():
+                    ok = False
+            if ok:
+                kept_m.append(m)
+                continue
+            skipped_m += 1
+            log_info(
+                "destination_foreign_planning_reload_skipped",
+                kind="planned_move",
+                context=str(context or "")[:160],
+            )
+        if skipped_m:
+            self.planned_moves = kept_m
+        skipped_p = 0
+        kept_p: list = []
+        for pf in list(self.proposed_folders or []):
+            md = self._proposed_folder_destination_drive_id(pf)
+            ok = True
+            if exp_drive and md and md.casefold() != exp_drive.casefold():
+                ok = False
+            if ok and exp_site:
+                if isinstance(pf, dict):
+                    ms = str(pf.get("DestinationSiteId") or "").strip()
+                else:
+                    ms = str(getattr(pf, "DestinationSiteId", "") or "").strip()
+                if ms and ms.casefold() != exp_site.casefold():
+                    ok = False
+            if ok:
+                kept_p.append(pf)
+                continue
+            skipped_p += 1
+            log_info(
+                "destination_foreign_planning_reload_skipped",
+                kind="proposed_folder",
+                context=str(context or "")[:160],
+            )
+        if skipped_p:
+            self.proposed_folders = kept_p
+        return skipped_m, skipped_p
+
+    def _destination_prune_multi_hub_foreign_roots(self, *, intended_drive_id: str) -> None:
+        """When multiple top-level hubs exist, remove non–live-graph scaffolds that conflict with the selected drive."""
+        model = getattr(self, "destination_planning_model", None)
+        if model is None:
+            return
+        did = str(intended_drive_id or "").strip()
+        if not did:
+            return
+        inv = QModelIndex()
+        try:
+            rc = int(model.rowCount(inv))
+        except Exception:
+            return
+        if rc <= 1:
+            return
+        good_tr: list[int] = []
+        bad_tr: list[int] = []
+        for tr in range(rc):
+            ix = model.index(tr, 0, inv)
+            pl = ix.data(Qt.UserRole) or {}
+            if not isinstance(pl, dict) or pl.get("placeholder"):
+                continue
+            rd = str(pl.get("drive_id") or "").strip()
+            live = destination_payload_is_live_graph_row(pl)
+            if live and rd and rd.casefold() == did.casefold():
+                good_tr.append(tr)
+                continue
+            if live and rd and rd.casefold() != did.casefold():
+                bad_tr.append(tr)
+                continue
+            if not live:
+                bad_tr.append(tr)
+        if not good_tr or not bad_tr:
+            return
+        for tr in sorted(set(bad_tr), reverse=True):
+            try:
+                model._remove_root_row(tr)
+            except Exception:
+                pass
+        log_info(
+            "destination_multi_hub_foreign_prune",
+            removed=len(bad_tr),
+            kept_live=len(good_tr),
+            intended_drive_suffix=did[-16:] if len(did) > 16 else did,
+        )
 
     def _memory_restore_blocks_source_full_count(self) -> bool:
         """True while memory restore owns the session; full library counts must not run yet."""
@@ -20148,7 +20411,24 @@ class MainWindow(QMainWindow):
             if model is not None and self._planning_browse_mode("destination") != "local":
                 raw_items = items if isinstance(items, list) else []
                 payloads = self._destination_root_payloads_from_graph_items(raw_items)
-                stats = model.merge_sharepoint_library_root_graph_children(payloads)
+                dest_did = str(
+                    self.pending_root_drive_ids.get("destination")
+                    or self._current_selected_destination_drive_id()
+                    or drive_id
+                    or ""
+                ).strip()
+                stats = model.merge_sharepoint_library_root_graph_children(
+                    payloads,
+                    intended_drive_id=dest_did,
+                    intended_site_id=self._current_selected_destination_site_id(),
+                    strict_planned_root_identity=bool(
+                        getattr(self, "_destination_strict_planning_identity_required", False)
+                    ),
+                )
+                try:
+                    self._destination_prune_multi_hub_foreign_roots(intended_drive_id=dest_did)
+                except Exception:
+                    pass
             tree = getattr(self, "destination_tree_widget", None)
             if tree is not None:
                 tree.setEnabled(True)
@@ -22139,6 +22419,8 @@ class MainWindow(QMainWindow):
                 shell.DestinationTreeSnapshotIdentityLibraryName = ""
                 shell.DestinationTreeSnapshotIdentitySiteId = ""
                 shell.DestinationTreeSnapshotIdentityInferredFromLegacy = False
+            self._destination_snap_preserving_disabled_due_to_identity_change = True
+            self._destination_strict_planning_identity_required = True
         else:
             log_info(
                 "destination_library_change_snapshot_identity_verified",
@@ -22147,6 +22429,95 @@ class MainWindow(QMainWindow):
             )
 
         self._destination_last_bound_library_drive_id = new_drive
+
+    def _destination_clear_stale_snapshot_state_on_site_change(
+        self,
+        *,
+        selected_site: dict | None,
+        previous_site_id: str,
+        new_site_id: str,
+    ) -> None:
+        """Clear destination runtime memory when the destination site identity changes (before library validity)."""
+        if self._planning_browse_mode("destination") == "local":
+            return
+        rs = getattr(self, "_runtime_session_tree_snapshots", None)
+        if isinstance(rs, dict):
+            rs["destination"] = []
+        pend = getattr(self, "_pending_session_tree_snapshots", None)
+        if isinstance(pend, dict):
+            pend["destination"] = []
+            self._pending_session_tree_snapshots = pend
+        self._destination_provisional_startup_applied = False
+        self._startup_visible_snapshot_bound = False
+        self._destination_startup_snapshot_mount_seen = False
+        try:
+            self._startup_memory_visible_tree_ready_mono = 0.0
+        except Exception:
+            pass
+        self._destination_suppress_provisional_placeholder_preservation = True
+        self._destination_snapshot_mount_drive_id = ""
+        prd = getattr(self, "pending_root_drive_ids", None)
+        if isinstance(prd, dict):
+            prd["destination"] = ""
+        prs = getattr(self, "pending_root_site_ids", None)
+        if isinstance(prs, dict):
+            prs["destination"] = ""
+        self._destination_last_bound_library_drive_id = ""
+
+        model = getattr(self, "destination_planning_model", None)
+        if model is not None:
+            try:
+                model.clear()
+            except Exception:
+                pass
+
+        prior_pm = len(self.planned_moves) if getattr(self, "planned_moves", None) else 0
+        prior_pf = len(self.proposed_folders) if getattr(self, "proposed_folders", None) else 0
+        if prior_pm or prior_pf:
+            self.planned_moves = []
+            self.proposed_folders = []
+            try:
+                self.refresh_planned_moves_table()
+            except Exception:
+                pass
+
+        shell = getattr(self, "_draft_shell_state", None)
+        if isinstance(shell, SessionState):
+            shell.DestinationTreeSnapshotIdentityDriveId = ""
+            shell.DestinationTreeSnapshotIdentityLibraryId = ""
+            shell.DestinationTreeSnapshotIdentityLibraryName = ""
+            shell.DestinationTreeSnapshotIdentitySiteId = ""
+            shell.DestinationTreeSnapshotIdentityInferredFromLegacy = False
+            shell.SelectedDestinationLibraryId = ""
+            shell.SelectedDestinationLibrary = ""
+            if isinstance(selected_site, dict):
+                shell.SelectedDestinationSite = str(selected_site.get("name") or "")
+                shell.SelectedDestinationSiteKey = str(
+                    selected_site.get("site_key") or selected_site.get("web_url") or selected_site.get("id") or ""
+                ).strip()
+            else:
+                shell.SelectedDestinationSite = ""
+                shell.SelectedDestinationSiteKey = ""
+
+        log_info(
+            "destination_site_change_cleared_stale_snapshot",
+            previous_site_suffix=previous_site_id[-16:] if len(previous_site_id) > 16 else previous_site_id,
+            new_site_suffix=new_site_id[-16:] if len(new_site_id) > 16 else new_site_id,
+        )
+        if prior_pm or prior_pf:
+            log_info(
+                "destination_site_change_planning_memory_cleared",
+                prior_planned_count=int(prior_pm),
+                prior_proposed_count=int(prior_pf),
+            )
+        else:
+            log_info(
+                "destination_site_change_planning_memory_cleared",
+                prior_planned_count=0,
+                prior_proposed_count=0,
+            )
+        self._destination_snap_preserving_disabled_due_to_identity_change = True
+        self._destination_strict_planning_identity_required = True
 
     def _select_destination_tree_snapshot_for_startup(
         self,
@@ -23084,6 +23455,32 @@ class MainWindow(QMainWindow):
 
             self._populate_library_selector_for_group(selector_group)
             if selector_group == "destination":
+                site_sel = self.planning_inputs.get("Destination Site")
+                raw_site = site_sel.currentData() if site_sel is not None else None
+                new_id = self._canonical_destination_site_identity_from_data(
+                    raw_site if isinstance(raw_site, dict) else None
+                )
+                prev_id = str(getattr(self, "_destination_last_memory_site_id", "") or "").strip()
+                initial_bind = (not prev_id) and bool(new_id)
+                site_changed_for_memory = (
+                    bool(prev_id or new_id)
+                    and (prev_id.casefold() != new_id.casefold())
+                    and (not initial_bind)
+                )
+                if site_changed_for_memory:
+                    self._destination_clear_stale_snapshot_state_on_site_change(
+                        selected_site=raw_site if isinstance(raw_site, dict) else None,
+                        previous_site_id=prev_id,
+                        new_site_id=new_id,
+                    )
+                log_info(
+                    "destination_selected_site_identity_resolved",
+                    resolved_site_suffix=new_id[-16:] if len(new_id) > 16 else new_id,
+                    previous_site_suffix=prev_id[-16:] if len(prev_id) > 16 else prev_id,
+                    initial_destination_site_bind=bool(initial_bind),
+                    site_memory_reset=bool(site_changed_for_memory),
+                )
+                self._destination_last_memory_site_id = new_id
                 self._maybe_schedule_legacy_snapshot_identity_inference_retry("destination_site_stabilized")
             if chain_library:
                 self.on_library_selector_changed(selector_group, force=force)
@@ -23172,10 +23569,16 @@ class MainWindow(QMainWindow):
             self.update_selector_context_labels()
             self._log_library_restore_step("step_05_update_labels_exit", selector_group=selector_group)
             if selector_group == "destination":
+                self._destination_suppress_provisional_placeholder_preservation = False
+                self._destination_last_memory_site_id = self._canonical_destination_site_identity_from_data(
+                    selected_site if isinstance(selected_site, dict) else None
+                )
                 self._destination_clear_stale_snapshot_state_on_library_change(
                     selected_site=selected_site if isinstance(selected_site, dict) else None,
                     selected_library=selected_library if isinstance(selected_library, dict) else None,
                 )
+                self._destination_filter_planning_memory_to_selected_identity(context="on_library_selector_valid")
+                self._destination_strict_planning_identity_required = False
             self._log_library_restore_step("step_06_load_library_root_enter", selector_group=selector_group)
             self.load_library_root(selector_group, selected_site, selected_library)
             if not getattr(self, "_memory_restore_in_progress", False):
@@ -23361,9 +23764,14 @@ class MainWindow(QMainWindow):
                 mount_did = str(getattr(self, "_destination_snapshot_mount_drive_id", "") or "").strip()
                 loading_msg = msg_s.lower().startswith("loading")
                 same_library_as_snapshot_mount = (not mount_did or not did_pending or mount_did == did_pending)
-                if loading_msg and same_library_as_snapshot_mount and (
-                    getattr(self, "_destination_provisional_startup_applied", False)
-                    or getattr(self, "_destination_startup_snapshot_mount_seen", False)
+                if (
+                    loading_msg
+                    and same_library_as_snapshot_mount
+                    and not getattr(self, "_destination_suppress_provisional_placeholder_preservation", False)
+                    and (
+                        getattr(self, "_destination_provisional_startup_applied", False)
+                        or getattr(self, "_destination_startup_snapshot_mount_seen", False)
+                    )
                 ):
                     quiet = str(
                         getattr(self, "_destination_provisional_startup_status_message", "") or ""
@@ -28384,7 +28792,8 @@ class MainWindow(QMainWindow):
                 did_shell_early = str(
                     self.pending_root_drive_ids.get("destination") or self._current_selected_destination_drive_id() or ""
                 ).strip()
-                snap_preserving = bool(
+                identity_snap_block = bool(getattr(self, "_destination_snap_preserving_disabled_due_to_identity_change", False))
+                snap_eligible = bool(
                     (
                         bool(getattr(self, "_destination_provisional_startup_applied", False))
                         or bool(pre_graph_snapshot_mount)
@@ -28393,6 +28802,12 @@ class MainWindow(QMainWindow):
                     )
                     and hasattr(model, "merge_sharepoint_library_root_graph_children")
                 )
+                if identity_snap_block and snap_eligible:
+                    log_info(
+                        "destination_snap_preserving_disabled_due_to_identity_change",
+                        drive_id_suffix=did_shell_early[-16:] if len(did_shell_early) > 16 else did_shell_early,
+                    )
+                snap_preserving = bool(snap_eligible and not identity_snap_block)
                 rows_top_before = int(model.rowCount(QModelIndex()))
                 nodes_before = 0
                 try:
@@ -28452,6 +28867,11 @@ class MainWindow(QMainWindow):
                         merge_stats = model.merge_sharepoint_library_root_graph_children(
                             payloads,
                             enrich_only=True,
+                            intended_drive_id=did_shell_early,
+                            intended_site_id=self._current_selected_destination_site_id(),
+                            strict_planned_root_identity=bool(
+                                getattr(self, "_destination_strict_planning_identity_required", False)
+                            ),
                         )
                     except Exception as exc:
                         log_info(
@@ -28533,6 +28953,13 @@ class MainWindow(QMainWindow):
                         snap_preserving=True,
                         drive_id_suffix=did_shell[-16:] if len(did_shell) > 16 else did_shell,
                     )
+                    try:
+                        self._destination_prune_multi_hub_foreign_roots(intended_drive_id=did_shell_early)
+                        self._destination_filter_planning_memory_to_selected_identity(
+                            context="after_graph_root_merge_snap_preserving",
+                        )
+                    except Exception:
+                        pass
                 else:
                     log_info(
                         "destination_authority_handoff_summary",
@@ -28562,6 +28989,14 @@ class MainWindow(QMainWindow):
                         extra=f"graph_item_count={len(items or [])}",
                     )
                     model.reset_root_payloads(payloads)
+                    self._destination_snap_preserving_disabled_due_to_identity_change = False
+                    try:
+                        self._destination_prune_multi_hub_foreign_roots(intended_drive_id=did_shell_early)
+                        self._destination_filter_planning_memory_to_selected_identity(
+                            context="after_graph_root_bind_shallow_reset",
+                        )
+                    except Exception:
+                        pass
                     _err_fb = 0
                     _rm = 0
                     _ins = len(payloads)
@@ -31778,6 +32213,42 @@ class MainWindow(QMainWindow):
                 hub_canons.append(c)
         if len(hub_canons) == 1:
             return hub_canons[0]
+        if len(hub_canons) > 1:
+            sel_drive = str(self._current_selected_destination_drive_id() or "").strip()
+            if not sel_drive:
+                sel_drive = str((getattr(self, "pending_root_drive_ids", None) or {}).get("destination") or "").strip()
+            for tr in range(rc):
+                ix = model.index(tr, 0, root)
+                if not ix.isValid():
+                    continue
+                pl = ix.data(Qt.UserRole) or {}
+                if not isinstance(pl, dict) or pl.get("placeholder"):
+                    continue
+                if not bool(pl.get("is_folder", False)):
+                    continue
+                rd = str(pl.get("drive_id") or "").strip()
+                if (
+                    sel_drive
+                    and rd
+                    and rd.casefold() == sel_drive.casefold()
+                    and destination_payload_is_live_graph_row(pl)
+                ):
+                    p = self._tree_item_path(pl)
+                    if not p:
+                        continue
+                    c = self._canonical_destination_projection_path(p) or self.normalize_memory_path(p)
+                    if c:
+                        log_info(
+                            "destination_anchor_multiple_hubs_resolved_to_live_graph",
+                            anchor_excerpt=str(c)[:200],
+                            drive_suffix=sel_drive[-16:] if len(sel_drive) > 16 else sel_drive,
+                        )
+                        return c
+            log_info(
+                "destination_anchor_multiple_hubs_blocked",
+                hub_count=int(len(hub_canons)),
+            )
+            return ""
         if rc == 1:
             ix = model.index(0, 0, root)
             if not ix.isValid():
@@ -50149,6 +50620,12 @@ class MainWindow(QMainWindow):
 
     def _startup_memory_truth_ensure_missing_intended_paths(self) -> tuple[int, list[str]]:
         """Second pass: bind planned chains for persisted targets still absent from visible planned rows."""
+        try:
+            self._destination_filter_planning_memory_to_selected_identity(
+                context="startup_memory_truth_ensure",
+            )
+        except Exception:
+            pass
         raw_intended = self._destination_collect_intended_workspace_target_canonical_paths()
         intended = []
         for p in raw_intended:
@@ -50183,6 +50660,12 @@ class MainWindow(QMainWindow):
 
     def _destination_planning_overlay_replay_persisted_only(self, ctx: str, *, destination_expanded_paths: Optional[set[str]] = None) -> int:
         """Replay unresolved proposed/allocation queues + visible allocation descendants (no reconcile/hydrate)."""
+        try:
+            self._destination_filter_planning_memory_to_selected_identity(
+                context=f"overlay_replay:{str(ctx or '')[:120]}",
+            )
+        except Exception:
+            pass
         if getattr(self, "_startup_memory_minimal_replay_active", False):
             log_info(
                 "startup_memory_minimal_replay_heavy_path_blocked",
@@ -50342,6 +50825,12 @@ class MainWindow(QMainWindow):
         narrow_restore_real_snapshot=False,
         force_authoritative_bind=False,
     ):
+        try:
+            self._destination_filter_planning_memory_to_selected_identity(
+                context=str(reason or "")[:160],
+            )
+        except Exception:
+            pass
         if str(reason or "").startswith("startup_planned_workspace_memory_truth"):
             return self._apply_destination_planning_overlays_body_memory_truth_startup(
                 reason,

@@ -489,7 +489,14 @@ def apply_destination_snapshot_identity_gate(
 
     ins = str(intended_site_id or "").strip()
     sts = str(snapshot_stored_site_id or "").strip()
-    if ins and sts:
+    if ins:
+        if not sts:
+            log_info(
+                "destination_snapshot_rejected_selected_site_missing_for_explicit_site_change",
+                source=str(source)[:40],
+                intended_site_suffix=ins[-16:] if len(ins) > 16 else ins,
+            )
+            return [], "rejected_snapshot_site_missing_for_explicit_intended"
         if ins.casefold() != sts.casefold():
             log_info(
                 "destination_snapshot_rejected_selected_site_mismatch",
@@ -502,8 +509,7 @@ def apply_destination_snapshot_identity_gate(
         log_info(
             "destination_snapshot_site_identity_check_skipped",
             source=str(source)[:40],
-            reason="one_or_both_site_ids_missing",
-            has_intended_site=bool(ins),
+            reason="intended_site_empty",
             has_snapshot_site=bool(sts),
         )
 

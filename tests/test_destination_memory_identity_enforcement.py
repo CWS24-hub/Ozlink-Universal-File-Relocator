@@ -86,7 +86,7 @@ class DestinationMemoryIdentityEnforcementTests(unittest.TestCase):
         self.assertEqual(out, [])
         self.assertEqual(tag, "rejected_site_mismatch")
 
-    def test_site_check_skipped_logged_when_site_partially_missing(self):
+    def test_explicit_intended_site_rejects_when_snapshot_site_missing(self):
         snaps = [_dest_root("R", "d1")]
         out, tag = apply_destination_snapshot_identity_gate(
             snaps,
@@ -96,6 +96,20 @@ class DestinationMemoryIdentityEnforcementTests(unittest.TestCase):
             source="session",
             intended_site_id="site-a",
             snapshot_stored_site_id="",
+        )
+        self.assertEqual(out, [])
+        self.assertEqual(tag, "rejected_snapshot_site_missing_for_explicit_intended")
+
+    def test_site_check_skipped_when_intended_site_empty(self):
+        snaps = [_dest_root("R", "d1")]
+        out, tag = apply_destination_snapshot_identity_gate(
+            snaps,
+            intended_drive_id="d1",
+            snapshot_stored_drive_id="d1",
+            snapshot_stored_library_id="d1",
+            source="session",
+            intended_site_id="",
+            snapshot_stored_site_id="site-a",
         )
         self.assertEqual(len(out), 1)
         self.assertEqual(tag, "identity_ok")
@@ -146,6 +160,97 @@ class DestinationMemoryIdentityEnforcementTests(unittest.TestCase):
         self.assertFalse(mw._startup_visible_snapshot_bound)
         self.assertFalse(mw._destination_startup_snapshot_mount_seen)
         self.assertEqual(mw._draft_shell_state.DestinationTreeSnapshotIdentityDriveId, "")
+        mw.destination_planning_model.clear.assert_called_once()
+
+    def test_site_change_clears_snapshots_before_library_valid_even_if_library_invalid(self):
+        """Stale runtime/pending snapshots clear on site change even when library currentData is invalid."""
+        mw = MainWindow.__new__(MainWindow)
+        mw._planning_browse_mode = lambda _k: "sharepoint"
+        mw._destination_last_memory_site_id = "site-a"
+        mw._runtime_session_tree_snapshots = {"source": [], "destination": [{"k": 1}]}
+        mw._pending_session_tree_snapshots = {"destination": [{"k": 2}]}
+        mw.pending_root_drive_ids = {"source": "", "destination": ""}
+        mw.pending_root_site_ids = {"source": "", "destination": ""}
+        mw._draft_shell_state = SessionState(DestinationTreeSnapshotIdentityDriveId="d1")
+        site_sel = MagicMock()
+        site_sel.currentData.return_value = {"id": "site-b", "name": "B"}
+        lib_sel = MagicMock()
+        lib_sel.currentData.return_value = None
+        mw.planning_inputs = {"Destination Site": site_sel, "Destination Library": lib_sel}
+        mw._populate_library_selector_for_group = lambda _g: None
+        mw._maybe_schedule_legacy_snapshot_identity_inference_retry = lambda *_a, **_k: None
+        mw._pending_login_restore_args = None
+        mw._suppress_selector_change_handlers = False
+        mw.bottom_destination = MagicMock()
+        mw.set_tree_placeholder = lambda *a, **k: None
+        mw.update_selector_context_labels = lambda *a, **k: None
+        with patch("ozlink_console.main_window.log_info", lambda *a, **k: None):
+            MainWindow.on_site_selector_changed(mw, "destination", chain_library=True)
+        self.assertEqual(mw._runtime_session_tree_snapshots["destination"], [])
+        self.assertEqual(mw._pending_session_tree_snapshots["destination"], [])
+        self.assertEqual(mw._destination_last_memory_site_id, "site-b")
+
+    def test_destination_site_change_resets_snapshot_bound_flags(self):
+        mw = MainWindow.__new__(MainWindow)
+        mw._planning_browse_mode = lambda _k: "sharepoint"
+        mw._runtime_session_tree_snapshots = {"destination": [{"x": 1}]}
+        mw._pending_session_tree_snapshots = {"destination": []}
+        mw._destination_provisional_startup_applied = True
+        mw._startup_visible_snapshot_bound = True
+        mw._destination_startup_snapshot_mount_seen = True
+        mw._startup_memory_visible_tree_ready_mono = 1.0
+        mw._draft_shell_state = SessionState()
+        mw.destination_planning_model = MagicMock()
+        mw.pending_root_drive_ids = {"source": "", "destination": "pd"}
+        mw.pending_root_site_ids = {"source": "", "destination": "ps"}
+        with patch("ozlink_console.main_window.log_info", lambda *a, **k: None):
+            MainWindow._destination_clear_stale_snapshot_state_on_site_change(
+                mw,
+                selected_site={"id": "s2", "name": "S"},
+                previous_site_id="s1",
+                new_site_id="s2",
+            )
+        self.assertFalse(mw._destination_provisional_startup_applied)
+        self.assertFalse(mw._startup_visible_snapshot_bound)
+        self.assertFalse(mw._destination_startup_snapshot_mount_seen)
+        self.assertEqual(mw._startup_memory_visible_tree_ready_mono, 0.0)
+        self.assertTrue(mw._destination_suppress_provisional_placeholder_preservation)
+        self.assertEqual(mw.pending_root_drive_ids["destination"], "")
+        self.assertEqual(mw.pending_root_site_ids["destination"], "")
+
+    def test_cross_site_same_library_name_snapshot_not_reused_when_site_mismatch(self):
+        """Same drive id label across sites: explicit intended site without snapshot site is rejected."""
+        snaps = [_dest_root("Documents", "docs-drive-1")]
+        out, tag = apply_destination_snapshot_identity_gate(
+            snaps,
+            intended_drive_id="docs-drive-1",
+            snapshot_stored_drive_id="docs-drive-1",
+            snapshot_stored_library_id="docs-drive-1",
+            source="session",
+            intended_site_id="site-contoso",
+            snapshot_stored_site_id="",
+        )
+        self.assertEqual(out, [])
+        self.assertEqual(tag, "rejected_snapshot_site_missing_for_explicit_intended")
+
+    def test_site_change_clears_destination_planning_model(self):
+        mw = MainWindow.__new__(MainWindow)
+        mw._planning_browse_mode = lambda _k: "sharepoint"
+        mw._runtime_session_tree_snapshots = {"destination": []}
+        mw._pending_session_tree_snapshots = {"destination": []}
+        mw._draft_shell_state = SessionState()
+        mw.destination_planning_model = MagicMock()
+        mw.pending_root_drive_ids = {"source": "", "destination": ""}
+        mw.pending_root_site_ids = {"source": "", "destination": ""}
+        mw.planned_moves = []
+        mw.proposed_folders = []
+        with patch("ozlink_console.main_window.log_info", lambda *a, **k: None):
+            MainWindow._destination_clear_stale_snapshot_state_on_site_change(
+                mw,
+                selected_site={"id": "s2"},
+                previous_site_id="s0",
+                new_site_id="s2",
+            )
         mw.destination_planning_model.clear.assert_called_once()
 
 
