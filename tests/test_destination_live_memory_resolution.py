@@ -128,21 +128,33 @@ def test_d_remove_blocked_when_dependent_allocations(monkeypatch: pytest.MonkeyP
     assert "depend" in (warns[0] if warns else "").lower()
 
 
-def test_e_rename_stub_logs(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_e_rename_logs_requested_then_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
     mw = MainWindow.__new__(MainWindow)
+    mw._live_memory_retarget_pending_indices = []
+    mw._live_memory_retarget_tree_hook = []
+    mw.proposed_folders = [ProposedFolder(FolderName="HR", DestinationPath=r"Root3\HR")]
     monkeypatch.setattr("ozlink_console.main_window.QMessageBox.information", lambda *_a, **_k: None)
+    monkeypatch.setattr("ozlink_console.main_window.QMessageBox.warning", lambda *_a, **_k: None)
     events: list[str] = []
 
     def _log(msg: str, **_kw) -> None:
         events.append(msg)
 
     monkeypatch.setattr("ozlink_console.main_window.log_info", _log)
-    MainWindow._live_duplicate_proposed_folder_rename_stub(mw, _row())
+    monkeypatch.setattr(
+        "ozlink_console.main_window.QInputDialog.getText",
+        lambda *a, **k: ("", False),
+    )
+    mw._canonical_destination_projection_path = lambda p: str(p or "").replace("/", "\\")  # type: ignore[method-assign]
+    MainWindow._live_duplicate_proposed_folder_run_rename(mw, _row())
     assert "destination_live_memory_duplicate_rename_requested" in events
+    assert "destination_live_memory_duplicate_rename_cancelled" in events
 
 
-def test_f_retarget_stub_logs(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_f_retarget_logs_requested_and_started_with_dependents(monkeypatch: pytest.MonkeyPatch) -> None:
     mw = MainWindow.__new__(MainWindow)
+    mw._live_memory_retarget_pending_indices = []
+    mw._live_memory_retarget_tree_hook = []
     monkeypatch.setattr("ozlink_console.main_window.QMessageBox.information", lambda *_a, **_k: None)
     events: list[str] = []
 
@@ -150,8 +162,22 @@ def test_f_retarget_stub_logs(monkeypatch: pytest.MonkeyPatch) -> None:
         events.append(msg)
 
     monkeypatch.setattr("ozlink_console.main_window.log_info", _log)
-    MainWindow._live_duplicate_proposed_folder_retarget_stub(mw, _row())
+    mw.proposed_folders = [ProposedFolder(FolderName="HR", DestinationPath=r"Root3\HR")]
+    mw.planned_moves = [
+        {"source_path": "s1", "destination_path": r"Root3\HR\f.txt", "source": {"is_folder": False}},
+    ]
+    mw.destination_tree_widget = None
+    mw.normalize_memory_path = lambda p: str(p or "").replace("/", "\\")  # type: ignore[method-assign]
+    mw._canonical_destination_projection_path = lambda p: str(p or "").replace("/", "\\")  # type: ignore[method-assign]
+
+    def _deps(_dp):
+        return [mw.planned_moves[0]]
+
+    mw._planned_moves_dependent_on_proposed_destination = _deps  # type: ignore[method-assign]
+    MainWindow._live_duplicate_proposed_folder_begin_retarget(mw, _row())
+    MainWindow._end_live_memory_duplicate_retarget_session(mw, cancelled=True)
     assert "destination_live_memory_duplicate_retarget_requested" in events
+    assert "destination_live_memory_duplicate_retarget_started" in events
 
 
 def test_filter_runtime_rows_removes_one_match() -> None:

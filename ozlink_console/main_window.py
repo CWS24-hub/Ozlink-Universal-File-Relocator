@@ -25,7 +25,7 @@ import shutil as _shutil
 import requests
 from datetime import datetime, timezone
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Tuple
 import xml.etree.ElementTree as ET
 
@@ -158,6 +158,7 @@ from ozlink_console.destination_live_memory_conflicts import (
     merge_unique,
     normalize_path_key,
 )
+from ozlink_console.destination_delta_scoped_overlay import build_delta_overlay_scope_paths
 from ozlink_console.destination_live_memory_resolution import (
     RESOLVED_BY_ACCEPT_EXISTING_LIVE_FOLDER,
     apply_accept_existing_live_folder_to_proposed_folder,
@@ -3442,6 +3443,8 @@ class MainWindow(QMainWindow):
         self.discovered_sites = []
         self._retarget_mode_active = False
         self._retarget_row_index = None
+        self._live_memory_retarget_pending_indices: list[int] = []
+        self._live_memory_retarget_tree_hook: list[tuple[Any, Any]] = []
         self._plan_leaf_exclusions = set()
         self._cached_duplicate_destination_groups: dict[str, list] = {}
         self._planning_derived_state = PlanningDerivedState(
@@ -15311,6 +15314,7 @@ class MainWindow(QMainWindow):
             "proposed_branch_dependency",
             "weak_suggestion",
             REVIEW_TYPE_DESTINATION_ANCHOR_MISSING,
+            REVIEW_TYPE_LIVE_MEMORY_DUPLICATE,
         }
         nra = sum(
             1
@@ -20061,10 +20065,10 @@ class MainWindow(QMainWindow):
                 dlg.accept()
 
         def _on_rename() -> None:
-            self._live_duplicate_proposed_folder_rename_stub(row_data)
+            self._live_duplicate_proposed_folder_run_rename(row_data, parent=dlg)
 
         def _on_retarget() -> None:
-            self._live_duplicate_proposed_folder_retarget_stub(row_data)
+            self._live_duplicate_proposed_folder_begin_retarget(row_data, parent=dlg)
 
         btn_accept.clicked.connect(_on_accept)
         btn_remove.clicked.connect(_on_remove)
@@ -20179,32 +20183,250 @@ class MainWindow(QMainWindow):
         )
         return True
 
-    def _live_duplicate_proposed_folder_rename_stub(self, row_data: dict) -> None:
-        log_info(
-            "destination_live_memory_duplicate_rename_requested",
-            subtype=str(row_data.get("live_memory_subtype") or "")[:80],
-            source_path=str(row_data.get("source_path") or "")[:260],
-        )
-        QMessageBox.information(
-            self,
-            "Rename proposed folder",
-            "Full rename from this dialog is not wired yet. "
-            "Rename the proposed folder from the planning workspace (proposed folders / inline rename) "
-            "so the path no longer collides, then review Needs Review again.",
-        )
+    def _disconnect_live_memory_duplicate_retarget_tree(self) -> None:
+        for sig, slot in list(getattr(self, "_live_memory_retarget_tree_hook", []) or []):
+            try:
+                sig.disconnect(slot)
+            except Exception:
+                pass
+        self._live_memory_retarget_tree_hook = []
 
-    def _live_duplicate_proposed_folder_retarget_stub(self, row_data: dict) -> None:
+    def _connect_live_memory_duplicate_retarget_tree(self) -> None:
+        self._disconnect_live_memory_duplicate_retarget_tree()
+        tw = getattr(self, "destination_tree_widget", None)
+        if tw is None:
+            return
+        if isinstance(tw, QTreeView):
+
+            def _slot(ix: QModelIndex) -> None:
+                self._on_live_memory_retarget_destination_pick(ix)
+
+            tw.clicked.connect(_slot)
+            self._live_memory_retarget_tree_hook.append((tw.clicked, _slot))
+        else:
+
+            def _slot2(it: QTreeWidgetItem, _col: int) -> None:
+                self._on_live_memory_retarget_destination_pick(it)
+
+            tw.itemClicked.connect(_slot2)
+            self._live_memory_retarget_tree_hook.append((tw.itemClicked, _slot2))
+
+    def _end_live_memory_duplicate_retarget_session(
+        self, *, cancelled: bool = False, failed: bool = False, error_excerpt: str = ""
+    ) -> None:
+        self._disconnect_live_memory_duplicate_retarget_tree()
+        self._live_memory_retarget_pending_indices = []
+        if cancelled:
+            log_info("destination_live_memory_duplicate_retarget_cancelled")
+        elif failed:
+            log_info(
+                "destination_live_memory_duplicate_retarget_failed",
+                error_excerpt=str(error_excerpt or "")[:400],
+            )
+
+    def _on_live_memory_retarget_destination_pick(self, item_ref) -> None:
+        if not getattr(self, "_live_memory_retarget_pending_indices", None):
+            return
+        if self._planning_browse_mode("destination") == "local":
+            QMessageBox.warning(
+                self,
+                "Retarget allocations",
+                "Switch the destination panel to SharePoint, then pick a folder.",
+            )
+            return
+        idx = int(self._live_memory_retarget_pending_indices[0])
+        n = len(self.planned_moves or [])
+        if idx < 0 or idx >= n:
+            self._end_live_memory_duplicate_retarget_session(failed=True, error_excerpt="planned_move_index_out_of_range")
+            return
+        nd = self.get_tree_item_node_data(item_ref) or {}
+        if not self.node_is_manual_drag_destination_folder(nd):
+            QMessageBox.information(
+                self,
+                "Retarget allocations",
+                "Select a valid destination folder row (not a file).",
+            )
+            return
+        ok = self._planning_retarget_planned_file_to_folder_node(self, idx, nd, interactive_confirm=True)
+        if not ok:
+            log_info(
+                "destination_live_memory_duplicate_retarget_cancelled",
+                reason="retarget_not_applied",
+                planned_index=int(idx),
+            )
+            return
+        self._live_memory_retarget_pending_indices.pop(0)
+        self.refresh_planned_moves_table()
+        self._refresh_workflow_state_on_demand()
+        self._refresh_planning_derived_state("live_memory_duplicate_retarget")
+        self._notify_planning_mutation_destination_snapshot_dirty(
+            reason="live_memory_duplicate_retarget",
+            surface="live_memory_duplicate",
+        )
+        if not self._live_memory_retarget_pending_indices:
+            n0 = int(getattr(self, "_live_memory_retarget_initial_count", 0) or 0)
+            log_info("destination_live_memory_duplicate_retarget_completed", retargeted_planned_rows=int(n0))
+            self._disconnect_live_memory_duplicate_retarget_tree()
+            QMessageBox.information(
+                self,
+                "Retarget allocations",
+                "Retarget completed for dependent mappings.",
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Retarget allocations",
+                f"{len(self._live_memory_retarget_pending_indices)} mapping(s) remain — pick another folder.",
+            )
+
+    def _live_duplicate_proposed_folder_begin_retarget(self, row_data: dict, parent: QWidget | None = None) -> None:
         log_info(
             "destination_live_memory_duplicate_retarget_requested",
             subtype=str(row_data.get("live_memory_subtype") or "")[:80],
             source_path=str(row_data.get("source_path") or "")[:260],
         )
-        QMessageBox.information(
-            self,
-            "Retarget allocations",
-            "Automated retarget from this dialog is not wired yet. "
-            "Use Retarget on the relevant planned rows or the duplicate / review tools in the planning workspace.",
+        host = parent or self
+        if self._live_memory_retarget_pending_indices:
+            self._end_live_memory_duplicate_retarget_session(cancelled=True)
+        idx_pf = self._proposed_folder_index_for_live_duplicate_row(row_data)
+        if idx_pf < 0:
+            QMessageBox.warning(host, "Retarget allocations", "Could not find the matching proposed folder row.")
+            return
+        pf = self._coerce_proposed_folder_model((self.proposed_folders or [])[idx_pf])
+        if pf is None:
+            QMessageBox.warning(host, "Retarget allocations", "Invalid proposed folder row.")
+            return
+        proposed_canon = self._canonical_destination_projection_path(getattr(pf, "DestinationPath", "") or "") or ""
+        deps = self._planned_moves_dependent_on_proposed_destination(proposed_canon)
+        indices: list[int] = []
+        for i, m in enumerate(self.planned_moves or []):
+            if not any(m is d for d in deps):
+                continue
+            src = m.get("source") or {}
+            if isinstance(src, dict) and bool(src.get("is_folder")):
+                continue
+            indices.append(i)
+        if not indices:
+            QMessageBox.information(
+                host,
+                "Retarget allocations",
+                "No dependent file allocations need retarget. Folder mappings are not retargeted from this dialog.",
+            )
+            return
+        log_info(
+            "destination_live_memory_duplicate_retarget_started",
+            dependent_count=len(indices),
+            proposed_path_excerpt=str(proposed_canon)[:260],
         )
+        self._live_memory_retarget_initial_count = int(len(indices))
+        self._live_memory_retarget_pending_indices = list(indices)
+        self._connect_live_memory_duplicate_retarget_tree()
+        QMessageBox.information(
+            host,
+            "Retarget allocations",
+            f"{len(indices)} planned file mapping(s) depend on this proposed folder.\n\n"
+            "Click a destination folder in the SharePoint destination tree for each mapping. "
+            "This is planning-only and does not change SharePoint content.",
+        )
+
+    def _live_duplicate_proposed_folder_run_rename(self, row_data: dict, parent: QWidget | None = None) -> None:
+        log_info(
+            "destination_live_memory_duplicate_rename_requested",
+            subtype=str(row_data.get("live_memory_subtype") or "")[:80],
+            source_path=str(row_data.get("source_path") or "")[:260],
+        )
+        host = parent or self
+        live_path = str(row_data.get("live_graph_path") or row_data.get("action") or "")
+        idx = self._proposed_folder_index_for_live_duplicate_row(row_data)
+        if idx < 0:
+            log_info("destination_live_memory_duplicate_rename_failed", reason="proposed_folder_not_found")
+            QMessageBox.warning(host, "Rename proposed folder", "Could not find the matching proposed folder row.")
+            return
+        pf = self._coerce_proposed_folder_model((self.proposed_folders or [])[idx])
+        if pf is None:
+            log_info("destination_live_memory_duplicate_rename_failed", reason="invalid_proposed_model")
+            QMessageBox.warning(host, "Rename proposed folder", "Invalid proposed folder row.")
+            return
+        existing_proposed = self._find_proposed_folder_record_by_path(
+            str(getattr(pf, "DestinationPath", "") or ""),
+        )
+        if existing_proposed is not None and self._is_proposed_folder_submitted(existing_proposed):
+            log_info("destination_live_memory_duplicate_rename_failed", reason="submitted_locked")
+            self._show_submitted_item_locked_message(
+                "Rename proposed folder",
+                f"'{getattr(pf, 'FolderName', 'This proposed folder')}'",
+                self._submitted_batch_id_for_proposed_folder(existing_proposed),
+            )
+            return
+        orig_canon = self._canonical_destination_projection_path(getattr(pf, "DestinationPath", "") or "") or ""
+        segs = self._path_segments(orig_canon)
+        leaf = segs[-1] if segs else str(getattr(pf, "FolderName", "") or "").strip()
+        new_name, accepted = QInputDialog.getText(
+            host,
+            "Rename proposed folder",
+            "New folder name (planning only — does not rename anything in SharePoint):",
+            text=str(leaf or ""),
+        )
+        if not accepted:
+            log_info("destination_live_memory_duplicate_rename_cancelled", reason="input_dialog_rejected")
+            return
+        new_name = str(new_name or "").strip()
+        if not new_name:
+            log_info("destination_live_memory_duplicate_rename_cancelled", reason="empty_name")
+            return
+        if new_name.casefold() == str(leaf or "").strip().casefold():
+            log_info("destination_live_memory_duplicate_rename_cancelled", reason="unchanged_name")
+            return
+        parent_path = self._destination_parent_path(orig_canon)
+        proposed_path = self.normalize_memory_path("\\".join(part for part in [parent_path, new_name] if part))
+        if not proposed_path:
+            log_info("destination_live_memory_duplicate_rename_failed", reason="empty_destination_path")
+            return
+        if normalize_path_key(proposed_path) == normalize_path_key(live_path):
+            log_info(
+                "destination_live_memory_duplicate_rename_failed",
+                reason="collides_with_live_graph_path",
+            )
+            QMessageBox.warning(
+                host,
+                "Rename proposed folder",
+                "That path still matches the live folder at the same location. Choose a different name.",
+            )
+            return
+        log_info(
+            "destination_live_memory_duplicate_rename_started",
+            from_path_excerpt=str(orig_canon)[:260],
+            to_path_excerpt=str(proposed_path)[:260],
+        )
+        visible = self._find_visible_destination_item_by_path(orig_canon)
+        try:
+            self._rewrite_proposed_branch_runtime_paths(orig_canon, proposed_path)
+            if visible is not None and isinstance(visible, QModelIndex) and visible.isValid():
+                self._rename_visible_destination_subtree_index(visible, orig_canon, proposed_path)
+            elif visible is not None and not isinstance(visible, QModelIndex):
+                self._rename_visible_destination_subtree(visible, orig_canon, proposed_path)
+        except Exception as exc:
+            log_info("destination_live_memory_duplicate_rename_failed", error=str(exc)[:400])
+            QMessageBox.warning(
+                host,
+                "Rename proposed folder",
+                f"Rename failed: {str(exc)[:500]}",
+            )
+            return
+        self._drop_runtime_live_memory_conflict_row(row_data)
+        self._refresh_workflow_state_on_demand()
+        self._refresh_proposed_folders_table()
+        self._refresh_planning_derived_state("live_memory_duplicate_rename")
+        self._notify_planning_mutation_destination_snapshot_dirty(
+            reason="live_memory_duplicate_rename",
+            surface="live_memory_duplicate",
+        )
+        log_info(
+            "destination_live_memory_duplicate_rename_completed",
+            new_path_excerpt=str(proposed_path)[:260],
+        )
+        if hasattr(self, "destination_tree_status") and self.destination_tree_status is not None:
+            self.destination_tree_status.setText("Proposed folder renamed (live folder unchanged).")
 
     def update_selector_context_labels(self):
         if not hasattr(self, "planning_inputs"):
@@ -23672,7 +23894,7 @@ class MainWindow(QMainWindow):
         return proposed, planned, alloc_targets
 
     def _destination_try_scoped_planning_overlay_after_delta(self, drive_id: str, entries: list) -> None:
-        """Intersects delta-touched paths with planning overlays; suppresses broad overlay elsewhere on delta success."""
+        """Apply planning overlays only for Graph delta branches that intersect planning (no broad global overlay)."""
         item_ids = self._destination_delta_entry_item_ids(drive_id, entries)
         live_by_key = self._destination_live_path_meta_for_delta_item_ids(drive_id, item_ids)
         scope_keys = {normalize_path_key(str(m.get("path") or "")) for m in live_by_key.values()}
@@ -23693,6 +23915,12 @@ class MainWindow(QMainWindow):
                     break
         if hit == 0:
             log_info(
+                "destination_overlay_scoped_apply_skipped",
+                drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+                reason="planning_paths_do_not_intersect_delta_scope",
+                scope_path_sample=sorted({m.get("path") for m in list(live_by_key.values())[:8] if m.get("path")}),
+            )
+            log_info(
                 "destination_overlay_delta_scope_noop",
                 drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
                 reason="planning_paths_do_not_intersect_delta_scope",
@@ -23704,6 +23932,62 @@ class MainWindow(QMainWindow):
             drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
             intersected_planning_rows=hit,
             delta_scope_path_sample=sorted({m.get("path") for m in list(live_by_key.values())[:12] if m.get("path")}),
+        )
+        scope_paths = build_delta_overlay_scope_paths(
+            live_meta_by_key=dict(live_by_key),
+            proposed_paths=proposed,
+            planned_paths=planned,
+            allocation_paths=alloc_targets,
+            normalize=lambda p: str(
+                self._canonical_destination_projection_path(str(p or "").strip()) or self.normalize_memory_path(str(p or "").strip())
+            ).strip(),
+        )
+        if not scope_paths:
+            log_info(
+                "destination_overlay_delta_scope_noop",
+                drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+                reason="scoped_overlay_path_set_empty",
+            )
+            log_info(
+                "destination_overlay_scoped_apply_skipped",
+                drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+                reason="empty_scope_paths",
+            )
+            return
+        log_info(
+            "destination_overlay_scoped_apply_started",
+            drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+            scope_path_count=len(scope_paths),
+            scope_path_sample=sorted(list(scope_paths))[:16],
+        )
+        prev_drf = set(getattr(self, "_destination_drfws_affected_paths", None) or set())
+        applied = 0
+        try:
+            self._destination_drfws_affected_paths = set(prev_drf) | set(scope_paths)
+            applied = int(
+                self._destination_materialize_with_optional_overlay_scope(
+                    "local_first_edit_graph_delta_scoped",
+                    allow_defer=True,
+                    prefer_chunked_projection=True,
+                    narrow_restore_real_snapshot=False,
+                    scope_paths=set(scope_paths),
+                )
+                or 0
+            )
+        except Exception as exc:
+            log_info(
+                "destination_overlay_scoped_apply_failed",
+                drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+                error=str(exc)[:400],
+            )
+            return
+        finally:
+            self._destination_drfws_affected_paths = set(prev_drf)
+        log_info(
+            "destination_overlay_scoped_apply_completed",
+            drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+            overlay_applied_rows=int(applied),
+            scope_path_count=len(scope_paths),
         )
 
     def _detect_runtime_live_memory_duplicate_conflicts_after_graph_delta(self, drive_id: str, entries: list) -> None:
@@ -63241,31 +63525,30 @@ class MainWindow(QMainWindow):
             return
 
         updated_proposed_folders = []
-        for proposed_folder in self.proposed_folders:
-            folder_path = self._proposed_destination_path(proposed_folder)
+        for raw_pf in self.proposed_folders:
+            pf = self._coerce_proposed_folder_model(raw_pf)
+            if pf is None:
+                updated_proposed_folders.append(raw_pf)
+                continue
+            folder_path = self._proposed_destination_path(pf)
             if folder_path == normalized_original or folder_path.startswith(normalized_original + "\\"):
-                suffix = folder_path[len(normalized_original):]
+                suffix = folder_path[len(normalized_original) :]
                 next_path = self.normalize_memory_path(normalized_updated + suffix)
-                next_name = self._path_segments(next_path)[-1] if self._path_segments(next_path) else proposed_folder.FolderName
+                next_name = self._path_segments(next_path)[-1] if self._path_segments(next_path) else pf.FolderName
                 updated_proposed_folders.append(
-                    ProposedFolder(
-                        DestinationId=proposed_folder.DestinationId,
+                    replace(
+                        pf,
                         FolderName=next_name,
                         DestinationPath=next_path,
-                        DestinationDriveId=proposed_folder.DestinationDriveId,
-                        DestinationParentItemId=proposed_folder.DestinationParentItemId,
                         ParentPath=self._destination_parent_path(next_path),
-                        StableKey=str(getattr(proposed_folder, "StableKey", "") or "").strip()
-                        or self._proposed_folder_deterministic_stable_key(proposed_folder),
-                        IsSelectable=proposed_folder.IsSelectable,
-                        IsProposed=proposed_folder.IsProposed,
-                        Status=proposed_folder.Status,
-                        RequestedBy=proposed_folder.RequestedBy,
-                        RequestedDate=proposed_folder.RequestedDate,
+                        LiveMemoryDuplicateResolution="",
+                        LiveMemoryDuplicateLiveItemId="",
+                        LiveMemoryDuplicateLiveItemPath="",
+                        LiveMemoryDuplicateResolvedAtUtc="",
                     )
                 )
             else:
-                updated_proposed_folders.append(proposed_folder)
+                updated_proposed_folders.append(pf)
         self.proposed_folders = updated_proposed_folders
 
         for move in self.planned_moves:
