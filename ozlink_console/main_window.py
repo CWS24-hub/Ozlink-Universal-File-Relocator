@@ -10400,7 +10400,8 @@ class MainWindow(QMainWindow):
             self.refresh_planned_moves_table()
 
     def _draft_selected_source_library_id(self) -> str:
-        state = self._draft_shell_state if isinstance(self._draft_shell_state, SessionState) else SessionState()
+        shell = getattr(self, "_draft_shell_state", None)
+        state = shell if isinstance(shell, SessionState) else SessionState()
         return str(getattr(state, "SelectedSourceLibraryId", "") or "").strip()
 
     def _early_hydrate_pending_session_source_snapshots_for_login(self) -> None:

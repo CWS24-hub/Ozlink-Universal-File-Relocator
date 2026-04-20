@@ -23,6 +23,7 @@ def _bare_mw_for_graph_batch():
     w._invalidate_projection_lookup_caches = MagicMock()
     w._log_restore_exception = MagicMock()
     w.update_progress_summaries = MagicMock()
+    w._notify_planning_mutation_destination_snapshot_dirty = MagicMock()
     w.source_tree_widget = None
     w.destination_tree_widget = None
     w._save_draft_shell = MagicMock()
@@ -70,7 +71,8 @@ class GraphIdsRefreshBatchCoalesceTests(unittest.TestCase):
         self.assertEqual(queued[0][0], "graph_ids_resolved_from_sharepoint_paths")
         self.assertEqual(queued[0][1], {"p1", "p2"})
         self.assertEqual(queued[0][2], 120)
-        w._save_draft_shell.assert_called_once_with(force=True)
+        w._notify_planning_mutation_destination_snapshot_dirty.assert_called()
+        w.update_progress_summaries.assert_called()
 
     def test_while_deferred_running_enqueue_merges_no_timer_start(self):
         w = _bare_mw_for_graph_batch()

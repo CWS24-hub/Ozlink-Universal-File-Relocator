@@ -335,6 +335,10 @@ class MemoryImportRegressionTests(unittest.TestCase):
             (bundle_root / "Draft-SessionState.json").write_text(json.dumps(session_payload, indent=2), encoding="utf-8")
             (bundle_root / "Draft-AllocationQueue.json").write_text(json.dumps(allocations_payload, indent=2), encoding="utf-8")
             (bundle_root / "Draft-ProposedFolders.json").write_text(json.dumps(proposed_payload, indent=2), encoding="utf-8")
+            (bundle_root / "LegacyMigrationReport.json").write_text(
+                json.dumps({"schema_version": 1, "migrated": True, "note": "unit import normalization"}),
+                encoding="utf-8",
+            )
 
             with patch.dict(os.environ, {"LOCALAPPDATA": str(localappdata)}):
                 manager = MemoryManager(tenant_domain="aquaticcs.com.au", operator_upn="gary@aquaticcs.com.au")
@@ -1797,7 +1801,8 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window.destination_tree_widget = _TreeStub()
         window.source_tree_widget = _TreeStub()
         window._deferred_planning_refresh_pending = True
-        window._deferred_planning_refresh_reasons = ["planning_change_lightweight", "planned_item_moved"]
+        # Coalesced incremental-only reasons skip overlay; include a non-incremental driver to materialize.
+        window._deferred_planning_refresh_reasons = ["planning_change_lightweight", "move_folder"]
         window._deferred_source_projection_paths = set()
         materialized = []
         window._apply_destination_planning_overlays = lambda reason, **kwargs: materialized.append(reason)
@@ -1811,7 +1816,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._run_deferred_planning_refresh()
 
         self.assertEqual(len(materialized), 1)
-        self.assertIn("planned_item_moved", materialized[0])
+        self.assertIn("move_folder", materialized[0])
 
     def test_finalize_cache_refresh_workspace_restore_reapplies_destination_overlay(self):
         window = MainWindow.__new__(MainWindow)

@@ -119,22 +119,29 @@ def test_invariant_future_bind_may_insert_when_local_destination():
 
 
 def test_invariant_graph_descendant_tick_defers_while_scroll_active_and_preserves_state():
-    """Graph-walk descendant work must not run during active scroll; state preserved; follow-up scheduled."""
+    """Graph-walk descendant work must not run during active scroll; state preserved; scroll-idle follow-up."""
     mw = MainWindow.__new__(MainWindow)
     st = {"graph_walk": True, "walk_phase": "walk"}
     mw._destination_descendant_apply_state = st
     mw._destination_descendant_apply_queue = deque()
-    scheduled: list[str] = []
+    idle_delays: list[int] = []
+    tick_scheduled: list[bool] = []
 
     def _sched():
-        scheduled.append("tick")
+        tick_scheduled.append(True)
 
     mw._schedule_destination_descendant_apply_tick = _sched
+    t_idle = MagicMock()
+    t_idle.start = MagicMock(side_effect=lambda ms: idle_delays.append(int(ms)))
+    mw._destination_tree_scroll_idle_timer = t_idle
     with patch.object(mw, "_destination_user_scroll_interaction_active", return_value=True):
         with patch("ozlink_console.main_window.log_info"):
             MainWindow._run_destination_descendant_apply_tick_body(mw)
     assert mw._destination_descendant_apply_state is st
-    assert scheduled == ["tick"]
+    assert mw._destination_descendant_apply_deferred_for_scroll_resume is True
+    assert not tick_scheduled
+    t_idle.start.assert_called_once()
+    assert idle_delays and idle_delays[0] >= 120
 
 
 def test_invariant_descendant_tick_body_closes_structure_coalesce_on_empty_queue():

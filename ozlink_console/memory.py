@@ -1368,10 +1368,46 @@ class MemoryManager:
 
     def import_bundle(self, source_folder: Path) -> None:
         required = ["Draft-SessionState.json", "Draft-AllocationQueue.json", "Draft-ProposedFolders.json"]
+        session_payload_preview: dict[str, Any] | None = None
+        allocations_preview: list[Any] = []
+        proposed_preview: list[Any] = []
         for name in required:
             if not (source_folder / name).exists():
                 raise FileNotFoundError(f"Import bundle missing required file: {name}")
-            json.loads((source_folder / name).read_text(encoding="utf-8"))
+            raw = json.loads((source_folder / name).read_text(encoding="utf-8"))
+            if name == "Draft-SessionState.json" and isinstance(raw, dict):
+                session_payload_preview = raw
+            elif name == "Draft-AllocationQueue.json" and isinstance(raw, list):
+                allocations_preview = raw
+            elif name == "Draft-ProposedFolders.json" and isinstance(raw, list):
+                proposed_preview = raw
+
+        if session_payload_preview is not None:
+            from .legacy_backup_migration.shape import is_legacy_shaped_bundle
+            from .legacy_backup_migration.errors import LegacyBackupDirectRestoreBlocked
+
+            legacy, lb_reasons = is_legacy_shaped_bundle(
+                session_payload_preview, allocations_preview, proposed_preview
+            )
+            migrated_marker = (Path(source_folder) / "LegacyMigrationReport.json").is_file()
+            if migrated_marker:
+                log_info("migrated_backup_restore_started", source=str(source_folder))
+            allow_legacy_direct = os.environ.get("OZLINK_ALLOW_LEGACY_DIRECT_RESTORE", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+            if legacy and not migrated_marker and not allow_legacy_direct:
+                log_info(
+                    "legacy_backup_direct_restore_blocked_requires_migration",
+                    reasons=lb_reasons,
+                    source=str(source_folder),
+                )
+                raise LegacyBackupDirectRestoreBlocked(
+                    "Legacy-shaped memory bundle requires migration before import (or set "
+                    "OZLINK_ALLOW_LEGACY_DIRECT_RESTORE=1 for debug).",
+                    reasons=lb_reasons,
+                )
 
         stamp = "ImportBefore_" + datetime.now().strftime("%Y%m%d-%H%M%S")
         qdir = self.quarantine / stamp
