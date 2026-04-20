@@ -15124,38 +15124,95 @@ class MainWindow(QMainWindow):
             return skipped_m, skipped_p
         skipped_m = 0
         kept_m: list = []
+        legacy_tol_m = 0
         for m in list(self.planned_moves or []):
+            md = self._planned_move_destination_drive_id(m) if isinstance(m, dict) else ""
+            ms = str((m or {}).get("DestinationSiteId") or (m or {}).get("destination_site_id") or "").strip() if isinstance(m, dict) else ""
             if self._destination_planned_row_matches_selected_identity(
                 m, sel_drive=sel_drive, sel_site=sel_site, strict=strict
             ):
+                if isinstance(m, dict) and sel_drive and not md:
+                    legacy_tol_m += 1
                 kept_m.append(m)
                 continue
             skipped_m += 1
-            log_info(
-                "destination_foreign_planning_row_skipped",
-                kind="planned_move",
-                context=str(context or "")[:160],
-                strict=bool(strict),
-            )
+            if md and sel_drive and md.casefold() != sel_drive.casefold():
+                log_info(
+                    "destination_planning_row_rejected_explicit_identity_mismatch",
+                    kind="planned_move",
+                    reason="drive_mismatch",
+                    context=str(context or "")[:160],
+                )
+            elif sel_site and ms and ms.casefold() != sel_site.casefold():
+                log_info(
+                    "destination_planning_row_rejected_explicit_identity_mismatch",
+                    kind="planned_move",
+                    reason="site_mismatch",
+                    context=str(context or "")[:160],
+                )
+            else:
+                log_info(
+                    "destination_foreign_planning_row_skipped",
+                    kind="planned_move",
+                    context=str(context or "")[:160],
+                    strict=bool(strict),
+                )
         if skipped_m:
             self.planned_moves = kept_m
+        if legacy_tol_m:
+            log_info(
+                "destination_legacy_planning_identity_tolerated",
+                kind="planned_move",
+                count=int(legacy_tol_m),
+                context=str(context or "")[:160],
+            )
         skipped_p = 0
         kept_p: list = []
+        legacy_tol_p = 0
         for pf in list(self.proposed_folders or []):
+            md = self._proposed_folder_destination_drive_id(pf)
+            if isinstance(pf, dict):
+                ms = str(pf.get("DestinationSiteId") or pf.get("destination_site_id") or "").strip()
+            else:
+                ms = str(getattr(pf, "DestinationSiteId", "") or "").strip()
             if self._destination_proposed_row_matches_selected_identity(
                 pf, sel_drive=sel_drive, sel_site=sel_site, strict=strict
             ):
+                if sel_drive and not md:
+                    legacy_tol_p += 1
                 kept_p.append(pf)
                 continue
             skipped_p += 1
-            log_info(
-                "destination_foreign_planning_row_skipped",
-                kind="proposed_folder",
-                context=str(context or "")[:160],
-                strict=bool(strict),
-            )
+            if md and sel_drive and md.casefold() != sel_drive.casefold():
+                log_info(
+                    "destination_planning_row_rejected_explicit_identity_mismatch",
+                    kind="proposed_folder",
+                    reason="drive_mismatch",
+                    context=str(context or "")[:160],
+                )
+            elif sel_site and ms and ms.casefold() != sel_site.casefold():
+                log_info(
+                    "destination_planning_row_rejected_explicit_identity_mismatch",
+                    kind="proposed_folder",
+                    reason="site_mismatch",
+                    context=str(context or "")[:160],
+                )
+            else:
+                log_info(
+                    "destination_foreign_planning_row_skipped",
+                    kind="proposed_folder",
+                    context=str(context or "")[:160],
+                    strict=bool(strict),
+                )
         if skipped_p:
             self.proposed_folders = kept_p
+        if legacy_tol_p:
+            log_info(
+                "destination_legacy_planning_identity_tolerated",
+                kind="proposed_folder",
+                count=int(legacy_tol_p),
+                context=str(context or "")[:160],
+            )
         return skipped_m, skipped_p
 
     def _destination_filter_restored_planning_against_session_identity(
@@ -21242,8 +21299,21 @@ class MainWindow(QMainWindow):
 
         if source_site_matched:
             self.on_site_selector_changed("source", force=True, chain_library=False)
+        preserved_dst_lib_id = str(getattr(state, "SelectedDestinationLibraryId", "") or "").strip()
+        preserved_dst_lib_name = str(getattr(state, "SelectedDestinationLibrary", "") or "").strip()
+        log_info(
+            "destination_restore_selector_stored_library_preserved",
+            stored_drive_id_suffix=preserved_dst_lib_id[-16:] if len(preserved_dst_lib_id) > 16 else preserved_dst_lib_id,
+            stored_name_excerpt=preserved_dst_lib_name[:120],
+        )
+
         if destination_site_matched:
-            self.on_site_selector_changed("destination", force=True, chain_library=False)
+            self.on_site_selector_changed(
+                "destination",
+                force=True,
+                chain_library=False,
+                destination_site_clear_reason="restore_rebind",
+            )
 
         src_rows = self._planning_library_selector_item_rows(source_library_selector)
         src_idx, src_tag = library_combo_index_for_session_restore(
@@ -21288,8 +21358,8 @@ class MainWindow(QMainWindow):
 
         dst_rows = self._planning_library_selector_item_rows(destination_library_selector)
         dst_idx, dst_tag = library_combo_index_for_session_restore(
-            stored_drive_id=str(getattr(state, "SelectedDestinationLibraryId", "") or ""),
-            stored_display_name=str(getattr(state, "SelectedDestinationLibrary", "") or ""),
+            stored_drive_id=preserved_dst_lib_id,
+            stored_display_name=preserved_dst_lib_name,
             item_rows=dst_rows,
         )
         destination_library_matched = False
@@ -21297,11 +21367,19 @@ class MainWindow(QMainWindow):
             if self._set_selector_index_safely(destination_library_selector, dst_idx):
                 destination_library_matched = True
                 log_info(
+                    "destination_restore_selector_library_match_using_preserved_values",
+                    outcome_tag=dst_tag,
+                    index=dst_idx,
+                    stored_drive_id=preserved_dst_lib_id,
+                    stored_name=preserved_dst_lib_name,
+                    selector_item_count=len(dst_rows),
+                )
+                log_info(
                     "destination_library_restore_match_success",
                     outcome_tag=dst_tag,
                     index=dst_idx,
-                    stored_drive_id=str(getattr(state, "SelectedDestinationLibraryId", "") or ""),
-                    stored_name=str(getattr(state, "SelectedDestinationLibrary", "") or ""),
+                    stored_drive_id=preserved_dst_lib_id,
+                    stored_name=preserved_dst_lib_name,
                     selector_item_count=len(dst_rows),
                 )
                 if dst_tag == "legacy_name_only":
@@ -21322,8 +21400,8 @@ class MainWindow(QMainWindow):
             )
             log_info(
                 "destination_library_restore_match_failed",
-                stored_name=str(getattr(state, "SelectedDestinationLibrary", "") or ""),
-                stored_drive_id=str(getattr(state, "SelectedDestinationLibraryId", "") or ""),
+                stored_name=preserved_dst_lib_name,
+                stored_drive_id=preserved_dst_lib_id,
                 outcome_tag=dst_tag,
                 selector_item_count=len(dst_rows),
                 destination_site_context=str(getattr(state, "SelectedDestinationSite", "") or ""),
@@ -22436,8 +22514,15 @@ class MainWindow(QMainWindow):
         selected_site: dict | None,
         previous_site_id: str,
         new_site_id: str,
+        reason: str = "user_site_change",
     ) -> None:
-        """Clear destination runtime memory when the destination site identity changes (before library validity)."""
+        """Clear destination runtime memory when the destination site identity changes (before library validity).
+
+        ``reason``:
+        - ``user_site_change``: full unbind (planning lists, strict identity) for a real user site change.
+        - ``restore_rebind``: clear stale snapshot/model/bind flags only; keep planned_moves/proposed_folders
+          and do not erase persisted selector library fields needed by :meth:`_restore_selector_matches`.
+        """
         if self._planning_browse_mode("destination") == "local":
             return
         rs = getattr(self, "_runtime_session_tree_snapshots", None)
@@ -22473,7 +22558,7 @@ class MainWindow(QMainWindow):
 
         prior_pm = len(self.planned_moves) if getattr(self, "planned_moves", None) else 0
         prior_pf = len(self.proposed_folders) if getattr(self, "proposed_folders", None) else 0
-        if prior_pm or prior_pf:
+        if reason == "user_site_change" and (prior_pm or prior_pf):
             self.planned_moves = []
             self.proposed_folders = []
             try:
@@ -22488,8 +22573,6 @@ class MainWindow(QMainWindow):
             shell.DestinationTreeSnapshotIdentityLibraryName = ""
             shell.DestinationTreeSnapshotIdentitySiteId = ""
             shell.DestinationTreeSnapshotIdentityInferredFromLegacy = False
-            shell.SelectedDestinationLibraryId = ""
-            shell.SelectedDestinationLibrary = ""
             if isinstance(selected_site, dict):
                 shell.SelectedDestinationSite = str(selected_site.get("name") or "")
                 shell.SelectedDestinationSiteKey = str(
@@ -22503,21 +22586,31 @@ class MainWindow(QMainWindow):
             "destination_site_change_cleared_stale_snapshot",
             previous_site_suffix=previous_site_id[-16:] if len(previous_site_id) > 16 else previous_site_id,
             new_site_suffix=new_site_id[-16:] if len(new_site_id) > 16 else new_site_id,
+            reason=str(reason or "user_site_change")[:40],
         )
-        if prior_pm or prior_pf:
+        if reason == "user_site_change":
+            if prior_pm or prior_pf:
+                log_info(
+                    "destination_site_change_planning_memory_cleared",
+                    prior_planned_count=int(prior_pm),
+                    prior_proposed_count=int(prior_pf),
+                )
+            else:
+                log_info(
+                    "destination_site_change_planning_memory_cleared",
+                    prior_planned_count=0,
+                    prior_proposed_count=0,
+                )
+        else:
             log_info(
-                "destination_site_change_planning_memory_cleared",
+                "destination_site_change_planning_memory_preserved",
+                reason=str(reason or "")[:40],
                 prior_planned_count=int(prior_pm),
                 prior_proposed_count=int(prior_pf),
             )
-        else:
-            log_info(
-                "destination_site_change_planning_memory_cleared",
-                prior_planned_count=0,
-                prior_proposed_count=0,
-            )
         self._destination_snap_preserving_disabled_due_to_identity_change = True
-        self._destination_strict_planning_identity_required = True
+        if reason == "user_site_change":
+            self._destination_strict_planning_identity_required = True
 
     def _select_destination_tree_snapshot_for_startup(
         self,
@@ -23424,7 +23517,14 @@ class MainWindow(QMainWindow):
             self._begin_destination_model_expand_all()
             return
 
-    def on_site_selector_changed(self, selector_group, *, force=False, chain_library: bool = True):
+    def on_site_selector_changed(
+        self,
+        selector_group,
+        *,
+        force=False,
+        chain_library: bool = True,
+        destination_site_clear_reason: str | None = None,
+    ):
         try:
             if self._pending_login_restore_args and not force:
                 self._log_restore_phase(
@@ -23468,10 +23568,12 @@ class MainWindow(QMainWindow):
                     and (not initial_bind)
                 )
                 if site_changed_for_memory:
+                    _site_clear_reason = str(destination_site_clear_reason or "user_site_change").strip() or "user_site_change"
                     self._destination_clear_stale_snapshot_state_on_site_change(
                         selected_site=raw_site if isinstance(raw_site, dict) else None,
                         previous_site_id=prev_id,
                         new_site_id=new_id,
+                        reason=_site_clear_reason,
                     )
                 log_info(
                     "destination_selected_site_identity_resolved",
@@ -23577,8 +23679,10 @@ class MainWindow(QMainWindow):
                     selected_site=selected_site if isinstance(selected_site, dict) else None,
                     selected_library=selected_library if isinstance(selected_library, dict) else None,
                 )
-                self._destination_filter_planning_memory_to_selected_identity(context="on_library_selector_valid")
+                # Valid destination library is bound: relax strict missing-drive rejection before filtering so
+                # legacy rows without DestinationDriveId are kept unless an explicit drive/site mismatch exists.
                 self._destination_strict_planning_identity_required = False
+                self._destination_filter_planning_memory_to_selected_identity(context="on_library_selector_valid")
             self._log_library_restore_step("step_06_load_library_root_enter", selector_group=selector_group)
             self.load_library_root(selector_group, selected_site, selected_library)
             if not getattr(self, "_memory_restore_in_progress", False):
