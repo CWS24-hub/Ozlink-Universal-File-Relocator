@@ -2961,6 +2961,8 @@ class MainWindow(QMainWindow):
         self._destination_startup_snapshot_mount_seen = False
         # Drive id for the library whose session snapshot was mounted (loading placeholder must not wipe it).
         self._destination_snapshot_mount_drive_id: str = ""
+        # Last destination library drive id bound from the picker (detect library changes vs stale snapshot memory).
+        self._destination_last_bound_library_drive_id: str = ""
         # Tracks which destination drive promoted semantic paths belong to (cleared on library change).
         self._destination_startup_promotion_scope_drive_id: str = ""
         # While memory-truth startup is still attaching / deferred refinement — coalesce forced live snapshot churn.
@@ -14987,6 +14989,18 @@ class MainWindow(QMainWindow):
             return library.get("id", "")
         return ""
 
+    def _current_selected_destination_site_id(self) -> str:
+        """Graph site id for the current Destination Site selector (strict identity with snapshot site)."""
+        if not hasattr(self, "planning_inputs"):
+            return ""
+        selector = self.planning_inputs.get("Destination Site")
+        if selector is None:
+            return ""
+        site = selector.currentData()
+        if isinstance(site, dict):
+            return str(site.get("id") or site.get("site_key") or "").strip()
+        return ""
+
     def _memory_restore_blocks_source_full_count(self) -> bool:
         """True while memory restore owns the session; full library counts must not run yet."""
         return bool(
@@ -22054,6 +22068,86 @@ class MainWindow(QMainWindow):
             "destination": list(getattr(state, "DestinationTreeSnapshot", []) or []),
         }
 
+    def _destination_clear_stale_snapshot_state_on_library_change(
+        self,
+        *,
+        selected_site: dict | None,
+        selected_library: dict | None,
+    ) -> None:
+        """Clear runtime/pending destination snapshots when the picker library no longer matches mounted memory."""
+        if self._planning_browse_mode("destination") == "local":
+            return
+        new_drive = str((selected_library or {}).get("id") or "").strip()
+        if not new_drive:
+            return
+        prev = str(getattr(self, "_destination_last_bound_library_drive_id", "") or "").strip()
+        mount = str(getattr(self, "_destination_snapshot_mount_drive_id", "") or "").strip()
+        rs = getattr(self, "_runtime_session_tree_snapshots", None)
+        has_runtime = bool(isinstance(rs, dict) and list(rs.get("destination") or []))
+        pend = getattr(self, "_pending_session_tree_snapshots", None)
+        has_pend = bool(isinstance(pend, dict) and list(pend.get("destination") or []))
+        prov = bool(getattr(self, "_destination_provisional_startup_applied", False))
+
+        library_changed = bool(prev and new_drive and prev.casefold() != new_drive.casefold())
+        mount_mismatch = bool(
+            mount and new_drive and mount.casefold() != new_drive.casefold() and (has_runtime or has_pend or prov)
+        )
+        need_clear = bool(library_changed or mount_mismatch)
+
+        shell = getattr(self, "_draft_shell_state", None)
+        if isinstance(shell, SessionState):
+            shell.SelectedDestinationLibraryId = new_drive
+            shell.SelectedDestinationLibrary = str((selected_library or {}).get("name") or "")
+            if isinstance(selected_site, dict):
+                shell.SelectedDestinationSite = str(selected_site.get("name") or "")
+                shell.SelectedDestinationSiteKey = str(
+                    selected_site.get("site_key") or selected_site.get("web_url") or selected_site.get("id") or ""
+                ).strip()
+
+        if need_clear:
+            log_info(
+                "destination_library_change_cleared_stale_snapshot",
+                previous_drive_suffix=prev[-16:] if len(prev) > 16 else prev,
+                new_drive_suffix=new_drive[-16:] if len(new_drive) > 16 else new_drive,
+                mount_drive_suffix=mount[-16:] if len(mount) > 16 else mount,
+                had_runtime_snapshot=has_runtime,
+                had_pending_snapshot=has_pend,
+                library_changed=bool(library_changed),
+                mount_mismatch=bool(mount_mismatch),
+            )
+            if isinstance(rs, dict):
+                rs["destination"] = []
+            if isinstance(pend, dict):
+                pend["destination"] = []
+                self._pending_session_tree_snapshots = pend
+            self._destination_provisional_startup_applied = False
+            self._startup_visible_snapshot_bound = False
+            self._destination_startup_snapshot_mount_seen = False
+            try:
+                self._startup_memory_visible_tree_ready_mono = 0.0
+            except Exception:
+                pass
+            model = getattr(self, "destination_planning_model", None)
+            if model is not None:
+                try:
+                    model.clear()
+                except Exception:
+                    pass
+            if isinstance(shell, SessionState):
+                shell.DestinationTreeSnapshotIdentityDriveId = ""
+                shell.DestinationTreeSnapshotIdentityLibraryId = ""
+                shell.DestinationTreeSnapshotIdentityLibraryName = ""
+                shell.DestinationTreeSnapshotIdentitySiteId = ""
+                shell.DestinationTreeSnapshotIdentityInferredFromLegacy = False
+        else:
+            log_info(
+                "destination_library_change_snapshot_identity_verified",
+                drive_suffix=new_drive[-16:] if len(new_drive) > 16 else new_drive,
+                had_previous=bool(prev),
+            )
+
+        self._destination_last_bound_library_drive_id = new_drive
+
     def _select_destination_tree_snapshot_for_startup(
         self,
         session_destination_snaps: list,
@@ -22064,26 +22158,59 @@ class MainWindow(QMainWindow):
 
         state = self._draft_shell_state if isinstance(self._draft_shell_state, SessionState) else SessionState()
         combo_did = str(self._current_selected_destination_drive_id() or "").strip()
-        intended = str(
-            getattr(state, "DestinationTreeSnapshotIdentityDriveId", "")
-            or getattr(state, "SelectedDestinationLibraryId", "")
-            or ""
-        ).strip()
-        if not intended:
+        snap_id_drive = str(getattr(state, "DestinationTreeSnapshotIdentityDriveId", "") or "").strip()
+        selected_session_drive = str(getattr(state, "SelectedDestinationLibraryId", "") or "").strip()
+        if combo_did:
             intended = combo_did
+            source_of_intended = "current_combo_drive_id"
+        elif selected_session_drive:
+            intended = selected_session_drive
+            source_of_intended = "selected_session_drive_id"
+        elif snap_id_drive:
+            intended = snap_id_drive
+            source_of_intended = "snapshot_identity_cold_load_fallback"
+        else:
+            intended = ""
+            source_of_intended = "none"
+
+        combo_site = str(self._current_selected_destination_site_id() or "").strip()
+        sess_site_key = str(getattr(state, "SelectedDestinationSiteKey", "") or "").strip()
+        snap_site = str(getattr(state, "DestinationTreeSnapshotIdentitySiteId", "") or "").strip()
+        if combo_site:
+            intended_site = combo_site
+        elif sess_site_key:
+            intended_site = sess_site_key
+        elif snap_site:
+            intended_site = snap_site
+        else:
+            intended_site = ""
+
+        log_info(
+            "destination_snapshot_intended_drive_resolved",
+            current_combo_drive_id=combo_did,
+            selected_session_drive_id=selected_session_drive,
+            snapshot_identity_drive_id=snap_id_drive,
+            final_intended_drive_id=str(intended or "")[:120],
+            source_of_intended_drive_id=str(source_of_intended)[:80],
+            intended_site_id_suffix=intended_site[-16:] if len(intended_site) > 16 else intended_site,
+        )
+
         sess_drive = str(getattr(state, "DestinationTreeSnapshotIdentityDriveId", "") or "").strip()
         sess_lib = str(getattr(state, "DestinationTreeSnapshotIdentityLibraryId", "") or "").strip()
         if not sess_drive and not sess_lib:
             sess_drive = sess_lib = str(getattr(state, "SelectedDestinationLibraryId", "") or "").strip()
         if not sess_drive and not sess_lib:
             sess_drive = sess_lib = combo_did
+        sess_site_env = str(getattr(state, "DestinationTreeSnapshotIdentitySiteId", "") or "").strip()
         sidecar_d = ""
         sidecar_lib = ""
+        sidecar_site = ""
         if isinstance(workspace_sidecar, dict):
             ident = workspace_sidecar.get("destination_tree_snapshot_identity")
             if isinstance(ident, dict):
                 sidecar_d = str(ident.get("drive_id") or ident.get("library_id") or "").strip()
                 sidecar_lib = str(ident.get("library_id") or ident.get("drive_id") or "").strip() or sidecar_d
+                sidecar_site = str(ident.get("site_id") or "").strip()
         side_list: list = []
         if isinstance(workspace_sidecar, dict):
             raw = workspace_sidecar.get("destination_tree_snapshot")
@@ -22097,9 +22224,12 @@ class MainWindow(QMainWindow):
             ctx,
             session_envelope_drive_id=sess_drive,
             session_envelope_library_id=sess_lib,
+            session_envelope_site_id=sess_site_env,
             sidecar_envelope_drive_id=sidecar_d,
             sidecar_envelope_library_id=sidecar_lib,
+            sidecar_envelope_site_id=sidecar_site,
             intended_drive_id=intended,
+            intended_site_id=intended_site,
             legacy_library_candidates=legacy_cands or None,
         )
         self._apply_destination_snapshot_legacy_identity_stamp(meta)
@@ -23041,6 +23171,11 @@ class MainWindow(QMainWindow):
             self._log_library_restore_step("step_05_update_labels_enter", selector_group=selector_group)
             self.update_selector_context_labels()
             self._log_library_restore_step("step_05_update_labels_exit", selector_group=selector_group)
+            if selector_group == "destination":
+                self._destination_clear_stale_snapshot_state_on_library_change(
+                    selected_site=selected_site if isinstance(selected_site, dict) else None,
+                    selected_library=selected_library if isinstance(selected_library, dict) else None,
+                )
             self._log_library_restore_step("step_06_load_library_root_enter", selector_group=selector_group)
             self.load_library_root(selector_group, selected_site, selected_library)
             if not getattr(self, "_memory_restore_in_progress", False):

@@ -253,6 +253,8 @@ def apply_destination_snapshot_identity_gate_with_legacy(
     snapshot_stored_library_id: str,
     source: str,
     legacy_library_candidates: list[DestinationLibraryCandidate] | None,
+    intended_site_id: str = "",
+    snapshot_stored_site_id: str = "",
 ) -> tuple[list, str, dict[str, Any] | None]:
     """Like :func:`apply_destination_snapshot_identity_gate` but infers missing envelope when safe.
 
@@ -279,6 +281,8 @@ def apply_destination_snapshot_identity_gate_with_legacy(
             snapshot_stored_drive_id=stored_d,
             snapshot_stored_library_id=stored_lib,
             source=source,
+            intended_site_id=intended_site_id,
+            snapshot_stored_site_id=str(snapshot_stored_site_id or "").strip(),
         )
         return gated, tag, None
 
@@ -351,12 +355,25 @@ def apply_destination_snapshot_identity_gate_with_legacy(
         )
         return [], "legacy_identity_high_intended_mismatch", meta
 
+    ins = str(intended_site_id or "").strip()
+    inf_site = str(inf.matched_site_id or "").strip()
+    if ins and inf_site and ins.casefold() != inf_site.casefold():
+        log_info(
+            "destination_snapshot_rejected_selected_site_mismatch",
+            source=str(source)[:40],
+            intended_site_suffix=ins[-16:] if len(ins) > 16 else ins,
+            snapshot_site_suffix=inf_site[-16:] if len(inf_site) > 16 else inf_site,
+        )
+        return [], "legacy_identity_high_site_mismatch", meta
+
     gated, strict_tag = apply_destination_snapshot_identity_gate(
         snapshots,
         intended_drive_id=intended,
         snapshot_stored_drive_id=inf.matched_drive_id,
         snapshot_stored_library_id=inf.matched_library_id or inf.matched_drive_id,
         source=source,
+        intended_site_id=intended_site_id,
+        snapshot_stored_site_id=inf_site or str(snapshot_stored_site_id or "").strip(),
     )
     stamp = {
         "destination_snapshot_identity_inferred_from_legacy": True,
@@ -386,7 +403,7 @@ def canonical_legacy_inference_block_reason(gate_tag: str) -> str:
         return "blocked_legacy_no_candidates"
     if t in ("legacy_identity_low_unresolved", "legacy_identity_medium_unresolved"):
         return "low_confidence"
-    if t in ("legacy_identity_high_ambiguous", "legacy_identity_high_intended_mismatch"):
+    if t in ("legacy_identity_high_ambiguous", "legacy_identity_high_intended_mismatch", "legacy_identity_high_site_mismatch"):
         return "insufficient_signal"
     return ""
 
@@ -427,6 +444,8 @@ def apply_destination_snapshot_identity_gate(
     snapshot_stored_drive_id: str,
     snapshot_stored_library_id: str,
     source: str,
+    intended_site_id: str = "",
+    snapshot_stored_site_id: str = "",
 ) -> tuple[list, str]:
     """Enforce snapshot-level destination drive identity before any visible restore.
 
@@ -455,12 +474,38 @@ def apply_destination_snapshot_identity_gate(
 
     if eff.casefold() != intended.casefold():
         log_info(
+            "destination_snapshot_rejected_selected_library_mismatch",
+            source=str(source)[:40],
+            intended_drive_suffix=intended[-16:] if len(intended) > 16 else intended,
+            stored_drive_suffix=eff[-16:] if len(eff) > 16 else eff,
+        )
+        log_info(
             "destination_startup_snapshot_rejected_identity_mismatch",
             source=str(source)[:40],
             intended_drive_suffix=intended[-16:] if len(intended) > 16 else intended,
             stored_drive_suffix=eff[-16:] if len(eff) > 16 else eff,
         )
         return [], "rejected_envelope_mismatch"
+
+    ins = str(intended_site_id or "").strip()
+    sts = str(snapshot_stored_site_id or "").strip()
+    if ins and sts:
+        if ins.casefold() != sts.casefold():
+            log_info(
+                "destination_snapshot_rejected_selected_site_mismatch",
+                source=str(source)[:40],
+                intended_site_suffix=ins[-16:] if len(ins) > 16 else ins,
+                snapshot_site_suffix=sts[-16:] if len(sts) > 16 else sts,
+            )
+            return [], "rejected_site_mismatch"
+    else:
+        log_info(
+            "destination_snapshot_site_identity_check_skipped",
+            source=str(source)[:40],
+            reason="one_or_both_site_ids_missing",
+            has_intended_site=bool(ins),
+            has_snapshot_site=bool(sts),
+        )
 
     log_info(
         "destination_snapshot_identity_loaded",
@@ -532,9 +577,12 @@ def select_validated_destination_startup_snapshot(
     *,
     session_envelope_drive_id: str = "",
     session_envelope_library_id: str = "",
+    session_envelope_site_id: str = "",
     sidecar_envelope_drive_id: str = "",
     sidecar_envelope_library_id: str = "",
+    sidecar_envelope_site_id: str = "",
     intended_drive_id: str = "",
+    intended_site_id: str = "",
     legacy_library_candidates: list[DestinationLibraryCandidate] | None = None,
 ) -> tuple[list, str, int, int, dict[str, Any]]:
     """Choose session vs sidecar after identity gate + sanitization; validity outranks raw node count.
@@ -552,6 +600,8 @@ def select_validated_destination_startup_snapshot(
         snapshot_stored_library_id=session_envelope_library_id or session_envelope_drive_id,
         source="session",
         legacy_library_candidates=legacy_library_candidates,
+        intended_site_id=intended_site_id,
+        snapshot_stored_site_id=session_envelope_site_id,
     )
     side_gated, side_gate_tag, side_legacy_stamp = apply_destination_snapshot_identity_gate_with_legacy(
         side_list,
@@ -560,6 +610,8 @@ def select_validated_destination_startup_snapshot(
         snapshot_stored_library_id=sidecar_envelope_library_id or sidecar_envelope_drive_id,
         source="sidecar",
         legacy_library_candidates=legacy_library_candidates,
+        intended_site_id=intended_site_id,
+        snapshot_stored_site_id=sidecar_envelope_site_id,
     )
 
     sess_gated, _npr_s = prune_nested_snapshot_nodes_for_wrong_drive(
