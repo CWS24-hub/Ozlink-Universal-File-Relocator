@@ -15,6 +15,9 @@ class MigrationIdentityPreflight:
     destination_site_key: str = ""
     destination_site_id: str = ""
     destination_drive_id: str = ""
+    # Selected library display names (legacy app sometimes prefixed paths with these; stripped first).
+    source_library_display_name: str = ""
+    destination_library_display_name: str = ""
     # Visible library hub segment for path checks, e.g. Root3 (optional).
     visible_destination_anchor: str = ""
 

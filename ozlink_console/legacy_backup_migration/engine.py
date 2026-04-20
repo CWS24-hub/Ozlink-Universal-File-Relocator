@@ -22,6 +22,12 @@ from ozlink_console.logger import log_info
 from ozlink_console.paths import normalize_manifest_path
 from ozlink_console.sharepoint_destination_overlay_attach import WORKSPACE_ROW_STATE_PLANNED_ONLY
 
+from .library_container_strip import (
+    OUTCOME_AMBIGUOUS as LIB_WRAP_AMBIGUOUS,
+    OUTCOME_IDENTITY_MISSING as LIB_WRAP_IDENTITY_MISSING,
+    OUTCOME_STRIPPED as LIB_WRAP_STRIPPED,
+    strip_legacy_library_container_segment,
+)
 from .live_path_reanchor import (
     GRAPH_ROOT_EMPTY,
     GRAPH_ROOT_NON_EMPTY,
@@ -279,6 +285,11 @@ def migrate_legacy_backup_folder(
     session["LegacyMigrationEmptyDestinationGraph"] = bool(empty_destination_graph)
     session["LegacyMigrationGraphRootProbeKind"] = str(graph_root_probe_kind or "")
 
+    dst_lib_disp = str(
+        mi.destination_library_display_name or session.get("SelectedDestinationLibrary") or ""
+    ).strip()
+    src_lib_disp = str(mi.source_library_display_name or session.get("SelectedSourceLibrary") or "").strip()
+
     conflicts: list[MigrationConflictRecord] = []
     counts = {
         "allocations_input": len(allocations),
@@ -298,6 +309,16 @@ def migrate_legacy_backup_folder(
         "path_reanchor_failed": 0,
         "foreign_root_blocked": 0,
         "planned_scaffold_empty_library_rows": 0,
+        "library_container_destination_wrappers_stripped": 0,
+        "library_container_source_wrappers_stripped": 0,
+        "library_wrapper_identity_missing_destination_rows": 0,
+        "library_wrapper_identity_missing_source_rows": 0,
+        "library_wrapper_ambiguous_destination_rows": 0,
+        "library_wrapper_ambiguous_source_rows": 0,
+        "allocation_reanchor_attempted": 0,
+        "allocation_reanchored": 0,
+        "allocation_reanchor_failed": 0,
+        "allocation_foreign_root_after_unresolved_documents_token": 0,
     }
     row_notes: list[dict[str, Any]] = []
 
@@ -311,7 +332,47 @@ def migrate_legacy_backup_folder(
     out_alloc: list[dict[str, Any]] = []
     for i, row in enumerate(allocations):
         r = dict(row)
-        dest_path = str(r.get("RequestedDestinationPath") or "").strip()
+        dest_in = str(r.get("RequestedDestinationPath") or "").strip()
+        src_in = str(r.get("SourcePath") or "").strip()
+        dest_path, dst_lw = strip_legacy_library_container_segment(
+            dest_in,
+            dst_lib_disp or None,
+            row_index=i,
+            row_kind="allocation",
+            role="destination",
+        )
+        src_path, src_lw = strip_legacy_library_container_segment(
+            src_in,
+            src_lib_disp or None,
+            row_index=i,
+            row_kind="allocation",
+            role="source",
+        )
+        r["SourcePath"] = src_path
+        if dst_lw == LIB_WRAP_STRIPPED:
+            counts["library_container_destination_wrappers_stripped"] += 1
+        if src_lw == LIB_WRAP_STRIPPED:
+            counts["library_container_source_wrappers_stripped"] += 1
+        if dst_lw == LIB_WRAP_IDENTITY_MISSING and dest_in:
+            counts["library_wrapper_identity_missing_destination_rows"] += 1
+            stx = str(r.get("Status") or "Pending")
+            if "LegacyLibraryWrapperIdentityMissing" not in stx:
+                r["Status"] = _apply_status_suffix(stx, "LegacyLibraryWrapperIdentityMissing")
+        elif dst_lw == LIB_WRAP_AMBIGUOUS and dest_in:
+            counts["library_wrapper_ambiguous_destination_rows"] += 1
+            stx = str(r.get("Status") or "Pending")
+            if "LegacyLibraryWrapperAmbiguous" not in stx:
+                r["Status"] = _apply_status_suffix(stx, "LegacyLibraryWrapperAmbiguous")
+        if src_lw == LIB_WRAP_IDENTITY_MISSING and src_in:
+            counts["library_wrapper_identity_missing_source_rows"] += 1
+            stx = str(r.get("Status") or "Pending")
+            if "LegacyLibraryWrapperSourceIdentityMissing" not in stx:
+                r["Status"] = _apply_status_suffix(stx, "LegacyLibraryWrapperSourceIdentityMissing")
+        elif src_lw == LIB_WRAP_AMBIGUOUS and src_in:
+            counts["library_wrapper_ambiguous_source_rows"] += 1
+            stx = str(r.get("Status") or "Pending")
+            if "LegacyLibraryWrapperSourceAmbiguous" not in stx:
+                r["Status"] = _apply_status_suffix(stx, "LegacyLibraryWrapperSourceAmbiguous")
 
         if can_skeleton:
             stripped_dest = normalize_manifest_path(dest_path)
@@ -419,6 +480,12 @@ def migrate_legacy_backup_folder(
         work_path = stripped_dest
         reanchor_unresolved = False
         if can_skeleton:
+            counts["allocation_reanchor_attempted"] += 1
+            log_info(
+                "legacy_backup_migration_alloc_reanchor_attempt",
+                row_index=i,
+                path_excerpt=work_path[:220],
+            )
             ra = reanchor_manifest_destination_path_against_live_skeleton(
                 work_path,
                 destination_drive_id=str(mi.destination_drive_id),
@@ -432,18 +499,45 @@ def migrate_legacy_backup_folder(
                 counts["synthetic_root_stripped"] += 1
             if ra.kind == "reanchored":
                 counts["path_reanchored"] += 1
+                counts["allocation_reanchored"] += 1
+                log_info(
+                    "legacy_backup_migration_alloc_reanchored",
+                    row_index=i,
+                    after_excerpt=work_path[:220],
+                )
             elif ra.kind == "ambiguous":
                 counts["path_reanchor_ambiguous"] += 1
                 reanchor_unresolved = True
+                counts["allocation_reanchor_failed"] += 1
                 r["Status"] = _apply_status_suffix(str(r.get("Status") or ""), "LegacyReanchorAmbiguous")
+                log_info(
+                    "legacy_backup_migration_alloc_reanchor_failed",
+                    row_index=i,
+                    reason="ambiguous",
+                    path_excerpt=work_path[:220],
+                )
             elif ra.kind == "failed":
                 counts["path_reanchor_failed"] += 1
                 reanchor_unresolved = True
+                counts["allocation_reanchor_failed"] += 1
                 r["Status"] = _apply_status_suffix(str(r.get("Status") or ""), "LegacyReanchorFailed")
+                log_info(
+                    "legacy_backup_migration_alloc_reanchor_failed",
+                    row_index=i,
+                    reason="no_live_match",
+                    path_excerpt=work_path[:220],
+                )
             elif ra.kind == "foreign_root_blocked":
                 counts["foreign_root_blocked"] += 1
+                counts["allocation_foreign_root_after_unresolved_documents_token"] += 1
                 reanchor_unresolved = True
                 r["Status"] = _apply_status_suffix(str(r.get("Status") or ""), "LegacyForeignRootBlocked")
+                log_info(
+                    "legacy_backup_migration_alloc_foreign_block_after_reanchor_failed",
+                    row_index=i,
+                    path_excerpt=work_path[:220],
+                    note="namespace_token_documents_not_live_proven",
+                )
             r["RequestedDestinationPath"] = work_path
             r["LegacyMigrationAnchorClassification"] = legacy_anchor_classification_from_reanchor(ra)
             if reanchor_unresolved:
@@ -482,6 +576,8 @@ def migrate_legacy_backup_folder(
                     before_excerpt=dest_path[:120],
                     after_excerpt=new_dp[:120],
                 )
+        elif dest_path and not str(r.get("RequestedDestinationPath") or "").strip():
+            r["RequestedDestinationPath"] = normalize_manifest_path(stripped_dest)
 
         if not str(r.get("DestinationDriveId") or "").strip():
             r["DestinationDriveId"] = str(mi.destination_drive_id)
@@ -582,8 +678,47 @@ def migrate_legacy_backup_folder(
             r["StableKey"] = uuid.uuid4().hex
             log_info("legacy_backup_migration_row_stamped", row_index=j, kind="proposed", field="StableKey")
 
-        dp = str(r.get("DestinationPath") or "").strip()
-        pp = str(r.get("ParentPath") or "").strip()
+        dp_in = str(r.get("DestinationPath") or "").strip()
+        pp_in = str(r.get("ParentPath") or "").strip()
+        dp, dp_lw = strip_legacy_library_container_segment(
+            dp_in,
+            dst_lib_disp or None,
+            row_index=j,
+            row_kind="proposed_dest",
+            role="destination",
+        )
+        pp, pp_lw = strip_legacy_library_container_segment(
+            pp_in,
+            dst_lib_disp or None,
+            row_index=j,
+            row_kind="proposed_parent",
+            role="destination",
+        )
+        if dp_lw == LIB_WRAP_STRIPPED:
+            counts["library_container_destination_wrappers_stripped"] += 1
+        if pp_lw == LIB_WRAP_STRIPPED:
+            counts["library_container_destination_wrappers_stripped"] += 1
+        if dp_lw == LIB_WRAP_IDENTITY_MISSING and dp_in:
+            counts["library_wrapper_identity_missing_destination_rows"] += 1
+            stp = str(r.get("Status") or "Proposed")
+            if "LegacyLibraryWrapperIdentityMissing" not in stp:
+                r["Status"] = _apply_status_suffix(stp, "LegacyLibraryWrapperIdentityMissing", default_base="Proposed")
+        elif dp_lw == LIB_WRAP_AMBIGUOUS and dp_in:
+            counts["library_wrapper_ambiguous_destination_rows"] += 1
+            stp = str(r.get("Status") or "Proposed")
+            if "LegacyLibraryWrapperAmbiguous" not in stp:
+                r["Status"] = _apply_status_suffix(stp, "LegacyLibraryWrapperAmbiguous", default_base="Proposed")
+        if pp_lw == LIB_WRAP_IDENTITY_MISSING and pp_in:
+            counts["library_wrapper_identity_missing_destination_rows"] += 1
+            stp = str(r.get("Status") or "Proposed")
+            if "LegacyLibraryWrapperIdentityMissing" not in stp:
+                r["Status"] = _apply_status_suffix(stp, "LegacyLibraryWrapperIdentityMissing", default_base="Proposed")
+        elif pp_lw == LIB_WRAP_AMBIGUOUS and pp_in:
+            counts["library_wrapper_ambiguous_destination_rows"] += 1
+            stp = str(r.get("Status") or "Proposed")
+            if "LegacyLibraryWrapperAmbiguous" not in stp:
+                r["Status"] = _apply_status_suffix(stp, "LegacyLibraryWrapperAmbiguous", default_base="Proposed")
+
         if can_skeleton:
             stripped_dp = normalize_manifest_path(dp)
             synth_d = False

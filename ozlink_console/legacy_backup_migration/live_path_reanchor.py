@@ -20,11 +20,14 @@ from ozlink_console.legacy_backup_migration.types import (
 from ozlink_console.logger import log_info
 from ozlink_console.paths import normalize_manifest_path
 
-# First-segment names that often denote library / app wrappers rather than business content.
-# Matching still requires a unique live suffix proof via Graph (not blind strip).
-_LEGACY_NAMESPACE_MARKERS_CF = frozenset(
+# First-segment names that denote **library/app namespace tokens** (not business folders named Root).
+# Do **not** include ``LEGACY_INTERNAL_ROOT_SEGMENT`` (``Root``): after library-container strip, a leading
+# ``Root\\`` segment is usually a legacy business hub folder; re-anchor tries ``Root3\\…`` etc. Treating
+# ``root`` as a foreign namespace here caused allocation-only ``foreign_root_blocked`` when Graph had
+# no match yet—same paths worked for proposed when shallow (e.g. ``Root\\Finance``).
+# ``foreign_root_blocked`` from re-anchor applies only to unresolvable **documents**/wrapper-like tokens.
+_LEGACY_REANCHOR_FOREIGN_NAMESPACE_MARKERS_CF = frozenset(
     {
-        str(LEGACY_INTERNAL_ROOT_SEGMENT).casefold(),
         "documents",
         "library documents",
     }
@@ -258,7 +261,7 @@ def reanchor_manifest_destination_path_against_live_skeleton(
             reason="single_segment_no_live_parent",
             before_excerpt=before[:220],
         )
-        if first_cf in _LEGACY_NAMESPACE_MARKERS_CF:
+        if first_cf in _LEGACY_REANCHOR_FOREIGN_NAMESPACE_MARKERS_CF:
             log_info(
                 "legacy_backup_migration_foreign_root_blocked",
                 row_index=row_index,
@@ -322,7 +325,7 @@ def reanchor_manifest_destination_path_against_live_skeleton(
         before_excerpt=before[:220],
     )
 
-    if first_cf in _LEGACY_NAMESPACE_MARKERS_CF:
+    if first_cf in _LEGACY_REANCHOR_FOREIGN_NAMESPACE_MARKERS_CF:
         log_info(
             "legacy_backup_migration_foreign_root_blocked",
             row_index=row_index,

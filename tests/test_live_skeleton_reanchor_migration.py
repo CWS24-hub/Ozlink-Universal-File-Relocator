@@ -162,7 +162,9 @@ def test_f_no_suffix_match_marks_failed_or_unresolved(tmp_path):
     res = migrate_legacy_backup_folder(src, tmp_path, identity=_identity("Root3"), graph=g, skip_graph_resolution=True)
     assert res.ok
     out = json.loads((res.output_folder / "Draft-AllocationQueue.json").read_text(encoding="utf-8"))
-    assert "LegacyReanchor" in str(out[0].get("Status", "")) or "ForeignRoot" in str(out[0].get("Status", ""))
+    # Legacy top segment OldTop is not a documents namespace token: re-anchor fails, not foreign_root_blocked.
+    st = str(out[0].get("Status", ""))
+    assert "LegacyReanchorFailed" in st or "LegacyReanchorAmbiguous" in st
 
 
 def test_g_conflict_when_live_folder_exists_at_target(tmp_path):
