@@ -59,6 +59,9 @@ def _minimal_mw_for_memory_truth_body():
     mw._replay_unresolved_proposed_overlay = lambda *a, **k: 0
     mw._replay_unresolved_allocation_overlay = lambda *a, **k: 0
     mw._count_visible_destination_future_state_nodes = lambda: 0
+    mw.memory_manager = MagicMock()
+    mw._save_draft_shell = MagicMock(return_value=True)
+    mw._schedule_startup_replay_settle_autosave = MagicMock()
     return mw
 
 
@@ -361,6 +364,7 @@ def test_post_startup_workspace_building_cleared_before_deferred_refine():
                 assert mw._destination_startup_memory_phase == "memory_presented"
                 drain()
     mw._mark_destination_tree_snapshot_dirty_after_injection.assert_called_once()
+    mw._schedule_startup_replay_settle_autosave.assert_called_once()
 
 
 def test_outer_overlay_returns_before_background_replay():
@@ -934,18 +938,107 @@ def test_minimal_replay_logs_progress_each_round_when_replay_runs():
         if msg == "startup_memory_minimal_replay_exit_reason":
             exits.append(str(kwargs.get("reason", "")))
 
+    _real_minimal = MainWindow._startup_memory_minimal_replay_pass
+
+    def _minimal_pass_clear_eager(self, ctx, r):
+        # Snapshot presentation sets eager (512-round cap); this test targets OZLINK_STARTUP_MINIMAL_REPLAY_MAX_ROUNDS=4.
+        self._startup_destination_eager_full_memory = False
+        return _real_minimal(self, ctx, r)
+
     with patch.dict(
         os.environ,
         {"OZLINK_STARTUP_BACKGROUND_REFINE_GRACE_MS": "120", "OZLINK_STARTUP_MINIMAL_REPLAY_MAX_ROUNDS": "4"},
         clear=False,
     ):
-        with patch("ozlink_console.main_window.log_info", side_effect=cap):
-            with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
-                with _memory_truth_timer_queue() as drain:
-                    MainWindow._apply_destination_planning_overlays_body_memory_truth_startup(
-                        mw,
-                        "startup_planned_workspace_memory_truth",
-                    )
-                    drain()
+        with patch.object(MainWindow, "_startup_memory_minimal_replay_pass", _minimal_pass_clear_eager):
+            with patch("ozlink_console.main_window.log_info", side_effect=cap):
+                with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
+                    with _memory_truth_timer_queue() as drain:
+                        MainWindow._apply_destination_planning_overlays_body_memory_truth_startup(
+                            mw,
+                            "startup_planned_workspace_memory_truth",
+                        )
+                        drain()
     assert len(progress) == 4
     assert exits == ["max_rounds"]
+
+
+def test_startup_replay_settle_autosave_skipped_when_suppressed():
+    mw = MainWindow.__new__(MainWindow)
+    mw.memory_manager = MagicMock()
+    mw._save_draft_shell = MagicMock(return_value=True)
+    mw._startup_replay_settle_autosave_timer_pending = False
+    scheduled: list[tuple[int, object]] = []
+
+    def cap(ms, fn):
+        scheduled.append((int(ms), fn))
+
+    with patch("ozlink_console.main_window.QTimer.singleShot", side_effect=cap):
+        MainWindow._schedule_startup_replay_settle_autosave(
+            mw,
+            suppress_startup_replay=True,
+            n_min_total=3,
+            n_persisted=2,
+            min_rep={"rounds": 1},
+            settle_reason="unit_suppressed",
+        )
+    assert scheduled == []
+    mw._save_draft_shell.assert_not_called()
+
+
+def test_startup_replay_settle_autosave_skipped_when_no_replay_work():
+    mw = MainWindow.__new__(MainWindow)
+    mw.memory_manager = MagicMock()
+    mw._save_draft_shell = MagicMock(return_value=True)
+    mw._startup_replay_settle_autosave_timer_pending = False
+    scheduled: list[tuple[int, object]] = []
+
+    def cap(ms, fn):
+        scheduled.append((int(ms), fn))
+
+    with patch("ozlink_console.main_window.QTimer.singleShot", side_effect=cap):
+        MainWindow._schedule_startup_replay_settle_autosave(
+            mw,
+            suppress_startup_replay=False,
+            n_min_total=0,
+            n_persisted=0,
+            min_rep={"rounds": 0},
+            settle_reason="unit_no_work",
+        )
+    assert scheduled == []
+    mw._save_draft_shell.assert_not_called()
+
+
+def test_startup_replay_settle_autosave_schedules_once_and_saves():
+    mw = MainWindow.__new__(MainWindow)
+    mw.memory_manager = MagicMock()
+    mw._save_draft_shell = MagicMock(return_value=True)
+    mw._log_restore_exception = lambda *a, **k: None
+    mw._startup_replay_settle_autosave_timer_pending = False
+    mw._safe_invoke = lambda _n, fn: fn()
+    scheduled: list[tuple[int, object]] = []
+
+    def cap(ms, fn):
+        scheduled.append((int(ms), fn))
+
+    with patch("ozlink_console.main_window.QTimer.singleShot", side_effect=cap):
+        MainWindow._schedule_startup_replay_settle_autosave(
+            mw,
+            suppress_startup_replay=False,
+            n_min_total=0,
+            n_persisted=2,
+            min_rep={"rounds": 0},
+            settle_reason="unit_persisted_overlay",
+        )
+        MainWindow._schedule_startup_replay_settle_autosave(
+            mw,
+            suppress_startup_replay=False,
+            n_min_total=0,
+            n_persisted=1,
+            min_rep={"rounds": 0},
+            settle_reason="unit_second",
+        )
+    assert len(scheduled) == 1
+    assert scheduled[0][0] == 1600
+    scheduled[0][1]()
+    mw._save_draft_shell.assert_called_once_with(force=True, include_workspace_ui=False)

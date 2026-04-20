@@ -2981,6 +2981,8 @@ class MainWindow(QMainWindow):
         self._startup_visible_snapshot_bound: bool = False
         self._startup_refinement_in_progress: bool = False
         self._startup_refinement_complete: bool = False
+        # One-shot guard: delayed draft save after startup replay settle (hybrid destination persistence).
+        self._startup_replay_settle_autosave_timer_pending: bool = False
         # Until startup refinement finishes: synchronous destination overlay + full replay (no source-gate / throttling).
         self._startup_destination_eager_full_memory: bool = False
         self._startup_background_refine_pending: dict[str, Any] | None = None
@@ -8587,6 +8589,145 @@ class MainWindow(QMainWindow):
         log_info(
             "destination_snapshot_marked_dirty_after_injection",
             reason=str(reason or "")[:220],
+        )
+
+    def _schedule_startup_replay_settle_autosave(
+        self,
+        *,
+        suppress_startup_replay: bool,
+        n_min_total: int,
+        n_persisted: int,
+        min_rep: dict[str, Any] | None,
+        settle_reason: str,
+    ) -> None:
+        """Queue a one-shot delayed draft save so replay-expanded destination rows reach DestinationTreeSnapshot.
+
+        Startup-only: does not alter global autosave timers. Skips when replay was suppressed with no work,
+        when nothing changed, when a delayed save is already pending, or when no memory manager exists.
+        """
+        if getattr(self, "_application_shutting_down", False):
+            log_info(
+                "startup_replay_autosave_skipped",
+                reason="application_shutting_down",
+                suppress_startup_replay=bool(suppress_startup_replay),
+                minimal_overlay_rows=int(n_min_total),
+                persisted_overlay_rows=int(n_persisted),
+                minimal_replay_rounds=int((min_rep or {}).get("rounds", 0) or 0),
+                destination_snapshot_dirty=bool(getattr(self, "_destination_tree_snapshot_dirty_for_persist", False)),
+            )
+            return
+        if suppress_startup_replay:
+            log_info(
+                "startup_replay_autosave_skipped",
+                reason="startup_replay_suppressed",
+                suppress_startup_replay=True,
+                minimal_overlay_rows=0,
+                persisted_overlay_rows=0,
+                minimal_replay_rounds=0,
+                destination_snapshot_dirty=bool(getattr(self, "_destination_tree_snapshot_dirty_for_persist", False)),
+            )
+            return
+        rounds = int((min_rep or {}).get("rounds", 0) or 0)
+        replay_work = int(n_min_total) + int(n_persisted) > 0 or rounds > 0
+        if not replay_work:
+            log_info(
+                "startup_replay_autosave_skipped",
+                reason="no_replay_work_to_persist",
+                suppress_startup_replay=False,
+                minimal_overlay_rows=int(n_min_total),
+                persisted_overlay_rows=int(n_persisted),
+                minimal_replay_rounds=int(rounds),
+                destination_snapshot_dirty=bool(getattr(self, "_destination_tree_snapshot_dirty_for_persist", False)),
+            )
+            return
+        if getattr(self, "memory_manager", None) is None:
+            log_info(
+                "startup_replay_autosave_skipped",
+                reason="no_memory_manager",
+                suppress_startup_replay=False,
+                minimal_overlay_rows=int(n_min_total),
+                persisted_overlay_rows=int(n_persisted),
+                minimal_replay_rounds=int(rounds),
+                destination_snapshot_dirty=bool(getattr(self, "_destination_tree_snapshot_dirty_for_persist", False)),
+            )
+            return
+        if getattr(self, "_startup_replay_settle_autosave_timer_pending", False):
+            log_info(
+                "startup_replay_autosave_skipped",
+                reason="startup_replay_autosave_already_pending",
+                suppress_startup_replay=False,
+                minimal_overlay_rows=int(n_min_total),
+                persisted_overlay_rows=int(n_persisted),
+                minimal_replay_rounds=int(rounds),
+                destination_snapshot_dirty=bool(getattr(self, "_destination_tree_snapshot_dirty_for_persist", False)),
+            )
+            return
+        delay_ms = 1600
+        self._startup_replay_settle_autosave_timer_pending = True
+        log_info(
+            "startup_replay_autosave_scheduled",
+            delay_ms=int(delay_ms),
+            settle_reason=str(settle_reason or "")[:200],
+            minimal_overlay_rows=int(n_min_total),
+            persisted_overlay_rows=int(n_persisted),
+            minimal_replay_rounds=int(rounds),
+            destination_snapshot_dirty=bool(getattr(self, "_destination_tree_snapshot_dirty_for_persist", False)),
+        )
+
+        def _run() -> None:
+            self._safe_invoke(
+                "startup_replay_settle_autosave",
+                lambda: self._run_startup_replay_settle_autosave(
+                    settle_reason=str(settle_reason or "")[:200],
+                    minimal_overlay_rows=int(n_min_total),
+                    persisted_overlay_rows=int(n_persisted),
+                    minimal_replay_rounds=int(rounds),
+                ),
+            )
+
+        QTimer.singleShot(int(delay_ms), _run)
+
+    def _run_startup_replay_settle_autosave(
+        self,
+        *,
+        settle_reason: str,
+        minimal_overlay_rows: int,
+        persisted_overlay_rows: int,
+        minimal_replay_rounds: int,
+    ) -> None:
+        self._startup_replay_settle_autosave_timer_pending = False
+        if getattr(self, "_application_shutting_down", False):
+            log_info(
+                "startup_replay_autosave_skipped",
+                reason="application_shutting_down_at_fire",
+                settle_reason=str(settle_reason or "")[:200],
+                minimal_overlay_rows=int(minimal_overlay_rows),
+                persisted_overlay_rows=int(persisted_overlay_rows),
+                minimal_replay_rounds=int(minimal_replay_rounds),
+                destination_snapshot_dirty=bool(getattr(self, "_destination_tree_snapshot_dirty_for_persist", False)),
+            )
+            return
+        log_info(
+            "startup_replay_autosave_begin",
+            settle_reason=str(settle_reason or "")[:200],
+            minimal_overlay_rows=int(minimal_overlay_rows),
+            persisted_overlay_rows=int(persisted_overlay_rows),
+            minimal_replay_rounds=int(minimal_replay_rounds),
+            destination_snapshot_dirty=bool(getattr(self, "_destination_tree_snapshot_dirty_for_persist", False)),
+        )
+        ok = False
+        try:
+            ok = bool(self._save_draft_shell(force=True, include_workspace_ui=False))
+        except Exception as exc:
+            self._log_restore_exception("startup_replay_settle_autosave", exc)
+        log_info(
+            "startup_replay_autosave_complete",
+            success=bool(ok),
+            settle_reason=str(settle_reason or "")[:200],
+            minimal_overlay_rows=int(minimal_overlay_rows),
+            persisted_overlay_rows=int(persisted_overlay_rows),
+            minimal_replay_rounds=int(minimal_replay_rounds),
+            destination_snapshot_dirty=bool(getattr(self, "_destination_tree_snapshot_dirty_for_persist", False)),
         )
 
     def _destination_startup_snapshot_root_context(self) -> DestinationStartupSnapshotRootContext:
@@ -49312,6 +49453,7 @@ class MainWindow(QMainWindow):
             self._startup_refinement_in_progress = True
             n_min_total = 0
             n_persisted = 0
+            min_rep: dict[str, Any] | None = None
             suppress_startup_replay = self._startup_snapshot_suppresses_startup_replay()
             try:
                 log_info(
@@ -49443,6 +49585,16 @@ class MainWindow(QMainWindow):
                 try:
                     self._mark_destination_tree_snapshot_dirty_after_injection(
                         reason="startup_memory_truth_settled"
+                    )
+                except Exception:
+                    pass
+                try:
+                    self._schedule_startup_replay_settle_autosave(
+                        suppress_startup_replay=bool(suppress_startup_replay),
+                        n_min_total=int(n_min_total),
+                        n_persisted=int(n_persisted),
+                        min_rep=min_rep,
+                        settle_reason=str(r)[:200],
                     )
                 except Exception:
                     pass
