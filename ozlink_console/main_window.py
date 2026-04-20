@@ -145,6 +145,7 @@ from ozlink_console.legacy_backup_migration import MigrationIdentityPreflight, m
 from ozlink_console.legacy_backup_migration.types import migration_identity_complete
 from ozlink_console.version_info import APP_VERSION
 from ozlink_console.models import AllocationRow, ProposedFolder, SessionState, SubmissionBatch
+from ozlink_console.recovered_planning_display import recovered_planning_display_label, recovered_planning_status_tooltip
 from ozlink_console.planning_destination_anchor_review import (
     REVIEW_TYPE_DESTINATION_ANCHOR_MISSING,
     build_destination_anchor_missing_needs_review_row,
@@ -12147,6 +12148,15 @@ class MainWindow(QMainWindow):
             "requested_by": row.RequestedBy,
             "requested_date": row.RequestedDate,
             "status": row.Status,
+            "LegacyMigrationAnchorClassification": str(row.LegacyMigrationAnchorClassification or ""),
+            "LegacyMigrationPlannedScaffoldOnly": bool(row.LegacyMigrationPlannedScaffoldOnly),
+            "LegacyMigrationRootNotLiveConfirmed": bool(row.LegacyMigrationRootNotLiveConfirmed),
+            "LegacyMigrationUnresolvedGraphAnchor": bool(row.LegacyMigrationUnresolvedGraphAnchor),
+            "LegacyForeignRootBlocked": bool(row.LegacyForeignRootBlocked),
+            "LegacyMigrationPlannedParentResolved": bool(row.LegacyMigrationPlannedParentResolved),
+            "LegacyMigrationDestinationParentResolution": str(row.LegacyMigrationDestinationParentResolution or ""),
+            "DestinationParentPlannedPath": str(row.DestinationParentPlannedPath or ""),
+            "LegacyMigrationPlannedParentMatchKind": str(row.LegacyMigrationPlannedParentMatchKind or ""),
             "source_id": sid,
             "source_name": row.SourceItemName,
             "source_path": source_path,
@@ -69361,7 +69371,9 @@ class MainWindow(QMainWindow):
             name = str(pf.FolderName or "").strip()
             parent = str(pf.ParentPath or "").strip()
             is_submitted = self._is_proposed_folder_submitted(pf)
-            status_text = "Submitted" if is_submitted else (str(pf.Status or "").strip() or "Draft")
+            raw_pf_status = str(getattr(pf, "Status", "") or "").strip()
+            friendly_pf = recovered_planning_display_label(pf)
+            status_text = "Submitted" if is_submitted else (friendly_pf or raw_pf_status or "Draft")
             dest_path = self._proposed_destination_path(pf) or str(pf.DestinationPath or "").strip()
             values = [name, parent, status_text]
             for column_index, value in enumerate(values):
@@ -69381,7 +69393,11 @@ class MainWindow(QMainWindow):
                         else "Submitted and locked."
                     )
                 else:
-                    item.setToolTip(dest_path if dest_path else "Draft proposed folder")
+                    if column_index == 2:
+                        tip_pf = recovered_planning_status_tooltip(raw_status=raw_pf_status, display_label=friendly_pf)
+                        item.setToolTip(tip_pf or (dest_path if dest_path else "Draft proposed folder"))
+                    else:
+                        item.setToolTip(dest_path if dest_path else "Draft proposed folder")
                 table.setItem(row_index, column_index, item)
         table.clearSelection()
 
@@ -69423,7 +69439,12 @@ class MainWindow(QMainWindow):
 
         for row_index, move in enumerate(self.planned_moves):
             is_submitted = self._is_move_submitted(move)
-            status_text = "Submitted" if is_submitted else "Draft"
+            raw_move_status = str((move or {}).get("status", "") or "")
+            friendly = recovered_planning_display_label(move) if isinstance(move, dict) else None
+            if is_submitted:
+                status_text = "Submitted"
+            else:
+                status_text = friendly or "Draft"
             values = [
                 move.get("source_name", ""),
                 move.get("source_path", ""),
@@ -69447,6 +69468,11 @@ class MainWindow(QMainWindow):
                         if batch_id
                         else "Submitted and locked."
                     )
+                else:
+                    if column_index == 4:
+                        tip = recovered_planning_status_tooltip(raw_status=raw_move_status, display_label=friendly)
+                        if tip:
+                            item.setToolTip(tip)
                 self.planned_moves_table.setItem(row_index, column_index, item)
 
         if self.planned_moves:
@@ -70733,21 +70759,37 @@ class MainWindow(QMainWindow):
             or destination_node.get("display_path")
             or ""
         )
-        return AllocationRow(
-            RequestId=self._ensure_move_request_id(move, index_hint),
-            SourceItemName=move.get("source_name") or source_node.get("name", "Unnamed Item"),
-            SourcePath=source_path,
-            SourceType="Folder" if source_node.get("is_folder", True) else "File",
-            RequestedDestinationPath=destination_path,
-            AllocationMethod=move.get("allocation_method", "Manual - Recursive"),
-            RequestedBy=move.get("requested_by", self.current_session_context.get("operator_display_name", "")),
-            RequestedDate=move.get("requested_date", datetime.utcnow().strftime("%Y-%m-%d %H:%M")),
-            Status=move.get("status", "Pending"),
-            SourceDriveId=str(source_node.get("drive_id", "") or move.get("source_drive_id", "") or ""),
-            SourceItemId=str(source_node.get("id", "") or move.get("source_id", "") or ""),
-            DestinationDriveId=str(destination_node.get("drive_id", "") or move.get("destination_drive_id", "") or ""),
-            DestinationParentItemId=str(destination_node.get("id", "") or move.get("destination_id", "") or ""),
+        alloc_payload: dict[str, Any] = {
+            "RequestId": self._ensure_move_request_id(move, index_hint),
+            "SourceItemName": move.get("source_name") or source_node.get("name", "Unnamed Item"),
+            "SourcePath": source_path,
+            "SourceType": "Folder" if source_node.get("is_folder", True) else "File",
+            "RequestedDestinationPath": destination_path,
+            "AllocationMethod": move.get("allocation_method", "Manual - Recursive"),
+            "RequestedBy": move.get("requested_by", self.current_session_context.get("operator_display_name", "")),
+            "RequestedDate": move.get("requested_date", datetime.utcnow().strftime("%Y-%m-%d %H:%M")),
+            "Status": move.get("status", "Pending"),
+            "SourceDriveId": str(source_node.get("drive_id", "") or move.get("source_drive_id", "") or ""),
+            "SourceItemId": str(source_node.get("id", "") or move.get("source_id", "") or ""),
+            "DestinationDriveId": str(destination_node.get("drive_id", "") or move.get("destination_drive_id", "") or ""),
+            "DestinationParentItemId": str(destination_node.get("id", "") or move.get("destination_id", "") or ""),
+        }
+        _leg = (
+            "LegacyMigrationAnchorClassification",
+            "LegacyMigrationPlannedScaffoldOnly",
+            "LegacyMigrationRootNotLiveConfirmed",
+            "LegacyMigrationUnresolvedGraphAnchor",
+            "LegacyForeignRootBlocked",
+            "LegacyMigrationPlannedParentResolved",
+            "LegacyMigrationDestinationParentResolution",
+            "DestinationParentPlannedPath",
+            "LegacyMigrationPlannedParentMatchKind",
         )
+        if isinstance(move, dict):
+            for k in _leg:
+                if k in move:
+                    alloc_payload[k] = move[k]
+        return AllocationRow.from_dict(alloc_payload)
 
     def _find_submitted_move_by_source_node(self, source_node):
         for move in self.planned_moves:
