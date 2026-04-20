@@ -263,7 +263,9 @@ def test_ensure_full_tree_not_blocked_by_memory_restore_when_graph_authority_act
     mw._destination_full_tree_ready = lambda: False  # type: ignore[method-assign]
     started: list[str] = []
     mw.start_destination_full_tree_worker = lambda d: started.append(str(d))  # type: ignore[method-assign]
-    MainWindow._ensure_sharepoint_destination_full_tree_worker_scheduled(mw, "d-graph")
+    MainWindow._ensure_sharepoint_destination_full_tree_worker_scheduled(
+        mw, "d-graph", bootstrap=True, schedule_reason="test_bootstrap"
+    )
     assert started == ["d-graph"]
 
 
@@ -281,7 +283,9 @@ def test_ensure_full_tree_not_blocked_by_memory_restore_when_authority_shell_act
     mw._destination_full_tree_completed_drive_id = ""
     started: list[str] = []
     mw.start_destination_full_tree_worker = lambda d: started.append(str(d))  # type: ignore[method-assign]
-    MainWindow._ensure_sharepoint_destination_full_tree_worker_scheduled(mw, "d-mem")
+    MainWindow._ensure_sharepoint_destination_full_tree_worker_scheduled(
+        mw, "d-mem", bootstrap=True, schedule_reason="test_bootstrap"
+    )
     assert started == ["d-mem"]
 
 
@@ -299,7 +303,9 @@ def test_ensure_full_tree_not_blocked_by_expand_burst_when_authority_shell_activ
     mw._destination_full_tree_completed_drive_id = ""
     started: list[str] = []
     mw.start_destination_full_tree_worker = lambda d: started.append(str(d))  # type: ignore[method-assign]
-    MainWindow._ensure_sharepoint_destination_full_tree_worker_scheduled(mw, "d-burst")
+    MainWindow._ensure_sharepoint_destination_full_tree_worker_scheduled(
+        mw, "d-burst", bootstrap=True, schedule_reason="test_bootstrap"
+    )
     assert started == ["d-burst"]
 
 
@@ -317,7 +323,9 @@ def test_ensure_full_tree_when_shell_active_bypasses_ready_short_circuit():
     mw._destination_full_tree_worker = None
     started: list[str] = []
     mw.start_destination_full_tree_worker = lambda d: started.append(str(d))  # type: ignore[method-assign]
-    MainWindow._ensure_sharepoint_destination_full_tree_worker_scheduled(mw, "d-shell")
+    MainWindow._ensure_sharepoint_destination_full_tree_worker_scheduled(
+        mw, "d-shell", bootstrap=True, schedule_reason="test_bootstrap"
+    )
     assert started == ["d-shell"]
 
 
@@ -460,7 +468,7 @@ def test_sharepoint_materialize_gate_schedules_full_tree_when_no_worker():
             self.pending_root_drive_ids = {"source": "", "destination": "drive-sched"}
             self.scheduled_drives: list[str] = []
 
-        def _ensure_sharepoint_destination_full_tree_worker_scheduled(self, drive_id: str) -> None:
+        def _ensure_sharepoint_destination_full_tree_worker_scheduled(self, drive_id: str, **_kwargs) -> None:
             self.scheduled_drives.append(str(drive_id or ""))
 
     host = _GateHost()
@@ -533,13 +541,14 @@ def test_light_validation_structure_mismatch_schedules_full_walk():
     def _invalidate(_self, d):
         calls.append(f"invalidate:{d}")
 
-    def _start(_self, d):
-        calls.append(f"walk:{d}")
+    def _ensure_ft(_self, d, **_kwargs):
+        calls.append(f"ensure:{d}")
 
     mw._invalidate_destination_full_tree_for_live_reconcile = MethodType(  # type: ignore[method-assign]
         _invalidate, mw
     )
-    mw.start_destination_full_tree_worker = MethodType(_start, mw)  # type: ignore[method-assign]
+    mw._ensure_sharepoint_destination_full_tree_worker_scheduled = MethodType(_ensure_ft, mw)  # type: ignore[method-assign]
+    mw._safe_invoke = lambda _n, fn, *a, **k: fn(*a, **k)  # type: ignore[method-assign]
     rf, _rn = MainWindow._destination_root_children_fingerprint_from_full_snapshot(mw)
     MainWindow._on_destination_spo_snapshot_light_validation_success(
         mw,
@@ -556,7 +565,7 @@ def test_light_validation_structure_mismatch_schedules_full_walk():
     _loop.exec()
     QApplication.processEvents()
     assert any(c.startswith("invalidate:") for c in calls)
-    assert any(c.startswith("walk:") for c in calls)
+    assert any(c.startswith("ensure:") for c in calls)
 
 
 def test_full_tree_success_flushes_non_auth_shell_via_non_deferring_materialize():

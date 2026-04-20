@@ -87,6 +87,11 @@ class ProposedFolder:
     LegacyMigrationDestinationParentResolution: str = ""
     DestinationParentPlannedPath: str = ""
     LegacyMigrationPlannedParentMatchKind: str = ""
+    # Runtime live-vs-memory duplicate resolution (planning only; no SharePoint mutations).
+    LiveMemoryDuplicateResolution: str = ""
+    LiveMemoryDuplicateLiveItemId: str = ""
+    LiveMemoryDuplicateLiveItemPath: str = ""
+    LiveMemoryDuplicateResolvedAtUtc: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ProposedFolder":
@@ -112,6 +117,10 @@ class ProposedFolder:
             LegacyMigrationDestinationParentResolution=str(data.get("LegacyMigrationDestinationParentResolution", "") or ""),
             DestinationParentPlannedPath=str(data.get("DestinationParentPlannedPath", "") or ""),
             LegacyMigrationPlannedParentMatchKind=str(data.get("LegacyMigrationPlannedParentMatchKind", "") or ""),
+            LiveMemoryDuplicateResolution=str(data.get("LiveMemoryDuplicateResolution", "") or ""),
+            LiveMemoryDuplicateLiveItemId=str(data.get("LiveMemoryDuplicateLiveItemId", "") or ""),
+            LiveMemoryDuplicateLiveItemPath=str(data.get("LiveMemoryDuplicateLiveItemPath", "") or ""),
+            LiveMemoryDuplicateResolvedAtUtc=str(data.get("LiveMemoryDuplicateResolvedAtUtc", "") or ""),
         )
 
     def to_dict(self) -> dict[str, Any]:

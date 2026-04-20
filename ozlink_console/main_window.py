@@ -146,6 +146,24 @@ from ozlink_console.legacy_backup_migration.types import migration_identity_comp
 from ozlink_console.version_info import APP_VERSION
 from ozlink_console.models import AllocationRow, ProposedFolder, SessionState, SubmissionBatch
 from ozlink_console.recovered_planning_display import recovered_planning_display_label, recovered_planning_status_tooltip
+from ozlink_console.destination_full_tree_policy import (
+    destination_graph_delta_cursor_present,
+    log_destination_graph_delta_lifecycle,
+    should_schedule_destination_full_tree,
+)
+from ozlink_console.destination_graph_truth_export import graph_item_path_to_raw_windows_path
+from ozlink_console.destination_live_memory_conflicts import (
+    REVIEW_TYPE_LIVE_MEMORY_DUPLICATE,
+    detect_conflicts_for_live_paths,
+    merge_unique,
+    normalize_path_key,
+)
+from ozlink_console.destination_live_memory_resolution import (
+    RESOLVED_BY_ACCEPT_EXISTING_LIVE_FOLDER,
+    apply_accept_existing_live_folder_to_proposed_folder,
+    filter_runtime_live_memory_rows,
+    proposed_folder_accepts_existing_live_folder,
+)
 from ozlink_console.planning_destination_anchor_review import (
     REVIEW_TYPE_DESTINATION_ANCHOR_MISSING,
     build_destination_anchor_missing_needs_review_row,
@@ -3370,6 +3388,7 @@ class MainWindow(QMainWindow):
         self._workflow_not_planned_rows = []
         self._workflow_suggestion_rows = []
         self._workflow_needs_review_rows = []
+        self._runtime_live_memory_conflict_rows: list[dict[str, Any]] = []
         self._migration_import_needs_review_rows: list[dict[str, Any]] = []
         self._destination_anchor_missing_review_sig: str | None = None
         self._needs_review_dismissed_inherited_paths: set[str] = set()
@@ -4040,7 +4059,11 @@ class MainWindow(QMainWindow):
         if getattr(self, "_sharepoint_lazy_mode", False):
             self._deferred_background_load_targets[panel_key] = str(drive_id or "")
             if panel_key == "destination" and drive_id:
-                self._ensure_sharepoint_destination_full_tree_worker_scheduled(drive_id)
+                self._ensure_sharepoint_destination_full_tree_worker_scheduled(
+                    drive_id,
+                    schedule_reason="deferred_background_load_lazy_destination",
+                    bootstrap=True,
+                )
             elif panel_key == "source" and drive_id:
                 self._schedule_full_count_with_restore_backoff(drive_id)
             return
@@ -4049,8 +4072,12 @@ class MainWindow(QMainWindow):
             if panel_key == "source":
                 self._schedule_full_count_with_restore_backoff(drive_id)
             elif panel_key == "destination":
-                self._ensure_sharepoint_destination_full_tree_worker_scheduled(drive_id)
-            return
+                self._ensure_sharepoint_destination_full_tree_worker_scheduled(
+                    drive_id,
+                    schedule_reason="deferred_background_timer_destination",
+                    bootstrap=True,
+                )
+                return
 
         self._deferred_background_load_targets[panel_key] = str(drive_id or "")
         timer.stop()
@@ -4067,7 +4094,11 @@ class MainWindow(QMainWindow):
         if panel_key == "source":
             self._schedule_full_count_with_restore_backoff(drive_id)
         elif panel_key == "destination":
-            self._ensure_sharepoint_destination_full_tree_worker_scheduled(drive_id)
+            self._ensure_sharepoint_destination_full_tree_worker_scheduled(
+                drive_id,
+                schedule_reason="deferred_background_run_destination",
+                bootstrap=True,
+            )
 
     def _refresh_tree_column_width(self, panel_key):
         tree = self.source_tree_widget if panel_key == "source" else self.destination_tree_widget
@@ -6414,6 +6445,7 @@ class MainWindow(QMainWindow):
             "proposed_branch_dependency",
             "weak_suggestion",
             "migration_live_duplicate_proposed_folder",
+            REVIEW_TYPE_LIVE_MEMORY_DUPLICATE,
             REVIEW_TYPE_DESTINATION_ANCHOR_MISSING,
         }
         n_inherited_not_dismissed = 0
@@ -16176,7 +16208,11 @@ class MainWindow(QMainWindow):
                 "destination_full_tree_worker_rekick_after_stall",
                 drive_id_suffix=did[-16:] if len(did) > 16 else did,
             )
-            self._ensure_sharepoint_destination_full_tree_worker_scheduled(did)
+            self._ensure_sharepoint_destination_full_tree_worker_scheduled(
+                did,
+                schedule_reason="destination_authority_stall_rekick",
+                recovery=True,
+            )
 
     def _destination_planned_reconcile_after_authority_or_flush_overlay(self, *, exception_log_key: str) -> None:
         """Run global planned-parent reconcile once per overlay stack.
@@ -16484,8 +16520,11 @@ class MainWindow(QMainWindow):
                 0,
                 lambda d=drive_id: self._safe_invoke(
                     "destination_spo_light_mismatch_full_walk",
-                    self.start_destination_full_tree_worker,
-                    d,
+                    lambda: self._ensure_sharepoint_destination_full_tree_worker_scheduled(
+                        d,
+                        schedule_reason="spo_snapshot_root_fingerprint_mismatch",
+                        recovery=True,
+                    ),
                 ),
             )
             return
@@ -16505,8 +16544,11 @@ class MainWindow(QMainWindow):
                 0,
                 lambda d=drive_id: self._safe_invoke(
                     "destination_spo_deep_count_mismatch_full_walk",
-                    self.start_destination_full_tree_worker,
-                    d,
+                    lambda: self._ensure_sharepoint_destination_full_tree_worker_scheduled(
+                        d,
+                        schedule_reason="spo_snapshot_recursive_count_mismatch",
+                        recovery=True,
+                    ),
                 ),
             )
             return
@@ -16525,8 +16567,11 @@ class MainWindow(QMainWindow):
                 0,
                 lambda d=drive_id: self._safe_invoke(
                     "destination_spo_structure_mismatch_full_walk",
-                    self.start_destination_full_tree_worker,
-                    d,
+                    lambda: self._ensure_sharepoint_destination_full_tree_worker_scheduled(
+                        d,
+                        schedule_reason="spo_snapshot_structure_fingerprint_mismatch",
+                        recovery=True,
+                    ),
                 ),
             )
             return
@@ -16561,8 +16606,11 @@ class MainWindow(QMainWindow):
                 0,
                 lambda d=drive_id: self._safe_invoke(
                     "destination_spo_light_error_full_walk",
-                    self.start_destination_full_tree_worker,
-                    d,
+                    lambda: self._ensure_sharepoint_destination_full_tree_worker_scheduled(
+                        d,
+                        schedule_reason="spo_snapshot_light_validation_error",
+                        recovery=True,
+                    ),
                 ),
             )
 
@@ -18566,7 +18614,18 @@ class MainWindow(QMainWindow):
             return False
         return True
 
-    def _ensure_sharepoint_destination_full_tree_worker_scheduled(self, drive_id: str) -> None:
+    def _ensure_sharepoint_destination_full_tree_worker_scheduled(
+        self,
+        drive_id: str,
+        *,
+        schedule_reason: str = "unspecified",
+        routine_followup: bool = False,
+        bootstrap: bool = False,
+        explicit_refresh: bool = False,
+        recovery: bool = False,
+        delta_failed: bool = False,
+        force_refresh: bool = False,
+    ) -> None:
         """Start (or keep) the full-library walk when SharePoint authority is required; retries past transient skips."""
         if getattr(self, "_application_shutting_down", False):
             return
@@ -18595,8 +18654,11 @@ class MainWindow(QMainWindow):
                 400,
                 lambda d=did: self._safe_invoke(
                     "destination_full_tree_retry_after_bind_sync",
-                    self._ensure_sharepoint_destination_full_tree_worker_scheduled,
-                    d,
+                    lambda: self._ensure_sharepoint_destination_full_tree_worker_scheduled(
+                        d,
+                        schedule_reason="retry_after_bind_sync",
+                        recovery=True,
+                    ),
                 ),
             )
             return
@@ -18610,8 +18672,11 @@ class MainWindow(QMainWindow):
                 420,
                 lambda d=did: self._safe_invoke(
                     "destination_full_tree_retry_after_startup_phase",
-                    self._ensure_sharepoint_destination_full_tree_worker_scheduled,
-                    d,
+                    lambda: self._ensure_sharepoint_destination_full_tree_worker_scheduled(
+                        d,
+                        schedule_reason="retry_after_startup_phase",
+                        bootstrap=True,
+                    ),
                 ),
             )
             return
@@ -18632,15 +18697,36 @@ class MainWindow(QMainWindow):
                 320,
                 lambda d=did: self._safe_invoke(
                     "destination_full_tree_retry_after_restore_or_burst",
-                    self._ensure_sharepoint_destination_full_tree_worker_scheduled,
-                    d,
+                    lambda: self._ensure_sharepoint_destination_full_tree_worker_scheduled(
+                        d,
+                        schedule_reason="retry_after_restore_or_burst",
+                        recovery=True,
+                    ),
                 ),
             )
+            return
+        _sched = should_schedule_destination_full_tree(
+            reason=str(schedule_reason),
+            drive_id=did,
+            force_refresh=bool(force_refresh),
+            delta_failed=bool(delta_failed),
+            bootstrap=bool(bootstrap),
+            explicit_refresh=bool(explicit_refresh),
+            recovery=bool(recovery),
+            routine_followup=bool(routine_followup),
+            delta_cursor_present=destination_graph_delta_cursor_present(getattr(self, "graph", None), did),
+            bootstrap_complete=bool(
+                self._destination_full_tree_ready()
+                and str(getattr(self, "_destination_full_tree_completed_drive_id", "") or "").strip() == did
+            ),
+        )
+        if not _sched.allowed:
             return
         self._log_restore_phase(
             "destination_authority_pipeline",
             step="authority_worker_scheduled",
             drive_id_suffix=did[-16:] if len(did) > 16 else did,
+            full_tree_schedule_reason=str(schedule_reason)[:120],
         )
         self.start_destination_full_tree_worker(did)
 
@@ -18660,8 +18746,11 @@ class MainWindow(QMainWindow):
                 400,
                 lambda d=did_bind: self._safe_invoke(
                     "destination_full_tree_retry_after_bind_sync_start",
-                    self._ensure_sharepoint_destination_full_tree_worker_scheduled,
-                    d,
+                    lambda: self._ensure_sharepoint_destination_full_tree_worker_scheduled(
+                        d,
+                        schedule_reason="retry_after_bind_sync_start",
+                        recovery=True,
+                    ),
                 ),
             )
             return
@@ -19701,6 +19790,19 @@ class MainWindow(QMainWindow):
         if mig_extra:
             needs_review_rows.extend(mig_extra)
 
+        for row in list(getattr(self, "_runtime_live_memory_conflict_rows", None) or []):
+            if not isinstance(row, dict):
+                continue
+            key = (
+                str(row.get("review_type") or "").strip(),
+                self.normalize_memory_path(str(row.get("source_path") or "")),
+                str(row.get("reason") or ""),
+            )
+            if key in review_seen:
+                continue
+            review_seen.add(key)
+            needs_review_rows.append(row)
+
         needs_review_rows.sort(key=lambda row: (row["review_type"], row["source_path"].lower()))
 
         self._workflow_not_planned_rows = not_planned_rows
@@ -19767,6 +19869,33 @@ class MainWindow(QMainWindow):
         self._activate_workflow_source_row(row_data if isinstance(row_data, dict) else {})
 
     def _activate_workflow_source_row(self, row_data: dict) -> None:
+        if isinstance(row_data, dict) and str(row_data.get("review_type") or "").strip() == REVIEW_TYPE_LIVE_MEMORY_DUPLICATE:
+            log_info(
+                "destination_live_memory_duplicate_needs_review_activation",
+                subtype=str(row_data.get("live_memory_subtype") or ""),
+                source_path=str(row_data.get("source_path") or "")[:260],
+                live_path=str(row_data.get("live_graph_path") or row_data.get("action") or "")[:260],
+            )
+            if str(row_data.get("live_memory_subtype") or "").strip() == "live_duplicate_proposed_folder":
+                self._show_live_duplicate_proposed_folder_resolution_dialog(row_data)
+                if hasattr(self, "destination_tree_widget"):
+                    try:
+                        self.destination_tree_widget.setFocus(Qt.FocusReason.OtherFocusReason)
+                    except Exception:
+                        pass
+                return
+            QMessageBox.information(
+                self,
+                "Live vs planning conflict",
+                "Microsoft 365 already has an item at a path that matches pending planning. "
+                "The live library structure wins; choose how to reconcile planning when actions are available.",
+            )
+            if hasattr(self, "destination_tree_widget"):
+                try:
+                    self.destination_tree_widget.setFocus(Qt.FocusReason.OtherFocusReason)
+                except Exception:
+                    pass
+            return
         if isinstance(row_data, dict) and str(row_data.get("review_type") or "").strip() == REVIEW_TYPE_DESTINATION_ANCHOR_MISSING:
             QMessageBox.information(
                 self,
@@ -19809,6 +19938,273 @@ class MainWindow(QMainWindow):
         self.on_tree_selection_changed("source")
         if hasattr(self, "workspace_tabs"):
             self.workspace_tabs.setCurrentWidget(self.details_box)
+
+    def _coerce_proposed_folder_model(self, raw: Any) -> ProposedFolder | None:
+        if isinstance(raw, ProposedFolder):
+            return raw
+        if isinstance(raw, dict):
+            try:
+                return ProposedFolder.from_dict(raw)
+            except Exception:
+                return None
+        return None
+
+    def _proposed_folder_index_for_live_duplicate_row(self, row_data: dict) -> int:
+        sp = self.normalize_memory_path(str(row_data.get("source_path") or ""))
+        if not sp:
+            return -1
+        want = self._canonical_destination_projection_path(sp) or sp
+        want_key = normalize_path_key(want)
+        for i, raw in enumerate(self.proposed_folders or []):
+            pf = self._coerce_proposed_folder_model(raw)
+            if pf is None:
+                continue
+            dp = self._canonical_destination_projection_path(getattr(pf, "DestinationPath", "") or "") or ""
+            if not dp:
+                continue
+            ck = normalize_path_key(dp)
+            if ck == want_key:
+                return i
+        return -1
+
+    def _planned_moves_dependent_on_proposed_destination(self, proposed_canon: str) -> list[dict]:
+        """Same dependency rule as proposed_branch_dependency in the planning workflow."""
+        out: list[dict] = []
+        prop = self._canonical_destination_projection_path(proposed_canon) or self.normalize_memory_path(proposed_canon)
+        if not prop:
+            return out
+        for move in self.planned_moves or []:
+            if not isinstance(move, dict):
+                continue
+            allocation_parent_path = self._canonical_destination_projection_path(self._allocation_parent_path(move))
+            if not allocation_parent_path:
+                continue
+            if self._paths_equivalent(allocation_parent_path, prop, "destination") or self._path_is_descendant(
+                allocation_parent_path,
+                prop,
+                "destination",
+            ):
+                out.append(move)
+        return out
+
+    def _drop_runtime_live_memory_conflict_row(self, row_data: dict) -> None:
+        rows = list(getattr(self, "_runtime_live_memory_conflict_rows", None) or [])
+        new_rows, _ = filter_runtime_live_memory_rows(
+            rows,
+            normalized_source_path=str(row_data.get("source_path") or ""),
+            live_memory_subtype=str(row_data.get("live_memory_subtype") or ""),
+            normalize_path=self.normalize_memory_path,
+        )
+        self._runtime_live_memory_conflict_rows = new_rows
+
+    def _log_live_memory_duplicate_resolved(self, *, resolved_by: str, row_data: dict) -> None:
+        log_info(
+            "destination_live_memory_duplicate_resolved",
+            resolved_by=str(resolved_by or "")[:120],
+            subtype=str(row_data.get("live_memory_subtype") or "")[:80],
+            source_path=str(row_data.get("source_path") or "")[:260],
+            live_item_id=str(row_data.get("live_item_id") or "")[:120],
+            live_item_path=str(row_data.get("live_graph_path") or row_data.get("action") or "")[:260],
+        )
+
+    def _show_live_duplicate_proposed_folder_resolution_dialog(self, row_data: dict) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Proposed folder conflicts with live library")
+        dlg.setMinimumWidth(460)
+        v = QVBoxLayout(dlg)
+        v.addWidget(
+            QLabel(
+                "A proposed destination folder matches a folder that already exists in Microsoft 365. "
+                "Resolve the planning conflict here (no SharePoint changes)."
+            )
+        )
+        detail = QLabel(
+            f"Proposed path:\n{str(row_data.get('source_path') or '')}\n\n"
+            f"Live path:\n{str(row_data.get('live_graph_path') or row_data.get('action') or '')}"
+        )
+        detail.setWordWrap(True)
+        detail.setObjectName("MutedText")
+        v.addWidget(detail)
+
+        btn_accept = QPushButton("Accept existing live folder")
+        btn_accept.setToolTip(
+            "Keep the live folder; mark this proposed folder satisfied and clear the conflict (planning only)."
+        )
+        btn_remove = QPushButton("Remove proposed folder")
+        btn_remove.setToolTip("Delete this entry from proposed folders in the draft only; live folder unchanged.")
+        btn_rename = QPushButton("Rename proposed…")
+        btn_rename.setToolTip("Use the proposed-folder rename flow in the workspace when available.")
+        btn_retarget = QPushButton("Retarget allocations…")
+        btn_retarget.setToolTip("Point dependent mappings at another folder (opens when integrated).")
+        btn_close = QPushButton("Close")
+
+        row1 = QWidget()
+        h1 = QHBoxLayout(row1)
+        h1.setContentsMargins(0, 0, 0, 0)
+        h1.addWidget(btn_accept)
+        h1.addWidget(btn_remove)
+        v.addWidget(row1)
+        row2 = QWidget()
+        h2 = QHBoxLayout(row2)
+        h2.setContentsMargins(0, 0, 0, 0)
+        h2.addWidget(btn_rename)
+        h2.addWidget(btn_retarget)
+        v.addWidget(row2)
+        v.addWidget(btn_close, 0, Qt.AlignmentFlag.AlignRight)
+
+        def _on_accept() -> None:
+            if self._resolve_live_duplicate_proposed_folder_accept_existing(row_data):
+                dlg.accept()
+
+        def _on_remove() -> None:
+            if self._resolve_live_duplicate_proposed_folder_remove_proposed(row_data):
+                dlg.accept()
+
+        def _on_rename() -> None:
+            self._live_duplicate_proposed_folder_rename_stub(row_data)
+
+        def _on_retarget() -> None:
+            self._live_duplicate_proposed_folder_retarget_stub(row_data)
+
+        btn_accept.clicked.connect(_on_accept)
+        btn_remove.clicked.connect(_on_remove)
+        btn_rename.clicked.connect(_on_rename)
+        btn_retarget.clicked.connect(_on_retarget)
+        btn_close.clicked.connect(dlg.reject)
+        dlg.exec()
+
+    def _resolve_live_duplicate_proposed_folder_accept_existing(self, row_data: dict) -> bool:
+        log_info(
+            "destination_live_memory_duplicate_accept_existing_requested",
+            subtype=str(row_data.get("live_memory_subtype") or "")[:80],
+            source_path=str(row_data.get("source_path") or "")[:260],
+            live_item_id=str(row_data.get("live_item_id") or "")[:120],
+            live_item_path=str(row_data.get("live_graph_path") or row_data.get("action") or "")[:260],
+        )
+        idx = self._proposed_folder_index_for_live_duplicate_row(row_data)
+        if idx < 0:
+            QMessageBox.warning(
+                self,
+                "Accept existing live folder",
+                "Could not find a matching proposed folder for this review item.",
+            )
+            return False
+        raw = (self.proposed_folders or [])[idx]
+        pf = self._coerce_proposed_folder_model(raw)
+        if pf is None:
+            QMessageBox.warning(self, "Accept existing live folder", "Invalid proposed folder row.")
+            return False
+        live_id = str(row_data.get("live_item_id") or "")
+        live_path = str(row_data.get("live_graph_path") or row_data.get("action") or "")
+        new_pf = apply_accept_existing_live_folder_to_proposed_folder(
+            pf,
+            live_item_id=live_id,
+            live_item_path=live_path,
+        )
+        folders = list(self.proposed_folders)
+        folders[idx] = new_pf
+        self.proposed_folders = folders
+        self._drop_runtime_live_memory_conflict_row(row_data)
+        log_info(
+            "destination_live_memory_duplicate_accept_existing_completed",
+            resolved_by=RESOLVED_BY_ACCEPT_EXISTING_LIVE_FOLDER,
+            live_item_id=live_id[:120],
+            live_item_path=live_path[:260],
+            resolved_at_utc=str(getattr(new_pf, "LiveMemoryDuplicateResolvedAtUtc", "") or "")[:80],
+        )
+        self._log_live_memory_duplicate_resolved(
+            resolved_by=RESOLVED_BY_ACCEPT_EXISTING_LIVE_FOLDER,
+            row_data=row_data,
+        )
+        self._refresh_workflow_state_on_demand()
+        self._refresh_proposed_folders_table()
+        self._notify_planning_mutation_destination_snapshot_dirty(
+            reason="live_memory_duplicate_accept_existing",
+            surface="live_memory_duplicate",
+        )
+        return True
+
+    def _resolve_live_duplicate_proposed_folder_remove_proposed(self, row_data: dict) -> bool:
+        log_info(
+            "destination_live_memory_duplicate_remove_proposed_requested",
+            subtype=str(row_data.get("live_memory_subtype") or "")[:80],
+            source_path=str(row_data.get("source_path") or "")[:260],
+        )
+        idx = self._proposed_folder_index_for_live_duplicate_row(row_data)
+        if idx < 0:
+            QMessageBox.warning(
+                self,
+                "Remove proposed folder",
+                "Could not find a matching proposed folder for this review item.",
+            )
+            return False
+        raw = (self.proposed_folders or [])[idx]
+        pf = self._coerce_proposed_folder_model(raw)
+        if pf is None:
+            QMessageBox.warning(self, "Remove proposed folder", "Invalid proposed folder row.")
+            return False
+        dp = self._canonical_destination_projection_path(getattr(pf, "DestinationPath", "") or "") or ""
+        deps = self._planned_moves_dependent_on_proposed_destination(dp)
+        if deps:
+            log_info(
+                "destination_live_memory_duplicate_remove_proposed_blocked",
+                dependent_planned_moves=len(deps),
+                proposed_path_excerpt=dp[:240],
+            )
+            QMessageBox.warning(
+                self,
+                "Cannot remove proposed folder",
+                f"{len(deps)} planned allocation(s) depend on this proposed folder branch. "
+                "Retarget those mappings first, then remove the proposed entry.",
+            )
+            return False
+        folders = list(self.proposed_folders)
+        folders.pop(idx)
+        self.proposed_folders = folders
+        self._drop_runtime_live_memory_conflict_row(row_data)
+        log_info(
+            "destination_live_memory_duplicate_remove_proposed_completed",
+            resolved_by="remove_proposed_folder",
+            removed_destination_path_excerpt=dp[:260],
+        )
+        self._log_live_memory_duplicate_resolved(
+            resolved_by="remove_proposed_folder",
+            row_data=row_data,
+        )
+        self._refresh_workflow_state_on_demand()
+        self._refresh_proposed_folders_table()
+        self._notify_planning_mutation_destination_snapshot_dirty(
+            reason="live_memory_duplicate_remove_proposed",
+            surface="live_memory_duplicate",
+        )
+        return True
+
+    def _live_duplicate_proposed_folder_rename_stub(self, row_data: dict) -> None:
+        log_info(
+            "destination_live_memory_duplicate_rename_requested",
+            subtype=str(row_data.get("live_memory_subtype") or "")[:80],
+            source_path=str(row_data.get("source_path") or "")[:260],
+        )
+        QMessageBox.information(
+            self,
+            "Rename proposed folder",
+            "Full rename from this dialog is not wired yet. "
+            "Rename the proposed folder from the planning workspace (proposed folders / inline rename) "
+            "so the path no longer collides, then review Needs Review again.",
+        )
+
+    def _live_duplicate_proposed_folder_retarget_stub(self, row_data: dict) -> None:
+        log_info(
+            "destination_live_memory_duplicate_retarget_requested",
+            subtype=str(row_data.get("live_memory_subtype") or "")[:80],
+            source_path=str(row_data.get("source_path") or "")[:260],
+        )
+        QMessageBox.information(
+            self,
+            "Retarget allocations",
+            "Automated retarget from this dialog is not wired yet. "
+            "Use Retarget on the relevant planned rows or the duplicate / review tools in the planning workspace.",
+        )
 
     def update_selector_context_labels(self):
         if not hasattr(self, "planning_inputs"):
@@ -21143,8 +21539,11 @@ class MainWindow(QMainWindow):
                     0,
                     lambda d=drive_id: self._safe_invoke(
                         "destination_reconcile_after_incremental_cache_refresh",
-                        self._ensure_sharepoint_destination_full_tree_worker_scheduled,
-                        d,
+                        lambda: self._ensure_sharepoint_destination_full_tree_worker_scheduled(
+                            d,
+                            schedule_reason="incremental_destination_cache_refresh_explicit",
+                            explicit_refresh=True,
+                        ),
                     ),
                 )
             self._set_tree_status_message(
@@ -22999,10 +23398,12 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _on_drive_delta_sync_success(self, payload: dict, drive_id: str):
+        _dsuf = drive_id[-16:] if len(drive_id) > 16 else drive_id
+        log_destination_graph_delta_lifecycle("destination_graph_delta_started", drive_id_suffix=_dsuf)
         if self._restore_abort_active():
             self._log_restore_phase(
                 "drive_delta_sync_success_ignored",
-                drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+                drive_id_suffix=_dsuf,
                 reason="restore_abort_mode",
             )
             return
@@ -23010,44 +23411,82 @@ class MainWindow(QMainWindow):
             log_trace(
                 "drive_delta_sync",
                 "skipped",
-                drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+                drive_id_suffix=_dsuf,
                 reason=payload.get("reason", ""),
             )
             return
         log_info(
             "drive_delta_sync_completed",
-            drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+            drive_id_suffix=_dsuf,
             pages=int(payload.get("pages") or 0),
             invalidated_folders=int(payload.get("invalidated_folders") or 0),
             initial_token_run=bool(payload.get("initial_token_run")),
         )
         inv = int(payload.get("invalidated_folders") or 0)
         initial = bool(payload.get("initial_token_run"))
+        items_seen = int(payload.get("items_seen") or 0)
         entries = payload.get("invalidated_entries") or []
+        dest_did = str(
+            self.pending_root_drive_ids.get("destination")
+            or self._current_selected_destination_drive_id()
+            or ""
+        ).strip()
+
+        if inv <= 0:
+            log_destination_graph_delta_lifecycle(
+                "destination_graph_delta_no_change",
+                drive_id_suffix=_dsuf,
+                changed_items=items_seen,
+                invalidated_folders=0,
+            )
+        else:
+            log_destination_graph_delta_lifecycle(
+                "destination_graph_delta_items_changed",
+                drive_id_suffix=_dsuf,
+                changed_items=items_seen,
+                invalidated_folders=inv,
+            )
+
+        expanded_reloads = 0
         if isinstance(entries, list) and inv > 0:
-            self._apply_graph_delta_to_visible_trees(drive_id, entries)
-        if inv > 0:
-            dest_did = str(
-                self.pending_root_drive_ids.get("destination")
-                or self._current_selected_destination_drive_id()
-                or ""
-            ).strip()
+            for row in entries:
+                if isinstance(row, dict) and str(row.get("drive_id") or "").strip() == drive_id:
+                    log_destination_graph_delta_lifecycle(
+                        "destination_graph_delta_branch_updated",
+                        drive_id_suffix=_dsuf,
+                        invalidated_item_id_suffix=str(row.get("item_id") or "")[-16:],
+                    )
+            expanded_reloads = int(self._apply_graph_delta_to_visible_trees(drive_id, entries) or 0)
             if dest_did and str(drive_id).strip() == dest_did:
-                self._log_restore_phase(
-                    "snapshot_invalid_requires_live_check",
-                    reason="delta_sync_remote_change",
-                    drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
-                    invalidated_folders=inv,
-                )
-                self._invalidate_destination_full_tree_for_live_reconcile(drive_id)
-                QTimer.singleShot(
-                    0,
-                    lambda d=drive_id: self._safe_invoke(
-                        "destination_reconcile_after_delta_sync",
-                        self._ensure_sharepoint_destination_full_tree_worker_scheduled,
-                        d,
-                    ),
-                )
+                self._detect_runtime_live_memory_duplicate_conflicts_after_graph_delta(drive_id, entries)
+                self._destination_try_scoped_planning_overlay_after_delta(drive_id, entries)
+
+        log_destination_graph_delta_lifecycle(
+            "destination_graph_delta_completed",
+            drive_id_suffix=_dsuf,
+            invalidated_folders=inv,
+            expanded_branch_reload_count=expanded_reloads,
+        )
+        log_destination_graph_delta_lifecycle(
+            "destination_graph_delta_cursor_saved",
+            drive_id_suffix=_dsuf,
+            delta_cursor_present=destination_graph_delta_cursor_present(getattr(self, "graph", None), drive_id),
+            initial_token_run=initial,
+        )
+
+        # Delta-first: do not run full-tree enumeration after a successful delta; Graph cache invalidation + branch reloads suffice.
+        if inv > 0 and dest_did and str(drive_id).strip() == dest_did:
+            should_schedule_destination_full_tree(
+                reason="post_graph_delta_success_routine_followup_would_have_run",
+                drive_id=drive_id,
+                routine_followup=True,
+                delta_cursor_present=destination_graph_delta_cursor_present(getattr(self, "graph", None), drive_id),
+                bootstrap_complete=bool(
+                    self._destination_full_tree_ready()
+                    and str(getattr(self, "_destination_full_tree_completed_drive_id", "") or "").strip() == drive_id
+                ),
+            )
+
         status = getattr(self, "planned_moves_status", None)
         if status is not None:
             if initial:
@@ -23060,19 +23499,37 @@ class MainWindow(QMainWindow):
                 )
 
     def _on_drive_delta_sync_error(self, message: str, drive_id: str):
+        _dsuf = drive_id[-16:] if len(drive_id) > 16 else drive_id
         log_warn(
             "drive_delta_sync_failed",
-            drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+            drive_id_suffix=_dsuf,
             error=str(message)[:500],
         )
+        did = str(drive_id or "").strip()
+        if did:
+            QTimer.singleShot(
+                0,
+                lambda d=did: self._safe_invoke(
+                    "destination_full_tree_after_delta_sync_error",
+                    lambda: self._ensure_sharepoint_destination_full_tree_worker_scheduled(
+                        d,
+                        schedule_reason="drive_delta_sync_error_fallback",
+                        delta_failed=True,
+                        recovery=True,
+                    ),
+                ),
+            )
         status = getattr(self, "planned_moves_status", None)
         if status is not None:
             status.setText(
                 "Incremental SharePoint sync failed (cache still works; use Refresh Cache if needed)."
             )
 
-    def _apply_graph_delta_to_visible_trees(self, drive_id: str, entries: list):
-        """Mark affected folders stale and reload expanded Graph-backed branches so the UI matches cache invalidation."""
+    def _apply_graph_delta_to_visible_trees(self, drive_id: str, entries: list) -> int:
+        """Mark affected folders stale and reload expanded Graph-backed branches so the UI matches cache invalidation.
+
+        Returns the number of expanded branch reload kicks applied (destination + source panels).
+        """
         ids = set()
         for row in entries:
             if not isinstance(row, dict):
@@ -23083,7 +23540,8 @@ class MainWindow(QMainWindow):
             if iid:
                 ids.add(iid)
         if not ids:
-            return
+            return 0
+        expanded_reloads = 0
         for panel_key in ("source", "destination"):
             tree = self.source_tree_widget if panel_key == "source" else self.destination_tree_widget
             if tree is None:
@@ -23110,9 +23568,192 @@ class MainWindow(QMainWindow):
                     if isinstance(item, QModelIndex):
                         if tree_panel is not None and bool(tree_panel.isExpanded(item)):
                             self._ensure_tree_item_load_started(panel_key, item)
+                            expanded_reloads += 1
                     else:
                         if item.isExpanded():
                             self.on_tree_item_expanded(panel_key, item)
+                            expanded_reloads += 1
+        return expanded_reloads
+
+    def _destination_delta_entry_item_ids(self, drive_id: str, entries: list) -> list[str]:
+        out: list[str] = []
+        for row in entries or []:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("drive_id") or "").strip() != drive_id:
+                continue
+            iid = str(row.get("item_id") or "").strip()
+            if iid:
+                out.append(iid)
+        return out
+
+    def _destination_live_path_meta_for_delta_item_ids(self, drive_id: str, item_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Resolve Graph item ids to library-relative canonical paths without scanning the whole tree."""
+        out: dict[str, dict[str, Any]] = {}
+        if not item_ids:
+            return out
+        model = getattr(self, "destination_planning_model", None)
+        graph = getattr(self, "graph", None)
+        for iid in item_ids[:128]:
+            if model is not None:
+                try:
+                    ix = model.find_index_by_drive_item(drive_id, iid)
+                except Exception:
+                    ix = QModelIndex()
+                if ix is not None and ix.isValid():
+                    pl = ix.data(Qt.UserRole) or {}
+                    if not isinstance(pl, dict):
+                        pl = {}
+                    canon = self._destination_row_semantic_path(pl)
+                    canon = self._canonical_destination_projection_path(canon) or self.normalize_memory_path(canon)
+                    key = normalize_path_key(canon)
+                    if not key:
+                        continue
+                    is_file = not bool(pl.get("is_folder", True))
+                    out[key] = {
+                        "path": canon,
+                        "id": iid,
+                        "name": str(pl.get("name") or ""),
+                        "type": "file" if is_file else "folder",
+                        "webUrl": str(pl.get("webUrl") or pl.get("web_url") or ""),
+                        "branch": canon,
+                    }
+                    continue
+            if graph is None:
+                continue
+            raw_item = graph.get_drive_item_optional(drive_id, iid)
+            if not isinstance(raw_item, dict):
+                continue
+            ip = graph_item_path_to_raw_windows_path(GraphClient.build_item_path(raw_item))
+            canon = self._canonical_destination_projection_path(ip) or self.normalize_memory_path(ip)
+            key = normalize_path_key(canon)
+            if not key:
+                continue
+            is_file = bool(raw_item.get("file"))
+            out[key] = {
+                "path": canon,
+                "id": iid,
+                "name": str(raw_item.get("name") or ""),
+                "type": "file" if is_file else "folder",
+                "webUrl": str(raw_item.get("webUrl") or ""),
+                "branch": canon,
+            }
+        return out
+
+    def _destination_memory_paths_for_live_conflict_detection(self) -> tuple[list[str], list[str], list[str]]:
+        proposed: list[str] = []
+        for raw in self.proposed_folders or []:
+            if isinstance(raw, dict):
+                try:
+                    folder = ProposedFolder.from_dict(raw)
+                except Exception:
+                    continue
+            elif isinstance(raw, ProposedFolder):
+                folder = raw
+            else:
+                continue
+            if proposed_folder_accepts_existing_live_folder(folder):
+                continue
+            p = self._canonical_destination_projection_path(getattr(folder, "DestinationPath", "") or "")
+            if p:
+                proposed.append(p)
+        planned: list[str] = []
+        alloc_targets: list[str] = []
+        for move in self.planned_moves or []:
+            if not isinstance(move, dict):
+                continue
+            proj = self._canonical_destination_projection_path(self._allocation_projection_path(move))
+            if proj:
+                planned.append(proj)
+            raw_t = str(move.get("destination_path", "") or "").strip()
+            ap = self._canonical_destination_projection_path(raw_t)
+            if ap:
+                alloc_targets.append(ap)
+        return proposed, planned, alloc_targets
+
+    def _destination_try_scoped_planning_overlay_after_delta(self, drive_id: str, entries: list) -> None:
+        """Intersects delta-touched paths with planning overlays; suppresses broad overlay elsewhere on delta success."""
+        item_ids = self._destination_delta_entry_item_ids(drive_id, entries)
+        live_by_key = self._destination_live_path_meta_for_delta_item_ids(drive_id, item_ids)
+        scope_keys = {normalize_path_key(str(m.get("path") or "")) for m in live_by_key.values()}
+        scope_keys.discard("")
+        if not scope_keys:
+            log_info(
+                "destination_overlay_delta_scope_noop",
+                drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+                reason="no_resolved_paths_for_delta_items",
+            )
+            return
+        proposed, planned, alloc_targets = self._destination_memory_paths_for_live_conflict_detection()
+        hit = 0
+        for lst in (proposed, planned, alloc_targets):
+            for p in lst:
+                if normalize_path_key(p) in scope_keys:
+                    hit += 1
+                    break
+        if hit == 0:
+            log_info(
+                "destination_overlay_delta_scope_noop",
+                drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+                reason="planning_paths_do_not_intersect_delta_scope",
+                scope_path_sample=sorted({m.get("path") for m in list(live_by_key.values())[:8] if m.get("path")}),
+            )
+            return
+        log_info(
+            "destination_overlay_scoped_to_delta_branch",
+            drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+            intersected_planning_rows=hit,
+            delta_scope_path_sample=sorted({m.get("path") for m in list(live_by_key.values())[:12] if m.get("path")}),
+        )
+
+    def _detect_runtime_live_memory_duplicate_conflicts_after_graph_delta(self, drive_id: str, entries: list) -> None:
+        active = str(
+            self.pending_root_drive_ids.get("destination")
+            or self._current_selected_destination_drive_id()
+            or ""
+        ).strip()
+        if not active or str(drive_id).strip().casefold() != active.casefold():
+            return
+        item_ids = self._destination_delta_entry_item_ids(drive_id, entries)
+        live_by_key = self._destination_live_path_meta_for_delta_item_ids(drive_id, item_ids)
+        proposed, planned, alloc_targets = self._destination_memory_paths_for_live_conflict_detection()
+        recs = detect_conflicts_for_live_paths(
+            live_path_by_key=dict(live_by_key),
+            proposed_destination_paths=proposed,
+            planned_destination_paths=planned,
+            allocation_targets=alloc_targets,
+        )
+        if not recs:
+            return
+        log_info(
+            "destination_live_memory_duplicate_detected",
+            drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+            conflict_count=len(recs),
+            live_paths_resolved=len(live_by_key),
+            delta_items=len(item_ids),
+        )
+        for rec in recs:
+            log_info(
+                "destination_planned_path_conflicts_with_live_graph",
+                subtype=rec.subtype,
+                memory_path=rec.planned_or_proposed_path,
+                live_path=rec.live_graph_path,
+            )
+            if rec.subtype == "live_duplicate_proposed_folder":
+                log_info(
+                    "destination_proposed_folder_conflicts_with_live_graph",
+                    memory_path=rec.planned_or_proposed_path,
+                    live_path=rec.live_graph_path,
+                )
+        merged = merge_unique(recs, list(getattr(self, "_runtime_live_memory_conflict_rows", None) or []))
+        self._runtime_live_memory_conflict_rows = merged
+        log_info(
+            "destination_live_memory_duplicate_review_item_created",
+            count=len(recs),
+            total_runtime_rows=len(merged),
+            drive_id_suffix=drive_id[-16:] if len(drive_id) > 16 else drive_id,
+        )
+        self._refresh_workflow_state_on_demand()
 
     def _destination_live_refresh_still_blocked(self):
         mem = bool(getattr(self, "_memory_restore_in_progress", False))
@@ -25848,7 +26489,11 @@ class MainWindow(QMainWindow):
                         self._schedule_full_count_with_restore_backoff(drive_id)
                     if panel_key == "destination":
                         self._destination_force_next_spo_snapshot_open_check = True
-                        self._ensure_sharepoint_destination_full_tree_worker_scheduled(drive_id)
+                        self._ensure_sharepoint_destination_full_tree_worker_scheduled(
+                            drive_id,
+                            schedule_reason="root_load_reuse_existing_same_signature",
+                            routine_followup=True,
+                        )
                 self._log_restore_phase(
                     "root_load reused_existing",
                     panel_key=panel_key,
@@ -29656,7 +30301,11 @@ class MainWindow(QMainWindow):
                             or self._current_selected_destination_drive_id()
                             or ""
                         ).strip()
-                        self._ensure_sharepoint_destination_full_tree_worker_scheduled(d0)
+                        self._ensure_sharepoint_destination_full_tree_worker_scheduled(
+                            d0,
+                            schedule_reason="authority_shell_empty_library_kick",
+                            bootstrap=True,
+                        )
 
                     self._schedule_destination_authority_shell_watchdog(35000)
                     QTimer.singleShot(0, lambda: self._safe_invoke("destination_authority_full_tree_kick_empty", _kick_empty))
@@ -30000,7 +30649,11 @@ class MainWindow(QMainWindow):
                         drive_id_suffix=d_kick[-16:] if len(d_kick) > 16 else d_kick,
                         captured_bind_drive_id=bool(str(_did_bind or "").strip()),
                     )
-                    self._ensure_sharepoint_destination_full_tree_worker_scheduled(d_kick)
+                    self._ensure_sharepoint_destination_full_tree_worker_scheduled(
+                        d_kick,
+                        schedule_reason="authority_full_tree_kick_after_root_bind",
+                        bootstrap=True,
+                    )
 
                 QTimer.singleShot(0, lambda: self._safe_invoke("destination_authority_full_tree_kick", _kick_authority))
                 try:
@@ -51949,7 +52602,11 @@ class MainWindow(QMainWindow):
                         drive_id_suffix=_ctx_did[-16:] if len(_ctx_did) > 16 else _ctx_did,
                         materialize_reason=str(reason or "")[:120],
                     )
-                    self._ensure_sharepoint_destination_full_tree_worker_scheduled(_ctx_did)
+                    self._ensure_sharepoint_destination_full_tree_worker_scheduled(
+                        _ctx_did,
+                        schedule_reason="materialize_gate_while_spo_live_authority",
+                        bootstrap=True,
+                    )
                 elif _spo_authoritative and not _full_tree_worker_running and not _ctx_did:
                     self._log_restore_phase(
                         "destination_full_tree_worker_not_scheduled",
@@ -70594,7 +71251,11 @@ class MainWindow(QMainWindow):
                     "Loading full destination tree in background; expanding loaded branches...",
                     loading=True,
                 )
-                self._ensure_sharepoint_destination_full_tree_worker_scheduled(drive_id)
+                self._ensure_sharepoint_destination_full_tree_worker_scheduled(
+                    drive_id,
+                    schedule_reason="expand_all_needs_full_destination_structure",
+                    bootstrap=True,
+                )
             if self._destination_pipeline_blocks_user_expand_gesture():
                 self._destination_expand_all_start_pending = True
                 self._log_restore_phase("destination_expand_all_deferred_until_structure_settled")
