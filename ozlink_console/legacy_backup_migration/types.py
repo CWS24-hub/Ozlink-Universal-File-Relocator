@@ -27,6 +27,39 @@ class MigrationConflictRecord:
     kind: str
     path: str
     detail: str = ""
+    proposed_row_index: int | None = None
+    proposed_stable_key: str = ""
+    proposed_folder_name: str = ""
+    proposed_parent_path: str = ""
+    proposed_full_path: str = ""
+    checked_graph_path: str = ""
+    live_item_id: str = ""
+    live_item_name: str = ""
+    live_item_type: str = ""
+    live_item_web_url: str = ""
+    destination_drive_id: str = ""
+
+    def to_report_dict(self) -> dict[str, Any]:
+        """Serialize for LegacyMigrationReport.json (allocation conflicts stay minimal)."""
+        out: dict[str, Any] = {"kind": self.kind, "path": self.path, "detail": self.detail}
+        if self.kind != "live_duplicate_proposed_folder":
+            return out
+        out.update(
+            {
+                "proposed_row_index": self.proposed_row_index,
+                "proposed_stable_key": self.proposed_stable_key,
+                "proposed_folder_name": self.proposed_folder_name,
+                "proposed_parent_path": self.proposed_parent_path,
+                "proposed_full_path": self.proposed_full_path,
+                "checked_graph_path": self.checked_graph_path or self.path,
+                "live_item_id": self.live_item_id,
+                "live_item_name": self.live_item_name,
+                "live_item_type": self.live_item_type,
+                "live_item_web_url": self.live_item_web_url,
+                "destination_drive_id": self.destination_drive_id,
+            }
+        )
+        return out
 
 
 @dataclass

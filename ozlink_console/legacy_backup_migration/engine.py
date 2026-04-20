@@ -604,50 +604,123 @@ def migrate_legacy_backup_folder(
             r["DestinationDriveId"] = str(mi.destination_drive_id)
             log_info("legacy_backup_migration_row_stamped", row_index=j, kind="proposed", field="DestinationDriveId")
 
+        # Canonical full folder path: legacy exports often omit DestinationPath; planning uses ParentPath + FolderName.
+        folder_name_prop = str(r.get("FolderName") or "").strip()
+        parent_path_prop = str(r.get("ParentPath") or "").strip()
+        dest_path_prop = str(r.get("DestinationPath") or "").strip()
+        if folder_name_prop and parent_path_prop and not dest_path_prop:
+            dest_path_prop = normalize_manifest_path(f"{parent_path_prop}\\{folder_name_prop}")
+            r["DestinationPath"] = dest_path_prop
+
         unresolved = False
         rel_parent = _rel_graph_path(str(r.get("ParentPath") or ""), anchor) if str(r.get("ParentPath") or "").strip() else ""
-        if (
+        graph_has_path = bool(
             not skip_graph_resolution
             and graph is not None
-            and rel_parent
+            and str(mi.destination_drive_id or "").strip()
             and getattr(graph, "get_drive_item_by_path", None)
-        ):
+        )
+        if graph_has_path:
             try:
-                parent_item = graph.get_drive_item_by_path(str(mi.destination_drive_id), rel_parent)
-                if parent_item and str(parent_item.get("id") or "").strip():
-                    r["DestinationParentItemId"] = str(parent_item.get("id") or "").strip()
-                    counts["graph_resolved_prop"] += 1
-                    log_info(
-                        "legacy_backup_migration_graph_id_resolved",
-                        row_index=j,
-                        kind="proposed_parent",
-                        field="DestinationParentItemId",
-                    )
-                else:
-                    unresolved = True
-                fold_rel = _rel_graph_path(str(r.get("DestinationPath") or ""), anchor)
-                if fold_rel and live_duplicate_check:
-                    ex = graph.get_drive_item_by_path(str(mi.destination_drive_id), fold_rel)
-                    if ex:
-                        conflicts.append(
-                            MigrationConflictRecord(
-                                kind="live_duplicate_proposed_folder",
-                                path=fold_rel,
-                                detail="live_item_exists_at_proposed_destination_path",
-                            )
-                        )
-                        counts["live_duplicate_detected"] += 1
+                if rel_parent:
+                    parent_item = graph.get_drive_item_by_path(str(mi.destination_drive_id), rel_parent)
+                    if parent_item and str(parent_item.get("id") or "").strip():
+                        r["DestinationParentItemId"] = str(parent_item.get("id") or "").strip()
+                        counts["graph_resolved_prop"] += 1
                         log_info(
-                            "legacy_backup_migration_live_duplicate_detected",
+                            "legacy_backup_migration_graph_id_resolved",
                             row_index=j,
-                            path_excerpt=fold_rel[:160],
-                            kind="proposed",
+                            kind="proposed_parent",
+                            field="DestinationParentItemId",
                         )
+                    else:
+                        unresolved = True
+                elif str(r.get("ParentPath") or "").strip():
+                    unresolved = True
+
+                # Duplicate = live **folder** at exact full proposed path (not parent-only, not anchor-only).
+                if live_duplicate_check:
+                    log_info(
+                        "legacy_backup_migration_proposed_duplicate_check_started",
+                        row_index=j,
+                        stable_key=str(r.get("StableKey") or "")[:80],
+                        folder_name_excerpt=folder_name_prop[:120],
+                    )
+                    fold_rel = ""
+                    ex = None
+                    if dest_path_prop and folder_name_prop:
+                        fold_rel = _rel_graph_path(dest_path_prop, anchor)
                         log_info(
-                            "legacy_backup_migration_conflict_recorded",
-                            conflict_kind="live_duplicate_proposed_folder",
-                            path_excerpt=fold_rel[:160],
+                            "legacy_backup_migration_proposed_duplicate_check_path",
+                            row_index=j,
+                            checked_graph_path=fold_rel,
+                            proposed_full_path_excerpt=dest_path_prop[:220],
                         )
+                        if fold_rel:
+                            ex = graph.get_drive_item_by_path(str(mi.destination_drive_id), fold_rel)
+                        else:
+                            log_info(
+                                "legacy_backup_migration_proposed_duplicate_check_no_match",
+                                row_index=j,
+                                reason="empty_graph_relative_path_after_normalize",
+                            )
+                    else:
+                        log_info(
+                            "legacy_backup_migration_proposed_duplicate_check_no_match",
+                            row_index=j,
+                            reason="missing_folder_name_or_destination_path",
+                        )
+
+                    if dest_path_prop and folder_name_prop and fold_rel:
+                        if not ex:
+                            log_info(
+                                "legacy_backup_migration_proposed_duplicate_check_no_match",
+                                row_index=j,
+                                reason="no_graph_item_at_full_proposed_path",
+                                checked_graph_path_excerpt=fold_rel[:200],
+                            )
+                        else:
+                            fld = ex.get("folder")
+                            is_folder = fld is not None and isinstance(fld, dict)
+                            if not is_folder:
+                                log_info(
+                                    "legacy_backup_migration_proposed_duplicate_check_no_match",
+                                    row_index=j,
+                                    reason="path_exists_but_not_a_folder",
+                                    checked_graph_path_excerpt=fold_rel[:200],
+                                )
+                            else:
+                                web_u = str(ex.get("webUrl") or "")
+                                rec = MigrationConflictRecord(
+                                    kind="live_duplicate_proposed_folder",
+                                    path=fold_rel,
+                                    detail="live_folder_exists_at_proposed_full_path",
+                                    proposed_row_index=j,
+                                    proposed_stable_key=str(r.get("StableKey") or ""),
+                                    proposed_folder_name=folder_name_prop,
+                                    proposed_parent_path=parent_path_prop,
+                                    proposed_full_path=dest_path_prop,
+                                    checked_graph_path=fold_rel,
+                                    live_item_id=str(ex.get("id") or ""),
+                                    live_item_name=str(ex.get("name") or ""),
+                                    live_item_type="folder",
+                                    live_item_web_url=web_u,
+                                    destination_drive_id=str(mi.destination_drive_id or ""),
+                                )
+                                conflicts.append(rec)
+                                counts["live_duplicate_detected"] += 1
+                                log_info(
+                                    "legacy_backup_migration_live_duplicate_proposed_folder_detected",
+                                    row_index=j,
+                                    checked_graph_path_excerpt=fold_rel[:180],
+                                    live_item_id_suffix=str(ex.get("id") or "")[-16:],
+                                    proposed_full_path_excerpt=dest_path_prop[:200],
+                                )
+                                log_info(
+                                    "legacy_backup_migration_conflict_recorded",
+                                    conflict_kind="live_duplicate_proposed_folder",
+                                    path_excerpt=fold_rel[:160],
+                                )
             except Exception:
                 unresolved = True
         elif not skip_graph_resolution and graph is None and pp:
@@ -1183,7 +1256,7 @@ def migrate_legacy_backup_folder(
         "legacy_shape_reasons": legacy_reasons,
         "graph_root_probe_kind": graph_root_probe_kind,
         "empty_destination_graph": empty_destination_graph,
-        "conflicts": [{"kind": c.kind, "path": c.path, "detail": c.detail} for c in conflicts],
+        "conflicts": [c.to_report_dict() for c in conflicts],
         "row_notes": row_notes,
     }
     (stamp_dir / "LegacyMigrationReport.json").write_text(json.dumps(report, indent=2), encoding="utf-8")

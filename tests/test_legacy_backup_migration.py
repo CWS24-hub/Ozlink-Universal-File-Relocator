@@ -256,6 +256,174 @@ def test_legacy_shape_false_for_empty_planning(tmp_path):
     assert is_legacy_shaped_bundle(session, [], []) == (False, [])
 
 
+def test_proposed_duplicate_no_match_when_only_parent_exists(tmp_path):
+    """Graph has Finance folder but not Finance\\Follow up → no duplicate (A)."""
+    src = tmp_path / "legacy"
+    _write_legacy_bundle(src)
+    prop = [
+        {
+            "FolderName": "Follow up",
+            "DestinationPath": "",
+            "ParentPath": r"Root3\Finance",
+            "DestinationDriveId": "",
+            "DestinationParentItemId": "",
+            "StableKey": "sk-a",
+        }
+    ]
+    (src / "Draft-ProposedFolders.json").write_text(json.dumps(prop), encoding="utf-8")
+
+    class G:
+        def get_drive_item_by_path(self, drive_id: str, relative_path: str):
+            rp = str(relative_path or "").replace("\\", "/").strip("/").lower()
+            if rp == "root3/finance":
+                return {"id": "parent-fin", "folder": {}}
+            return None
+
+    res = migrate_legacy_backup_folder(src, tmp_path, identity=_identity(), graph=G(), skip_graph_resolution=False)
+    assert res.ok
+    assert (res.report or {}).get("counts", {}).get("live_duplicate_detected", 0) == 0
+    out = json.loads((res.output_folder / "Draft-ProposedFolders.json").read_text(encoding="utf-8"))
+    assert "Follow up" in (out[0].get("DestinationPath") or "")
+
+
+def test_proposed_duplicate_when_full_folder_path_exists(tmp_path):
+    """Graph returns a folder at exact full proposed path → duplicate (B)."""
+    src = tmp_path / "legacy"
+    _write_legacy_bundle(src)
+    prop = [
+        {
+            "FolderName": "Follow up",
+            "DestinationPath": "",
+            "ParentPath": r"Root3\Finance",
+            "DestinationDriveId": "",
+            "DestinationParentItemId": "",
+            "StableKey": "sk-b",
+        }
+    ]
+    (src / "Draft-ProposedFolders.json").write_text(json.dumps(prop), encoding="utf-8")
+
+    class G:
+        def get_drive_item_by_path(self, drive_id: str, relative_path: str):
+            rp = str(relative_path or "").replace("\\", "/").strip("/")
+            if "finance" in rp.lower() and "follow" in rp.lower():
+                return {"id": "live-fold", "name": "Follow up", "folder": {}, "webUrl": "https://example.invalid/u"}
+            if "HR" in rp:
+                return {"id": "hr-parent", "folder": {}}
+            return None
+
+    res = migrate_legacy_backup_folder(src, tmp_path, identity=_identity(), graph=G(), skip_graph_resolution=False)
+    rep = res.report or {}
+    assert rep.get("counts", {}).get("live_duplicate_detected", 0) >= 1
+    conf = [c for c in (rep.get("conflicts") or []) if c.get("kind") == "live_duplicate_proposed_folder"]
+    assert conf
+    assert conf[0].get("checked_graph_path") or conf[0].get("path")
+    assert conf[0].get("proposed_full_path")
+    assert conf[0].get("live_item_id")
+
+
+def test_proposed_duplicate_uses_parent_plus_folder_when_destination_path_empty(tmp_path):
+    """Empty DestinationPath: duplicate check uses ParentPath + FolderName (C)."""
+    src = tmp_path / "legacy"
+    _write_legacy_bundle(src)
+    prop = [
+        {
+            "FolderName": "X",
+            "DestinationPath": "",
+            "ParentPath": r"Root3\Q",
+            "DestinationDriveId": "",
+            "DestinationParentItemId": "",
+            "StableKey": "sk-c",
+        }
+    ]
+    (src / "Draft-ProposedFolders.json").write_text(json.dumps(prop), encoding="utf-8")
+
+    seen: list[str] = []
+
+    class G:
+        def get_drive_item_by_path(self, drive_id: str, relative_path: str):
+            seen.append(str(relative_path or ""))
+            if "Root3" in relative_path and "Q" in relative_path and "X" in relative_path:
+                return {"id": "id-x", "name": "X", "folder": {}}
+            if "HR" in relative_path:
+                return {"id": "hr", "folder": {}}
+            return None
+
+    res = migrate_legacy_backup_folder(src, tmp_path, identity=_identity(), graph=G(), skip_graph_resolution=False)
+    assert res.ok
+    assert any("Q" in s and "X" in s.replace("\\", "/") for s in seen)
+
+
+def test_proposed_conflict_report_has_full_path_and_live_fields(tmp_path):
+    """Report stores proposed_full_path, checked_graph_path, live item ids (D)."""
+    src = tmp_path / "legacy"
+    _write_legacy_bundle(src)
+    prop = [
+        {
+            "FolderName": "D",
+            "DestinationPath": "",
+            "ParentPath": r"Root3\Z",
+            "DestinationDriveId": "",
+            "DestinationParentItemId": "",
+            "StableKey": "sk-d1",
+        }
+    ]
+    (src / "Draft-ProposedFolders.json").write_text(json.dumps(prop), encoding="utf-8")
+
+    class G:
+        def get_drive_item_by_path(self, drive_id: str, relative_path: str):
+            rp = str(relative_path or "").replace("\\", "/")
+            if "Z" in rp and "D" in rp:
+                return {
+                    "id": "item-d",
+                    "name": "D",
+                    "folder": {},
+                    "webUrl": "https://tenant.sharepoint.com/D",
+                }
+            if "HR" in relative_path:
+                return {"id": "hr", "folder": {}}
+            return None
+
+    res = migrate_legacy_backup_folder(src, tmp_path, identity=_identity(), graph=G(), skip_graph_resolution=False)
+    c = next(x for x in (res.report or {}).get("conflicts", []) if x.get("kind") == "live_duplicate_proposed_folder")
+    assert c.get("proposed_full_path")
+    assert (c.get("checked_graph_path") or c.get("path")) != "Root3"
+    assert c.get("live_item_id") == "item-d"
+    assert "sharepoint.com" in (c.get("live_item_web_url") or "")
+
+
+def test_no_conflict_path_is_anchor_only_root3(tmp_path):
+    """A lone 'Root3' segment must not be reported as the duplicate path (E)."""
+    src = tmp_path / "legacy"
+    _write_legacy_bundle(src)
+    prop = [
+        {
+            "FolderName": "Leaf",
+            "DestinationPath": "",
+            "ParentPath": r"Root3\A\B",
+            "DestinationDriveId": "",
+            "DestinationParentItemId": "",
+            "StableKey": "sk-e",
+        }
+    ]
+    (src / "Draft-ProposedFolders.json").write_text(json.dumps(prop), encoding="utf-8")
+
+    class G:
+        def get_drive_item_by_path(self, drive_id: str, relative_path: str):
+            rp = str(relative_path or "").replace("\\", "/").strip("/").lower()
+            if rp == "root3":
+                return {"id": "bad-root", "folder": {}}
+            if "a" in rp and "b" in rp and "leaf" in rp:
+                return {"id": "dup-leaf", "folder": {}}
+            if "HR" in relative_path:
+                return {"id": "hr", "folder": {}}
+            return None
+
+    res = migrate_legacy_backup_folder(src, tmp_path, identity=_identity(), graph=G(), skip_graph_resolution=False)
+    for c in (res.report or {}).get("conflicts", []):
+        cg = str(c.get("checked_graph_path") or c.get("path") or "")
+        assert cg.lower().strip("/") != "root3"
+
+
 def test_migration_logs_started_completed(monkeypatch, tmp_path):
     msgs: list[str] = []
 
