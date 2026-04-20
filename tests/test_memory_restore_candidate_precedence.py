@@ -124,6 +124,49 @@ def test_select_restore_candidate_does_not_promote_backup_different_draft():
     assert "authoritative_python_live_primary" in reason
 
 
+def test_select_restore_promotes_backup_when_primary_has_only_site_hints_no_libraries():
+    """Site names/keys without library ids must not block sparse-primary promotion."""
+    ss_prim = SessionState()
+    ss_prim.DraftId = "RECOVERED-X"
+    ss_prim.SelectedSourceSite = "Aquatic"
+    ss_prim.SelectedSourceSiteKey = "https://tenant.sharepoint.com/sites/a"
+    ss_prim.SelectedDestinationSite = "Aquatic"
+    ss_prim.SelectedDestinationSiteKey = "https://tenant.sharepoint.com/sites/a"
+
+    ss_back = SessionState()
+    ss_back.DraftId = "RECOVERED-X"
+    ss_back.SelectedSourceLibraryId = "b!libsrc"
+    ss_back.SelectedSourceLibrary = "SourceLib"
+    ss_back.SelectedDestinationLibraryId = "b!libdst"
+    ss_back.SelectedDestinationLibrary = "DestLib"
+
+    candidates = [
+        _base_candidate(
+            "python_live_primary",
+            valid=True,
+            populated=False,
+            allocation_count=0,
+            session_state=ss_prim,
+            ts=500.0,
+        ),
+        _base_candidate(
+            "python_backup_latest",
+            valid=True,
+            populated=True,
+            allocation_count=12,
+            draft_id="RECOVERED-X",
+            session_state=ss_back,
+            ts=400.0,
+        ),
+    ]
+    candidates[0]["draft_id"] = "RECOVERED-X"
+    mm = MemoryManager()
+    selected, reason = mm.select_restore_candidate(candidates)
+    assert selected is not None
+    assert selected["name"] == "python_backup_latest"
+    assert "authoritative_python_backup_promoted" in reason
+
+
 def test_select_restore_primary_wins_when_backup_sparse_but_primary_has_selectors():
     ss = SessionState()
     ss.DraftId = "DRAFT-Z"

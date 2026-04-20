@@ -10619,7 +10619,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._log_restore_exception("destination_snapshot_persist_validation", exc)
 
-    def _build_current_draft_shell_state(self, *, include_workspace_ui: bool = False):
+    def _build_current_draft_shell_state(self, *, include_workspace_ui: bool = False, save_reason: str = ""):
         state = SessionState()
         existing_state = self._draft_shell_state if isinstance(self._draft_shell_state, SessionState) else SessionState()
         workspace_ui_state = self._capture_workspace_tree_state() if include_workspace_ui and hasattr(self, "source_tree_widget") else {
@@ -10700,9 +10700,55 @@ class MainWindow(QMainWindow):
         destination_library_selector = self.planning_inputs.get("Destination Library") if hasattr(self, "planning_inputs") else None
 
         source_site = source_site_selector.currentData() if source_site_selector is not None else None
-        source_library = source_library_selector.currentData() if source_library_selector is not None else None
         destination_site = destination_site_selector.currentData() if destination_site_selector is not None else None
         destination_library = destination_library_selector.currentData() if destination_library_selector is not None else None
+
+        sk_src = ""
+        if isinstance(source_site, dict):
+            sk_src = str(source_site.get("site_key") or source_site.get("web_url") or source_site.get("id", "") or "").strip()
+        sk_dst = ""
+        if isinstance(destination_site, dict):
+            sk_dst = str(
+                destination_site.get("site_key") or destination_site.get("web_url") or destination_site.get("id", "") or ""
+            ).strip()
+
+        cap_sn, cap_si = self._extract_sharepoint_planning_library_fields_for_save("source", source_library_selector)
+        cap_dn, cap_di = self._extract_sharepoint_planning_library_fields_for_save("destination", destination_library_selector)
+
+        def _sf(x: str) -> str:
+            t = str(x or "").strip()
+            return t[-24:] if len(t) > 24 else t
+
+        log_info(
+            "draft_shell_selector_state_before_save",
+            include_workspace_ui=bool(include_workspace_ui),
+            save_reason=str(save_reason or "")[:240],
+            existing_source_library_id_suffix=_sf(getattr(existing_state, "SelectedSourceLibraryId", "") or ""),
+            existing_source_library_name=str(getattr(existing_state, "SelectedSourceLibrary", "") or "")[:160],
+            captured_source_library_id_suffix=_sf(cap_si),
+            captured_source_library_name=str(cap_sn or "")[:160],
+            existing_destination_library_id_suffix=_sf(getattr(existing_state, "SelectedDestinationLibraryId", "") or ""),
+            existing_destination_library_name=str(getattr(existing_state, "SelectedDestinationLibrary", "") or "")[:160],
+            captured_destination_library_id_suffix=_sf(cap_di),
+            captured_destination_library_name=str(cap_dn or "")[:160],
+        )
+
+        src_lib_name, src_lib_id = self._merge_persisted_library_fields_for_draft_shell(
+            group="source",
+            existing=existing_state,
+            site_key_new=sk_src,
+            library_selector=source_library_selector,
+            name_new=cap_sn,
+            id_new=cap_si,
+        )
+        dst_lib_name, dst_lib_id = self._merge_persisted_library_fields_for_draft_shell(
+            group="destination",
+            existing=existing_state,
+            site_key_new=sk_dst,
+            library_selector=destination_library_selector,
+            name_new=cap_dn,
+            id_new=cap_di,
+        )
 
         state.DraftId = self.active_draft_session_id or existing_state.DraftId
         state.DraftName = existing_state.DraftName or state.DraftId
@@ -10712,24 +10758,23 @@ class MainWindow(QMainWindow):
         state.LastSavedUtc = datetime.utcnow().isoformat()
         state.EnvironmentMode = existing_state.EnvironmentMode or self.current_session_context.get("user_role", "Client").title()
         state.SelectedSourceSite = source_site.get("name", "") if isinstance(source_site, dict) else ""
-        state.SelectedSourceSiteKey = ""
-        if isinstance(source_site, dict):
-            state.SelectedSourceSiteKey = source_site.get("site_key") or source_site.get("web_url") or source_site.get("id", "")
-        state.SelectedSourceLibrary = source_library.get("name", "") if isinstance(source_library, dict) else ""
-        state.SelectedSourceLibraryId = str(source_library.get("id", "") or "").strip() if isinstance(source_library, dict) else ""
+        state.SelectedSourceSiteKey = sk_src
+        state.SelectedSourceLibrary = src_lib_name
+        state.SelectedSourceLibraryId = src_lib_id
         state.SelectedDestinationSite = destination_site.get("name", "") if isinstance(destination_site, dict) else ""
-        state.SelectedDestinationSiteKey = ""
-        if isinstance(destination_site, dict):
-            state.SelectedDestinationSiteKey = destination_site.get("site_key") or destination_site.get("web_url") or destination_site.get("id", "")
-        state.SelectedDestinationLibrary = destination_library.get("name", "") if isinstance(destination_library, dict) else ""
-        state.SelectedDestinationLibraryId = (
-            str(destination_library.get("id", "") or "").strip() if isinstance(destination_library, dict) else ""
-        )
+        state.SelectedDestinationSiteKey = sk_dst
+        state.SelectedDestinationLibrary = dst_lib_name
+        state.SelectedDestinationLibraryId = dst_lib_id
         state.SourceBrowseMode = self._planning_browse_mode("source")
         state.DestinationBrowseMode = self._planning_browse_mode("destination")
         operator_upn = self.current_session_context.get("operator_upn", "")
         tenant_domain = self.current_session_context.get("tenant_domain", "")
         state.SessionFingerprint = existing_state.SessionFingerprint or f"{operator_upn}|{tenant_domain}".strip("|")
+        merged_dst_lib: dict[str, Any] = {}
+        if str(state.SelectedDestinationLibraryId or "").strip() or str(state.SelectedDestinationLibrary or "").strip():
+            merged_dst_lib = {"id": state.SelectedDestinationLibraryId, "name": state.SelectedDestinationLibrary}
+        elif isinstance(destination_library, dict) and str(destination_library.get("id") or "").strip():
+            merged_dst_lib = destination_library
         if include_workspace_ui:
             state.SourceExpandedAll = self._panel_is_expanded_all("source")
             state.DestinationExpandedAll = self._panel_is_expanded_all("destination")
@@ -10741,7 +10786,7 @@ class MainWindow(QMainWindow):
             state.DestinationSelectedPath = str(workspace_ui_state.get("destination_selected_path", "") or "")
             state.SourceTreeSnapshot = list(workspace_tree_snapshots.get("source", []) or [])
             state.DestinationTreeSnapshot = list(workspace_tree_snapshots.get("destination", []) or [])
-            self._apply_destination_tree_snapshot_identity_fields(state, destination_library, destination_site)
+            self._apply_destination_tree_snapshot_identity_fields(state, merged_dst_lib, destination_site)
         else:
             state.SourceExpandedAll = bool(getattr(existing_state, "SourceExpandedAll", False))
             state.DestinationExpandedAll = bool(getattr(existing_state, "DestinationExpandedAll", False))
@@ -10753,7 +10798,7 @@ class MainWindow(QMainWindow):
             state.DestinationSelectedPath = str(getattr(existing_state, "DestinationSelectedPath", "") or "")
             state.SourceTreeSnapshot = list(workspace_tree_snapshots.get("source", []) or [])
             state.DestinationTreeSnapshot = list(workspace_tree_snapshots.get("destination", []) or [])
-            self._apply_destination_tree_snapshot_identity_fields(state, destination_library, destination_site)
+            self._apply_destination_tree_snapshot_identity_fields(state, merged_dst_lib, destination_site)
         if not state.DraftName:
             operator_display = self.current_session_context.get("operator_display_name", "") or "Planning Session"
             state.DraftName = f"{operator_display} Draft"
@@ -10767,6 +10812,12 @@ class MainWindow(QMainWindow):
             self, "_destination_descendant_apply_tick_running", False
         ):
             self._destination_tree_snapshot_dirty_for_persist = False
+        self._log_draft_shell_selector_fields(
+            "draft_shell_selector_state_written",
+            state=state,
+            include_workspace_ui=bool(include_workspace_ui),
+            save_reason=str(save_reason or "")[:240],
+        )
         return state
 
     def _create_new_draft_session_id(self):
@@ -12465,7 +12516,11 @@ class MainWindow(QMainWindow):
 
             _shut = getattr(self, "_application_shutting_down", False)
             _t_build = time.perf_counter() if _shut else None
-            state = self._build_current_draft_shell_state(include_workspace_ui=include_workspace_ui)
+            _save_ctx = f"draft_save force={bool(force)} include_workspace_ui={bool(include_workspace_ui)}"
+            state = self._build_current_draft_shell_state(
+                include_workspace_ui=include_workspace_ui,
+                save_reason=_save_ctx,
+            )
             if include_workspace_ui:
                 self._destination_branch_forensic_log(
                     "save_draft_shell_built_state_snapshot",
@@ -12531,6 +12586,12 @@ class MainWindow(QMainWindow):
             self.memory_manager.save_proposed(
                 proposed_rows,
                 allow_empty=allow_empty_overwrite or self._restored_proposed_count == 0,
+            )
+            self._log_draft_shell_selector_fields(
+                "save_session_selector_fields",
+                state=state,
+                include_workspace_ui=bool(include_workspace_ui),
+                save_reason=_save_ctx,
             )
             self.memory_manager.save_session(state)
             self.memory_manager.refresh_manifest(
@@ -21077,6 +21138,170 @@ class MainWindow(QMainWindow):
         except Exception:
             return []
         return rows
+
+    def _planning_library_combo_has_explicit_empty_catalog(self, library_selector) -> bool:
+        text = ""
+        try:
+            text = (library_selector.currentText() or "").strip() if library_selector is not None else ""
+        except Exception:
+            text = ""
+        return "no usable libraries" in text.casefold()
+
+    def _should_preserve_existing_library_shell_fields(self) -> bool:
+        """Startup/restore paths where combo currentData may temporarily lag persisted shell JSON."""
+        return bool(
+            getattr(self, "_memory_restore_in_progress", False)
+            or getattr(self, "_suppress_autosave", False)
+            or getattr(self, "_memory_ui_rebind_in_progress", False)
+        )
+
+    def _extract_sharepoint_planning_library_fields_for_save(self, group: str, library_selector) -> tuple[str, str]:
+        """Return (display_name, graph_drive_id) for Draft-SessionState library fields."""
+        name, did = "", ""
+        if library_selector is None:
+            return name, did
+        data = None
+        try:
+            data = library_selector.currentData()
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            did = str(data.get("id") or data.get("drive_id") or "").strip()
+            name = str(data.get("name") or "").strip()
+            if did:
+                return name, did
+        try:
+            ix = library_selector.currentIndex()
+            if ix >= 0:
+                idata = library_selector.itemData(ix)
+                if isinstance(idata, dict):
+                    did2 = str(idata.get("id") or idata.get("drive_id") or "").strip()
+                    if did2:
+                        did = did2
+                        name = name or str(idata.get("name") or "").strip()
+                        return name, did
+        except Exception:
+            pass
+        pend = str((getattr(self, "pending_root_drive_ids", {}) or {}).get(group) or "").strip()
+        if not did and pend:
+            did = pend
+            ct = ""
+            try:
+                ct = (library_selector.currentText() or "").strip()
+            except Exception:
+                ct = ""
+            if ct and "no usable libraries" not in ct.casefold():
+                name = name or ct
+        if not did:
+            rows: list = []
+            try:
+                rows = self._planning_library_selector_item_rows(library_selector)
+            except Exception:
+                rows = []
+            ct = ""
+            try:
+                ct = (library_selector.currentText() or "").strip()
+            except Exception:
+                ct = ""
+            ccf = ct.casefold()
+            for text, payload in rows:
+                if not isinstance(payload, dict):
+                    continue
+                pid = str(payload.get("id") or "").strip()
+                if not pid:
+                    continue
+                pnm = str(payload.get("name") or "").strip().casefold()
+                tcf = str(text or "").strip().casefold()
+                if ccf and (ccf == tcf or ccf == pnm):
+                    did = pid
+                    name = str(payload.get("name") or text or "").strip()
+                    break
+        return name, did
+
+    def _merge_persisted_library_fields_for_draft_shell(
+        self,
+        *,
+        group: str,
+        existing: SessionState,
+        site_key_new: str,
+        library_selector,
+        name_new: str,
+        id_new: str,
+    ) -> tuple[str, str]:
+        if group == "source":
+            ex_key = str(getattr(existing, "SelectedSourceSiteKey", "") or "").strip()
+            ex_id = str(getattr(existing, "SelectedSourceLibraryId", "") or "").strip()
+            ex_name = str(getattr(existing, "SelectedSourceLibrary", "") or "").strip()
+        else:
+            ex_key = str(getattr(existing, "SelectedDestinationSiteKey", "") or "").strip()
+            ex_id = str(getattr(existing, "SelectedDestinationLibraryId", "") or "").strip()
+            ex_name = str(getattr(existing, "SelectedDestinationLibrary", "") or "").strip()
+        sk_new = str(site_key_new or "").strip()
+        if ex_key and sk_new and ex_key.casefold() != sk_new.casefold():
+            return str(name_new or "").strip(), str(id_new or "").strip()
+        id_n = str(id_new or "").strip()
+        nm_n = str(name_new or "").strip()
+        if id_n:
+            return nm_n, id_n
+        if self._planning_library_combo_has_explicit_empty_catalog(library_selector):
+            return "", ""
+        if not ex_id:
+            return nm_n, id_n
+        try:
+            if library_selector is not None and int(library_selector.count() or 0) == 0 and ex_id:
+                log_info(
+                    "draft_shell_selector_blank_preserved_from_existing",
+                    group=group,
+                    preserve_reason="library_selector_not_hydrated",
+                    existing_library_id_suffix=ex_id[-24:] if len(ex_id) > 24 else ex_id,
+                    existing_library_name_excerpt=ex_name[:160],
+                )
+                return ex_name, ex_id
+        except Exception:
+            pass
+        preserve = self._should_preserve_existing_library_shell_fields()
+        if preserve:
+            log_info(
+                "draft_shell_selector_blank_preserved_from_existing",
+                group=group,
+                preserve_reason="startup_or_restore_shell",
+                existing_library_id_suffix=ex_id[-24:] if len(ex_id) > 24 else ex_id,
+                existing_library_name_excerpt=ex_name[:160],
+            )
+            if getattr(self, "_memory_restore_in_progress", False):
+                log_info(
+                    "draft_shell_selector_blank_write_blocked_during_restore",
+                    group=group,
+                    existing_library_id_suffix=ex_id[-24:] if len(ex_id) > 24 else ex_id,
+                )
+            return ex_name, ex_id
+        return nm_n, id_n
+
+    def _log_draft_shell_selector_fields(
+        self,
+        message: str,
+        *,
+        state: Any,
+        include_workspace_ui: bool,
+        save_reason: str,
+    ) -> None:
+        def _sfx(s: str) -> str:
+            t = str(s or "").strip()
+            return t[-24:] if len(t) > 24 else t
+
+        log_info(
+            message,
+            include_workspace_ui=bool(include_workspace_ui),
+            save_reason=str(save_reason or "")[:240],
+            source_site_name=str(getattr(state, "SelectedSourceSite", "") or "")[:160],
+            source_site_key_suffix=_sfx(getattr(state, "SelectedSourceSiteKey", "") or ""),
+            source_library_name=str(getattr(state, "SelectedSourceLibrary", "") or "")[:160],
+            source_library_id_suffix=_sfx(getattr(state, "SelectedSourceLibraryId", "") or ""),
+            destination_site_name=str(getattr(state, "SelectedDestinationSite", "") or "")[:160],
+            destination_site_key_suffix=_sfx(getattr(state, "SelectedDestinationSiteKey", "") or ""),
+            destination_library_name=str(getattr(state, "SelectedDestinationLibrary", "") or "")[:160],
+            destination_library_id_suffix=_sfx(getattr(state, "SelectedDestinationLibraryId", "") or ""),
+        )
 
     def _set_planning_library_selector_unresolved(self, panel_key: str, *, selector, outcome_tag: str) -> None:
         """Clear library selection and show a safe placeholder (no implicit index-0 bind)."""

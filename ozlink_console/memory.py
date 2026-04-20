@@ -336,19 +336,27 @@ class MemoryManager:
                 return str(v).strip()
             return str(raw.get(raw_key, "") or "").strip()
 
-        has_src = bool(
-            _g("SelectedSourceLibraryId", "SelectedSourceLibraryId")
-            or _g("SelectedSourceSiteKey", "SelectedSourceSiteKey")
+        has_src_site = bool(
+            _g("SelectedSourceSiteKey", "SelectedSourceSiteKey")
             or _g("SelectedSourceSite", "SelectedSourceSite")
         )
-        has_dst = bool(
-            _g("SelectedDestinationLibraryId", "SelectedDestinationLibraryId")
-            or _g("SelectedDestinationSiteKey", "SelectedDestinationSiteKey")
+        has_dst_site = bool(
+            _g("SelectedDestinationSiteKey", "SelectedDestinationSiteKey")
             or _g("SelectedDestinationSite", "SelectedDestinationSite")
         )
+        has_src_lib = bool(
+            _g("SelectedSourceLibraryId", "SelectedSourceLibraryId")
+            or _g("SelectedSourceLibrary", "SelectedSourceLibrary")
+        )
+        has_dst_lib = bool(
+            _g("SelectedDestinationLibraryId", "SelectedDestinationLibraryId")
+            or _g("SelectedDestinationLibrary", "SelectedDestinationLibrary")
+        )
         return {
-            "has_source_selector": has_src,
-            "has_destination_selector": has_dst,
+            "has_source_selector": bool(has_src_site or has_src_lib),
+            "has_destination_selector": bool(has_dst_site or has_dst_lib),
+            "has_source_library_hint": bool(has_src_lib),
+            "has_destination_library_hint": bool(has_dst_lib),
             "source_snapshot_nodes": int(s_nodes),
             "destination_snapshot_nodes": int(d_nodes),
         }
@@ -358,11 +366,15 @@ class MemoryManager:
         ac = int(candidate.get("allocation_count", 0) or 0)
         pc = int(candidate.get("proposed_count", 0) or 0)
         snap = int(m["source_snapshot_nodes"]) + int(m["destination_snapshot_nodes"])
-        sel = (3 if m["has_source_selector"] else 0) + (3 if m["has_destination_selector"] else 0)
+        sel = (3 if m.get("has_source_library_hint") else 0) + (3 if m.get("has_destination_library_hint") else 0)
         return ac * 1_000_000 + pc * 10_000 + snap * 100 + sel
 
     def _restore_primary_is_sparse_for_promotion(self, primary: dict[str, Any]) -> bool:
-        """True when live primary has no allocations/proposed/selectors/snapshots to restore."""
+        """True when live primary has no workload and no *library* hints or tree snapshots.
+
+        Site-only strings do not count as selector material — a same-draft backup with libraries
+        or allocations can still be promoted.
+        """
         if not primary.get("valid"):
             return False
         ac = int(primary.get("allocation_count", 0) or 0)
@@ -370,7 +382,7 @@ class MemoryManager:
         if ac > 0 or pc > 0 or primary.get("populated"):
             return False
         m = self.restore_candidate_field_metrics(primary)
-        if m["has_source_selector"] or m["has_destination_selector"]:
+        if m.get("has_source_library_hint") or m.get("has_destination_library_hint"):
             return False
         if m["source_snapshot_nodes"] + m["destination_snapshot_nodes"] > 0:
             return False
@@ -422,6 +434,8 @@ class MemoryManager:
                 proposed_count=int(cand.get("proposed_count", 0) or 0),
                 has_source_selector=bool(m.get("has_source_selector")),
                 has_destination_selector=bool(m.get("has_destination_selector")),
+                has_source_library_hint=bool(m.get("has_source_library_hint")),
+                has_destination_library_hint=bool(m.get("has_destination_library_hint")),
                 source_snapshot_nodes=int(m.get("source_snapshot_nodes", 0)),
                 destination_snapshot_nodes=int(m.get("destination_snapshot_nodes", 0)),
                 score=int(self.restore_candidate_population_score(cand)),
