@@ -317,6 +317,17 @@ def migrate_legacy_backup_folder(
     session["LegacyMigrationEmptyDestinationGraph"] = bool(empty_destination_graph)
     session["LegacyMigrationGraphRootProbeKind"] = str(graph_root_probe_kind or "")
 
+    session["DestinationAnchorItemId"] = str(getattr(mi, "destination_anchor_item_id", "") or "")
+    session["DestinationAnchorDriveId"] = str(
+        getattr(mi, "destination_anchor_drive_id", "") or mi.destination_drive_id or ""
+    )
+    session["DestinationAnchorDisplayPath"] = str(getattr(mi, "destination_anchor_display_path", "") or "")
+    session["DestinationAnchorPathVerifiedAtUtc"] = str(
+        getattr(mi, "destination_anchor_path_verified_at_utc", "") or ""
+    )
+    session["DestinationAnchorPathOnlyBinding"] = bool(getattr(mi, "destination_anchor_path_only_binding", False))
+    session["DestinationAnchorLiveUnresolved"] = False
+
     dst_lib_disp = str(
         mi.destination_library_display_name or session.get("SelectedDestinationLibrary") or ""
     ).strip()
@@ -1253,6 +1264,14 @@ def migrate_legacy_backup_folder(
             "destination_drive_id": mi.destination_drive_id,
             "source_site_key": mi.source_site_key,
             "destination_site_key": mi.destination_site_key,
+            "destination_visible_anchor": {
+                "graph_item_id": str(getattr(mi, "destination_anchor_item_id", "") or ""),
+                "graph_drive_id": str(getattr(mi, "destination_anchor_drive_id", "") or mi.destination_drive_id or ""),
+                "display_path_canonical": str(getattr(mi, "destination_anchor_display_path", "") or ""),
+                "top_segment_display_name": str(getattr(mi, "visible_destination_anchor", "") or ""),
+                "path_only_binding": bool(getattr(mi, "destination_anchor_path_only_binding", False)),
+                "verified_at_utc": str(getattr(mi, "destination_anchor_path_verified_at_utc", "") or ""),
+            },
         },
         "counts": counts,
         "legacy_shape_reasons": legacy_reasons,

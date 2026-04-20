@@ -112,6 +112,9 @@ from ozlink_console.destination_startup_snapshot_roots import (
 )
 from ozlink_console.branding import apply_window_icon
 from ozlink_console.dev_mode import is_dev_mode
+from ozlink_console.destination_anchor_delta import (
+    rebase_allocation_and_proposed_paths_for_anchor_rename,
+)
 from ozlink_console.logger import (
     flush_logger,
     log_error,
@@ -13423,16 +13426,32 @@ class MainWindow(QMainWindow):
         src_lib_disp = src_lib_w.currentText().strip() if src_lib_w is not None else ""
         dst_lib_disp = dst_lib_w.currentText().strip() if dst_lib_w is not None else ""
 
-        anchor = ""
+        anchor_name = ""
+        anchor_path_full = ""
+        anchor_payload: dict[str, Any] | None = None
         try:
-            anchor_path = self._destination_visible_library_anchor_canonical_path()
-            if anchor_path:
-                norm = str(anchor_path).replace("/", "\\").strip()
+            anchor_path_full, anchor_payload = self._destination_visible_library_anchor_resolution()
+            if anchor_path_full:
+                norm = str(anchor_path_full).replace("/", "\\").strip()
                 parts = [x for x in norm.split("\\") if x]
                 if parts:
-                    anchor = parts[-1]
+                    anchor_name = parts[-1]
         except Exception:
-            anchor = ""
+            anchor_name = ""
+
+        item_id = ""
+        row_drive = ""
+        if isinstance(anchor_payload, dict):
+            item_id = str(anchor_payload.get("id") or anchor_payload.get("graph_item_id") or "").strip()
+            row_drive = str(anchor_payload.get("drive_id") or anchor_payload.get("library_id") or "").strip()
+        anchor_drive = row_drive or dst_drv
+        verified_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        path_only_binding = bool(anchor_path_full) and not bool(item_id)
+        log_info(
+            "destination_visible_anchor_resolved",
+            destination_visible_anchor_item_id=str(item_id or "(none)"),
+            destination_visible_anchor_display_path=str(anchor_path_full or "")[:500],
+        )
 
         return MigrationIdentityPreflight(
             source_site_key=_site_key(src_site_d),
@@ -13443,7 +13462,12 @@ class MainWindow(QMainWindow):
             destination_drive_id=dst_drv,
             source_library_display_name=src_lib_disp,
             destination_library_display_name=dst_lib_disp,
-            visible_destination_anchor=anchor,
+            visible_destination_anchor=anchor_name,
+            destination_anchor_item_id=item_id,
+            destination_anchor_drive_id=anchor_drive,
+            destination_anchor_display_path=str(anchor_path_full or ""),
+            destination_anchor_path_verified_at_utc=verified_utc,
+            destination_anchor_path_only_binding=path_only_binding,
         )
 
     def _draft_import_validate_migrated_interactive(self, bundle_dir: Path) -> bool:
@@ -27596,6 +27620,7 @@ class MainWindow(QMainWindow):
                         deb = max(deb, 56)
                     t_sr.start(max(0, deb))
                 return
+            self._destination_apply_anchor_graph_identity_delta_if_needed()
             self._on_destination_state_mutation("destination_model_structure_changed", None)
         except KeyboardInterrupt:
             log_info("shutdown_trace", event="flush_destination_structure_reactive_interrupted")
@@ -32873,31 +32898,26 @@ class MainWindow(QMainWindow):
                     out.append(c)
         return out
 
-    def _destination_visible_library_anchor_canonical_path(self) -> str:
-        """Canonical path of the visible document-library hub for SharePoint path re-anchor.
+    def _destination_visible_library_anchor_resolution(self) -> tuple[str, dict[str, Any] | None]:
+        """Return ``(canonical_path, hub_payload)`` for the visible document-library hub row.
 
-        Persisted planning paths often use ``Root\\\\Child...`` while the live tree shows the library
-        folder at the pane root (e.g. ``Root\\\\Root3\\\\Child...``). :meth:`_destination_visible_path_lookup_canonical_keys`
-        remaps under this anchor when Graph authority is active.
-
-        When an authority-pending placeholder sits beside exactly one real top-level folder,
-        ``rowCount`` is 2+ but there is still a single hub — we return that folder's path. If several
-        real top-level folders are visible (multi-library shell), return ``""`` so we do not pick a
-        wrong anchor.
+        The hub is a normal folder inside the selected destination document library (SharePoint).
+        It must be tracked by Graph ``id`` + ``drive_id`` for durable identity; the returned path is
+        mutable display state that may change when the folder is renamed in Graph.
         """
         if not destination_authority_contract.graph_owns_visible_real_destination_structure(self):
-            return ""
+            return "", None
         model = getattr(self, "destination_planning_model", None)
         if model is None:
-            return ""
+            return "", None
         try:
             rc = int(model.rowCount(QModelIndex()))
         except Exception:
-            return ""
+            return "", None
         if rc <= 0:
-            return ""
+            return "", None
         root = QModelIndex()
-        hub_canons: list[str] = []
+        hubs: list[tuple[str, dict[str, Any]]] = []
         for tr in range(rc):
             ix = model.index(tr, 0, root)
             if not ix.isValid():
@@ -32917,10 +32937,10 @@ class MainWindow(QMainWindow):
                 continue
             c = self._canonical_destination_projection_path(p) or self.normalize_memory_path(p)
             if c:
-                hub_canons.append(c)
-        if len(hub_canons) == 1:
-            return hub_canons[0]
-        if len(hub_canons) > 1:
+                hubs.append((c, pl))
+        if len(hubs) == 1:
+            return hubs[0][0], hubs[0][1]
+        if len(hubs) > 1:
             sel_drive = str(self._current_selected_destination_drive_id() or "").strip()
             if not sel_drive:
                 sel_drive = str((getattr(self, "pending_root_drive_ids", None) or {}).get("destination") or "").strip()
@@ -32950,31 +32970,127 @@ class MainWindow(QMainWindow):
                             anchor_excerpt=str(c)[:200],
                             drive_suffix=sel_drive[-16:] if len(sel_drive) > 16 else sel_drive,
                         )
-                        return c
+                        return c, pl
             log_info(
                 "destination_anchor_multiple_hubs_blocked",
-                hub_count=int(len(hub_canons)),
+                hub_count=int(len(hubs)),
             )
-            return ""
+            return "", None
         if rc == 1:
             ix = model.index(0, 0, root)
             if not ix.isValid():
-                return ""
+                return "", None
             pl = ix.data(Qt.UserRole) or {}
             if not isinstance(pl, dict) or pl.get("placeholder"):
-                return ""
+                return "", None
             p = self._tree_item_path(pl)
             if not p:
-                return ""
-            return self._canonical_destination_projection_path(p) or self.normalize_memory_path(p)
-        return ""
+                return "", None
+            c = self._canonical_destination_projection_path(p) or self.normalize_memory_path(p)
+            return c, pl
+        return "", None
+
+    def _destination_visible_library_anchor_canonical_path(self) -> str:
+        """See :meth:`_destination_visible_library_anchor_resolution` — path-only convenience."""
+        p, _pl = self._destination_visible_library_anchor_resolution()
+        return p
+
+    def _destination_apply_anchor_graph_identity_delta_if_needed(self) -> None:
+        """Reconcile persisted visible-anchor Graph identity with the live tree (rename updates paths; missing → review)."""
+        try:
+            if self._planning_browse_mode("destination") == "local":
+                return
+            mm = self.memory_manager
+            if mm is None:
+                return
+            st = self._draft_shell_state if isinstance(self._draft_shell_state, SessionState) else None
+            if st is None:
+                return
+            aid = str(getattr(st, "DestinationAnchorItemId", "") or "").strip()
+            if not aid:
+                return
+            dd = str(getattr(st, "DestinationAnchorDriveId", "") or "").strip() or str(
+                self._current_selected_destination_drive_id() or ""
+            ).strip()
+            if not dd:
+                return
+            dm = getattr(self, "destination_planning_model", None)
+            if dm is None:
+                return
+            ix = dm.find_index_by_drive_item(dd, aid)
+            old_disp = str(getattr(st, "DestinationAnchorDisplayPath", "") or "").strip()
+            if not ix.isValid():
+                if not bool(getattr(st, "DestinationAnchorLiveUnresolved", False)):
+                    log_info(
+                        "destination_anchor_missing_after_delta",
+                        item_id_suffix=aid[-16:] if len(aid) > 16 else aid,
+                        drive_suffix=dd[-16:] if len(dd) > 16 else dd,
+                    )
+                    log_info(
+                        "destination_memory_anchor_unresolved",
+                        reason="anchor_item_not_found_in_destination_tree",
+                    )
+                    st.DestinationAnchorLiveUnresolved = True
+                    self._save_draft_shell()
+                return
+            pl = ix.data(Qt.UserRole) or {}
+            if not isinstance(pl, dict):
+                return
+            live_id = str(pl.get("id") or pl.get("graph_item_id") or "").strip()
+            if live_id and live_id.casefold() != aid.casefold():
+                return
+            new_path = str(self._destination_row_semantic_path(pl) or "").strip()
+            st.DestinationAnchorLiveUnresolved = False
+            if new_path and old_disp and new_path.casefold() != old_disp.casefold():
+                log_info(
+                    "destination_anchor_renamed_by_graph_delta",
+                    old_excerpt=old_disp[:200],
+                    new_excerpt=new_path[:200],
+                    item_id_suffix=aid[-16:] if len(aid) > 16 else aid,
+                )
+                ad_raw = [r.to_dict() for r in mm.load_allocations()]
+                pd_raw = [r.to_dict() for r in mm.load_proposed()]
+                nchg, ad2, pd2 = rebase_allocation_and_proposed_paths_for_anchor_rename(
+                    ad_raw, pd_raw, old_anchor_path=old_disp, new_anchor_path=new_path
+                )
+                if nchg:
+                    log_info(
+                        "destination_memory_paths_rebased_after_anchor_rename",
+                        fields_updated=int(nchg),
+                    )
+                    mm.save_allocations(
+                        [AllocationRow.from_dict(x) for x in ad2],
+                        allow_empty_planning_persist=True,
+                        save_reason="destination_anchor_display_rename",
+                    )
+                    mm.save_proposed(
+                        [ProposedFolder.from_dict(x) for x in pd2],
+                        allow_empty_planning_persist=True,
+                        save_reason="destination_anchor_display_rename",
+                    )
+                st.DestinationAnchorDisplayPath = new_path
+                st.DestinationAnchorPathVerifiedAtUtc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                self._save_draft_shell()
+                session_raw = json.loads(mm.paths["session"].read_text(encoding="utf-8"))
+                self._restore_memory_payload(
+                    st,
+                    mm.load_allocations(),
+                    mm.load_proposed(),
+                    session_raw,
+                )
+            elif new_path and not old_disp:
+                st.DestinationAnchorDisplayPath = new_path
+                st.DestinationAnchorPathVerifiedAtUtc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                self._save_draft_shell()
+        except Exception as exc:
+            self._log_restore_exception("destination_apply_anchor_graph_identity_delta", exc)
 
     def _canonical_destination_path_with_visible_library_anchor(self, raw_planning_path: str) -> str:
         """Same library re-anchor as :meth:`_ensure_destination_projection_path_sharepoint_graph_only`.
 
         Proposed/allocation memory paths often omit the visible hub (e.g. ``Finance\\Child``) while
-        model parent rows are anchored (``Root3\\Finance``). Suffix-under-parent checks must compare
-        like-for-like canonical paths.
+        model parent rows are anchored under the live library hub folder (e.g. ``<hub>\\Finance``).
+        Suffix-under-parent checks must compare like-for-like canonical paths.
         """
         from ozlink_console.destination_path_bridge import (
             remap_under_visible_library_anchor,

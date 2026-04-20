@@ -157,6 +157,14 @@ class SessionState:
     DestinationTreeSnapshotIdentitySiteId: str = ""
     # True when DestinationTreeSnapshot* identity fields were backfilled by legacy startup inference (migration).
     DestinationTreeSnapshotIdentityInferredFromLegacy: bool = False
+    # Visible library hub folder inside the selected document library (Graph drive item — not library identity).
+    # Path/name is mutable display state; ``DestinationAnchorItemId`` is the durable live-folder key when present.
+    DestinationAnchorItemId: str = ""
+    DestinationAnchorDriveId: str = ""
+    DestinationAnchorDisplayPath: str = ""
+    DestinationAnchorPathVerifiedAtUtc: str = ""
+    DestinationAnchorPathOnlyBinding: bool = False
+    DestinationAnchorLiveUnresolved: bool = False
     # Canonical source paths (files) excluded from inherited folder allocations; persisted with draft session.
     PlanLeafExclusions: list[str] = field(default_factory=list)
     # Source paths for inherited_mapping rows the user dismissed in Needs Review (UI only; does not change the plan).

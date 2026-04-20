@@ -18,8 +18,13 @@ class MigrationIdentityPreflight:
     # Selected library display names (legacy app sometimes prefixed paths with these; stripped first).
     source_library_display_name: str = ""
     destination_library_display_name: str = ""
-    # Visible library hub segment for path checks, e.g. Root3 (optional).
+    # Visible library hub segment for path checks (mutable display label of the anchor folder — not durable identity).
     visible_destination_anchor: str = ""
+    destination_anchor_item_id: str = ""
+    destination_anchor_drive_id: str = ""
+    destination_anchor_display_path: str = ""
+    destination_anchor_path_verified_at_utc: str = ""
+    destination_anchor_path_only_binding: bool = False
 
 
 @dataclass
