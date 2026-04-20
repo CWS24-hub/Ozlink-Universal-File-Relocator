@@ -18,6 +18,12 @@ class AllocationRow:
     SourceItemId: str = ""
     DestinationDriveId: str = ""
     DestinationParentItemId: str = ""
+    # Legacy backup migration review metadata (round-trip through Memory JSON).
+    LegacyMigrationAnchorClassification: str = ""
+    LegacyMigrationPlannedScaffoldOnly: bool = False
+    LegacyMigrationRootNotLiveConfirmed: bool = False
+    LegacyMigrationUnresolvedGraphAnchor: bool = False
+    LegacyForeignRootBlocked: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AllocationRow":
@@ -35,6 +41,11 @@ class AllocationRow:
             SourceItemId=str(data.get("SourceItemId", "")),
             DestinationDriveId=str(data.get("DestinationDriveId", "")),
             DestinationParentItemId=str(data.get("DestinationParentItemId", "")),
+            LegacyMigrationAnchorClassification=str(data.get("LegacyMigrationAnchorClassification", "") or ""),
+            LegacyMigrationPlannedScaffoldOnly=bool(data.get("LegacyMigrationPlannedScaffoldOnly", False)),
+            LegacyMigrationRootNotLiveConfirmed=bool(data.get("LegacyMigrationRootNotLiveConfirmed", False)),
+            LegacyMigrationUnresolvedGraphAnchor=bool(data.get("LegacyMigrationUnresolvedGraphAnchor", False)),
+            LegacyForeignRootBlocked=bool(data.get("LegacyForeignRootBlocked", False)),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -59,6 +70,11 @@ class ProposedFolder:
     Status: str = "Proposed"
     RequestedBy: str = ""
     RequestedDate: str = ""
+    LegacyMigrationAnchorClassification: str = ""
+    LegacyMigrationPlannedScaffoldOnly: bool = False
+    LegacyMigrationRootNotLiveConfirmed: bool = False
+    LegacyMigrationUnresolvedGraphAnchor: bool = False
+    LegacyForeignRootBlocked: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ProposedFolder":
@@ -75,6 +91,11 @@ class ProposedFolder:
             Status=str(data.get("Status", "Proposed")),
             RequestedBy=str(data.get("RequestedBy", "")),
             RequestedDate=str(data.get("RequestedDate", "")),
+            LegacyMigrationAnchorClassification=str(data.get("LegacyMigrationAnchorClassification", "") or ""),
+            LegacyMigrationPlannedScaffoldOnly=bool(data.get("LegacyMigrationPlannedScaffoldOnly", False)),
+            LegacyMigrationRootNotLiveConfirmed=bool(data.get("LegacyMigrationRootNotLiveConfirmed", False)),
+            LegacyMigrationUnresolvedGraphAnchor=bool(data.get("LegacyMigrationUnresolvedGraphAnchor", False)),
+            LegacyForeignRootBlocked=bool(data.get("LegacyForeignRootBlocked", False)),
         )
 
     def to_dict(self) -> dict[str, Any]:
