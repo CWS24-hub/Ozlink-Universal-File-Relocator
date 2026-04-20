@@ -31,6 +31,13 @@ from .paths import (
 _RESTORE_BACKUP_STALENESS_SOFT_SEC = float(45 * 86400)
 
 
+def _persist_ctx_for_log(ctx: dict[str, Any] | None) -> dict[str, Any]:
+    """Drop keys duplicated as explicit ``log_info`` kwargs (``save_reason`` is passed separately)."""
+    out = dict(ctx or {})
+    out.pop("save_reason", None)
+    return out
+
+
 def _restore_candidate_preference_score(name: str) -> int:
     """Higher score wins when sorting fallback candidates (non-authoritative live paths)."""
     n = str(name or "")
@@ -952,21 +959,9 @@ class MemoryManager:
                 except Exception:
                     pass
 
-    def _write_json_safely(
-        self,
-        target: Path,
-        recovery: Path | None,
-        payload: Any,
-        new_count: int,
-        allow_dangerous_empty_overwrite: bool = False,
-        label: str = "Memory",
-    ) -> None:
+    def _write_json_safely(self, target: Path, recovery: Path | None, payload: Any) -> None:
         serialized = json.dumps(payload, indent=2, ensure_ascii=False)
         json.loads(serialized)
-
-        existing_count = self._json_count(target)
-        if not allow_dangerous_empty_overwrite and existing_count > 0 and new_count == 0:
-            raise ValueError(f"Memory protection blocked empty overwrite for {label}. ExistingCount={existing_count} NewCount={new_count}")
 
         self._backup_file(target, target.stem)
         self._atomic_write_text(target, serialized)
@@ -980,17 +975,106 @@ class MemoryManager:
         log_trace("memory", "load_allocations", row_count=len(rows), path_excerpt=str(self.paths["allocations"])[-80:])
         return rows
 
-    def save_allocations(self, rows: list[AllocationRow], *, allow_empty: bool = False) -> None:
+    def _maybe_log_planning_recovery_candidate(
+        self,
+        *,
+        planning_file: str,
+        glob_pattern: str,
+        live_primary_count: int,
+        save_reason: str,
+        persist_context: dict[str, Any] | None,
+    ) -> None:
+        """When the live primary file is empty on disk, log if a rotated backup still has rows (recovery hint)."""
+        try:
+            if live_primary_count > 0 or not self.backups.is_dir():
+                return
+            candidates = sorted(
+                self.backups.glob(glob_pattern),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            for bp in candidates[:40]:
+                bc = self._json_count(bp)
+                if bc > 0:
+                    log_info(
+                        "planning_memory_recovery_candidate_found",
+                        planning_file=str(planning_file),
+                        backup_path=str(bp),
+                        backup_row_count=int(bc),
+                        live_primary_count=int(live_primary_count),
+                        save_reason=str(save_reason or "")[:240],
+                        **_persist_ctx_for_log(persist_context),
+                    )
+                    return
+        except Exception:
+            return
+
+    def save_allocations(
+        self,
+        rows: list[AllocationRow],
+        *,
+        allow_empty: bool | None = None,
+        allow_empty_planning_persist: bool = False,
+        save_reason: str = "",
+        persist_context: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist allocation queue. Empty overwrite of a non-empty file requires allow_empty_planning_persist."""
+        if allow_empty is not None:
+            allow_empty_planning_persist = bool(allow_empty_planning_persist or allow_empty)
+
         payload = [r.to_dict() for r in rows]
+        new_count = len(payload)
+        target = self.paths["allocations"]
+        existing_count = self._json_count(target)
+        ctx = dict(persist_context or {})
+        ctx_log = _persist_ctx_for_log(ctx)
+
+        if new_count == 0 and existing_count == 0:
+            self._maybe_log_planning_recovery_candidate(
+                planning_file="Draft-AllocationQueue.json",
+                glob_pattern="Draft-AllocationQueue*.json",
+                live_primary_count=0,
+                save_reason=save_reason,
+                persist_context=ctx,
+            )
+
+        if new_count == 0 and existing_count > 0:
+            log_info(
+                "allocation_queue_empty_write_attempt",
+                previous_count=int(existing_count),
+                new_count=int(new_count),
+                save_reason=str(save_reason or "")[:240],
+                allow_empty_planning_persist=bool(allow_empty_planning_persist),
+                **ctx_log,
+            )
+            if not allow_empty_planning_persist:
+                log_info(
+                    "allocation_queue_empty_write_blocked",
+                    previous_count=int(existing_count),
+                    new_count=int(new_count),
+                    save_reason=str(save_reason or "")[:240],
+                    **ctx_log,
+                )
+                return
+            log_info(
+                "allocation_queue_empty_write_allowed_explicit_clear",
+                previous_count=int(existing_count),
+                new_count=int(new_count),
+                save_reason=str(save_reason or "")[:240],
+                **ctx_log,
+            )
+
         self._write_json_safely(
             self.paths["allocations"],
             self.paths["allocations_recovery"],
             payload,
-            new_count=len(payload),
-            allow_dangerous_empty_overwrite=allow_empty,
-            label="AllocationQueue",
         )
-        log_trace("memory", "save_allocations", row_count=len(payload), allow_empty=allow_empty)
+        log_trace(
+            "memory",
+            "save_allocations",
+            row_count=len(payload),
+            allow_empty_planning_persist=allow_empty_planning_persist,
+        )
 
     def load_proposed(self) -> list[ProposedFolder]:
         data = self._read_json(self.paths["proposed"], [])
@@ -998,17 +1082,70 @@ class MemoryManager:
         log_trace("memory", "load_proposed", row_count=len(rows))
         return rows
 
-    def save_proposed(self, rows: list[ProposedFolder], *, allow_empty: bool = False) -> None:
+    def save_proposed(
+        self,
+        rows: list[ProposedFolder],
+        *,
+        allow_empty: bool | None = None,
+        allow_empty_planning_persist: bool = False,
+        save_reason: str = "",
+        persist_context: dict[str, Any] | None = None,
+    ) -> None:
+        if allow_empty is not None:
+            allow_empty_planning_persist = bool(allow_empty_planning_persist or allow_empty)
+
         payload = [r.to_dict() for r in rows]
+        new_count = len(payload)
+        existing_count = self._json_count(self.paths["proposed"])
+        ctx = dict(persist_context or {})
+        ctx_log = _persist_ctx_for_log(ctx)
+
+        if new_count == 0 and existing_count == 0:
+            self._maybe_log_planning_recovery_candidate(
+                planning_file="Draft-ProposedFolders.json",
+                glob_pattern="Draft-ProposedFolders*.json",
+                live_primary_count=0,
+                save_reason=save_reason,
+                persist_context=ctx,
+            )
+
+        if new_count == 0 and existing_count > 0:
+            log_info(
+                "proposed_folders_empty_write_attempt",
+                previous_count=int(existing_count),
+                new_count=int(new_count),
+                save_reason=str(save_reason or "")[:240],
+                allow_empty_planning_persist=bool(allow_empty_planning_persist),
+                **ctx_log,
+            )
+            if not allow_empty_planning_persist:
+                log_info(
+                    "proposed_folders_empty_write_blocked",
+                    previous_count=int(existing_count),
+                    new_count=int(new_count),
+                    save_reason=str(save_reason or "")[:240],
+                    **ctx_log,
+                )
+                return
+            log_info(
+                "proposed_folders_empty_write_allowed_explicit_clear",
+                previous_count=int(existing_count),
+                new_count=int(new_count),
+                save_reason=str(save_reason or "")[:240],
+                **ctx_log,
+            )
+
         self._write_json_safely(
             self.paths["proposed"],
             self.paths["proposed_recovery"],
             payload,
-            new_count=len(payload),
-            allow_dangerous_empty_overwrite=allow_empty,
-            label="ProposedFolders",
         )
-        log_trace("memory", "save_proposed", row_count=len(payload), allow_empty=allow_empty)
+        log_trace(
+            "memory",
+            "save_proposed",
+            row_count=len(payload),
+            allow_empty_planning_persist=allow_empty_planning_persist,
+        )
 
     def load_session(self) -> SessionState:
         state = SessionState.from_dict(self._read_json(self.paths["session"], {}))
@@ -1026,18 +1163,42 @@ class MemoryManager:
             self.paths["session"],
             self.paths["session_recovery"],
             payload,
-            new_count=1,
-            allow_dangerous_empty_overwrite=True,
-            label="SessionState",
         )
         log_trace("memory", "save_session", draft_id_excerpt=str(getattr(state, "DraftId", "") or "")[:40])
 
-    def write_workspace_snapshot(self, payload: dict[str, Any]) -> None:
-        """Replace ``WorkspaceSnapshot.json`` entirely (no merge with any prior JSON on disk)."""
+    def write_workspace_snapshot(
+        self,
+        payload: dict[str, Any],
+        *,
+        allow_strip_allocation_graph: bool = False,
+        save_reason: str = "",
+    ) -> None:
+        """Replace ``WorkspaceSnapshot.json`` entirely (no merge with any prior JSON on disk).
+
+        Strips ``allocation_graph_identity`` only when allow_strip_allocation_graph is True; otherwise
+        previous non-empty graph rows are merged forward to avoid silent loss during partial saves.
+        """
         if not isinstance(payload, dict):
             raise TypeError("workspace snapshot payload must be a dict")
         data = dict(payload)
         data.setdefault("schema_version", WORKSPACE_SNAPSHOT_SCHEMA_VERSION)
+
+        prev = self.read_workspace_snapshot_optional()
+        prev_n = 0
+        if isinstance(prev, dict):
+            pag = prev.get("allocation_graph_identity")
+            prev_n = len(pag) if isinstance(pag, list) else 0
+        agi_new = data.get("allocation_graph_identity")
+        new_n = len(agi_new) if isinstance(agi_new, list) else 0
+        if prev_n > 0 and new_n == 0 and not allow_strip_allocation_graph:
+            data["allocation_graph_identity"] = [dict(x) for x in (prev.get("allocation_graph_identity") or []) if isinstance(x, dict)]
+            log_info(
+                "workspace_snapshot_allocation_graph_preserved_from_existing",
+                previous_graph_rows=int(prev_n),
+                new_graph_rows_before_merge=int(new_n),
+                save_reason=str(save_reason or "")[:240],
+            )
+
         text = json.dumps(data, indent=2, ensure_ascii=False)
         json.loads(text)
         path = self.paths["workspace_snapshot"]
@@ -1155,8 +1316,8 @@ class MemoryManager:
         proposed = [ProposedFolder.from_dict(x) for x in proposed_raw if isinstance(x, dict)]
 
         self.save_session(session_state)
-        self.save_allocations(allocations, allow_empty=True)
-        self.save_proposed(proposed, allow_empty=True)
+        self.save_allocations(allocations, allow_empty_planning_persist=True, save_reason="apply_draft_reset_backup")
+        self.save_proposed(proposed, allow_empty_planning_persist=True, save_reason="apply_draft_reset_backup")
         fp = str(session_state.SessionFingerprint or self.expected_fingerprint or "")
         self.refresh_manifest(draft_id=str(session_state.DraftId or ""), fingerprint=fp, status="Healthy")
 

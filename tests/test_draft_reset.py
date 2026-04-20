@@ -220,8 +220,14 @@ def test_apply_draft_reset_after_backup_clears_runtime_and_persists_empty():
     assert mw.proposed_folders == []
     assert mw.active_draft_session_id == "NEW-DRAFT-ID"
     assert mw._suppress_autosave is False
-    mm.save_allocations.assert_called_once_with([], allow_empty=True)
-    mm.save_proposed.assert_called_once_with([], allow_empty=True)
+    mm.save_allocations.assert_called_once()
+    sa_call = mm.save_allocations.call_args
+    assert sa_call[0][0] == []
+    assert sa_call.kwargs.get("allow_empty_planning_persist") is True
+    mm.save_proposed.assert_called_once()
+    sp_call = mm.save_proposed.call_args
+    assert sp_call[0][0] == []
+    assert sp_call.kwargs.get("allow_empty_planning_persist") is True
     mm.save_session.assert_called_once()
     mm.refresh_manifest.assert_called_once()
     mw._apply_destination_planning_overlays.assert_called_once()

@@ -3037,6 +3037,8 @@ class MainWindow(QMainWindow):
         self._suppress_autosave = True
         self._restored_allocation_count = 0
         self._restored_proposed_count = 0
+        self._allow_empty_planning_persist: bool = False
+        self._planning_memory_clear_reason: str = ""
         self._cached_loaded_source_items = 0
         self._source_restore_materialization_queue = []
         self._source_restore_materialization_seen = set()
@@ -12385,11 +12387,22 @@ class MainWindow(QMainWindow):
             },
         }
 
-    def _persist_workspace_snapshot_file(self, *, phase: str = "") -> None:
+    def _persist_workspace_snapshot_file(
+        self, *, phase: str = "", allow_strip_allocation_graph: bool | None = None
+    ) -> None:
         if self.memory_manager is None:
             return
         payload = self._build_workspace_snapshot_payload(trigger_phase=phase)
-        self.memory_manager.write_workspace_snapshot(payload)
+        _sr = f"workspace_snapshot:{phase}" if phase else "workspace_snapshot"
+        if allow_strip_allocation_graph is not None:
+            _strip = bool(allow_strip_allocation_graph)
+        else:
+            _strip = bool(getattr(self, "_allow_empty_planning_persist", False))
+        self.memory_manager.write_workspace_snapshot(
+            payload,
+            allow_strip_allocation_graph=_strip,
+            save_reason=_sr,
+        )
 
     def _validate_imported_workspace_snapshot(self, snap: dict[str, Any]) -> list[str]:
         """Lightweight import checks; does not block load."""
@@ -12465,6 +12478,23 @@ class MainWindow(QMainWindow):
                 runtime_proposed_missing=int(runtime_audit.get("proposed_rows_missing_graph_ids") or 0),
                 source=source,
             )
+
+    def _planning_persist_context(self, *, save_reason: str = "") -> dict[str, Any]:
+        """Structured context for planning queue persist logs (memory + JSON guard)."""
+        st = self._draft_shell_state if isinstance(self._draft_shell_state, SessionState) else SessionState()
+        return {
+            "startup_restore_in_progress": bool(getattr(self, "_pending_login_restore_args", None)),
+            "memory_restore_in_progress": bool(getattr(self, "_memory_restore_in_progress", False)),
+            "suppress_autosave": bool(getattr(self, "_suppress_autosave", False)),
+            "planning_memory_clear_reason": str(getattr(self, "_planning_memory_clear_reason", "") or "")[:200],
+            "selected_source_site_key_suffix": str(getattr(st, "SelectedSourceSiteKey", "") or "")[-40:],
+            "selected_source_library_id_suffix": str(getattr(st, "SelectedSourceLibraryId", "") or "")[-32:],
+            "selected_destination_site_key_suffix": str(getattr(st, "SelectedDestinationSiteKey", "") or "")[-40:],
+            "selected_destination_library_id_suffix": str(getattr(st, "SelectedDestinationLibraryId", "") or "")[-32:],
+            "save_reason": str(save_reason or "")[:240],
+            "planned_moves_runtime_count": len(getattr(self, "planned_moves", None) or []),
+            "proposed_folders_runtime_count": len(getattr(self, "proposed_folders", None) or []),
+        }
 
     def _save_draft_shell(self, *, force: bool = False, include_workspace_ui: bool = False):
         if self.memory_manager is None:
@@ -12571,7 +12601,6 @@ class MainWindow(QMainWindow):
                 self._log_restore_exception("draft_save_snapshot_validation", exc)
             allocation_rows = self._build_memory_allocation_rows()
             proposed_rows = self._build_memory_proposed_folders()
-            allow_empty_overwrite = bool(force)
             _t_mem = time.perf_counter() if _shut else None
             log_info(
                 "draft_save_executed",
@@ -12579,14 +12608,23 @@ class MainWindow(QMainWindow):
                 include_workspace_ui=bool(include_workspace_ui),
                 draft_id=str(getattr(state, "DraftId", "") or "")[:80],
             )
+            _persist_ctx = self._planning_persist_context(save_reason=_save_ctx)
+            _explicit_empty = bool(getattr(self, "_allow_empty_planning_persist", False))
+            _workspace_sidecar_allow_strip_graph = bool(_explicit_empty)
             self.memory_manager.save_allocations(
                 allocation_rows,
-                allow_empty=allow_empty_overwrite or self._restored_allocation_count == 0,
+                allow_empty_planning_persist=_explicit_empty,
+                save_reason=_save_ctx,
+                persist_context=_persist_ctx,
             )
             self.memory_manager.save_proposed(
                 proposed_rows,
-                allow_empty=allow_empty_overwrite or self._restored_proposed_count == 0,
+                allow_empty_planning_persist=_explicit_empty,
+                save_reason=_save_ctx,
+                persist_context=_persist_ctx,
             )
+            self._allow_empty_planning_persist = False
+            self._planning_memory_clear_reason = ""
             self._log_draft_shell_selector_fields(
                 "save_session_selector_fields",
                 state=state,
@@ -12654,7 +12692,10 @@ class MainWindow(QMainWindow):
             if include_workspace_ui:
                 _t_ws = time.perf_counter() if _shut else None
                 try:
-                    self._persist_workspace_snapshot_file(phase="draft_save_include_workspace_ui")
+                    self._persist_workspace_snapshot_file(
+                        phase="draft_save_include_workspace_ui",
+                        allow_strip_allocation_graph=_workspace_sidecar_allow_strip_graph,
+                    )
                 except Exception as snap_exc:
                     log_warn(
                         "workspace_snapshot_write_failed",
@@ -12835,8 +12876,19 @@ class MainWindow(QMainWindow):
         self._draft_shell_state = fresh
         self._draft_shell_raw = fresh.to_dict()
 
-        self.memory_manager.save_allocations([], allow_empty=True)
-        self.memory_manager.save_proposed([], allow_empty=True)
+        _persist = self._planning_persist_context(save_reason="apply_draft_reset_after_backup_new_session")
+        self.memory_manager.save_allocations(
+            [],
+            allow_empty_planning_persist=True,
+            save_reason="apply_draft_reset_after_backup_new_session",
+            persist_context=_persist,
+        )
+        self.memory_manager.save_proposed(
+            [],
+            allow_empty_planning_persist=True,
+            save_reason="apply_draft_reset_after_backup_new_session",
+            persist_context=_persist,
+        )
         self.memory_manager.save_session(fresh)
         self.memory_manager.refresh_manifest(
             draft_id=fresh.DraftId,
@@ -22851,6 +22903,8 @@ class MainWindow(QMainWindow):
         if reason == "user_site_change" and (prior_pm or prior_pf):
             self.planned_moves = []
             self.proposed_folders = []
+            self._allow_empty_planning_persist = True
+            self._planning_memory_clear_reason = "user_confirmed_destination_site_change_unbind"
             try:
                 self.refresh_planned_moves_table()
             except Exception:
