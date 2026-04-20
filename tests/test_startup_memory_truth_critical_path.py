@@ -258,9 +258,8 @@ def test_broad_replay_skipped_when_snapshot_contract_bound():
                         drain()
     assert replay_calls[0] == 0
     assert minimal_calls[0] == 0
-    assert "startup_broad_replay_skipped_snapshot_contract" in seq
-    assert "startup_snapshot_used_without_replay" in seq
-    assert "replay_skipped_no_change" in seq
+    assert "startup_replay_visibility_audit_complete" in seq
+    assert "startup_replay_skipped_snapshot_already_complete" in seq
 
 
 def test_deferred_finish_skips_graph_chain_ensure_when_snapshot_suppresses_replay():
@@ -704,7 +703,7 @@ def test_workspace_audit_missing_zero_before_visible_tree_ready_when_converged()
 
     def audit():
         audit_calls[0] += 1
-        if audit_calls[0] == 1:
+        if audit_calls[0] <= 2:
             return {
                 "present_visible_planned_rows": 0,
                 "missing_visible_planned_rows": 1,
@@ -780,7 +779,7 @@ def test_minimal_replay_seeds_queues_for_deep_persisted_paths_before_visible_rea
 
     def audit():
         audit_calls[0] += 1
-        if audit_calls[0] == 1:
+        if audit_calls[0] <= 2:
             return {
                 "present_visible_planned_rows": 0,
                 "missing_visible_planned_rows": 1,
@@ -1042,3 +1041,100 @@ def test_startup_replay_settle_autosave_schedules_once_and_saves():
     assert scheduled[0][0] == 1600
     scheduled[0][1]()
     mw._save_draft_shell.assert_called_once_with(force=True, include_workspace_ui=False)
+
+
+def test_delta_replay_snapshot_bound_passes_scoped_destination_expanded_paths():
+    """When snapshot is authoritative but audit shows gaps, persisted overlay receives delta-scoped expanded paths."""
+    mw = _minimal_mw_for_memory_truth_body()
+    mw._startup_memory_visible_tree_ready_mono = 1.0
+    mw._startup_visible_snapshot_bound = True
+    mw._destination_provisional_startup_applied = True
+    captured: list[object] = []
+
+    def capture_overlay(_ctx, **kwargs):
+        captured.append(kwargs.get("destination_expanded_paths"))
+        return 0
+
+    mw._destination_planning_overlay_replay_persisted_only = capture_overlay
+    ac = [0]
+
+    def audit():
+        ac[0] += 1
+        if ac[0] <= 2:
+            return {
+                "present_visible_planned_rows": 0,
+                "missing_visible_planned_rows": 1,
+                "missing_visible_proposed_folders": 0,
+                "missing_planned_paths": ["Z\\Sub\\Leaf"],
+                "missing_proposed_paths": [],
+                "expected_total_persisted_planned_rows": 1,
+                "expected_total_persisted_proposed_folders": 0,
+                "present_visible_proposed_folders": 0,
+                "visible_planned_enumeration_count": 0,
+            }
+        return {
+            "present_visible_planned_rows": 1,
+            "missing_visible_planned_rows": 0,
+            "missing_visible_proposed_folders": 0,
+            "missing_planned_paths": [],
+            "missing_proposed_paths": [],
+            "expected_total_persisted_planned_rows": 1,
+            "expected_total_persisted_proposed_folders": 0,
+            "present_visible_proposed_folders": 0,
+            "visible_planned_enumeration_count": 1,
+        }
+
+    mw._startup_memory_full_workspace_audit_run = audit
+    mw._unresolved_proposed_queue_size = lambda: 0
+    mw._unresolved_allocation_queue_size = lambda: 0
+
+    with patch.object(destination_authority_contract, "graph_owns_visible_real_destination_structure", return_value=False):
+        with patch.dict(os.environ, {"OZLINK_STARTUP_BACKGROUND_REFINE_GRACE_MS": "120"}, clear=False):
+            with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
+                with _memory_truth_timer_queue() as drain:
+                    MainWindow._apply_destination_planning_overlays_body_memory_truth_startup(
+                        mw,
+                        "startup_planned_workspace_memory_truth",
+                    )
+                    drain()
+    assert len(captured) == 1
+    exp = captured[0]
+    assert isinstance(exp, set)
+    joined = " ".join(sorted(exp))
+    assert "Z" in joined and "Sub" in joined
+
+
+def test_snapshot_complete_skips_replay_and_does_not_mark_destination_snapshot_dirty():
+    """Visibility audit clean under snapshot contract: no replay tail mutation and no snapshot dirty stamp."""
+    mw = _minimal_mw_for_memory_truth_body()
+    mw._startup_memory_visible_tree_ready_mono = 1.0
+    mw._startup_visible_snapshot_bound = True
+    mw._destination_provisional_startup_applied = True
+    mw._mark_destination_tree_snapshot_dirty_after_injection = MagicMock()
+    with patch.dict(os.environ, {"OZLINK_STARTUP_BACKGROUND_REFINE_GRACE_MS": "120"}, clear=False):
+        with patch("ozlink_console.main_window.QApplication.processEvents", lambda *_a, **_k: None):
+            with _memory_truth_timer_queue() as drain:
+                MainWindow._apply_destination_planning_overlays_body_memory_truth_startup(
+                    mw,
+                    "startup_planned_workspace_memory_truth",
+                )
+                drain()
+    mw._mark_destination_tree_snapshot_dirty_after_injection.assert_not_called()
+
+
+def test_visibility_audit_invalid_rows_excluded_from_missing_count_via_audit_contract():
+    """Full workspace audit excludes structurally invalid targets; missing_count reflects valid expected rows only."""
+    mw = MainWindow.__new__(MainWindow)
+    mw._startup_memory_invalid_planned_cf = set()
+    mw.planned_moves = [{"destination_path": "X\\..\\Broken", "destination": {"display_path": "bad"}}]
+    mw.proposed_folders = []
+    mw._allocation_projection_path = lambda m: (m or {}).get("destination_path") or ""
+    mw._canonical_destination_path_with_visible_library_anchor = lambda p: p
+    mw._canonical_destination_projection_path = lambda p: p
+    mw.normalize_memory_path = lambda p: p
+    mw._destination_structural_path_chain_invalid_for_container_parent = lambda _p: (True, "unit_invalid")
+    mw._destination_enumerate_visible_planned_paths_and_all_visible = lambda: ([], [])
+    with patch.object(destination_authority_contract, "graph_owns_visible_real_destination_structure", return_value=False):
+        audit = MainWindow._startup_memory_full_workspace_audit_run(mw)
+    assert int(audit.get("missing_visible_planned_rows", -1)) == 0
+    assert int(audit.get("expected_total_persisted_planned_rows", -1)) == 0

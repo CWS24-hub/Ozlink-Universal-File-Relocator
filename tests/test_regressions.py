@@ -1708,7 +1708,10 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window = MainWindow.__new__(MainWindow)
         window.destination_tree_widget = _TreeStub()
         window.source_tree_widget = _TreeStub()
-        window._save_draft_shell = lambda force=False: setattr(window, "_saved_force", force)
+        window.memory_manager = object()
+        window._save_draft_shell = lambda force=False, include_workspace_ui=False: setattr(
+            window, "_saved_force", force
+        )
         window._rebuild_submission_visual_cache = lambda: setattr(window, "_cache_rebuilt", True)
         window._collect_current_source_projection_paths = lambda: {"FTBMRoot", "FTBMRoot\\Contracts"}
         window._queue_deferred_planning_refresh = (
@@ -1720,6 +1723,14 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         )
         window.update_progress_summaries = lambda: setattr(window, "_progress_updated", True)
         window._log_restore_exception = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected exception"))
+        window._safe_invoke = lambda _n, fn, *a, **k: fn(*a, **k)
+        window._mark_destination_tree_snapshot_dirty_after_injection = lambda **kw: None
+
+        def _immediate_planning_autosave(*, reason, surface=""):
+            window._planning_mutation_autosave_pending_reason = str(reason or "")[:220]
+            MainWindow._on_planning_mutation_autosave_timer(window)
+
+        window._schedule_planning_mutation_debounced_autosave = _immediate_planning_autosave
 
         window._persist_planning_change_lightweight()
 

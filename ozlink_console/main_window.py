@@ -2910,6 +2910,10 @@ class MainWindow(QMainWindow):
         self._workspace_ui_persist_timer = QTimer(self)
         self._workspace_ui_persist_timer.setSingleShot(True)
         self._workspace_ui_persist_timer.timeout.connect(self._on_workspace_ui_persist_timer)
+        self._planning_mutation_autosave_timer = QTimer(self)
+        self._planning_mutation_autosave_timer.setSingleShot(True)
+        self._planning_mutation_autosave_timer.timeout.connect(self._on_planning_mutation_autosave_timer)
+        self._planning_mutation_autosave_pending_reason: str = ""
         self._workspace_ui_snapshot_dirty_panels = set()
         self._pending_session_workspace_restore_panels = set()
         self._pending_workspace_post_expand_selection = {"source": "", "destination": ""}
@@ -7459,13 +7463,10 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._log_restore_exception("graph_ids_refresh_batch_flush.deferred_queue", exc)
 
-        def _deferred_save():
-            try:
-                self._save_draft_shell(force=True)
-            except Exception as exc2:
-                self._log_restore_exception("graph_ids_refresh_batch_flush.save", exc2)
-
-        QTimer.singleShot(50, _deferred_save)
+        self._notify_planning_mutation_destination_snapshot_dirty(
+            str(flush_phase or "graph_ids_refresh_batch_flush"),
+            surface="graph_ids_batch",
+        )
         _elapsed_ms = round((time.perf_counter() - _t0) * 1000.0, 3)
         log_info(
             "graph_ids_refresh_batch_flushed",
@@ -8591,6 +8592,120 @@ class MainWindow(QMainWindow):
             reason=str(reason or "")[:220],
         )
 
+    def _notify_planning_mutation_destination_snapshot_dirty(
+        self,
+        reason: str = "",
+        *,
+        surface: str = "",
+    ) -> None:
+        """Mark destination tree snapshot dirty and schedule debounced draft save (user planning mutations).
+
+        Covers reactive ``planned_moves`` / ``proposed_folders`` updates, persist helpers, and callers that
+        mutate planning state without going through :class:`_ReactiveNotifyList` alone.
+        """
+        if getattr(self, "_application_shutting_down", False):
+            return
+        r = str(reason or "").strip() or "planning_mutation"
+        surf = str(surface or "").strip()
+        log_info(
+            "planning_mutation_snapshot_dirty",
+            reason=r[:220],
+            surface=surf[:120],
+        )
+        self._mark_destination_tree_snapshot_dirty_after_injection(
+            reason=f"planning_mutation:{r[:200]}",
+        )
+        self._schedule_planning_mutation_debounced_autosave(reason=r, surface=surf)
+
+    def _schedule_planning_mutation_debounced_autosave(self, *, reason: str, surface: str = "") -> None:
+        """Debounce :meth:`_save_draft_shell` so rapid planning edits coalesce; restarts timer on each call."""
+        if getattr(self, "_application_shutting_down", False):
+            return
+        if getattr(self, "memory_manager", None) is None:
+            return
+        if bool(getattr(self, "_destination_save_in_progress", False)):
+            log_info(
+                "planning_mutation_autosave_skipped_existing_pending",
+                reason=str(reason or "")[:220],
+                surface=str(surface or "")[:120],
+                note="draft_save_already_in_progress",
+            )
+            return
+        delay_ms = max(400, int(os.environ.get("OZLINK_PLANNING_MUTATION_AUTOSAVE_DEBOUNCE_MS", "") or 1200) or 1200)
+        tmr = getattr(self, "_planning_mutation_autosave_timer", None)
+        if tmr is None:
+            try:
+                tmr = QTimer(self)
+                tmr.setSingleShot(True)
+                tmr.timeout.connect(self._on_planning_mutation_autosave_timer)
+                self._planning_mutation_autosave_timer = tmr
+            except Exception as exc:
+                log_info(
+                    "planning_mutation_autosave_timer_init_failed",
+                    error=str(exc)[:240],
+                    note="fallback_single_shot_partial_host",
+                )
+                QTimer.singleShot(
+                    int(delay_ms),
+                    lambda: self._safe_invoke(
+                        "planning_mutation_autosave_fallback",
+                        self._on_planning_mutation_autosave_timer,
+                    ),
+                )
+                log_info(
+                    "planning_mutation_autosave_scheduled",
+                    delay_ms=int(delay_ms),
+                    reason=str(reason or "")[:220],
+                    surface=str(surface or "")[:120],
+                    debounce_reset=False,
+                    fallback_single_shot=True,
+                )
+                return
+        was_active = bool(tmr.isActive()) if hasattr(tmr, "isActive") else False
+        try:
+            tmr.stop()
+        except Exception:
+            pass
+        self._planning_mutation_autosave_pending_reason = str(reason or "")[:220]
+        try:
+            tmr.start(int(delay_ms))
+        except Exception as exc:
+            self._log_restore_exception("planning_mutation_autosave_scheduled", exc)
+            return
+        log_info(
+            "planning_mutation_autosave_scheduled",
+            delay_ms=int(delay_ms),
+            reason=str(reason or "")[:220],
+            surface=str(surface or "")[:120],
+            debounce_reset=bool(was_active),
+        )
+
+    def _on_planning_mutation_autosave_timer(self) -> None:
+        reason = str(getattr(self, "_planning_mutation_autosave_pending_reason", "") or "")[:220]
+        self._planning_mutation_autosave_pending_reason = ""
+        if getattr(self, "_application_shutting_down", False):
+            return
+        if getattr(self, "memory_manager", None) is None:
+            return
+        if bool(getattr(self, "_destination_save_in_progress", False)):
+            log_info(
+                "planning_mutation_autosave_skipped_existing_pending",
+                reason=reason[:220],
+                note="draft_save_started_before_timer_fire",
+            )
+            return
+        ok = False
+        try:
+            ok = bool(self._save_draft_shell(force=True, include_workspace_ui=False))
+        except Exception as exc:
+            self._log_restore_exception("planning_mutation_autosave", exc)
+        log_info(
+            "planning_mutation_autosave_complete",
+            success=bool(ok),
+            reason=reason[:220],
+            destination_snapshot_dirty=bool(getattr(self, "_destination_tree_snapshot_dirty_for_persist", False)),
+        )
+
     def _schedule_startup_replay_settle_autosave(
         self,
         *,
@@ -9552,6 +9667,7 @@ class MainWindow(QMainWindow):
             "_session_keepalive_timer",
             "_loading_visual_timer",
             "_planning_graph_assurance_hide_timer",
+            "_planning_mutation_autosave_timer",
         ):
             timer = getattr(self, name, None)
             if timer is None:
@@ -48799,6 +48915,43 @@ class MainWindow(QMainWindow):
             return []
         return ["\\".join(parts[:i]) for i in range(1, len(parts))]
 
+    def _startup_replay_count_missing_parent_groups(self, missing_leaf_paths: list[str]) -> int:
+        """Count distinct ancestor folder prefixes of missing paths that are not yet visible in the destination model."""
+        seen: set[str] = set()
+        for mp in missing_leaf_paths:
+            mp_s = str(mp or "").strip()
+            if not mp_s:
+                continue
+            for pfx in self._startup_memory_parent_prefix_paths(mp_s):
+                if self._startup_memory_minimal_replay_prefix_visible_in_model(pfx):
+                    continue
+                seen.add(pfx.casefold())
+        return len(seen)
+
+    def _startup_replay_delta_scoped_expanded_paths(
+        self, audit: dict[str, Any], base_exp_bind: set[str]
+    ) -> set[str]:
+        """Narrow ``destination_expanded_paths`` to missing branches + base bind (avoid broad allocation replay)."""
+        out: set[str] = set(base_exp_bind or set())
+        missing = list(audit.get("missing_planned_paths") or []) + list(audit.get("missing_proposed_paths") or [])
+        graph_auth = destination_authority_contract.graph_owns_visible_real_destination_structure(self)
+        for raw_full in missing:
+            raw_full = str(raw_full or "").strip()
+            if not raw_full:
+                continue
+            segs = self._path_segments(raw_full)
+            acc: list[str] = []
+            for s in segs:
+                acc.append(s)
+                walk = "\\".join(acc)
+                adj = walk
+                if graph_auth:
+                    adj = self._canonical_destination_path_with_visible_library_anchor(walk) or walk
+                c = self._canonical_destination_projection_path(adj) or self.normalize_memory_path(adj)
+                if c:
+                    out.add(c)
+        return out
+
     def _startup_memory_minimal_replay_prefix_visible_in_model(self, prefix: str) -> bool:
         raw = str(prefix or "").strip()
         if not raw:
@@ -49310,12 +49463,12 @@ class MainWindow(QMainWindow):
         _walk(QModelIndex())
 
     def _startup_snapshot_suppresses_startup_replay(self) -> bool:
-        """True when DestinationTreeSnapshot was bound via reset_nested and contract is snapshot_bound.
+        """True when provisional snapshot bind is authoritative enough to skip **broad recovery** (queue reset + full bind).
 
-        In that case startup must not run minimal/persisted replay or graph chain-ensure for *visibility* — the
-        remembered workspace is already rendered. Recovery (replay + ensure) runs only when this returns False,
-        e.g. missing/empty snapshot roots, no drive match, planning present but model empty, or
-        ``OZLINK_STARTUP_FORCE_BROAD_REPLAY``.
+        When True, deferred startup still runs :meth:`_startup_memory_full_workspace_audit_run`; if valid expected
+        rows are missing from the visible model, **delta** replay (minimal + scoped persisted overlay) runs — not
+        the unscoped recovery path. When False (empty/invalid snapshot, planning with empty model, or
+        ``OZLINK_STARTUP_FORCE_BROAD_REPLAY``), full recovery replay applies.
         """
         raw = str(os.environ.get("OZLINK_STARTUP_FORCE_BROAD_REPLAY", "") or "").strip().lower()
         if raw in ("1", "true", "yes", "on"):
@@ -49454,39 +49607,83 @@ class MainWindow(QMainWindow):
             n_min_total = 0
             n_persisted = 0
             min_rep: dict[str, Any] | None = None
-            suppress_startup_replay = self._startup_snapshot_suppresses_startup_replay()
+            suppress_startup_replay = False
+            skip_replay_tail_noop = False
+            suppress_broad = self._startup_snapshot_suppresses_startup_replay()
+            force_broad = str(os.environ.get("OZLINK_STARTUP_FORCE_BROAD_REPLAY", "") or "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            audit = self._startup_memory_full_workspace_audit_run()
+            miss_pl = int(audit.get("missing_visible_planned_rows", 0) or 0)
+            miss_pr = int(audit.get("missing_visible_proposed_folders", 0) or 0)
+            missing_total = int(miss_pl + miss_pr)
+            expected_valid = int(audit.get("expected_total_persisted_planned_rows", 0) or 0) + int(
+                audit.get("expected_total_persisted_proposed_folders", 0) or 0
+            )
+            present_vis = int(audit.get("present_visible_planned_rows", 0) or 0) + int(
+                audit.get("present_visible_proposed_folders", 0) or 0
+            )
+            missing_paths_all = list(audit.get("missing_planned_paths") or []) + list(
+                audit.get("missing_proposed_paths") or []
+            )
+            missing_parent_count = self._startup_replay_count_missing_parent_groups(missing_paths_all)
             try:
+                log_info(
+                    "startup_replay_visibility_audit_complete",
+                    reason=str(r)[:200],
+                    expected_count=int(expected_valid),
+                    visible_count=int(present_vis),
+                    missing_count=int(missing_total),
+                    missing_parent_count=int(missing_parent_count),
+                    startup_snapshot_suppresses_broad=bool(suppress_broad),
+                    force_broad_replay=bool(force_broad),
+                )
                 log_info(
                     "startup_memory_replay_deferred_to_background",
                     reason=str(r)[:200],
                     expanded_path_closure_count=len(exp_bind),
-                    startup_snapshot_suppresses_replay=bool(suppress_startup_replay),
+                    startup_snapshot_suppresses_replay=bool(suppress_broad),
                 )
-                if suppress_startup_replay:
-                    try:
-                        ws_n = int(self._count_destination_model_non_placeholder_nodes())
-                    except Exception:
-                        ws_n = -1
+                if suppress_broad and not force_broad and missing_total == 0:
+                    skip_replay_tail_noop = True
+                    suppress_startup_replay = True
                     log_info(
-                        "startup_snapshot_used_without_replay",
+                        "startup_replay_skipped_snapshot_already_complete",
                         reason=str(r)[:200],
-                        workspace_visible_rows=int(ws_n),
-                        replay_trigger_reason="none",
+                        expected_count=int(expected_valid),
+                        visible_count=int(present_vis),
+                        missing_count=0,
+                        missing_parent_count=0,
                         replay_scope_size=0,
                     )
-                    log_info(
-                        "replay_skipped_no_change",
-                        reason=str(r)[:200],
-                        replay_trigger_reason="none",
-                        note="snapshot_authoritative_startup_visibility_not_replay_gated",
+                    try:
+                        self._destination_prune_invalid_unresolved_replay_parent_paths(
+                            context=f"memory_truth_startup_background:{str(r)[:80]}"
+                        )
+                    except Exception:
+                        pass
+                    self._cancel_destination_future_async_projection(r or "memory_truth_startup")
+                elif suppress_broad and not force_broad and missing_total > 0:
+                    delta_exp = self._startup_replay_delta_scoped_expanded_paths(
+                        audit, set(exp_bind) if exp_bind else set()
                     )
+                    replay_scope_size = int(len(delta_exp))
+                    affected_parents: list[str] = []
+                    for mp in missing_paths_all[:64]:
+                        for pfx in self._startup_memory_parent_prefix_paths(str(mp or "")):
+                            affected_parents.append(pfx)
                     log_info(
-                        "startup_broad_replay_skipped_snapshot_contract",
+                        "startup_replay_delta_begin",
                         reason=str(r)[:200],
-                        note="phase2_incremental_graph_reconcile_only_no_global_startup_sweep",
-                        visible_snapshot_bound=bool(getattr(self, "_startup_visible_snapshot_bound", False)),
-                        provisional_startup_applied=bool(getattr(self, "_destination_provisional_startup_applied", False)),
-                        workspace_visible_rows=int(ws_n),
+                        expected_count=int(expected_valid),
+                        visible_count=int(present_vis),
+                        missing_count=int(missing_total),
+                        missing_parent_count=int(missing_parent_count),
+                        replay_scope_size=int(replay_scope_size),
+                        affected_parent_paths=affected_parents[:48],
                     )
                     try:
                         self._destination_prune_invalid_unresolved_replay_parent_paths(
@@ -49497,9 +49694,66 @@ class MainWindow(QMainWindow):
                     log_info(
                         "startup_memory_truth_materialize_deferred_until_visible_tree_ready",
                         reason=str(r)[:200],
-                        broad_replay_skipped=True,
+                        broad_replay_skipped=False,
                     )
                     self._cancel_destination_future_async_projection(r or "memory_truth_startup")
+                    min_rep = self._startup_memory_minimal_replay_pass(ctx, r)
+                    n_min_total = int(min_rep.get("n_prop", 0) or 0) + int(min_rep.get("n_alloc", 0) or 0)
+                    audit_after = min_rep.get("audit") or self._startup_memory_full_workspace_audit_run()
+                    miss_pl_a = int(audit_after.get("missing_visible_planned_rows", 0) or 0)
+                    miss_pr_a = int(audit_after.get("missing_visible_proposed_folders", 0) or 0)
+                    persisted_complete = miss_pl_a == 0 and miss_pr_a == 0
+                    if persisted_complete:
+                        log_info(
+                            "startup_memory_minimal_replay_complete",
+                            present_visible_planned_rows=int(audit_after.get("present_visible_planned_rows", 0) or 0),
+                            missing_visible_planned_rows=0,
+                            missing_visible_proposed_folders=0,
+                            minimal_replay_rounds=int(min_rep.get("rounds", 0) or 0),
+                            lite_overlay_rows=int(n_min_total),
+                        )
+                    else:
+                        miss_paths: list[str] = []
+                        miss_paths.extend(list(audit_after.get("missing_planned_paths") or [])[:48])
+                        miss_paths.extend(list(audit_after.get("missing_proposed_paths") or [])[:32])
+                        log_info(
+                            "startup_memory_incomplete_after_minimal_replay",
+                            reason=str(r)[:200],
+                            missing_visible_planned_rows=int(miss_pl_a),
+                            missing_visible_proposed_folders=int(miss_pr_a),
+                            minimal_replay_rounds=int(min_rep.get("rounds", 0) or 0),
+                            lite_overlay_rows=int(n_min_total),
+                            missing=miss_paths[:64],
+                        )
+                    n_persisted = int(
+                        self._destination_planning_overlay_replay_persisted_only(
+                            ctx, destination_expanded_paths=delta_exp
+                        )
+                    )
+                    _scope = int(n_min_total) + int(n_persisted)
+                    rounds_done = int((min_rep or {}).get("rounds", 0) or 0)
+                    log_info(
+                        "startup_replay_delta_complete",
+                        reason=str(r)[:200],
+                        expected_count=int(expected_valid),
+                        visible_count=int(present_vis),
+                        missing_count_before=int(missing_total),
+                        missing_parent_count=int(missing_parent_count),
+                        replay_scope_size=int(replay_scope_size),
+                        minimal_overlay_rows=int(n_min_total),
+                        persisted_overlay_rows=int(n_persisted),
+                        minimal_replay_rounds=int(rounds_done),
+                        missing_visible_planned_rows_after=int(miss_pl_a),
+                        missing_visible_proposed_folders_after=int(miss_pr_a),
+                    )
+                    if _scope == 0 and rounds_done == 0:
+                        log_info(
+                            "startup_replay_delta_noop",
+                            reason=str(r)[:200],
+                            missing_count_before=int(missing_total),
+                            replay_scope_size=int(replay_scope_size),
+                        )
+                    suppress_startup_replay = False
                 else:
                     log_info(
                         "startup_replay_recovery_begin",
@@ -49562,6 +49816,7 @@ class MainWindow(QMainWindow):
                         minimal_overlay_rows=int(n_min_total),
                         persisted_overlay_rows=int(n_persisted),
                     )
+                    suppress_startup_replay = False
             except Exception as exc:
                 self._log_restore_exception("startup_memory_background_workspace_replay", exc)
             try:
@@ -49582,12 +49837,13 @@ class MainWindow(QMainWindow):
             finally:
                 log_info("startup_memory_truth_materialize_released", reason=str(r)[:200])
                 log_info("startup_snapshot_capture_released_after_startup_settle")
-                try:
-                    self._mark_destination_tree_snapshot_dirty_after_injection(
-                        reason="startup_memory_truth_settled"
-                    )
-                except Exception:
-                    pass
+                if not skip_replay_tail_noop:
+                    try:
+                        self._mark_destination_tree_snapshot_dirty_after_injection(
+                            reason="startup_memory_truth_settled"
+                        )
+                    except Exception:
+                        pass
                 try:
                     self._schedule_startup_replay_settle_autosave(
                         suppress_startup_replay=bool(suppress_startup_replay),
@@ -57304,8 +57560,9 @@ class MainWindow(QMainWindow):
         if isinstance(payload, dict):
             _surf = str(payload.get("surface") or "")
             if _surf in ("planned_moves", "proposed_folders"):
-                self._mark_destination_tree_snapshot_dirty_after_injection(
-                    reason=f"planning_list_mutation:{str(reason or '')[:160]}"
+                self._notify_planning_mutation_destination_snapshot_dirty(
+                    str(reason or "")[:220],
+                    surface=_surf,
                 )
         _ = payload
         if int(getattr(self, "_overlay_invariant_suppress_depth", 0) or 0) > 0:
@@ -60205,7 +60462,10 @@ class MainWindow(QMainWindow):
         notify_saved=True,
         deferred_source_projection_paths=None,
     ):
-        self._save_draft_shell(force=True)
+        self._notify_planning_mutation_destination_snapshot_dirty(
+            str(planning_refresh_reason or "planning_change_lightweight"),
+            surface="persist_lightweight",
+        )
         self._rebuild_submission_visual_cache()
         if deferred_source_projection_paths is None:
             spd = set(self._collect_current_source_projection_paths())
@@ -60419,7 +60679,7 @@ class MainWindow(QMainWindow):
             self._queue_unresolved_proposed_folder(proposed_folder, "inline_proposed_graph_dialog")
             self._sync_restore_destination_overlay_pending_from_unresolved_queues()
             self._apply_destination_planning_overlays("inline_proposed_graph_dialog")
-            self._save_draft_shell(force=True)
+            self._rebuild_submission_visual_cache()
             self.update_progress_summaries()
             self.refresh_planned_moves_table()
             self.destination_tree_status.setText("Proposed folder added (pending library row).")
@@ -60518,7 +60778,7 @@ class MainWindow(QMainWindow):
             self._queue_unresolved_proposed_folder(proposed_folder, "inline_proposed_graph_dialog")
             self._sync_restore_destination_overlay_pending_from_unresolved_queues()
             self._apply_destination_planning_overlays("inline_proposed_graph_dialog")
-            self._save_draft_shell(force=True)
+            self._rebuild_submission_visual_cache()
             self.update_progress_summaries()
             self.refresh_planned_moves_table()
             self.destination_tree_status.setText("Proposed folder added (pending library row).")
@@ -61641,7 +61901,7 @@ class MainWindow(QMainWindow):
             self._apply_tree_item_visual_state(None, dict(ix0.data(Qt.UserRole) or {}))
             self._inline_proposed_commit_item_id = ""
             self.destination_tree_status.setText("Proposed folder added.")
-            self._save_draft_shell(force=True)
+            self._rebuild_submission_visual_cache()
             self.update_progress_summaries()
             self.refresh_planned_moves_table()
             selected_ix = self._find_visible_destination_item_by_path(proposed_path)
@@ -61779,7 +62039,7 @@ class MainWindow(QMainWindow):
             self._apply_explorer_metadata_columns(item, node_data)
             self._inline_proposed_commit_item_id = ""
             self.destination_tree_status.setText("Proposed folder added.")
-            self._save_draft_shell(force=True)
+            self._rebuild_submission_visual_cache()
             self.update_progress_summaries()
             self.refresh_planned_moves_table()
             selected_item = self._find_visible_destination_item_by_path(proposed_path)
@@ -68782,6 +69042,10 @@ class MainWindow(QMainWindow):
                     notify_saved=notify_saved,
                     clear_source_path_lookups=clear_source_path_lookups,
                 )
+            self._notify_planning_mutation_destination_snapshot_dirty(
+                reason_s,
+                surface="persist_planning_change_graph_ids",
+            )
             return
         with _PerfExplorerTimer(
             "persist_planning_change",
@@ -68820,14 +69084,7 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self._log_restore_exception("persist_planning_change.deferred_queue", exc)
 
-        def _deferred_save():
-            try:
-                self._save_draft_shell(force=True)
-            except Exception as exc:
-                self._log_restore_exception("persist_planning_change.save", exc)
-
-        # Yield a few frames so the planned-moves table and trees can repaint before disk I/O.
-        QTimer.singleShot(50, _deferred_save)
+        self._notify_planning_mutation_destination_snapshot_dirty(reason_s, surface="persist_planning_change")
 
     def _is_move_submitted(self, move):
         return str((move or {}).get("status", "")).strip().lower() == "submitted"

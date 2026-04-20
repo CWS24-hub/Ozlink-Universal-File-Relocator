@@ -587,6 +587,21 @@ class DestinationInjectionSnapshotPersistenceRegressionTests(unittest.TestCase):
         self.assertEqual(list(saved.DestinationTreeSnapshot or []), injected)
         self.assertIn("FromInjection", str(saved.DestinationTreeSnapshot))
 
+    def test_planning_mutation_notify_marks_dirty_and_schedules_debounced_autosave(self):
+        w = MainWindow.__new__(MainWindow)
+        w._application_shutting_down = False
+        w.memory_manager = MagicMock()
+        w._mark_destination_tree_snapshot_dirty_after_injection = MagicMock()
+        w._schedule_planning_mutation_debounced_autosave = MagicMock()
+        with patch("ozlink_console.main_window.log_info") as m_log:
+            MainWindow._notify_planning_mutation_destination_snapshot_dirty(
+                w, "unit_reason", surface="planned_moves"
+            )
+        topics = [c.args[0] for c in m_log.call_args_list if c.args]
+        self.assertIn("planning_mutation_snapshot_dirty", topics)
+        w._mark_destination_tree_snapshot_dirty_after_injection.assert_called_once()
+        w._schedule_planning_mutation_debounced_autosave.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
