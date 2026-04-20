@@ -145,6 +145,10 @@ from ozlink_console.legacy_backup_migration import MigrationIdentityPreflight, m
 from ozlink_console.legacy_backup_migration.types import migration_identity_complete
 from ozlink_console.version_info import APP_VERSION
 from ozlink_console.models import AllocationRow, ProposedFolder, SessionState, SubmissionBatch
+from ozlink_console.planning_destination_anchor_review import (
+    REVIEW_TYPE_DESTINATION_ANCHOR_MISSING,
+    build_destination_anchor_missing_needs_review_row,
+)
 from ozlink_console.planning_selector_restore import library_combo_index_for_session_restore
 from ozlink_console.requests_store import RequestStore
 from ozlink_console.graph_folder_execution_safety import compute_graph_unsafe_folder_step_indices
@@ -3366,6 +3370,7 @@ class MainWindow(QMainWindow):
         self._workflow_suggestion_rows = []
         self._workflow_needs_review_rows = []
         self._migration_import_needs_review_rows: list[dict[str, Any]] = []
+        self._destination_anchor_missing_review_sig: str | None = None
         self._needs_review_dismissed_inherited_paths: set[str] = set()
         self._submission_test_mode = False
         self._pending_login_email = ""
@@ -6408,6 +6413,7 @@ class MainWindow(QMainWindow):
             "proposed_branch_dependency",
             "weak_suggestion",
             "migration_live_duplicate_proposed_folder",
+            REVIEW_TYPE_DESTINATION_ANCHOR_MISSING,
         }
         n_inherited_not_dismissed = 0
         for r in all_rows:
@@ -15262,6 +15268,7 @@ class MainWindow(QMainWindow):
             "duplicate_destination_projection",
             "proposed_branch_dependency",
             "weak_suggestion",
+            REVIEW_TYPE_DESTINATION_ANCHOR_MISSING,
         }
         nra = sum(
             1
@@ -15338,6 +15345,7 @@ class MainWindow(QMainWindow):
             "duplicate_destination_projection",
             "proposed_branch_dependency",
             "inherited_mapping",
+            REVIEW_TYPE_DESTINATION_ANCHOR_MISSING,
         }
         review_rows = getattr(self, "_workflow_needs_review_rows", None) or []
         show = any(
@@ -19519,6 +19527,27 @@ class MainWindow(QMainWindow):
 
         return None
 
+    def _log_destination_anchor_missing_review_transition(self, row: dict[str, Any] | None) -> None:
+        """Emit created/updated logs when the missing-anchor review row appears or its signature changes."""
+        if row is None:
+            self._destination_anchor_missing_review_sig = None
+            return
+        sig = str(row.get("_review_sig") or "")
+        prev = self._destination_anchor_missing_review_sig
+        payload = {
+            "anchor_display_path": str(row.get("source_path") or "")[:500],
+            "anchor_item_id_suffix": str(row.get("anchor_item_id_suffix") or ""),
+            "destination_drive_id_suffix": str(row.get("destination_drive_id_suffix") or ""),
+            "planned_moves_count": len(self.planned_moves),
+            "proposed_folders_count": len(self.proposed_folders),
+            "affected_planning_total": int(row.get("affected_planning_total") or 0),
+        }
+        if prev is None:
+            log_info("destination_anchor_missing_review_item_created", **payload)
+        elif prev != sig:
+            log_info("destination_anchor_missing_review_item_updated", **payload)
+        self._destination_anchor_missing_review_sig = sig
+
     def _append_needs_review_row(self, rows, seen_keys, *, item_name, source_path, reason, action, review_type):
         key = (review_type, self.normalize_memory_path(source_path), reason)
         if key in seen_keys:
@@ -19635,6 +19664,27 @@ class MainWindow(QMainWindow):
                     review_type="proposed_branch_dependency",
                 )
 
+        shell = self._draft_shell_state if isinstance(self._draft_shell_state, SessionState) else None
+        anchor_row: dict[str, Any] | None = None
+        if shell is not None:
+            anchor_row = build_destination_anchor_missing_needs_review_row(
+                shell,
+                planned_moves_count=len(self.planned_moves),
+                proposed_folders_count=len(self.proposed_folders),
+            )
+        if anchor_row is None:
+            self._log_destination_anchor_missing_review_transition(None)
+        else:
+            self._log_destination_anchor_missing_review_transition(anchor_row)
+            k = (
+                str(anchor_row.get("review_type") or "").strip(),
+                self.normalize_memory_path(str(anchor_row.get("source_path") or "")),
+                str(anchor_row.get("reason") or ""),
+            )
+            if k not in review_seen:
+                review_seen.add(k)
+                needs_review_rows.append({kk: vv for kk, vv in anchor_row.items() if not str(kk).startswith("_")})
+
         suggestion_rows.sort(key=lambda row: (-row["confidence"], row["source_path"].lower()))
         not_planned_rows.sort(key=lambda row: row["source_path"].lower())
         mig_extra = list(getattr(self, "_migration_import_needs_review_rows", None) or [])
@@ -19707,6 +19757,19 @@ class MainWindow(QMainWindow):
         self._activate_workflow_source_row(row_data if isinstance(row_data, dict) else {})
 
     def _activate_workflow_source_row(self, row_data: dict) -> None:
+        if isinstance(row_data, dict) and str(row_data.get("review_type") or "").strip() == REVIEW_TYPE_DESTINATION_ANCHOR_MISSING:
+            QMessageBox.information(
+                self,
+                "Destination anchor",
+                "The remembered destination anchor may no longer exist at the expected path in SharePoint. "
+                "Use the destination tree and planning header to review and rebind the visible anchor folder.",
+            )
+            if hasattr(self, "destination_tree_widget"):
+                try:
+                    self.destination_tree_widget.setFocus(Qt.FocusReason.OtherFocusReason)
+                except Exception:
+                    pass
+            return
         source_path = row_data.get("source_path", "") if isinstance(row_data, dict) else ""
         source_item = self._find_visible_source_item_by_path(source_path)
         if source_item is None:
