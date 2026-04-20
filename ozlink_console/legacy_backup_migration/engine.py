@@ -37,8 +37,16 @@ from .live_path_reanchor import (
     reanchor_manifest_destination_path_against_live_skeleton,
     strip_internal_root_with_log_legacy_only,
 )
+from .planned_parent_index import (
+    align_legacy_top_segment_to_anchor,
+    build_planned_parent_path_index,
+    lookup_planned_parent,
+)
 from .shape import is_legacy_shaped_bundle
 from .types import (
+    ANCHOR_CLASS_PLANNED_PARENT_MISSING_DESCENDANT,
+    ANCHOR_CLASS_PLANNED_PARENT_RESOLVED_ANCESTOR,
+    ANCHOR_CLASS_PLANNED_PARENT_RESOLVED_EXACT,
     ANCHOR_CLASS_PLANNED_SCAFFOLD_EMPTY_LIBRARY,
     ANCHOR_CLASS_REANCHORED_TO_LIVE_GRAPH,
     MigrationConflictRecord,
@@ -114,6 +122,30 @@ def _apply_status_suffix(status: str, suffix: str, *, default_base: str = "Pendi
     s = str(status or "").strip()
     base = s if s else default_base
     return base if suffix in base else f"{base}_{suffix}"
+
+
+def _stamp_allocation_planned_destination_parent(
+    r: dict[str, Any],
+    *,
+    parent_planned_norm: str,
+    match_kind: str,
+) -> None:
+    """Mark allocation row as covered by migrated proposed/planned paths (no fake Graph ids)."""
+    r["DestinationParentItemId"] = ""
+    r["LegacyMigrationPlannedParentResolved"] = True
+    r["LegacyMigrationDestinationParentResolution"] = "planned_parent"
+    r["DestinationParentPlannedPath"] = parent_planned_norm
+    r["LegacyMigrationPlannedParentMatchKind"] = match_kind
+    if match_kind == "exact":
+        r["LegacyMigrationAnchorClassification"] = ANCHOR_CLASS_PLANNED_PARENT_RESOLVED_EXACT
+        r["Status"] = _apply_status_suffix(str(r.get("Status") or ""), "PlannedParentResolved")
+    elif match_kind == "ancestor":
+        r["LegacyMigrationAnchorClassification"] = ANCHOR_CLASS_PLANNED_PARENT_RESOLVED_ANCESTOR
+        r["Status"] = _apply_status_suffix(str(r.get("Status") or ""), "PlannedParentResolved")
+    else:
+        r["LegacyMigrationAnchorClassification"] = ANCHOR_CLASS_PLANNED_PARENT_MISSING_DESCENDANT
+        r["Status"] = _apply_status_suffix(str(r.get("Status") or ""), "PlannedParentPartial")
+
 
 def _now_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -319,6 +351,13 @@ def migrate_legacy_backup_folder(
         "allocation_reanchored": 0,
         "allocation_reanchor_failed": 0,
         "allocation_foreign_root_after_unresolved_documents_token": 0,
+        "allocation_parent_graph_resolved": 0,
+        "allocation_parent_graph_unresolved_but_planned": 0,
+        "allocation_planned_parent_resolved": 0,
+        "allocation_planned_parent_exact": 0,
+        "allocation_planned_parent_ancestor": 0,
+        "allocation_planned_parent_missing_descendant": 0,
+        "allocation_parent_unresolved_after_planned_lookup": 0,
     }
     row_notes: list[dict[str, Any]] = []
 
@@ -328,348 +367,7 @@ def migrate_legacy_backup_folder(
         and str(mi.destination_drive_id or "").strip()
         and not empty_destination_graph
     )
-
-    out_alloc: list[dict[str, Any]] = []
-    for i, row in enumerate(allocations):
-        r = dict(row)
-        dest_in = str(r.get("RequestedDestinationPath") or "").strip()
-        src_in = str(r.get("SourcePath") or "").strip()
-        dest_path, dst_lw = strip_legacy_library_container_segment(
-            dest_in,
-            dst_lib_disp or None,
-            row_index=i,
-            row_kind="allocation",
-            role="destination",
-        )
-        src_path, src_lw = strip_legacy_library_container_segment(
-            src_in,
-            src_lib_disp or None,
-            row_index=i,
-            row_kind="allocation",
-            role="source",
-        )
-        r["SourcePath"] = src_path
-        if dst_lw == LIB_WRAP_STRIPPED:
-            counts["library_container_destination_wrappers_stripped"] += 1
-        if src_lw == LIB_WRAP_STRIPPED:
-            counts["library_container_source_wrappers_stripped"] += 1
-        if dst_lw == LIB_WRAP_IDENTITY_MISSING and dest_in:
-            counts["library_wrapper_identity_missing_destination_rows"] += 1
-            stx = str(r.get("Status") or "Pending")
-            if "LegacyLibraryWrapperIdentityMissing" not in stx:
-                r["Status"] = _apply_status_suffix(stx, "LegacyLibraryWrapperIdentityMissing")
-        elif dst_lw == LIB_WRAP_AMBIGUOUS and dest_in:
-            counts["library_wrapper_ambiguous_destination_rows"] += 1
-            stx = str(r.get("Status") or "Pending")
-            if "LegacyLibraryWrapperAmbiguous" not in stx:
-                r["Status"] = _apply_status_suffix(stx, "LegacyLibraryWrapperAmbiguous")
-        if src_lw == LIB_WRAP_IDENTITY_MISSING and src_in:
-            counts["library_wrapper_identity_missing_source_rows"] += 1
-            stx = str(r.get("Status") or "Pending")
-            if "LegacyLibraryWrapperSourceIdentityMissing" not in stx:
-                r["Status"] = _apply_status_suffix(stx, "LegacyLibraryWrapperSourceIdentityMissing")
-        elif src_lw == LIB_WRAP_AMBIGUOUS and src_in:
-            counts["library_wrapper_ambiguous_source_rows"] += 1
-            stx = str(r.get("Status") or "Pending")
-            if "LegacyLibraryWrapperSourceAmbiguous" not in stx:
-                r["Status"] = _apply_status_suffix(stx, "LegacyLibraryWrapperSourceAmbiguous")
-
-        if can_skeleton:
-            stripped_dest = normalize_manifest_path(dest_path)
-            synth = False
-        elif empty_destination_graph:
-            # No live top-level anchors: preserve legacy segments (including Root / Root3) as planning scaffold.
-            stripped_dest = normalize_manifest_path(dest_path)
-            synth = False
-        else:
-            stripped_dest, synth = strip_internal_root_with_log_legacy_only(
-                dest_path,
-                row_index=i,
-                row_kind="allocation",
-            )
-        if synth:
-            counts["synthetic_root_stripped"] += 1
-
-        if empty_destination_graph and dest_path:
-            r["RequestedDestinationPath"] = normalize_manifest_path(stripped_dest)
-            _stamp_planned_scaffold_empty_library_row(
-                r,
-                row_index=i,
-                row_kind="allocation",
-                path_excerpt=str(r.get("RequestedDestinationPath") or ""),
-            )
-            counts["planned_scaffold_empty_library_rows"] += 1
-            if not str(r.get("DestinationDriveId") or "").strip():
-                r["DestinationDriveId"] = str(mi.destination_drive_id)
-                log_info(
-                    "legacy_backup_migration_row_stamped",
-                    row_index=i,
-                    kind="allocation",
-                    field="DestinationDriveId",
-                )
-            unresolved = False
-            if not skip_graph_resolution and graph is not None and str(mi.source_drive_id):
-                try:
-                    src_path = str(r.get("SourcePath") or "").strip()
-                    src_rel = _rel_graph_path(src_path, "")
-                    if src_rel and getattr(graph, "get_drive_item_by_path", None):
-                        src_item = graph.get_drive_item_by_path(str(mi.source_drive_id), src_rel)
-                        if src_item and str(src_item.get("id") or "").strip():
-                            r["SourceItemId"] = str(src_item.get("id") or "").strip()
-                            r["SourceDriveId"] = str(mi.source_drive_id)
-                            log_info(
-                                "legacy_backup_migration_graph_id_resolved",
-                                row_index=i,
-                                kind="allocation_source",
-                                field="SourceItemId",
-                            )
-                        else:
-                            unresolved = True
-                except Exception as exc:
-                    unresolved = True
-                    log_info("legacy_backup_migration_failed", error=str(exc)[:200], phase="allocation_scaffold_source")
-            elif not skip_graph_resolution and graph is None:
-                unresolved = not str(r.get("SourceItemId") or "").strip()
-
-            if unresolved:
-                counts["graph_unresolved_alloc"] += 1
-                sta = str(r.get("Status") or "Pending")
-                if "_LegacyMigrationUnresolved" not in sta:
-                    r["Status"] = f"{sta}_LegacyMigrationUnresolved"
-                log_info(
-                    "legacy_backup_migration_graph_id_unresolved",
-                    row_index=i,
-                    kind="allocation",
-                )
-            row_notes.append(
-                {
-                    "index": i,
-                    "kind": "allocation",
-                    "unresolved": unresolved,
-                    "empty_library_scaffold": True,
-                }
-            )
-            out_alloc.append(r)
-            continue
-
-        if dest_path and anchor and not empty_destination_graph and _legacy_foreign_hub_before_anchor_remap(stripped_dest, anchor):
-            counts["foreign_hub_rejected"] += 1
-            counts["rows_rejected"] += 1
-            st = str(r.get("Status") or "Pending")
-            if "_ForeignHubRejected" not in st:
-                r["Status"] = f"{st}_ForeignHubRejected"
-            log_info(
-                "legacy_backup_migration_foreign_hub_rejected",
-                row_index=i,
-                kind="allocation",
-                top_segment=(stripped_dest.split("\\")[0] if stripped_dest else "")[:80],
-                anchor_segment=normalize_manifest_path(anchor).split("\\")[0][:80],
-            )
-            if not str(r.get("DestinationDriveId") or "").strip():
-                r["DestinationDriveId"] = str(mi.destination_drive_id)
-                log_info(
-                    "legacy_backup_migration_row_stamped",
-                    row_index=i,
-                    kind="allocation",
-                    field="DestinationDriveId",
-                )
-            row_notes.append({"index": i, "kind": "allocation", "unresolved": False, "foreign_hub": True})
-            out_alloc.append(r)
-            continue
-
-        work_path = stripped_dest
-        reanchor_unresolved = False
-        if can_skeleton:
-            counts["allocation_reanchor_attempted"] += 1
-            log_info(
-                "legacy_backup_migration_alloc_reanchor_attempt",
-                row_index=i,
-                path_excerpt=work_path[:220],
-            )
-            ra = reanchor_manifest_destination_path_against_live_skeleton(
-                work_path,
-                destination_drive_id=str(mi.destination_drive_id),
-                graph=graph,
-                live_top_level_names=live_top_names,
-                row_index=i,
-                row_kind="allocation",
-            )
-            work_path = ra.path_manifest or stripped_dest
-            if getattr(ra, "ignored_legacy_internal_root_segment", False):
-                counts["synthetic_root_stripped"] += 1
-            if ra.kind == "reanchored":
-                counts["path_reanchored"] += 1
-                counts["allocation_reanchored"] += 1
-                log_info(
-                    "legacy_backup_migration_alloc_reanchored",
-                    row_index=i,
-                    after_excerpt=work_path[:220],
-                )
-            elif ra.kind == "ambiguous":
-                counts["path_reanchor_ambiguous"] += 1
-                reanchor_unresolved = True
-                counts["allocation_reanchor_failed"] += 1
-                r["Status"] = _apply_status_suffix(str(r.get("Status") or ""), "LegacyReanchorAmbiguous")
-                log_info(
-                    "legacy_backup_migration_alloc_reanchor_failed",
-                    row_index=i,
-                    reason="ambiguous",
-                    path_excerpt=work_path[:220],
-                )
-            elif ra.kind == "failed":
-                counts["path_reanchor_failed"] += 1
-                reanchor_unresolved = True
-                counts["allocation_reanchor_failed"] += 1
-                r["Status"] = _apply_status_suffix(str(r.get("Status") or ""), "LegacyReanchorFailed")
-                log_info(
-                    "legacy_backup_migration_alloc_reanchor_failed",
-                    row_index=i,
-                    reason="no_live_match",
-                    path_excerpt=work_path[:220],
-                )
-            elif ra.kind == "foreign_root_blocked":
-                counts["foreign_root_blocked"] += 1
-                counts["allocation_foreign_root_after_unresolved_documents_token"] += 1
-                reanchor_unresolved = True
-                r["Status"] = _apply_status_suffix(str(r.get("Status") or ""), "LegacyForeignRootBlocked")
-                log_info(
-                    "legacy_backup_migration_alloc_foreign_block_after_reanchor_failed",
-                    row_index=i,
-                    path_excerpt=work_path[:220],
-                    note="namespace_token_documents_not_live_proven",
-                )
-            r["RequestedDestinationPath"] = work_path
-            r["LegacyMigrationAnchorClassification"] = legacy_anchor_classification_from_reanchor(ra)
-            if reanchor_unresolved:
-                if not str(r.get("DestinationDriveId") or "").strip():
-                    r["DestinationDriveId"] = str(mi.destination_drive_id)
-                    log_info(
-                        "legacy_backup_migration_row_stamped",
-                        row_index=i,
-                        kind="allocation",
-                        field="DestinationDriveId",
-                    )
-                row_notes.append(
-                    {
-                        "index": i,
-                        "kind": "allocation",
-                        "unresolved": True,
-                        "reanchor": ra.kind,
-                    }
-                )
-                counts["graph_unresolved_alloc"] += 1
-                out_alloc.append(r)
-                continue
-        elif dest_path and anchor:
-            new_dp = remap_under_visible_library_anchor(
-                stripped_dest,
-                normalize_manifest_path(anchor),
-            )
-            r["RequestedDestinationPath"] = new_dp
-            if new_dp != dest_path:
-                counts["path_normalized"] += 1
-                r["LegacyMigrationAnchorClassification"] = ANCHOR_CLASS_REANCHORED_TO_LIVE_GRAPH
-                log_info(
-                    "legacy_backup_migration_path_normalized",
-                    row_index=i,
-                    kind="allocation",
-                    before_excerpt=dest_path[:120],
-                    after_excerpt=new_dp[:120],
-                )
-        elif dest_path and not str(r.get("RequestedDestinationPath") or "").strip():
-            r["RequestedDestinationPath"] = normalize_manifest_path(stripped_dest)
-
-        if not str(r.get("DestinationDriveId") or "").strip():
-            r["DestinationDriveId"] = str(mi.destination_drive_id)
-            log_info(
-                "legacy_backup_migration_row_stamped",
-                row_index=i,
-                kind="allocation",
-                field="DestinationDriveId",
-            )
-
-        unresolved = False
-        if not skip_graph_resolution and graph is not None and str(mi.destination_drive_id):
-            rel_full = _rel_graph_path(str(r.get("RequestedDestinationPath") or ""), anchor)
-            parent_rel = _parent_rel(str(r.get("RequestedDestinationPath") or ""))
-            parent_drive = _rel_graph_path(parent_rel, anchor) if parent_rel else ""
-
-            try:
-                if rel_full and live_duplicate_check and getattr(graph, "get_drive_item_by_path", None):
-                    live_item = graph.get_drive_item_by_path(str(mi.destination_drive_id), rel_full)
-                    if live_item and isinstance(live_item, dict):
-                        fld = live_item.get("folder")
-                        is_folder = fld is not None and isinstance(fld, dict)
-                        if is_folder:
-                            conflicts.append(
-                                MigrationConflictRecord(
-                                    kind="live_duplicate_allocation_target",
-                                    path=rel_full,
-                                    detail="live_folder_exists_at_planned_destination_path",
-                                )
-                            )
-                            counts["live_duplicate_detected"] += 1
-                            log_info(
-                                "legacy_backup_migration_live_duplicate_detected",
-                                row_index=i,
-                                path_excerpt=rel_full[:160],
-                                kind="allocation",
-                            )
-                            log_info(
-                                "legacy_backup_migration_conflict_recorded",
-                                conflict_kind="live_duplicate_allocation_target",
-                                path_excerpt=rel_full[:160],
-                            )
-                if parent_drive and getattr(graph, "get_drive_item_by_path", None):
-                    parent_item = graph.get_drive_item_by_path(str(mi.destination_drive_id), parent_drive)
-                    if parent_item and str(parent_item.get("id") or "").strip():
-                        r["DestinationParentItemId"] = str(parent_item.get("id") or "").strip()
-                        counts["graph_resolved_alloc"] += 1
-                        log_info(
-                            "legacy_backup_migration_graph_id_resolved",
-                            row_index=i,
-                            kind="allocation_destination_parent",
-                            field="DestinationParentItemId",
-                        )
-                    else:
-                        unresolved = True
-                src_path = str(r.get("SourcePath") or "").strip()
-                src_rel = _rel_graph_path(src_path, "")
-                if src_rel and getattr(graph, "get_drive_item_by_path", None):
-                    src_item = graph.get_drive_item_by_path(str(mi.source_drive_id), src_rel)
-                    if src_item and str(src_item.get("id") or "").strip():
-                        r["SourceItemId"] = str(src_item.get("id") or "").strip()
-                        r["SourceDriveId"] = str(mi.source_drive_id)
-                        log_info(
-                            "legacy_backup_migration_graph_id_resolved",
-                            row_index=i,
-                            kind="allocation_source",
-                            field="SourceItemId",
-                        )
-                    else:
-                        unresolved = True
-            except Exception as exc:
-                unresolved = True
-                log_info("legacy_backup_migration_failed", error=str(exc)[:200], phase="allocation_graph_row")
-        elif not skip_graph_resolution and graph is None:
-            unresolved = bool(
-                not str(r.get("DestinationParentItemId") or "").strip()
-                or not str(r.get("SourceItemId") or "").strip()
-            )
-
-        if unresolved:
-            counts["graph_unresolved_alloc"] += 1
-            sta = str(r.get("Status") or "Pending")
-            if "_LegacyMigrationUnresolved" not in sta:
-                r["Status"] = f"{sta}_LegacyMigrationUnresolved"
-            log_info(
-                "legacy_backup_migration_graph_id_unresolved",
-                row_index=i,
-                kind="allocation",
-            )
-
-        row_notes.append({"index": i, "kind": "allocation", "unresolved": unresolved})
-        out_alloc.append(r)
+    live_top_names_cf = frozenset(str(n or "").casefold() for n in (live_top_names or []))
 
     out_prop: list[dict[str, Any]] = []
     for j, row in enumerate(proposed):
@@ -963,6 +661,428 @@ def migrate_legacy_backup_folder(
             log_info("legacy_backup_migration_graph_id_unresolved", row_index=j, kind="proposed")
 
         out_prop.append(r)
+
+    planned_parent_index_cf, planned_scaffold_index_ct, planned_indexed_path_ct = build_planned_parent_path_index(
+        out_prop,
+        anchor=str(anchor or ""),
+        live_top_level_names_cf=live_top_names_cf,
+    )
+    log_info(
+        "legacy_backup_migration_planned_parent_index_built",
+        proposed_count=len(out_prop),
+        scaffold_count=planned_scaffold_index_ct,
+        indexed_path_count=planned_indexed_path_ct,
+    )
+
+    out_alloc: list[dict[str, Any]] = []
+    for i, row in enumerate(allocations):
+        r = dict(row)
+        dest_in = str(r.get("RequestedDestinationPath") or "").strip()
+        src_in = str(r.get("SourcePath") or "").strip()
+        dest_path, dst_lw = strip_legacy_library_container_segment(
+            dest_in,
+            dst_lib_disp or None,
+            row_index=i,
+            row_kind="allocation",
+            role="destination",
+        )
+        src_path, src_lw = strip_legacy_library_container_segment(
+            src_in,
+            src_lib_disp or None,
+            row_index=i,
+            row_kind="allocation",
+            role="source",
+        )
+        r["SourcePath"] = src_path
+        if dst_lw == LIB_WRAP_STRIPPED:
+            counts["library_container_destination_wrappers_stripped"] += 1
+        if src_lw == LIB_WRAP_STRIPPED:
+            counts["library_container_source_wrappers_stripped"] += 1
+        if dst_lw == LIB_WRAP_IDENTITY_MISSING and dest_in:
+            counts["library_wrapper_identity_missing_destination_rows"] += 1
+            stx = str(r.get("Status") or "Pending")
+            if "LegacyLibraryWrapperIdentityMissing" not in stx:
+                r["Status"] = _apply_status_suffix(stx, "LegacyLibraryWrapperIdentityMissing")
+        elif dst_lw == LIB_WRAP_AMBIGUOUS and dest_in:
+            counts["library_wrapper_ambiguous_destination_rows"] += 1
+            stx = str(r.get("Status") or "Pending")
+            if "LegacyLibraryWrapperAmbiguous" not in stx:
+                r["Status"] = _apply_status_suffix(stx, "LegacyLibraryWrapperAmbiguous")
+        if src_lw == LIB_WRAP_IDENTITY_MISSING and src_in:
+            counts["library_wrapper_identity_missing_source_rows"] += 1
+            stx = str(r.get("Status") or "Pending")
+            if "LegacyLibraryWrapperSourceIdentityMissing" not in stx:
+                r["Status"] = _apply_status_suffix(stx, "LegacyLibraryWrapperSourceIdentityMissing")
+        elif src_lw == LIB_WRAP_AMBIGUOUS and src_in:
+            counts["library_wrapper_ambiguous_source_rows"] += 1
+            stx = str(r.get("Status") or "Pending")
+            if "LegacyLibraryWrapperSourceAmbiguous" not in stx:
+                r["Status"] = _apply_status_suffix(stx, "LegacyLibraryWrapperSourceAmbiguous")
+
+        if can_skeleton:
+            stripped_dest = normalize_manifest_path(dest_path)
+            synth = False
+        elif empty_destination_graph:
+            # No live top-level anchors: preserve legacy segments (including Root / Root3) as planning scaffold.
+            stripped_dest = normalize_manifest_path(dest_path)
+            synth = False
+        else:
+            stripped_dest, synth = strip_internal_root_with_log_legacy_only(
+                dest_path,
+                row_index=i,
+                row_kind="allocation",
+            )
+        if synth:
+            counts["synthetic_root_stripped"] += 1
+
+        if empty_destination_graph and dest_path:
+            r["RequestedDestinationPath"] = normalize_manifest_path(stripped_dest)
+            _stamp_planned_scaffold_empty_library_row(
+                r,
+                row_index=i,
+                row_kind="allocation",
+                path_excerpt=str(r.get("RequestedDestinationPath") or ""),
+            )
+            counts["planned_scaffold_empty_library_rows"] += 1
+            if not str(r.get("DestinationDriveId") or "").strip():
+                r["DestinationDriveId"] = str(mi.destination_drive_id)
+                log_info(
+                    "legacy_backup_migration_row_stamped",
+                    row_index=i,
+                    kind="allocation",
+                    field="DestinationDriveId",
+                )
+            unresolved = False
+            if not skip_graph_resolution and graph is not None and str(mi.source_drive_id):
+                try:
+                    src_path = str(r.get("SourcePath") or "").strip()
+                    src_rel = _rel_graph_path(src_path, "")
+                    if src_rel and getattr(graph, "get_drive_item_by_path", None):
+                        src_item = graph.get_drive_item_by_path(str(mi.source_drive_id), src_rel)
+                        if src_item and str(src_item.get("id") or "").strip():
+                            r["SourceItemId"] = str(src_item.get("id") or "").strip()
+                            r["SourceDriveId"] = str(mi.source_drive_id)
+                            log_info(
+                                "legacy_backup_migration_graph_id_resolved",
+                                row_index=i,
+                                kind="allocation_source",
+                                field="SourceItemId",
+                            )
+                        else:
+                            unresolved = True
+                except Exception as exc:
+                    unresolved = True
+                    log_info("legacy_backup_migration_failed", error=str(exc)[:200], phase="allocation_scaffold_source")
+            elif not skip_graph_resolution and graph is None:
+                unresolved = not str(r.get("SourceItemId") or "").strip()
+
+            if unresolved:
+                counts["graph_unresolved_alloc"] += 1
+                sta = str(r.get("Status") or "Pending")
+                if "_LegacyMigrationUnresolved" not in sta:
+                    r["Status"] = f"{sta}_LegacyMigrationUnresolved"
+                log_info(
+                    "legacy_backup_migration_graph_id_unresolved",
+                    row_index=i,
+                    kind="allocation",
+                )
+            row_notes.append(
+                {
+                    "index": i,
+                    "kind": "allocation",
+                    "unresolved": unresolved,
+                    "empty_library_scaffold": True,
+                }
+            )
+            out_alloc.append(r)
+            continue
+
+        if dest_path and anchor and not empty_destination_graph and _legacy_foreign_hub_before_anchor_remap(stripped_dest, anchor):
+            counts["foreign_hub_rejected"] += 1
+            counts["rows_rejected"] += 1
+            st = str(r.get("Status") or "Pending")
+            if "_ForeignHubRejected" not in st:
+                r["Status"] = f"{st}_ForeignHubRejected"
+            log_info(
+                "legacy_backup_migration_foreign_hub_rejected",
+                row_index=i,
+                kind="allocation",
+                top_segment=(stripped_dest.split("\\")[0] if stripped_dest else "")[:80],
+                anchor_segment=normalize_manifest_path(anchor).split("\\")[0][:80],
+            )
+            if not str(r.get("DestinationDriveId") or "").strip():
+                r["DestinationDriveId"] = str(mi.destination_drive_id)
+                log_info(
+                    "legacy_backup_migration_row_stamped",
+                    row_index=i,
+                    kind="allocation",
+                    field="DestinationDriveId",
+                )
+            row_notes.append({"index": i, "kind": "allocation", "unresolved": False, "foreign_hub": True})
+            out_alloc.append(r)
+            continue
+
+        work_path = stripped_dest
+        reanchor_unresolved = False
+        if can_skeleton:
+            counts["allocation_reanchor_attempted"] += 1
+            log_info(
+                "legacy_backup_migration_alloc_reanchor_attempt",
+                row_index=i,
+                path_excerpt=work_path[:220],
+            )
+            ra = reanchor_manifest_destination_path_against_live_skeleton(
+                work_path,
+                destination_drive_id=str(mi.destination_drive_id),
+                graph=graph,
+                live_top_level_names=live_top_names,
+                row_index=i,
+                row_kind="allocation",
+            )
+            work_path = ra.path_manifest or stripped_dest
+            if getattr(ra, "ignored_legacy_internal_root_segment", False):
+                counts["synthetic_root_stripped"] += 1
+            if ra.kind == "reanchored":
+                counts["path_reanchored"] += 1
+                counts["allocation_reanchored"] += 1
+                log_info(
+                    "legacy_backup_migration_alloc_reanchored",
+                    row_index=i,
+                    after_excerpt=work_path[:220],
+                )
+            elif ra.kind == "ambiguous":
+                counts["path_reanchor_ambiguous"] += 1
+                reanchor_unresolved = True
+                counts["allocation_reanchor_failed"] += 1
+                r["Status"] = _apply_status_suffix(str(r.get("Status") or ""), "LegacyReanchorAmbiguous")
+                log_info(
+                    "legacy_backup_migration_alloc_reanchor_failed",
+                    row_index=i,
+                    reason="ambiguous",
+                    path_excerpt=work_path[:220],
+                )
+            elif ra.kind == "failed":
+                counts["path_reanchor_failed"] += 1
+                reanchor_unresolved = True
+                counts["allocation_reanchor_failed"] += 1
+                r["Status"] = _apply_status_suffix(str(r.get("Status") or ""), "LegacyReanchorFailed")
+                log_info(
+                    "legacy_backup_migration_alloc_reanchor_failed",
+                    row_index=i,
+                    reason="no_live_match",
+                    path_excerpt=work_path[:220],
+                )
+            elif ra.kind == "foreign_root_blocked":
+                counts["foreign_root_blocked"] += 1
+                counts["allocation_foreign_root_after_unresolved_documents_token"] += 1
+                reanchor_unresolved = True
+                r["Status"] = _apply_status_suffix(str(r.get("Status") or ""), "LegacyForeignRootBlocked")
+                log_info(
+                    "legacy_backup_migration_alloc_foreign_block_after_reanchor_failed",
+                    row_index=i,
+                    path_excerpt=work_path[:220],
+                    note="namespace_token_documents_not_live_proven",
+                )
+            r["RequestedDestinationPath"] = work_path
+            r["LegacyMigrationAnchorClassification"] = legacy_anchor_classification_from_reanchor(ra)
+            if reanchor_unresolved:
+                if not str(r.get("DestinationDriveId") or "").strip():
+                    r["DestinationDriveId"] = str(mi.destination_drive_id)
+                    log_info(
+                        "legacy_backup_migration_row_stamped",
+                        row_index=i,
+                        kind="allocation",
+                        field="DestinationDriveId",
+                    )
+                # Fall through: try live Graph parent resolution, then proposed/planned path index.
+        elif dest_path and anchor:
+            new_dp = remap_under_visible_library_anchor(
+                stripped_dest,
+                normalize_manifest_path(anchor),
+            )
+            r["RequestedDestinationPath"] = new_dp
+            if new_dp != dest_path:
+                counts["path_normalized"] += 1
+                r["LegacyMigrationAnchorClassification"] = ANCHOR_CLASS_REANCHORED_TO_LIVE_GRAPH
+                log_info(
+                    "legacy_backup_migration_path_normalized",
+                    row_index=i,
+                    kind="allocation",
+                    before_excerpt=dest_path[:120],
+                    after_excerpt=new_dp[:120],
+                )
+        elif dest_path and not str(r.get("RequestedDestinationPath") or "").strip():
+            r["RequestedDestinationPath"] = normalize_manifest_path(stripped_dest)
+
+        if anchor and str(r.get("RequestedDestinationPath") or "").strip():
+            al = align_legacy_top_segment_to_anchor(
+                str(r.get("RequestedDestinationPath") or ""),
+                anchor,
+                live_top_level_names_cf=live_top_names_cf,
+            )
+            if al != str(r.get("RequestedDestinationPath") or "").strip():
+                r["RequestedDestinationPath"] = al
+
+        if not str(r.get("DestinationDriveId") or "").strip():
+            r["DestinationDriveId"] = str(mi.destination_drive_id)
+            log_info(
+                "legacy_backup_migration_row_stamped",
+                row_index=i,
+                kind="allocation",
+                field="DestinationDriveId",
+            )
+
+        parent_rel_display = _parent_rel(str(r.get("RequestedDestinationPath") or ""))
+        planned_parent_norm = normalize_manifest_path(parent_rel_display) if parent_rel_display else ""
+
+        dest_graph_unresolved = False
+        src_unresolved = False
+        if not skip_graph_resolution and graph is not None and str(mi.destination_drive_id):
+            rel_full = _rel_graph_path(str(r.get("RequestedDestinationPath") or ""), anchor)
+            parent_drive = _rel_graph_path(parent_rel_display, anchor) if parent_rel_display else ""
+
+            try:
+                if rel_full and live_duplicate_check and getattr(graph, "get_drive_item_by_path", None):
+                    live_item = graph.get_drive_item_by_path(str(mi.destination_drive_id), rel_full)
+                    if live_item and isinstance(live_item, dict):
+                        fld = live_item.get("folder")
+                        is_folder = fld is not None and isinstance(fld, dict)
+                        if is_folder:
+                            conflicts.append(
+                                MigrationConflictRecord(
+                                    kind="live_duplicate_allocation_target",
+                                    path=rel_full,
+                                    detail="live_folder_exists_at_planned_destination_path",
+                                )
+                            )
+                            counts["live_duplicate_detected"] += 1
+                            log_info(
+                                "legacy_backup_migration_live_duplicate_detected",
+                                row_index=i,
+                                path_excerpt=rel_full[:160],
+                                kind="allocation",
+                            )
+                            log_info(
+                                "legacy_backup_migration_conflict_recorded",
+                                conflict_kind="live_duplicate_allocation_target",
+                                path_excerpt=rel_full[:160],
+                            )
+                if parent_drive and getattr(graph, "get_drive_item_by_path", None):
+                    parent_item = graph.get_drive_item_by_path(str(mi.destination_drive_id), parent_drive)
+                    if parent_item and str(parent_item.get("id") or "").strip():
+                        r["DestinationParentItemId"] = str(parent_item.get("id") or "").strip()
+                        r["LegacyMigrationDestinationParentResolution"] = "graph"
+                        r["LegacyMigrationPlannedParentResolved"] = False
+                        r["DestinationParentPlannedPath"] = ""
+                        r["LegacyMigrationPlannedParentMatchKind"] = ""
+                        counts["graph_resolved_alloc"] += 1
+                        counts["allocation_parent_graph_resolved"] += 1
+                        log_info(
+                            "legacy_backup_migration_graph_id_resolved",
+                            row_index=i,
+                            kind="allocation_destination_parent",
+                            field="DestinationParentItemId",
+                        )
+                    else:
+                        dest_graph_unresolved = True
+                elif parent_rel_display:
+                    dest_graph_unresolved = True
+                src_path = str(r.get("SourcePath") or "").strip()
+                src_rel = _rel_graph_path(src_path, "")
+                if src_rel and getattr(graph, "get_drive_item_by_path", None):
+                    src_item = graph.get_drive_item_by_path(str(mi.source_drive_id), src_rel)
+                    if src_item and str(src_item.get("id") or "").strip():
+                        r["SourceItemId"] = str(src_item.get("id") or "").strip()
+                        r["SourceDriveId"] = str(mi.source_drive_id)
+                        log_info(
+                            "legacy_backup_migration_graph_id_resolved",
+                            row_index=i,
+                            kind="allocation_source",
+                            field="SourceItemId",
+                        )
+                    else:
+                        src_unresolved = True
+            except Exception as exc:
+                dest_graph_unresolved = bool(parent_rel_display)
+                src_unresolved = True
+                log_info("legacy_backup_migration_failed", error=str(exc)[:200], phase="allocation_graph_row")
+        elif not skip_graph_resolution and graph is None:
+            dest_graph_unresolved = bool(not str(r.get("DestinationParentItemId") or "").strip()) and bool(
+                planned_parent_norm
+            )
+            src_unresolved = bool(not str(r.get("SourceItemId") or "").strip())
+        else:
+            # skip_graph_resolution=True: still evaluate migrated proposed/planned parent support.
+            dest_graph_unresolved = bool(not str(r.get("DestinationParentItemId") or "").strip()) and bool(
+                planned_parent_norm
+            )
+            src_unresolved = bool(not str(r.get("SourceItemId") or "").strip())
+
+        planned_lookup = None
+        if dest_graph_unresolved and planned_parent_index_cf and planned_parent_norm:
+            planned_lookup = lookup_planned_parent(planned_parent_norm, planned_parent_index_cf)
+
+        dest_planned_ok = bool(planned_lookup is not None and (planned_lookup.kind or "") not in ("", "none"))
+
+        if dest_graph_unresolved and dest_planned_ok and planned_lookup is not None:
+            _stamp_allocation_planned_destination_parent(
+                r,
+                parent_planned_norm=planned_parent_norm,
+                match_kind=planned_lookup.kind,
+            )
+            counts["allocation_planned_parent_resolved"] += 1
+            counts["allocation_parent_graph_unresolved_but_planned"] += 1
+            if planned_lookup.kind == "exact":
+                counts["allocation_planned_parent_exact"] += 1
+            elif planned_lookup.kind == "ancestor":
+                counts["allocation_planned_parent_ancestor"] += 1
+            else:
+                counts["allocation_planned_parent_missing_descendant"] += 1
+            log_info(
+                "legacy_backup_migration_allocation_planned_parent_resolved",
+                row_index=i,
+                match_kind=planned_lookup.kind,
+                parent_excerpt=planned_parent_norm[:220],
+            )
+            log_info(
+                "legacy_backup_migration_allocation_parent_graph_unresolved_but_planned",
+                row_index=i,
+                parent_excerpt=planned_parent_norm[:220],
+            )
+        elif dest_graph_unresolved and (planned_lookup is None or not dest_planned_ok):
+            log_info(
+                "legacy_backup_migration_allocation_parent_unresolved",
+                row_index=i,
+                parent_excerpt=planned_parent_norm[:220],
+            )
+            counts["allocation_parent_unresolved_after_planned_lookup"] += 1
+
+        dest_needs_parent = bool(planned_parent_norm)
+        dest_ok = (not dest_needs_parent) or bool(str(r.get("DestinationParentItemId") or "").strip()) or bool(
+            dest_planned_ok
+        )
+        unresolved = bool(src_unresolved or not dest_ok)
+
+        if unresolved:
+            counts["graph_unresolved_alloc"] += 1
+            sta = str(r.get("Status") or "Pending")
+            if "_LegacyMigrationUnresolved" not in sta:
+                r["Status"] = f"{sta}_LegacyMigrationUnresolved"
+            log_info(
+                "legacy_backup_migration_graph_id_unresolved",
+                row_index=i,
+                kind="allocation",
+            )
+
+        row_notes.append(
+            {
+                "index": i,
+                "kind": "allocation",
+                "unresolved": unresolved,
+                "planned_parent_kind": getattr(planned_lookup, "kind", "") if planned_lookup else "",
+            }
+        )
+        out_alloc.append(r)
 
     # Foreign hub: first path segment must match anchor's top segment when anchor is set.
     # When the Graph library root is empty, legacy top segments are scaffold — do not enforce anchor match.

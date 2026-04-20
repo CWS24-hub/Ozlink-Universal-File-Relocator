@@ -44,6 +44,9 @@ ANCHOR_CLASS_REANCHORED_TO_LIVE_GRAPH = "reanchored_to_live_graph"
 ANCHOR_CLASS_PLANNED_SCAFFOLD_EMPTY_LIBRARY = "planned_scaffold_in_empty_library"
 ANCHOR_CLASS_UNRESOLVED_AMBIGUOUS_ANCHOR = "unresolved_ambiguous_anchor"
 ANCHOR_CLASS_FOREIGN_ROOT_BLOCKED = "foreign_root_blocked"
+ANCHOR_CLASS_PLANNED_PARENT_RESOLVED_EXACT = "planned_parent_resolved_exact"
+ANCHOR_CLASS_PLANNED_PARENT_RESOLVED_ANCESTOR = "planned_parent_resolved_ancestor"
+ANCHOR_CLASS_PLANNED_PARENT_MISSING_DESCENDANT = "planned_parent_missing_descendant"
 
 
 def migration_identity_complete(mi: MigrationIdentityPreflight | None) -> bool:

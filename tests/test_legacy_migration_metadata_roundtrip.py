@@ -78,3 +78,5 @@ def test_migration_metadata_defaults_when_absent():
     d = row.to_dict()
     assert d["LegacyMigrationAnchorClassification"] == ""
     assert d["LegacyMigrationPlannedScaffoldOnly"] is False
+    assert d["LegacyMigrationPlannedParentResolved"] is False
+    assert d["DestinationParentPlannedPath"] == ""

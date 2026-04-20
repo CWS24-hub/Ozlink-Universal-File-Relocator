@@ -24,6 +24,10 @@ class AllocationRow:
     LegacyMigrationRootNotLiveConfirmed: bool = False
     LegacyMigrationUnresolvedGraphAnchor: bool = False
     LegacyForeignRootBlocked: bool = False
+    LegacyMigrationPlannedParentResolved: bool = False
+    LegacyMigrationDestinationParentResolution: str = ""
+    DestinationParentPlannedPath: str = ""
+    LegacyMigrationPlannedParentMatchKind: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AllocationRow":
@@ -46,6 +50,10 @@ class AllocationRow:
             LegacyMigrationRootNotLiveConfirmed=bool(data.get("LegacyMigrationRootNotLiveConfirmed", False)),
             LegacyMigrationUnresolvedGraphAnchor=bool(data.get("LegacyMigrationUnresolvedGraphAnchor", False)),
             LegacyForeignRootBlocked=bool(data.get("LegacyForeignRootBlocked", False)),
+            LegacyMigrationPlannedParentResolved=bool(data.get("LegacyMigrationPlannedParentResolved", False)),
+            LegacyMigrationDestinationParentResolution=str(data.get("LegacyMigrationDestinationParentResolution", "") or ""),
+            DestinationParentPlannedPath=str(data.get("DestinationParentPlannedPath", "") or ""),
+            LegacyMigrationPlannedParentMatchKind=str(data.get("LegacyMigrationPlannedParentMatchKind", "") or ""),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -75,6 +83,10 @@ class ProposedFolder:
     LegacyMigrationRootNotLiveConfirmed: bool = False
     LegacyMigrationUnresolvedGraphAnchor: bool = False
     LegacyForeignRootBlocked: bool = False
+    LegacyMigrationPlannedParentResolved: bool = False
+    LegacyMigrationDestinationParentResolution: str = ""
+    DestinationParentPlannedPath: str = ""
+    LegacyMigrationPlannedParentMatchKind: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ProposedFolder":
@@ -96,6 +108,10 @@ class ProposedFolder:
             LegacyMigrationRootNotLiveConfirmed=bool(data.get("LegacyMigrationRootNotLiveConfirmed", False)),
             LegacyMigrationUnresolvedGraphAnchor=bool(data.get("LegacyMigrationUnresolvedGraphAnchor", False)),
             LegacyForeignRootBlocked=bool(data.get("LegacyForeignRootBlocked", False)),
+            LegacyMigrationPlannedParentResolved=bool(data.get("LegacyMigrationPlannedParentResolved", False)),
+            LegacyMigrationDestinationParentResolution=str(data.get("LegacyMigrationDestinationParentResolution", "") or ""),
+            DestinationParentPlannedPath=str(data.get("DestinationParentPlannedPath", "") or ""),
+            LegacyMigrationPlannedParentMatchKind=str(data.get("LegacyMigrationPlannedParentMatchKind", "") or ""),
         )
 
     def to_dict(self) -> dict[str, Any]:
