@@ -27,6 +27,10 @@ from .paths import (
 )
 
 
+# Reject promoting a backup session older than the live primary by more than this unless scores tie-break.
+_RESTORE_BACKUP_STALENESS_SOFT_SEC = float(45 * 86400)
+
+
 def _restore_candidate_preference_score(name: str) -> int:
     """Higher score wins when sorting fallback candidates (non-authoritative live paths)."""
     n = str(name or "")
@@ -293,6 +297,136 @@ class MemoryManager:
             "timestamp_sort_value": timestamp_sort_value,
         }
 
+    def _tree_snapshot_list_recursive_count(self, nodes: Any) -> int:
+        n = 0
+        if not isinstance(nodes, list):
+            return 0
+        for node in nodes:
+            if isinstance(node, dict):
+                n += 1
+                n += self._tree_snapshot_list_recursive_count(node.get("children") or [])
+        return n
+
+    def _tree_snapshot_node_counts_from_raw(self, raw: dict[str, Any]) -> tuple[int, int]:
+        if not isinstance(raw, dict):
+            return 0, 0
+        s_raw = raw.get("SourceTreeSnapshot") or []
+        d_raw = raw.get("DestinationTreeSnapshot") or []
+        s_list = s_raw if isinstance(s_raw, list) else []
+        d_list = d_raw if isinstance(d_raw, list) else []
+        return (
+            self._tree_snapshot_list_recursive_count(s_list),
+            self._tree_snapshot_list_recursive_count(d_list),
+        )
+
+    def restore_candidate_field_metrics(self, candidate: dict[str, Any]) -> dict[str, Any]:
+        """Selector + snapshot richness used for restore scoring and sparse-primary detection."""
+        ss = candidate.get("session_state")
+        raw = candidate.get("session_raw") if isinstance(candidate.get("session_raw"), dict) else {}
+        if not isinstance(ss, SessionState):
+            ss = SessionState()
+        s_nodes, d_nodes = self._tree_snapshot_node_counts_from_raw(raw)
+
+        def _g(attr: str, raw_key: str) -> str:
+            try:
+                v = getattr(ss, attr, "") if ss is not None else ""
+            except Exception:
+                v = ""
+            if str(v or "").strip():
+                return str(v).strip()
+            return str(raw.get(raw_key, "") or "").strip()
+
+        has_src = bool(
+            _g("SelectedSourceLibraryId", "SelectedSourceLibraryId")
+            or _g("SelectedSourceSiteKey", "SelectedSourceSiteKey")
+            or _g("SelectedSourceSite", "SelectedSourceSite")
+        )
+        has_dst = bool(
+            _g("SelectedDestinationLibraryId", "SelectedDestinationLibraryId")
+            or _g("SelectedDestinationSiteKey", "SelectedDestinationSiteKey")
+            or _g("SelectedDestinationSite", "SelectedDestinationSite")
+        )
+        return {
+            "has_source_selector": has_src,
+            "has_destination_selector": has_dst,
+            "source_snapshot_nodes": int(s_nodes),
+            "destination_snapshot_nodes": int(d_nodes),
+        }
+
+    def restore_candidate_population_score(self, candidate: dict[str, Any]) -> int:
+        m = self.restore_candidate_field_metrics(candidate)
+        ac = int(candidate.get("allocation_count", 0) or 0)
+        pc = int(candidate.get("proposed_count", 0) or 0)
+        snap = int(m["source_snapshot_nodes"]) + int(m["destination_snapshot_nodes"])
+        sel = (3 if m["has_source_selector"] else 0) + (3 if m["has_destination_selector"] else 0)
+        return ac * 1_000_000 + pc * 10_000 + snap * 100 + sel
+
+    def _restore_primary_is_sparse_for_promotion(self, primary: dict[str, Any]) -> bool:
+        """True when live primary has no allocations/proposed/selectors/snapshots to restore."""
+        if not primary.get("valid"):
+            return False
+        ac = int(primary.get("allocation_count", 0) or 0)
+        pc = int(primary.get("proposed_count", 0) or 0)
+        if ac > 0 or pc > 0 or primary.get("populated"):
+            return False
+        m = self.restore_candidate_field_metrics(primary)
+        if m["has_source_selector"] or m["has_destination_selector"]:
+            return False
+        if m["source_snapshot_nodes"] + m["destination_snapshot_nodes"] > 0:
+            return False
+        return True
+
+    def _restore_draft_ids_match(self, a: dict[str, Any], b: dict[str, Any]) -> bool:
+        da = str(a.get("draft_id") or "").strip()
+        db = str(b.get("draft_id") or "").strip()
+        if not da or not db:
+            return False
+        return da.casefold() == db.casefold()
+
+    def _restore_fingerprints_compatible(self, a: dict[str, Any], b: dict[str, Any]) -> bool:
+        fa = str(a.get("fingerprint") or "").strip().lower()
+        fb = str(b.get("fingerprint") or "").strip().lower()
+        if not fa or not fb:
+            return True
+        return fa == fb
+
+    def _restore_backup_too_stale_vs_primary(self, primary: dict[str, Any], backup: dict[str, Any]) -> bool:
+        """True when backup is far older than primary *and* not strictly richer (anti-stale promotion)."""
+        pb = float(primary.get("timestamp_sort_value") or float("-inf"))
+        bb = float(backup.get("timestamp_sort_value") or float("-inf"))
+        if pb == float("-inf") or bb == float("-inf"):
+            return False
+        if bb >= pb - 120.0:
+            return False
+        if bb >= pb - _RESTORE_BACKUP_STALENESS_SOFT_SEC:
+            return False
+        sp = self.restore_candidate_population_score(primary)
+        sb = self.restore_candidate_population_score(backup)
+        return sb <= sp
+
+    def _log_restore_candidate_population_scores(
+        self,
+        primary: dict[str, Any] | None,
+        backup: dict[str, Any] | None,
+    ) -> None:
+        for label, cand in (("python_live_primary", primary), ("python_backup_latest", backup)):
+            if cand is None:
+                continue
+            m = self.restore_candidate_field_metrics(cand)
+            log_info(
+                "restore_candidate_population_score",
+                candidate_kind=str(cand.get("name", label)),
+                draft_id=str(cand.get("draft_id", "") or "")[:120],
+                populated=bool(cand.get("populated")),
+                allocation_count=int(cand.get("allocation_count", 0) or 0),
+                proposed_count=int(cand.get("proposed_count", 0) or 0),
+                has_source_selector=bool(m.get("has_source_selector")),
+                has_destination_selector=bool(m.get("has_destination_selector")),
+                source_snapshot_nodes=int(m.get("source_snapshot_nodes", 0)),
+                destination_snapshot_nodes=int(m.get("destination_snapshot_nodes", 0)),
+                score=int(self.restore_candidate_population_score(cand)),
+            )
+
     def discover_restore_candidates(self) -> list[dict[str, Any]]:
         candidates = [
             self._inspect_candidate(
@@ -438,8 +572,79 @@ class MemoryManager:
 
         primary = next((c for c in inspected if str(c.get("name", "")) == "python_live_primary"), None)
         recovery = next((c for c in inspected if str(c.get("name", "")) == "python_live_recovery"), None)
+        backup_latest = next((c for c in inspected if str(c.get("name", "")) == "python_backup_latest"), None)
 
         if primary and primary.get("valid"):
+            self._log_restore_candidate_population_scores(primary, backup_latest)
+            promote_backup = False
+            promote_note = ""
+            if backup_latest and backup_latest.get("valid"):
+                sparse = self._restore_primary_is_sparse_for_promotion(primary)
+                same_draft = self._restore_draft_ids_match(primary, backup_latest)
+                fp_ok = self._restore_fingerprints_compatible(primary, backup_latest)
+                stale = self._restore_backup_too_stale_vs_primary(primary, backup_latest)
+                richer = self.restore_candidate_population_score(backup_latest) > self.restore_candidate_population_score(
+                    primary
+                )
+                if sparse and same_draft and fp_ok and (not stale) and richer:
+                    promote_backup = True
+                    promote_note = (
+                        "python_backup_latest promoted: sparse_primary "
+                        f"draft_match={same_draft} fingerprint_ok={fp_ok} richer={richer}"
+                    )
+                elif sparse and same_draft and backup_latest and not richer:
+                    log_info(
+                        "restore_candidate_empty_primary_rejected",
+                        note="backup_not_strictly_richer",
+                        primary_draft=str(primary.get("draft_id", "") or "")[:80],
+                    )
+                elif sparse and backup_latest and not same_draft:
+                    log_info(
+                        "restore_candidate_empty_primary_rejected",
+                        note="draft_id_mismatch_cannot_promote_backup",
+                        primary_draft=str(primary.get("draft_id", "") or "")[:80],
+                        backup_draft=str(backup_latest.get("draft_id", "") or "")[:80],
+                    )
+                elif sparse and backup_latest and not fp_ok:
+                    log_info(
+                        "restore_candidate_empty_primary_rejected",
+                        note="fingerprint_mismatch_cannot_promote_backup",
+                    )
+                elif sparse and backup_latest and stale:
+                    log_info(
+                        "restore_candidate_empty_primary_rejected",
+                        note="backup_too_stale_vs_primary",
+                    )
+
+            if promote_backup and backup_latest is not None:
+                selected = backup_latest
+                reason = (
+                    "authoritative_python_backup_promoted_over_sparse_primary "
+                    f"valid={selected.get('valid')} populated={selected.get('populated')} "
+                    f"allocations={selected.get('allocation_count', 0)} "
+                    f"proposed={selected.get('proposed_count', 0)} "
+                    f"timestamp_sort_value={selected.get('timestamp_sort_value', float('-inf'))} "
+                    f"detail={promote_note}"
+                )
+                log_info(
+                    "restore_candidate_backup_promoted",
+                    selected_name=str(selected.get("name", "")),
+                    draft_id=str(selected.get("draft_id", "") or "")[:120],
+                    allocation_count=int(selected.get("allocation_count", 0) or 0),
+                    proposed_count=int(selected.get("proposed_count", 0) or 0),
+                    populated=bool(selected.get("populated")),
+                )
+                log_info(
+                    "Restore candidate selected (backup promoted over sparse live primary).",
+                    selected_name=str(selected.get("name", "")),
+                    allocation_count=int(selected.get("allocation_count", 0) or 0),
+                    proposed_count=int(selected.get("proposed_count", 0) or 0),
+                    populated=bool(selected.get("populated")),
+                    stale_backup_skipped=False,
+                )
+                log_trace("memory", "select_restore_candidate", selected_name="python_backup_latest", reason_excerpt=reason[:400])
+                return selected, reason
+
             selected = primary
             reason = (
                 "authoritative_python_live_primary "

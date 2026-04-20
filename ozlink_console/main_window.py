@@ -15619,6 +15619,8 @@ class MainWindow(QMainWindow):
             stall_kind = "waiting_for_materialize"
         elif ft_running:
             stall_kind = "worker_running_slow"
+        elif did and ready and not trust_ok:
+            stall_kind = "snapshot_trust_expired_or_invalid"
         elif not ft_running and not ready:
             stall_kind = "worker_not_running"
 
@@ -15636,9 +15638,29 @@ class MainWindow(QMainWindow):
             bind_sync_active=bool(bind_sync),
             light_validation_running=bool(light_running),
         )
+        recovered_trust = False
+        if (
+            did
+            and self._destination_tree_shows_authority_pending_shell()
+            and self._destination_full_tree_ready()
+            and not trust_ok
+        ):
+            recovered_trust = bool(self._destination_try_recover_stall_trust_and_flush(did))
+        if recovered_trust:
+            log_info(
+                "destination_authority_shell_stall_recovered",
+                stall_kind=str(stall_kind or "")[:80],
+                drive_id_suffix=did[-16:] if len(did) > 16 else did,
+                recovery="trust_ttl_refresh",
+            )
+            return
         if ready and trust_ok:
             self._flush_destination_authority_shell_if_ready("destination_authority_shell_watchdog_flush")
         elif stall_kind == "worker_not_running" and did:
+            log_info(
+                "destination_full_tree_worker_rekick_after_stall",
+                drive_id_suffix=did[-16:] if len(did) > 16 else did,
+            )
             self._ensure_sharepoint_destination_full_tree_worker_scheduled(did)
 
     def _destination_planned_reconcile_after_authority_or_flush_overlay(self, *, exception_log_key: str) -> None:
@@ -15705,8 +15727,42 @@ class MainWindow(QMainWindow):
                 flush_reason=str(reason or "")[:160],
                 apply_destination_planning_overlays_ms=round(_apply_ms, 2),
                 planned_reconcile_ms=round(_rec_ms, 2),
-                skipped_planned_reconcile=_done_before,
+                    skipped_planned_reconcile=_done_before,
             )
+
+    def _destination_try_recover_stall_trust_and_flush(self, did: str) -> bool:
+        """Re-latch SPO trust when full enumerate completed but TTL/trust dropped while shell still pending.
+
+        Avoids indefinite 'reconciling' when ``_destination_snapshot_spo_trust_valid`` expires (300s TTL) after
+        ``on_destination_full_tree_success`` already marked the walk complete.
+        """
+        did = str(did or "").strip()
+        if not did:
+            return False
+        if self._planning_browse_mode("destination") == "local":
+            return False
+        if not self._destination_tree_shows_authority_pending_shell():
+            return False
+        if not self._destination_full_tree_ready():
+            return False
+        done = str(getattr(self, "_destination_full_tree_completed_drive_id", "") or "").strip()
+        if done.casefold() != did.casefold():
+            return False
+        if self._destination_snapshot_spo_trust_valid(did):
+            return False
+        self._destination_mark_spo_snapshot_trust_valid(did, "stall_recovery_trust_ttl_refresh")
+        log_info(
+            "destination_full_tree_ready_latched",
+            recovery_kind="trust_ttl_refresh",
+            drive_id_suffix=did[-16:] if len(did) > 16 else did,
+        )
+        self._flush_destination_authority_shell_if_ready("destination_authority_shell_stall_recovery")
+        log_info(
+            "destination_reconcile_status_cleared",
+            trigger="stall_recovery_trust_refresh",
+            drive_id_suffix=did[-16:] if len(did) > 16 else did,
+        )
+        return True
 
     def _destination_model_has_authority_pending_placeholder_rows(self) -> bool:
         """Model scan only (ignores reconcile / shell latches)."""
@@ -16038,9 +16094,14 @@ class MainWindow(QMainWindow):
 
         If the selector and pending root ids are momentarily empty (UI churn) but a completed enumerate exists,
         we still treat the snapshot as ready unless the user has explicitly selected a *different* library id.
+
+        A successful Graph walk can yield items that do not project into ``_destination_full_tree_snapshot``
+        (canonical-path filtering) or an **empty** document library (zero items). In those cases we still
+        treat the completed walk as ready when ``_destination_full_tree_completed_drive_id`` matches and
+        the walk reported a definitive item total (including zero).
         """
         done = str(getattr(self, "_destination_full_tree_completed_drive_id", "") or "").strip()
-        if not done or not self._destination_full_tree_snapshot:
+        if not done:
             return False
         sel = str(self._current_selected_destination_drive_id() or "").strip()
         pend = str(self.pending_root_drive_ids.get("destination", "") or "").strip()
@@ -16048,6 +16109,10 @@ class MainWindow(QMainWindow):
             return False
         if pend and pend != done:
             return False
+        snap = getattr(self, "_destination_full_tree_snapshot", None)
+        if snap:
+            return True
+        # Walk completed: snapshot rows may be empty while Graph reported items (path canonicalization), or library may be empty.
         return True
 
     def _destination_sharepoint_planning_destination_active(self) -> bool:
