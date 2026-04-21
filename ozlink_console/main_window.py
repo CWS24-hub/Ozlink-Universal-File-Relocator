@@ -3455,6 +3455,21 @@ class MainWindow(QMainWindow):
         # Defer overlay projection invariant repair while descendant apply is active (coalesce, reduce log spam).
         self._destination_projection_repair_pending_after_descendant_apply: bool = False
         self._destination_projection_repair_defer_suppress_count: int = 0
+        # Coalesce snapshot dirty + post-tick promotion during allocation-descendant bursts (Phase 1 perf).
+        self._destination_descendant_snapshot_dirty_batch_active: bool = False
+        self._destination_descendant_snapshot_dirty_pending: bool = False
+        self._destination_descendant_snapshot_dirty_reason_counts: Counter = Counter()
+        self._destination_descendant_snapshot_dirty_first_mono: float = 0.0
+        self._destination_descendant_snapshot_dirty_last_flush_ms: float = 0.0
+        self._destination_descendant_snapshot_dirty_affected_paths: set[str] = set()
+        self._destination_descendant_snapshot_dirty_max_delay_timer: Optional[QTimer] = None
+        self._destination_descendant_snapshot_dirty_suppressed_post_tick: int = 0
+        self._destination_descendant_snapshot_dirty_flush_pending_after_scroll: bool = False
+        self._destination_descendant_snapshot_coalesce_dirty_mark_calls: int = 0
+        self._destination_descendant_snapshot_coalesce_suppressed_marks: int = 0
+        self._destination_descendant_snapshot_coalesce_actual_flushes: int = 0
+        self._destination_descendant_snapshot_coalesce_post_tick_refreshes: int = 0
+        self._destination_descendant_snapshot_coalesce_guard_skip_observed: int = 0
         # When an allocation has more than this many collected descendants, file-level
         # projected_descendant rows are deferred until the user expands the allocation
         # (folders still projected eagerly for structure). planned_moves stays authoritative.
@@ -8686,17 +8701,247 @@ class MainWindow(QMainWindow):
             )
         return runtime_snapshots[panel_key]
 
-    def _mark_destination_tree_snapshot_dirty_after_injection(self, *, reason: str) -> None:
-        self._destination_tree_snapshot_dirty_for_persist = True
+    def _destination_descendant_allocation_descendant_burst_active(self) -> bool:
+        if bool(getattr(self, "_destination_descendant_apply_tick_running", False)):
+            return True
+        if getattr(self, "_destination_descendant_apply_state", None) is not None:
+            return True
+        dq = getattr(self, "_destination_descendant_apply_queue", None)
+        try:
+            if dq is not None and len(dq) > 0:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _destination_descendant_snapshot_coalescing_eligible(self, reason: str) -> bool:
+        """Allocation-descendant injection reasons batch post-tick promotion; planning/other stay immediate."""
+        r = str(reason or "")
+        return bool(r.startswith("allocation_descendant"))
+
+    def _destination_descendant_snapshot_batch_chunk_threshold(self) -> int:
+        raw = os.environ.get("OZLINK_DESCENDANT_SNAPSHOT_BATCH_CHUNK_SUPPRESSIONS", "").strip()
+        if raw:
+            try:
+                return max(8, min(512, int(raw)))
+            except ValueError:
+                pass
+        return 32
+
+    def _destination_descendant_snapshot_batch_max_delay_ms(self) -> int:
+        raw = os.environ.get("OZLINK_DESCENDANT_SNAPSHOT_BATCH_MAX_DELAY_MS", "").strip()
+        if raw:
+            try:
+                return max(400, min(60000, int(raw)))
+            except ValueError:
+                pass
+        return 2000
+
+    def _destination_maybe_schedule_descendant_snapshot_max_delay_timer(self) -> None:
+        if getattr(self, "_application_shutting_down", False):
+            return
+        delay_ms = int(self._destination_descendant_snapshot_batch_max_delay_ms())
+        t = getattr(self, "_destination_descendant_snapshot_dirty_max_delay_timer", None)
+        if t is None:
+            try:
+                t = QTimer(self)
+                t.setSingleShot(True)
+                t.timeout.connect(
+                    lambda: self._safe_invoke(
+                        "destination_descendant_snapshot_max_delay_flush",
+                        lambda: self._destination_flush_descendant_snapshot_dirty_batch(
+                            "max_delay_timer",
+                            force=True,
+                            skip_scroll_guard=True,
+                        ),
+                    )
+                )
+                self._destination_descendant_snapshot_dirty_max_delay_timer = t
+            except Exception:
+                return
+        try:
+            t.stop()
+            t.start(max(1, delay_ms))
+        except Exception:
+            pass
+
+    def _destination_flush_descendant_snapshot_dirty_batch(
+        self,
+        flush_reason: str,
+        *,
+        force: bool = False,
+        skip_scroll_guard: bool = False,
+    ) -> bool:
+        """Coalesced flush: promote runtime snapshot + schedule workspace persist once."""
+        fr = str(flush_reason or "")[:120]
+        pending_batch = bool(getattr(self, "_destination_descendant_snapshot_dirty_pending", False))
+        if not pending_batch:
+            log_info(
+                "destination_descendant_snapshot_dirty_flush_skipped",
+                flush_reason=fr,
+                note="no_pending_batched_dirty",
+            )
+            return False
+        scroll_active = False
+        try:
+            scroll_active = bool(self._destination_user_scroll_interaction_active())
+        except Exception:
+            scroll_active = False
+        if scroll_active and not force and not skip_scroll_guard and fr not in (
+            "shutdown",
+            "before_shutdown",
+            "before_save",
+            "draft_save",
+            "before_export",
+            "max_delay_timer",
+        ):
+            self._destination_descendant_snapshot_dirty_flush_pending_after_scroll = True
+            log_info(
+                "destination_descendant_snapshot_dirty_flush_deferred_for_scroll",
+                flush_reason=fr,
+                suppressed_since_flush=int(getattr(self, "_destination_descendant_snapshot_dirty_suppressed_post_tick", 0) or 0),
+            )
+            return False
+
+        t0 = time.perf_counter()
+        try:
+            rc = dict(getattr(self, "_destination_descendant_snapshot_dirty_reason_counts", Counter()) or {})
+        except Exception:
+            rc = {}
+        affected_n = 0
+        try:
+            affected_n = len(getattr(self, "_destination_descendant_snapshot_dirty_affected_paths", set()) or set())
+        except Exception:
+            affected_n = 0
+
+        self._destination_descendant_snapshot_dirty_batch_active = False
+        self._destination_descendant_snapshot_dirty_pending = False
+        self._destination_descendant_snapshot_dirty_reason_counts = Counter()
+        self._destination_descendant_snapshot_dirty_first_mono = 0.0
+        self._destination_descendant_snapshot_dirty_suppressed_post_tick = 0
+        self._destination_descendant_snapshot_dirty_affected_paths = set()
+        tmr = getattr(self, "_destination_descendant_snapshot_dirty_max_delay_timer", None)
+        if tmr is not None:
+            try:
+                tmr.stop()
+            except Exception:
+                pass
+
+        self._destination_descendant_snapshot_coalesce_actual_flushes += 1
+        # Deferred runner refuses while tick_running — pending survives until end of tick / idle.
         self._post_tick_snapshot_refresh_pending = True
+        try:
+            if not bool(getattr(self, "_destination_descendant_apply_tick_running", False)):
+                self._destination_run_post_tick_descendant_deferred()
+        except Exception as exc:
+            self._log_restore_exception("destination_descendant_snapshot_dirty_flush_deferred_invoke", exc)
+        self._destination_descendant_snapshot_dirty_last_flush_ms = time.perf_counter() * 1000.0
+        elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        log_info(
+            "destination_descendant_snapshot_dirty_flushed",
+            flush_reason=fr,
+            reason_counts=rc,
+            elapsed_ms=elapsed_ms,
+            affected_path_count=int(affected_n),
+            descendant_apply_active=bool(self._destination_descendant_allocation_descendant_burst_active()),
+            queue_size=int(len(getattr(self, "_destination_descendant_apply_queue", []) or [])),
+        )
+        log_info("destination_descendant_snapshot_dirty_flush_reason", flush_reason=fr)
+        if fr == "max_delay_timer":
+            log_info("destination_descendant_snapshot_dirty_flush_max_delay")
+
+        dq_len = 0
+        try:
+            dq_len = len(getattr(self, "_destination_descendant_apply_queue", []) or [])
+        except Exception:
+            dq_len = 0
+        log_info(
+            "destination_descendant_snapshot_coalesce_summary",
+            dirty_mark_calls=int(getattr(self, "_destination_descendant_snapshot_coalesce_dirty_mark_calls", 0) or 0),
+            suppressed_dirty_marks=int(getattr(self, "_destination_descendant_snapshot_coalesce_suppressed_marks", 0) or 0),
+            actual_flushes=int(getattr(self, "_destination_descendant_snapshot_coalesce_actual_flushes", 0) or 0),
+            descendant_generation_guard_skips_seen=int(
+                getattr(self, "_destination_descendant_snapshot_coalesce_guard_skip_observed", 0) or 0
+            ),
+            post_tick_refreshes_seen_if_available=int(
+                getattr(self, "_destination_descendant_snapshot_coalesce_post_tick_refreshes", 0) or 0
+            ),
+            flush_reason=fr,
+            queue_size=int(dq_len),
+        )
+        return True
+
+    def _mark_destination_tree_snapshot_dirty_after_injection(self, *, reason: str, affected_path: str = "") -> None:
+        self._destination_tree_snapshot_dirty_for_persist = True
         try:
             self._workspace_ui_snapshot_dirty_panels.add("destination")
         except Exception:
             pass
+        rsn = str(reason or "")[:220]
         log_info(
             "destination_snapshot_marked_dirty_after_injection",
-            reason=str(reason or "")[:220],
+            reason=rsn,
         )
+        burst = bool(self._destination_descendant_allocation_descendant_burst_active())
+        coalesce = bool(self._destination_descendant_snapshot_coalescing_eligible(rsn) and burst)
+        if coalesce:
+            ap = str(affected_path or "").strip()
+            if ap:
+                try:
+                    s = getattr(self, "_destination_descendant_snapshot_dirty_affected_paths", None)
+                    if not isinstance(s, set):
+                        self._destination_descendant_snapshot_dirty_affected_paths = set()
+                        s = self._destination_descendant_snapshot_dirty_affected_paths
+                    if len(s) < 64:
+                        s.add(ap[:400])
+                except Exception:
+                    pass
+            self._destination_descendant_snapshot_coalesce_dirty_mark_calls += 1
+            if not getattr(self, "_destination_descendant_snapshot_dirty_batch_active", False):
+                self._destination_descendant_snapshot_dirty_batch_active = True
+                self._destination_descendant_snapshot_dirty_first_mono = time.monotonic()
+                log_info(
+                    "destination_descendant_snapshot_dirty_batch_started",
+                    reason=str(rsn)[:220],
+                    queue_size=int(len(getattr(self, "_destination_descendant_apply_queue", []) or [])),
+                )
+            self._destination_descendant_snapshot_dirty_pending = True
+            try:
+                self._destination_descendant_snapshot_dirty_reason_counts[str(rsn)] += 1
+            except Exception:
+                pass
+            self._destination_descendant_snapshot_coalesce_suppressed_marks += 1
+            self._destination_descendant_snapshot_dirty_suppressed_post_tick += 1
+            n_sup = int(getattr(self, "_destination_descendant_snapshot_dirty_suppressed_post_tick", 0) or 0)
+            log_info(
+                "destination_descendant_snapshot_dirty_suppressed",
+                suppressed_count=n_sup,
+                reason_counts=dict(self._destination_descendant_snapshot_dirty_reason_counts or {}),
+                reason=str(rsn)[:220],
+            )
+            self._destination_maybe_schedule_descendant_snapshot_max_delay_timer()
+            chunk = int(self._destination_descendant_snapshot_batch_chunk_threshold())
+            if n_sup >= chunk:
+                self._destination_flush_descendant_snapshot_dirty_batch(
+                    "chunk_threshold",
+                    force=False,
+                    skip_scroll_guard=False,
+                )
+            return
+        self._post_tick_snapshot_refresh_pending = True
+
+    def _destination_maybe_flush_descendant_snapshot_batch_after_apply_job_complete(self) -> None:
+        """End-of-job flush: always promote after allocation descendant replay completes."""
+        if getattr(self, "_destination_descendant_snapshot_dirty_pending", False):
+            ok = self._destination_flush_descendant_snapshot_dirty_batch(
+                "after_descendant_apply_complete",
+                force=True,
+                skip_scroll_guard=True,
+            )
+            if ok:
+                log_info("destination_descendant_snapshot_dirty_flush_after_descendant_apply_complete")
+        else:
+            self._post_tick_snapshot_refresh_pending = True
 
     def _notify_planning_mutation_destination_snapshot_dirty(
         self,
@@ -10185,6 +10430,16 @@ class MainWindow(QMainWindow):
         Runs under ``_application_shutting_down`` before :meth:`_save_draft_shell` so injected rows are
         not dropped solely because post-tick promotion is suppressed during shutdown.
         """
+        try:
+            if bool(getattr(self, "_destination_descendant_snapshot_dirty_pending", False)):
+                self._destination_flush_descendant_snapshot_dirty_batch(
+                    "before_shutdown",
+                    force=True,
+                    skip_scroll_guard=True,
+                )
+                log_info("destination_descendant_snapshot_dirty_flush_before_shutdown")
+        except Exception as exc:
+            self._log_restore_exception("destination_descendant_snapshot_dirty_flush_before_shutdown_prep", exc)
         try:
             self._destination_finalize_inflight_descendant_apply_for_snapshot_capture()
         except Exception as exc:
@@ -13557,6 +13812,16 @@ class MainWindow(QMainWindow):
                 include_workspace_ui=bool(include_workspace_ui),
             )
             self._destination_save_in_progress = True
+            try:
+                if bool(getattr(self, "_destination_descendant_snapshot_dirty_pending", False)):
+                    self._destination_flush_descendant_snapshot_dirty_batch(
+                        "before_save",
+                        force=True,
+                        skip_scroll_guard=True,
+                    )
+                    log_info("destination_descendant_snapshot_dirty_flush_before_save")
+            except Exception as exc:
+                self._log_restore_exception("destination_descendant_snapshot_dirty_flush_before_save_hook", exc)
             self._destination_draft_save_destination_snapshot_override = None
             try:
                 _preflight = self._destination_force_live_destination_snapshot_for_session_persist(
@@ -13773,6 +14038,16 @@ class MainWindow(QMainWindow):
             return
 
         try:
+            if bool(getattr(self, "_destination_descendant_snapshot_dirty_pending", False)):
+                try:
+                    self._destination_flush_descendant_snapshot_dirty_batch(
+                        "before_export",
+                        force=True,
+                        skip_scroll_guard=True,
+                    )
+                    log_info("destination_descendant_snapshot_dirty_flush_before_export")
+                except Exception as exc:
+                    self._log_restore_exception("destination_descendant_snapshot_dirty_flush_before_export_hook", exc)
             if self._memory_restore_complete:
                 self._save_draft_shell(force=True)
             try:
@@ -43648,6 +43923,10 @@ class MainWindow(QMainWindow):
                 ran_snap = True
                 log_info("post_tick_snapshot_refresh_executed")
                 try:
+                    self._destination_descendant_snapshot_coalesce_post_tick_refreshes += 1
+                except Exception:
+                    pass
+                try:
                     self._promote_destination_workspace_snapshot_after_structure_change()
                 except Exception:
                     pass
@@ -44632,6 +44911,10 @@ class MainWindow(QMainWindow):
                     previous_generation=int(snap),
                     current_generation=cur_gen,
                 )
+                try:
+                    self._destination_descendant_snapshot_coalesce_guard_skip_observed += 1
+                except Exception:
+                    pass
                 self._destination_graph_descendant_apply_try_rebind_parent_ix(st)
             st["graph_model_structure_generation_snap"] = cur_gen
 
@@ -44930,13 +45213,14 @@ class MainWindow(QMainWindow):
         if bound is not None and bound.isValid():
             st["seg_index"] = int(st.get("seg_index") or 0) + 1
             self._destination_startup_descendant_injection_active = True
-            self._mark_destination_tree_snapshot_dirty_after_injection(reason="allocation_descendant_bind_segment")
-            self._post_tick_snapshot_refresh_pending = True
             try:
                 _hint = str(projection_terminal or expected_parent_before or descendant_source_path or "")[:400]
             except Exception:
                 _hint = str(expected_parent_before or "")[:400]
-            self._destination_startup_promote_runtime_snapshot_after_graph_bind(branch_path_excerpt=_hint)
+            self._mark_destination_tree_snapshot_dirty_after_injection(
+                reason="allocation_descendant_bind_segment",
+                affected_path=_hint,
+            )
         else:
             st["desc_index"] += 1
             st["walk_phase"] = "next_descendant"
@@ -45183,7 +45467,7 @@ class MainWindow(QMainWindow):
                         "destination_descendant_apply_on_complete_failed",
                         reason="callback_exception_graph_walk",
                     )
-            self._post_tick_snapshot_refresh_pending = True
+            self._destination_maybe_flush_descendant_snapshot_batch_after_apply_job_complete()
             log_info(
                 "destination_allocation_descendant_replay_completed",
                 graph_walk=True,
@@ -45216,7 +45500,7 @@ class MainWindow(QMainWindow):
                 tree.viewport().update()
             except Exception:
                 pass
-        self._post_tick_snapshot_refresh_pending = True
+        self._destination_maybe_flush_descendant_snapshot_batch_after_apply_job_complete()
         log_info(
             "destination_allocation_descendant_replay_completed",
             graph_walk=False,
@@ -56444,6 +56728,18 @@ class MainWindow(QMainWindow):
                 0,
                 lambda: self._safe_invoke("snapshot_capture_drain_after_scroll_idle", _retry_snapshot_drain),
             )
+        if getattr(self, "_destination_descendant_snapshot_dirty_flush_pending_after_scroll", False):
+            self._destination_descendant_snapshot_dirty_flush_pending_after_scroll = False
+            if bool(getattr(self, "_destination_descendant_snapshot_dirty_pending", False)):
+                try:
+                    self._destination_flush_descendant_snapshot_dirty_batch(
+                        "after_scroll_idle",
+                        force=False,
+                        skip_scroll_guard=True,
+                    )
+                    log_info("destination_descendant_snapshot_dirty_flush_after_scroll_idle")
+                except Exception as exc:
+                    self._log_restore_exception("destination_descendant_snapshot_dirty_flush_after_scroll_idle_hook", exc)
 
     def _refresh_destination_tree_indicators(self):
         _dsp_i = getattr(self, "_dest_scroll_profiler", None)
