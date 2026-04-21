@@ -6,7 +6,10 @@ from unittest.mock import MagicMock, patch
 
 from PySide6.QtCore import QModelIndex, Qt
 
-from ozlink_console.sharepoint_destination_overlay_attach import WORKSPACE_ROW_STATE_LIVE_CONFIRMED
+from ozlink_console.sharepoint_destination_overlay_attach import (
+    WORKSPACE_ROW_STATE_CACHED_PROVISIONAL,
+    WORKSPACE_ROW_STATE_LIVE_CONFIRMED,
+)
 from ozlink_console.tree_models.destination_planning_model import DestinationPlanningTreeModel
 
 
@@ -335,3 +338,129 @@ def test_unresolved_destination_library_blocks_expand():
         MainWindow._on_destination_planning_model_expanded(mw, mock_index)
     msgs = [c.args[0] for c in log.call_args_list if c.args]
     assert "destination_expand_blocked_library_unresolved" in msgs
+
+
+def test_provisional_destination_snapshot_deferred_when_library_unresolved():
+    """FIX1: no reset_nested while Destination Library selector is unresolved."""
+    from ozlink_console.main_window import MainWindow
+
+    mw = MainWindow.__new__(MainWindow)
+    mw._planning_browse_mode = lambda pk: "sharepoint"
+    mw._destination_tree_uses_model_view = lambda: True
+    mw.destination_planning_model = DestinationPlanningTreeModel()
+    mw.destination_tree_widget = MagicMock()
+    mw._pending_session_tree_snapshots = {"destination": [{"name": "Root3", "semantic_path": r"Lib\Root3"}]}
+    mw._runtime_session_tree_snapshots = {"source": [], "destination": []}
+    mw._intended_destination_drive_id_for_snapshot_validation = lambda: "drv_snap"
+    mw._destination_library_context_unresolved_for_graph_display = lambda: True
+    mw.set_tree_placeholder = MagicMock()
+
+    with patch("ozlink_console.main_window.sanitize_destination_startup_snapshot_top_level") as san:
+        with patch.object(mw.destination_planning_model, "reset_nested") as rn:
+            ok = MainWindow._destination_apply_provisional_session_snapshot_if_eligible(mw, phase="test")
+
+    assert ok is False
+    assert san.call_count == 0
+    rn.assert_not_called()
+    mw.set_tree_placeholder.assert_called()
+    ph_args = mw.set_tree_placeholder.call_args[0]
+    assert ph_args[0] == "destination"
+    assert "destination library" in ph_args[1].lower()
+
+
+def test_provisional_destination_snapshot_rejected_drive_mismatch():
+    """FIX1: envelope drive id must match selected library drive id."""
+    from ozlink_console.main_window import MainWindow
+
+    mw = MainWindow.__new__(MainWindow)
+    mw._planning_browse_mode = lambda pk: "sharepoint"
+    mw._destination_tree_uses_model_view = lambda: True
+    mw.destination_planning_model = DestinationPlanningTreeModel()
+    mw.destination_tree_widget = MagicMock()
+    mw._pending_session_tree_snapshots = {"destination": [{"name": "Root3"}]}
+    mw._runtime_session_tree_snapshots = {"source": [], "destination": []}
+    mw._intended_destination_drive_id_for_snapshot_validation = lambda: "drive_AAA"
+    mw._destination_library_context_unresolved_for_graph_display = lambda: False
+    mw._current_selected_destination_drive_id = lambda: "drive_BBB"
+    mw.set_tree_placeholder = MagicMock()
+
+    with patch("ozlink_console.main_window.sanitize_destination_startup_snapshot_top_level") as san:
+        with patch.object(mw.destination_planning_model, "reset_nested") as rn:
+            ok = MainWindow._destination_apply_provisional_session_snapshot_if_eligible(mw, phase="test")
+
+    assert ok is False
+    assert san.call_count == 0
+    rn.assert_not_called()
+
+
+def test_expand_maybe_reset_cached_provisional_finance_then_request_schedules_load():
+    """FIX2: cached_provisional + children_loaded + empty substantive -> Graph child request."""
+    from ozlink_console.main_window import MainWindow
+
+    fin_pl = {
+        "name": "Finance",
+        "id": "fin1",
+        "drive_id": "drvA",
+        "library_id": "drvA",
+        "is_folder": True,
+        "item_path": r"Lib\Root3\Finance",
+        "workspace_row_state": WORKSPACE_ROW_STATE_CACHED_PROVISIONAL,
+        "base_display_label": "Folder: Finance",
+        "tree_role": "destination",
+        "children_loaded": True,
+        "load_failed": False,
+        "verification_state": "live_confirmed",
+        "row_kind": "live_folder",
+    }
+    model = DestinationPlanningTreeModel()
+    model.reset_root_payloads([dict(fin_pl)])
+    fin_ix = model.index(0, 0, QModelIndex())
+
+    mw = MainWindow.__new__(MainWindow)
+    mw.destination_planning_model = model
+    mw._resolve_tree_item_drive_id = lambda panel, pl: str(pl.get("drive_id") or "")
+    mw._destination_library_context_unresolved_for_graph_display = lambda: False
+    mw._current_selected_destination_drive_id = lambda: "drvA"
+    mw._request_graph_destination_children_load = MagicMock(return_value=True)
+    mw.graph = MagicMock()
+    mw.graph.token = "t"
+
+    nd = dict(fin_ix.data(Qt.UserRole) or {})
+    nd2 = MainWindow._destination_expand_maybe_reset_stale_graph_children_loaded(mw, fin_ix, nd)
+    assert nd2.get("children_loaded") is False
+
+    with patch(
+        "ozlink_console.main_window.destination_authority_contract.graph_owns_visible_real_destination_structure",
+        return_value=True,
+    ):
+        MainWindow._destination_expand_request_live_graph_folder_child_load(mw, fin_ix)
+
+    mw._request_graph_destination_children_load.assert_called_once()
+
+
+def test_planned_only_row_blocked_from_graph_lazy_load_reset():
+    from ozlink_console.main_window import MainWindow
+
+    pl = {
+        "name": "Plan",
+        "id": "",
+        "drive_id": "drvA",
+        "is_folder": True,
+        "verification_state": "planned_only",
+        "row_kind": "planned_folder",
+        "workspace_row_state": "planned_only",
+        "children_loaded": True,
+        "base_display_label": "Folder: Plan",
+        "tree_role": "destination",
+    }
+    model = DestinationPlanningTreeModel()
+    model.reset_root_payloads([pl])
+    ix = model.index(0, 0, QModelIndex())
+    mw = MainWindow.__new__(MainWindow)
+    mw.destination_planning_model = model
+    mw._resolve_tree_item_drive_id = lambda panel, p: str(p.get("drive_id") or "")
+    mw._destination_library_context_unresolved_for_graph_display = lambda: False
+    mw._current_selected_destination_drive_id = lambda: "drvA"
+
+    out = MainWindow._destination_expand_maybe_reset_stale_graph_children_loaded(mw, ix, dict(pl))
+    assert out.get("children_loaded") is True

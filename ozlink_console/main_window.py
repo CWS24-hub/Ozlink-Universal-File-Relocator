@@ -25811,14 +25811,27 @@ class MainWindow(QMainWindow):
                 item_id_suffix=isfx,
             )
             return
-        if not is_live:
+        derived_ok = self._destination_row_is_graph_derived_dest_child_fetch_eligible(pl)
+        if not is_live and not derived_ok:
             log_info(
                 "destination_expand_live_folder_child_load_skipped",
                 reason="not_live_graph_row",
                 gate="not_live_graph_row",
                 item_id_suffix=isfx,
             )
+            log_info(
+                "destination_expand_cached_graph_row_blocked",
+                reason="not_live_or_graph_derived_for_child_fetch",
+                gate="expand_direct_child_fetch",
+                item_id_suffix=isfx,
+            )
             return
+        if not is_live and derived_ok:
+            log_info(
+                "destination_expand_cached_graph_row_allowed_for_child_load",
+                item_id_suffix=isfx,
+                drive_id_suffix=dsfx,
+            )
         if not item_id:
             log_info("destination_expand_live_folder_missing_item_id", name_excerpt=name_excerpt, phase="expand_direct")
             log_info(
@@ -31336,6 +31349,42 @@ class MainWindow(QMainWindow):
                 reason="intended_destination_drive_unknown",
             )
             return False
+        if self._destination_library_context_unresolved_for_graph_display():
+            log_info(
+                "destination_provisional_snapshot_deferred_library_unresolved",
+                phase=str(phase)[:80],
+            )
+            dm0 = getattr(self, "destination_planning_model", None)
+            _rows0 = 0
+            try:
+                _rows0 = int(dm0.rowCount(QModelIndex())) if dm0 is not None else 0
+            except Exception:
+                _rows0 = -1
+            log_info(
+                "destination_snapshot_display_blocked_library_unresolved",
+                phase=str(phase)[:80],
+                model_top_level_rows=int(_rows0),
+                gate="provisional_deferred_until_destination_library_resolved",
+            )
+            self.set_tree_placeholder("destination", "Select a destination library to load root content.")
+            return False
+        try:
+            _sel_drive = str(self._current_selected_destination_drive_id() or "").strip()
+            _int_drive = str(self._intended_destination_drive_id_for_snapshot_validation() or "").strip()
+            if _sel_drive and _int_drive and _sel_drive.casefold() != _int_drive.casefold():
+                log_info(
+                    "destination_provisional_snapshot_rejected_drive_mismatch",
+                    phase=str(phase)[:80],
+                    selected_drive_id_suffix=_sel_drive[-16:] if len(_sel_drive) > 16 else _sel_drive,
+                    envelope_drive_id_suffix=_int_drive[-16:] if len(_int_drive) > 16 else _int_drive,
+                )
+                self.set_tree_placeholder(
+                    "destination",
+                    "Choose the destination library that matches your session — the current selection is not the saved destination drive.",
+                )
+                return False
+        except Exception:
+            pass
         try:
             _ctx_pv = self._destination_startup_snapshot_root_context()
             snaps, _ = sanitize_destination_startup_snapshot_top_level(
@@ -31359,6 +31408,13 @@ class MainWindow(QMainWindow):
         if not roots:
             log_info("destination_provisional_startup_skipped", phase=str(phase)[:80], reason="empty_snapshot_roots")
             return False
+        _allow_drv = str(self._current_selected_destination_drive_id() or "").strip()
+        log_info(
+            "destination_provisional_snapshot_allowed_library_resolved",
+            phase=str(phase)[:80],
+            root_rows=len(roots),
+            selected_drive_id_suffix=_allow_drv[-16:] if len(_allow_drv) > 16 else _allow_drv,
+        )
         node_ct = self._count_tree_snapshot_nodes(snaps)
         self._startup_memory_presentation_wall_t0 = float(time.perf_counter())
         try:
@@ -32616,6 +32672,8 @@ class MainWindow(QMainWindow):
             else:
                 self._load_destination_projected_descendants_index(index)
             return
+        node_data = dict(col0.data(Qt.UserRole) or {})
+        node_data = self._destination_expand_maybe_reset_stale_graph_children_loaded(col0, node_data)
         if node_data.get("children_loaded") or node_data.get("load_failed"):
             return
 
@@ -32783,6 +32841,90 @@ class MainWindow(QMainWindow):
 
     def _destination_row_is_live_graph_structure(self, pl: dict) -> bool:
         return destination_payload_is_live_graph_row(pl)
+
+    def _destination_row_is_graph_derived_dest_child_fetch_eligible(self, pl: dict) -> bool:
+        """Merge-target Graph structural rows (incl. cached_provisional) when drive matches selected library."""
+        if not isinstance(pl, dict) or pl.get("placeholder"):
+            return False
+        if self._destination_library_context_unresolved_for_graph_display():
+            return False
+        if destination_payload_is_planned_workspace_row(pl):
+            return False
+        if not destination_payload_is_reconcile_merge_target_row(pl):
+            return False
+        drive_id = self._resolve_tree_item_drive_id("destination", pl)
+        sel = str(self._current_selected_destination_drive_id() or "").strip()
+        if not drive_id or not sel:
+            return False
+        return drive_id.strip().casefold() == sel.casefold()
+
+    def _destination_row_can_lazy_load_from_graph(self, col0: QModelIndex, pl: dict) -> bool:
+        """Expand-time gate: Graph identity + matching selected destination drive; excludes planned-only scaffolding."""
+        if not isinstance(pl, dict) or pl.get("placeholder"):
+            return False
+        if self._destination_library_context_unresolved_for_graph_display():
+            return False
+        if not bool(pl.get("is_folder", True)):
+            return False
+        if destination_payload_is_planned_workspace_row(pl):
+            return False
+        if not str(pl.get("id") or "").strip():
+            return False
+        if not self._resolve_tree_item_drive_id("destination", pl):
+            return False
+        return self._destination_row_is_graph_derived_dest_child_fetch_eligible(pl)
+
+    def _destination_expand_maybe_reset_stale_graph_children_loaded(
+        self, col0: QModelIndex, node_data: dict
+    ) -> dict:
+        """Clear stale children_loaded/load_failed for Graph-derived folders with no substantive children."""
+        pl = dict(node_data or {})
+        if not pl.get("children_loaded") and not pl.get("load_failed"):
+            return pl
+        model = getattr(self, "destination_planning_model", None)
+        if model is None or not col0.isValid():
+            return pl
+        try:
+            n_sub = int(model.substantive_destination_folder_child_row_count(col0))
+        except Exception:
+            n_sub = -1
+        if n_sub > 0:
+            return pl
+        if not self._destination_row_can_lazy_load_from_graph(col0, pl):
+            if destination_payload_is_planned_workspace_row(pl):
+                log_info("destination_expand_cached_graph_row_blocked", reason="planned_workspace_row", gate="planned_only")
+            elif not destination_payload_is_reconcile_merge_target_row(pl):
+                log_info(
+                    "destination_expand_cached_graph_row_blocked",
+                    reason="not_graph_merge_target_row",
+                    gate="not_reconcile_merge_target",
+                )
+            elif (
+                str(self._resolve_tree_item_drive_id("destination", pl) or "").strip().casefold()
+                != str(self._current_selected_destination_drive_id() or "").strip().casefold()
+            ):
+                log_info("destination_expand_cached_graph_row_blocked", reason="drive_mismatch", gate="drive_mismatch")
+            return pl
+
+        def _mut_reset(p: dict) -> None:
+            p["children_loaded"] = False
+            p["load_failed"] = False
+
+        try:
+            model.update_payload_for_index(col0, _mut_reset)
+        except Exception:
+            return pl
+        _iid = str(pl.get("id") or "")
+        log_info(
+            "destination_expand_children_loaded_reset_for_graph_identity_row",
+            item_id_suffix=_iid[-16:] if len(_iid) > 16 else _iid,
+        )
+        log_info(
+            "destination_expand_cached_graph_row_allowed_for_child_load",
+            item_id_suffix=_iid[-16:] if len(_iid) > 16 else _iid,
+            drive_id_suffix=str(self._resolve_tree_item_drive_id("destination", pl))[-16:],
+        )
+        return dict(col0.data(Qt.UserRole) or {})
 
     def _destination_row_may_lazy_enumerate_graph_children(self, pl: dict) -> bool:
         """Graph-backed or snapshot-shell folders that may still need a per-folder Graph child fetch."""
@@ -36755,7 +36897,9 @@ class MainWindow(QMainWindow):
         node_data = dict(col0.data(Qt.UserRole) or {})
         if node_data.get("placeholder"):
             return False
-        if not self._destination_row_is_live_graph_structure(node_data):
+        _live_row = self._destination_row_is_live_graph_structure(node_data)
+        _derived_ok = self._destination_row_is_graph_derived_dest_child_fetch_eligible(node_data)
+        if not _live_row and not _derived_ok:
             return False
         if node_data.get("children_loaded") or node_data.get("load_failed"):
             return False
@@ -36966,7 +37110,9 @@ class MainWindow(QMainWindow):
         node_data = dict(col0.data(Qt.UserRole) or {})
         if node_data.get("placeholder"):
             return False
-        if not self._destination_row_is_live_graph_structure(node_data):
+        _live_row = self._destination_row_is_live_graph_structure(node_data)
+        _derived_ok = self._destination_row_is_graph_derived_dest_child_fetch_eligible(node_data)
+        if not _live_row and not _derived_ok:
             return False
         if node_data.get("children_loaded") or node_data.get("load_failed"):
             return False
