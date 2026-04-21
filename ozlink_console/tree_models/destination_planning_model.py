@@ -16,6 +16,7 @@ from ozlink_console.sharepoint_destination_overlay_attach import (
     WORKSPACE_ROW_STATE_CACHED_PROVISIONAL,
     WORKSPACE_ROW_STATE_LIVE_CONFIRMED,
     WORKSPACE_ROW_STATE_PLANNED_ONLY,
+    destination_payload_is_live_graph_row,
     destination_payload_is_planned_workspace_row,
     destination_payload_workspace_row_state,
 )
@@ -690,6 +691,50 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
                     )
         return pruned, pruned_missing
 
+    def reconcile_top_level_live_graph_children_loaded_when_subtree_empty(self, *, reason: str = "unspecified") -> int:
+        """Clear ``children_loaded`` on live top-level folders when the model has zero child rows.
+
+        Snapshot / provisional shells may carry ``children_loaded=True`` without visible subtree rows.
+        Skeleton first-level child load skips those rows; resetting makes them eligible after shallow root bind.
+        """
+        inv = QModelIndex()
+        reset = 0
+        for r in range(self.rowCount(inv)):
+            ix = self.index(r, 0, inv)
+            pl = ix.data(Qt.UserRole) or {}
+            if not isinstance(pl, dict) or pl.get("placeholder"):
+                continue
+            if not pl.get("is_folder"):
+                continue
+            if not destination_payload_is_live_graph_row(pl):
+                continue
+            if not pl.get("children_loaded"):
+                continue
+            try:
+                n_sub = int(self.rowCount(ix))
+            except Exception:
+                n_sub = 0
+            if n_sub > 0:
+                continue
+
+            def _mut(p: Dict[str, Any]) -> None:
+                p["children_loaded"] = False
+
+            self.update_payload_for_index(ix, _mut)
+            reset += 1
+            _iid = str(pl.get("id", "") or "")
+            _did = str(pl.get("drive_id", "") or "")
+            log_info(
+                "destination_graph_skeleton_children_loaded_reset_for_empty_row",
+                reason=str(reason)[:160],
+                eligibility_tag="children_loaded_but_empty_reset",
+                row=int(r),
+                name_excerpt=str(pl.get("name", "") or "")[:120],
+                item_id_suffix=_iid[-16:] if len(_iid) > 16 else _iid,
+                drive_id_suffix=_did[-16:] if len(_did) > 16 else _did,
+            )
+        return reset
+
     def merge_sharepoint_library_root_graph_children(
         self,
         graph_payloads: List[Dict[str, Any]],
@@ -758,14 +803,20 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             if inc is None:
                 continue
             used.add(gid)
-            prev_children_loaded = bool(pl.get("children_loaded")) if pl.get("is_folder") else False
             inc_copy = dict(inc)
+            _ix_match = ix
 
-            def mutator(payload: Dict[str, Any], _prev=prev_children_loaded, _inc=inc_copy) -> None:
+            def mutator(payload: Dict[str, Any], _inc=inc_copy, _ix=_ix_match) -> None:
                 payload.update(_inc)
                 payload["workspace_row_state"] = WORKSPACE_ROW_STATE_LIVE_CONFIRMED
-                if payload.get("is_folder") and _prev:
-                    payload["children_loaded"] = True
+                if payload.get("is_folder"):
+                    try:
+                        n_sub = int(self.rowCount(_ix))
+                    except Exception:
+                        n_sub = 0
+                    # Shallow Graph library-root listing does not load folder children; never carry
+                    # snapshot ``children_loaded=True`` forward unless subtree rows already exist in-model.
+                    payload["children_loaded"] = bool(n_sub > 0)
 
             self.update_payload_for_index(ix, mutator)
             stats["updated"] += 1
@@ -797,16 +848,18 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
                     inc_gid = str(inc_path.get("id") or "").strip()
                     if inc_gid and inc_gid not in used:
                         ix = self.index(r, 0, inv)
-                        prev_children_loaded = bool(pl.get("children_loaded")) if pl.get("is_folder") else False
                         inc_copy = dict(inc_path)
+                        _ix_path = ix
 
-                        def mutator_path(
-                            payload: Dict[str, Any], _prev=prev_children_loaded, _inc=inc_copy
-                        ) -> None:
+                        def mutator_path(payload: Dict[str, Any], _inc=inc_copy, _ix=_ix_path) -> None:
                             payload.update(_inc)
                             payload["workspace_row_state"] = WORKSPACE_ROW_STATE_LIVE_CONFIRMED
-                            if payload.get("is_folder") and _prev:
-                                payload["children_loaded"] = True
+                            if payload.get("is_folder"):
+                                try:
+                                    n_sub = int(self.rowCount(_ix))
+                                except Exception:
+                                    n_sub = 0
+                                payload["children_loaded"] = bool(n_sub > 0)
 
                         self.update_payload_for_index(ix, mutator_path)
                         used.add(inc_gid)
@@ -836,6 +889,12 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             self._insert_root_child_at(row_ins, inc)
             used.add(gid)
             stats["inserted"] += 1
+
+        stats["children_loaded_reset_empty_subtree"] = int(
+            self.reconcile_top_level_live_graph_children_loaded_when_subtree_empty(
+                reason="merge_sharepoint_library_root_graph_children"
+            )
+        )
 
         self._rebuild_path_index()
         log_info(

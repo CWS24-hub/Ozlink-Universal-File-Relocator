@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QModelIndex, Qt
 
+from ozlink_console.sharepoint_destination_overlay_attach import WORKSPACE_ROW_STATE_LIVE_CONFIRMED
 from ozlink_console.tree_models.destination_planning_model import (
     DESTINATION_PLAN_LEAF_EXCLUSION_PAINT_ROLE,
     DestinationPlanningTreeModel,
@@ -258,3 +259,69 @@ def test_plan_leaf_exclusion_paint_role_matches_contract():
     assert ix.data(DESTINATION_PLAN_LEAF_EXCLUSION_PAINT_ROLE) is True
     model.set_plan_leaf_exclusion_paint_contract(frozenset({"other"}), lambda s: "canon_a" if s else "")
     assert ix.data(DESTINATION_PLAN_LEAF_EXCLUSION_PAINT_ROLE) is False
+
+
+def test_reconcile_clears_children_loaded_when_live_folder_has_empty_subtree():
+    """Stale snapshot may set children_loaded=True with no model rows under the folder."""
+    model = DestinationPlanningTreeModel()
+    model.reset_root_payloads(
+        [
+            {
+                "base_display_label": "Folder: Root3",
+                "name": "Root3",
+                "is_folder": True,
+                "id": "graph-item-root3",
+                "drive_id": "b!drive-test",
+                "workspace_row_state": WORKSPACE_ROW_STATE_LIVE_CONFIRMED,
+                "children_loaded": True,
+                "load_failed": False,
+                "item_path": "Root3",
+                "tree_role": "destination",
+            }
+        ]
+    )
+    n = model.reconcile_top_level_live_graph_children_loaded_when_subtree_empty(reason="unit_test")
+    assert n == 1
+    pl = model.index(0, 0, QModelIndex()).data(Qt.UserRole) or {}
+    assert pl.get("children_loaded") is False
+
+
+def test_reconcile_preserves_children_loaded_when_subtree_has_rows():
+    model = DestinationPlanningTreeModel()
+    model.reset_root_payloads(
+        [
+            {
+                "base_display_label": "Folder: Root3",
+                "name": "Root3",
+                "is_folder": True,
+                "id": "graph-item-root3",
+                "drive_id": "b!drive-test",
+                "workspace_row_state": WORKSPACE_ROW_STATE_LIVE_CONFIRMED,
+                "children_loaded": True,
+                "load_failed": False,
+                "item_path": "Root3",
+                "tree_role": "destination",
+            }
+        ]
+    )
+    top = model.index(0, 0, QModelIndex())
+    model.replace_all_children(
+        top,
+        [
+            {
+                "base_display_label": "Folder: Child",
+                "name": "Child",
+                "is_folder": True,
+                "id": "graph-item-child",
+                "drive_id": "b!drive-test",
+                "workspace_row_state": WORKSPACE_ROW_STATE_LIVE_CONFIRMED,
+                "children_loaded": False,
+                "item_path": r"Root3\Child",
+                "tree_role": "destination",
+            }
+        ],
+    )
+    n = model.reconcile_top_level_live_graph_children_loaded_when_subtree_empty(reason="unit_test")
+    assert n == 0
+    pl = top.data(Qt.UserRole) or {}
+    assert pl.get("children_loaded") is True

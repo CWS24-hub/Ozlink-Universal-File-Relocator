@@ -9785,27 +9785,149 @@ class MainWindow(QMainWindow):
                 worker_tag=str(worker_tag)[:80],
             )
             return
+        inv0 = QModelIndex()
+        try:
+            _rc_pre = int(model.rowCount(inv0))
+        except Exception:
+            _rc_pre = 0
+        _pre_rows: list[dict[str, Any]] = []
+        for _pr in range(min(_rc_pre, 48)):
+            try:
+                _pix = model.index(_pr, 0, inv0)
+            except Exception:
+                continue
+            if not _pix.isValid():
+                continue
+            _ppl = self._destination_model_index_user_role_dict(_pix)
+            if not isinstance(_ppl, dict):
+                continue
+            try:
+                _psub = int(model.rowCount(_pix))
+            except Exception:
+                _psub = -1
+            _pre_rows.append(
+                {
+                    "row": int(_pr),
+                    "name_excerpt": str(_ppl.get("name", "") or "")[:80],
+                    "children_loaded": bool(_ppl.get("children_loaded")),
+                    "subtree_child_rows": int(_psub),
+                    "item_id_suffix": str(_ppl.get("id", "") or "")[-16:],
+                }
+            )
+        log_info(
+            "destination_graph_skeleton_row_state_before_schedule",
+            phase="pre_children_loaded_reconcile",
+            worker_tag=str(worker_tag)[:80],
+            drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+            top_level_rows=int(_rc_pre),
+            rows=_pre_rows[:32],
+        )
+        try:
+            if hasattr(model, "reconcile_top_level_live_graph_children_loaded_when_subtree_empty"):
+                _sk_reset = model.reconcile_top_level_live_graph_children_loaded_when_subtree_empty(
+                    reason=f"graph_skeleton_preflight:{str(worker_tag)[:80]}"
+                )
+            else:
+                _sk_reset = 0
+        except Exception as _sk_exc:
+            _sk_reset = -1
+            log_warn(
+                "destination_graph_skeleton_reconcile_preflight_failed",
+                error=str(_sk_exc)[:220],
+                worker_tag=str(worker_tag)[:80],
+            )
+        log_info(
+            "destination_graph_skeleton_row_state_after_schedule",
+            phase="after_children_loaded_reconcile",
+            worker_tag=str(worker_tag)[:80],
+            resets_applied=int(_sk_reset),
+            drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+        )
         inv = QModelIndex()
         try:
             rc = int(model.rowCount(inv))
         except Exception:
             rc = 0
+        tw = getattr(self, "destination_tree_widget", None)
         eligible: list[tuple[int, dict]] = []
+        _dcf_sel = _dcf
+        _row_snapshots: list[dict[str, Any]] = []
         for r in range(rc):
+            _tag = ""
             try:
                 ix = model.index(r, 0, inv)
             except Exception:
+                _tag = "index_error"
+                _row_snapshots.append({"row": int(r), "eligibility_tag": _tag})
                 continue
             if not ix.isValid():
+                _tag = "invalid_index"
+                _row_snapshots.append({"row": int(r), "eligibility_tag": _tag})
                 continue
             pl = self._destination_model_index_user_role_dict(ix)
+            _nm = str(pl.get("name", "") or "")[:80] if isinstance(pl, dict) else ""
+            _iid = str(pl.get("id", "") or "").strip() if isinstance(pl, dict) else ""
+            _did = str(pl.get("drive_id", "") or "").strip() if isinstance(pl, dict) else ""
+            try:
+                n_sub = int(model.rowCount(ix))
+            except Exception:
+                n_sub = -1
+            _cl = bool(pl.get("children_loaded")) if isinstance(pl, dict) else False
+            _lf = bool(pl.get("load_failed")) if isinstance(pl, dict) else False
+            _expanded = False
+            try:
+                if tw is not None:
+                    _expanded = bool(tw.isExpanded(ix))
+            except Exception:
+                _expanded = False
+            _drive_match = bool(_dcf_sel and _did and _dcf_sel == _did.casefold())
             if not isinstance(pl, dict) or pl.get("placeholder"):
-                continue
-            if not self._destination_row_is_live_graph_structure(pl) or not pl.get("is_folder", True):
-                continue
-            if pl.get("children_loaded") or pl.get("load_failed"):
-                continue
-            eligible.append((r, pl))
+                _tag = "placeholder"
+            elif _lf:
+                _tag = "load_failed"
+            elif not pl.get("is_folder", True):
+                _tag = "not_folder"
+            elif not self._destination_row_is_live_graph_structure(pl):
+                _tag = "not_live_graph_row"
+            elif _cl:
+                _tag = "already_children_loaded"
+            elif not _did:
+                _tag = "missing_drive_id"
+            elif not _iid:
+                _tag = "missing_item_id"
+            else:
+                _tag = "eligible_candidate"
+                eligible.append((r, pl))
+            _row_snapshots.append(
+                {
+                    "row": int(r),
+                    "name_excerpt": _nm,
+                    "eligibility_tag": _tag,
+                    "children_loaded": _cl,
+                    "subtree_child_rows": int(n_sub),
+                    "load_failed": _lf,
+                    "expanded": _expanded,
+                    "item_id_suffix": _iid[-16:] if len(_iid) > 16 else _iid,
+                    "drive_id_suffix": _did[-16:] if len(_did) > 16 else _did,
+                    "selected_drive_matches_row_drive": _drive_match,
+                }
+            )
+            log_info(
+                "destination_graph_skeleton_top_level_row_gate",
+                worker_tag=str(worker_tag)[:80],
+                row=int(r),
+                eligibility_tag=str(_tag)[:80],
+                name_excerpt=_nm,
+                subtree_child_rows=int(n_sub),
+                children_loaded=_cl,
+            )
+        log_info(
+            "destination_graph_skeleton_eligibility_snapshot",
+            worker_tag=str(worker_tag)[:80],
+            drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+            top_level_rows=int(rc),
+            rows=_row_snapshots[:32],
+        )
         if not eligible:
             log_info(
                 "destination_graph_skeleton_child_load_skipped",
@@ -9814,7 +9936,6 @@ class MainWindow(QMainWindow):
                 top_level_rows=int(rc),
             )
             return
-        tw = getattr(self, "destination_tree_widget", None)
         targets: list[int] = []
         if len(eligible) == 1:
             targets = [eligible[0][0]]

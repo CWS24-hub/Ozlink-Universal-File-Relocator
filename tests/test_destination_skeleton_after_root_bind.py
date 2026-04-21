@@ -19,10 +19,13 @@ def mw() -> MainWindow:
     def _row_payload(r: int) -> dict:
         if r == 0:
             return {
+                "name": "Root3",
                 "is_folder": True,
                 "children_loaded": False,
                 "load_failed": False,
                 "placeholder": False,
+                "id": "item-root3-test",
+                "drive_id": "drive-BBB",
             }
         return {}
 
@@ -36,6 +39,7 @@ def mw() -> MainWindow:
 
     m.destination_planning_model.rowCount = _uc
     m.destination_planning_model.index = _index
+    m.destination_planning_model.reconcile_top_level_live_graph_children_loaded_when_subtree_empty = MagicMock(return_value=0)
 
     def _user_role(ix):
         return _row_payload(0)
