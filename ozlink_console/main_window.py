@@ -3125,6 +3125,7 @@ class MainWindow(QMainWindow):
         self._destination_mz_coalesce_drain_invocation = False
         self._pending_source_navigation = None
         self._pending_destination_navigation = None
+        self._saved_library_selector_hydration_attempt: dict[str, int] = {"source": 0, "destination": 0}
         self._destination_restore_materialization_queue = []
         self._destination_restore_materialization_seen = set()
         # Set True in _memory_restore_apply_finalize_success; blocks global restore queue restarts mid-session.
@@ -9302,7 +9303,13 @@ class MainWindow(QMainWindow):
         state = shell if isinstance(shell, SessionState) else SessionState()
         return str(getattr(state, "SelectedDestinationLibraryId", "") or "").strip()
 
-    def _destination_library_selector_has_drive_id(self, library_selector, drive_id: str) -> bool:
+    def _persisted_source_library_drive_id_from_session(self) -> str:
+        """Persisted session source library Graph drive id only (no combo / pending fallbacks)."""
+        shell = getattr(self, "_draft_shell_state", None)
+        state = shell if isinstance(shell, SessionState) else SessionState()
+        return str(getattr(state, "SelectedSourceLibraryId", "") or "").strip()
+
+    def _planning_library_selector_has_drive_id(self, library_selector, drive_id: str) -> bool:
         if library_selector is None:
             return False
         did = str(drive_id or "").strip()
@@ -9320,14 +9327,22 @@ class MainWindow(QMainWindow):
             return False
         return False
 
-    def _destination_should_defer_or_block_wrong_library_bind(
+    def _destination_library_selector_has_drive_id(self, library_selector, drive_id: str) -> bool:
+        return self._planning_library_selector_has_drive_id(library_selector, drive_id)
+
+    def _planning_should_defer_or_block_wrong_library_bind(
         self,
+        selector_group: str,
         *,
         selected_library: dict,
         library_selector,
     ) -> str:
         """Return '' to proceed, 'deferred' to skip load until selector is ready, 'blocked' if wrong id known."""
-        intended = self._persisted_destination_library_drive_id_from_session()
+        intended = (
+            self._persisted_source_library_drive_id_from_session()
+            if selector_group == "source"
+            else self._persisted_destination_library_drive_id_from_session()
+        )
         if not intended:
             return ""
         sel_id = str(selected_library.get("id") or selected_library.get("drive_id") or "").strip()
@@ -9335,28 +9350,44 @@ class MainWindow(QMainWindow):
             return ""
         if sel_id.casefold() == intended.casefold():
             return ""
-        in_combo = self._destination_library_selector_has_drive_id(library_selector, intended)
+        in_combo = self._planning_library_selector_has_drive_id(library_selector, intended)
+        _tag = f"{selector_group}_wrong_library_bind_blocked"
+        _tag_defer = f"{selector_group}_library_bind_deferred_selector_not_ready"
         if in_combo:
             log_info(
-                "destination_wrong_library_bind_blocked",
+                _tag,
                 selected_drive_suffix=sel_id[-16:] if len(sel_id) > 16 else sel_id,
                 intended_drive_suffix=intended[-16:] if len(intended) > 16 else intended,
                 selector_item_count=int(library_selector.count() if library_selector is not None else 0),
             )
             return "blocked"
         log_info(
-            "destination_library_bind_deferred_selector_not_ready",
+            _tag_defer,
             selected_drive_suffix=sel_id[-16:] if len(sel_id) > 16 else sel_id,
             intended_drive_suffix=intended[-16:] if len(intended) > 16 else intended,
             selector_item_count=int(library_selector.count() if library_selector is not None else 0),
         )
         return "deferred"
 
-    def _destination_sync_library_selector_to_persisted_intent(self, library_selector) -> None:
-        """After site library list (re)built, select persisted destination library or no selection."""
+    def _destination_should_defer_or_block_wrong_library_bind(
+        self,
+        *,
+        selected_library: dict,
+        library_selector,
+    ) -> str:
+        return self._planning_should_defer_or_block_wrong_library_bind(
+            "destination", selected_library=selected_library, library_selector=library_selector
+        )
+
+    def _sync_library_selector_to_persisted_session_drive(self, selector_group: str, library_selector) -> None:
+        """After site library list (re)built, select saved drive id from draft shell or no selection."""
         if library_selector is None:
             return
-        intended = self._persisted_destination_library_drive_id_from_session()
+        intended = (
+            self._persisted_source_library_drive_id_from_session()
+            if selector_group == "source"
+            else self._persisted_destination_library_drive_id_from_session()
+        )
         library_selector.blockSignals(True)
         try:
             if not intended:
@@ -9368,6 +9399,12 @@ class MainWindow(QMainWindow):
                 pid = str(data.get("id") or data.get("drive_id") or "").strip()
                 if pid and pid.casefold() == intended.casefold():
                     library_selector.setCurrentIndex(i)
+                    log_info(
+                        "library_selector_restore_selected_saved_drive",
+                        selector_group=selector_group,
+                        saved_drive_suffix=intended[-16:] if len(intended) > 16 else intended,
+                        index=int(i),
+                    )
                     return
             try:
                 library_selector.setCurrentIndex(-1)
@@ -9375,6 +9412,67 @@ class MainWindow(QMainWindow):
                 pass
         finally:
             library_selector.blockSignals(False)
+
+    def _destination_sync_library_selector_to_persisted_intent(self, library_selector) -> None:
+        self._sync_library_selector_to_persisted_session_drive("destination", library_selector)
+
+    def _schedule_saved_library_selector_hydration_retry(self, selector_group: str) -> None:
+        """Re-fetch list_site_drives and retry bind when saved drive was missing from a partial library list."""
+        attempt = int(self._saved_library_selector_hydration_attempt.get(selector_group, 0) or 0)
+        if attempt >= 6:
+            log_info(
+                "destination_saved_library_wait_retry_failed"
+                if selector_group == "destination"
+                else "source_saved_library_wait_retry_failed",
+                selector_group=selector_group,
+                attempts=int(attempt),
+            )
+            return
+        delay_ms = min(2800, max(120, 180 * (2**attempt)))
+        self._saved_library_selector_hydration_attempt[selector_group] = attempt + 1
+        log_info(
+            "destination_saved_library_wait_retry_scheduled"
+            if selector_group == "destination"
+            else "source_saved_library_wait_retry_scheduled",
+            selector_group=selector_group,
+            attempt=int(attempt + 1),
+            delay_ms=int(delay_ms),
+        )
+
+        def _run():
+            try:
+                self._populate_library_selector_for_group(selector_group)
+                lib_sel = (
+                    self.planning_inputs.get("Source Library")
+                    if selector_group == "source"
+                    else self.planning_inputs.get("Destination Library")
+                )
+                intended = (
+                    self._persisted_source_library_drive_id_from_session()
+                    if selector_group == "source"
+                    else self._persisted_destination_library_drive_id_from_session()
+                )
+                if intended and self._planning_library_selector_has_drive_id(lib_sel, intended):
+                    log_info(
+                        "destination_saved_library_wait_retry_success"
+                        if selector_group == "destination"
+                        else "source_saved_library_wait_retry_success",
+                        selector_group=selector_group,
+                        intended_drive_suffix=intended[-16:] if len(intended) > 16 else intended,
+                    )
+                    self._saved_library_selector_hydration_attempt[selector_group] = 0
+                    self.on_library_selector_changed(selector_group, force=True)
+                    return
+                self._schedule_saved_library_selector_hydration_retry(selector_group)
+            except Exception as exc:
+                log_warn(
+                    "saved_library_hydration_retry_run_failed",
+                    selector_group=selector_group,
+                    error=str(exc)[:400],
+                )
+                self._schedule_saved_library_selector_hydration_retry(selector_group)
+
+        QTimer.singleShot(delay_ms, lambda: self._safe_invoke(f"saved_library_hydration_retry.{selector_group}", _run))
 
     def _destination_schedule_skeleton_first_level_graph_child_loads(
         self, drive_id: str, worker_id: Any, *, worker_tag: str = "post_root"
@@ -22621,7 +22719,33 @@ class MainWindow(QMainWindow):
         if id_n:
             return nm_n, id_n
         if self._planning_library_combo_has_explicit_empty_catalog(library_selector):
+            if ex_id:
+                log_info(
+                    "draft_shell_selector_hydration_incomplete_preserved",
+                    group=group,
+                    reason="explicit_empty_catalog_keeps_saved_drive",
+                    existing_library_id_suffix=ex_id[-24:] if len(ex_id) > 24 else ex_id,
+                )
+                log_info(
+                    "draft_shell_selector_blank_write_blocked_selector_hydrating",
+                    group=group,
+                    existing_library_id_suffix=ex_id[-24:] if len(ex_id) > 24 else ex_id,
+                )
+                return ex_name, ex_id
             return "", ""
+        if ex_id and not id_n:
+            log_info(
+                "draft_shell_selector_hydration_incomplete_preserved",
+                group=group,
+                reason="blank_combo_capture_preserves_existing_id",
+                existing_library_id_suffix=ex_id[-24:] if len(ex_id) > 24 else ex_id,
+            )
+            log_info(
+                "draft_shell_selector_blank_write_blocked_selector_hydrating",
+                group=group,
+                existing_library_id_suffix=ex_id[-24:] if len(ex_id) > 24 else ex_id,
+            )
+            return ex_name, ex_id
         if not ex_id:
             return nm_n, id_n
         try:
@@ -22819,8 +22943,21 @@ class MainWindow(QMainWindow):
         if site_selector is None or library_selector is None:
             return False
 
+        intended_persisted = (
+            self._persisted_source_library_drive_id_from_session()
+            if selector_group == "source"
+            else self._persisted_destination_library_drive_id_from_session()
+        )
+        log_info(
+            "library_selector_hydration_started",
+            selector_group=selector_group,
+            intended_drive_suffix=intended_persisted[-16:] if len(intended_persisted) > 16 else intended_persisted,
+            had_intended=bool(intended_persisted),
+        )
+
         selected_site = site_selector.currentData()
-        libraries = []
+        libraries: list = []
+        site_id = ""
         if isinstance(selected_site, dict):
             libraries = list(selected_site.get("libraries") or [])
             site_id = str(selected_site.get("id", "") or "").strip()
@@ -22853,50 +22990,71 @@ class MainWindow(QMainWindow):
                         site_id_excerpt=site_id[:48],
                     )
                     libraries = []
-            # Destination: partial cached site["libraries"] can omit the saved library; refresh from Graph
-            # so restore does not leave the combo on index 0 (wrong library) while drive-id match fails.
-            if (
-                selector_group == "destination"
-                and libraries
-                and site_id
-                and self.graph is not None
+            # Source & destination: partial cached site["libraries"] can omit the saved drive; refresh from Graph.
+            if libraries and site_id and self.graph is not None and intended_persisted:
+                _dcf = intended_persisted.casefold()
+                has_intended = any(
+                    isinstance(lib, dict)
+                    and str(lib.get("id") or lib.get("drive_id") or "").strip().casefold() == _dcf
+                    for lib in libraries
+                )
+                if not has_intended:
+                    try:
+                        log_info(
+                            "library_selector_hydration_replaced_partial_list",
+                            selector_group=selector_group,
+                            site_id_excerpt=str(site_id)[:40],
+                            prior_count=int(len(libraries)),
+                            intended_drive_suffix=intended_persisted[-16:] if len(intended_persisted) > 16 else intended_persisted,
+                        )
+                        self._startup_post_snapshot_trace_event(
+                            "list_site_drives_refresh_missing_persisted_library",
+                            selector_group=str(selector_group),
+                            site_id_excerpt=str(site_id)[:32],
+                            intended_drive_suffix=intended_persisted[-16:] if len(intended_persisted) > 16 else intended_persisted,
+                        )
+                        _t_drv2 = time.perf_counter()
+                        drives2 = self.graph.list_site_drives(site_id)
+                        libraries = [
+                            self.graph.normalize_drive(drive)
+                            for drive in drives2
+                            if self.graph.is_usable_document_library(drive)
+                        ]
+                        selected_site["libraries"] = libraries
+                        self._startup_post_snapshot_trace_event(
+                            "list_site_drives_refresh_missing_persisted_library_exit",
+                            selector_group=str(selector_group),
+                            wall_ms=round((time.perf_counter() - _t_drv2) * 1000.0, 2),
+                            usable_library_count=len(libraries),
+                        )
+                    except Exception as exc:
+                        log_warn(
+                            "planning_library_selector_site_drives_refresh_failed",
+                            error=str(exc)[:500],
+                            site_id_excerpt=site_id[:48],
+                        )
+
+        if intended_persisted:
+            _dcg = intended_persisted.casefold()
+            if any(
+                isinstance(lib, dict)
+                and str(lib.get("id") or lib.get("drive_id") or "").strip().casefold() == _dcg
+                for lib in (libraries or [])
             ):
-                intended_dst = self._persisted_destination_library_drive_id_from_session()
-                if intended_dst:
-                    has_intended = any(
-                        isinstance(lib, dict)
-                        and str(lib.get("id") or lib.get("drive_id") or "").strip().casefold()
-                        == intended_dst.casefold()
-                        for lib in libraries
-                    )
-                    if not has_intended:
-                        try:
-                            self._startup_post_snapshot_trace_event(
-                                "list_site_drives_refresh_missing_persisted_library",
-                                selector_group="destination",
-                                site_id_excerpt=str(site_id)[:32],
-                                intended_drive_suffix=intended_dst[-16:] if len(intended_dst) > 16 else intended_dst,
-                            )
-                            _t_drv2 = time.perf_counter()
-                            drives2 = self.graph.list_site_drives(site_id)
-                            libraries = [
-                                self.graph.normalize_drive(drive)
-                                for drive in drives2
-                                if self.graph.is_usable_document_library(drive)
-                            ]
-                            selected_site["libraries"] = libraries
-                            self._startup_post_snapshot_trace_event(
-                                "list_site_drives_refresh_missing_persisted_library_exit",
-                                selector_group="destination",
-                                wall_ms=round((time.perf_counter() - _t_drv2) * 1000.0, 2),
-                                usable_library_count=len(libraries),
-                            )
-                        except Exception as exc:
-                            log_warn(
-                                "planning_library_selector_site_drives_refresh_failed",
-                                error=str(exc)[:500],
-                                site_id_excerpt=site_id[:48],
-                            )
+                log_info(
+                    "library_selector_hydration_saved_drive_found",
+                    selector_group=selector_group,
+                    drive_suffix=intended_persisted[-16:] if len(intended_persisted) > 16 else intended_persisted,
+                    list_len=int(len(libraries or [])),
+                )
+                self._saved_library_selector_hydration_attempt[selector_group] = 0
+            else:
+                log_info(
+                    "library_selector_hydration_saved_drive_missing",
+                    selector_group=selector_group,
+                    drive_suffix=intended_persisted[-16:] if len(intended_persisted) > 16 else intended_persisted,
+                    list_len=int(len(libraries or [])),
+                )
 
         library_selector.blockSignals(True)
         try:
@@ -22911,10 +23069,15 @@ class MainWindow(QMainWindow):
         finally:
             library_selector.blockSignals(False)
 
-        if selector_group == "destination":
-            self._destination_sync_library_selector_to_persisted_intent(library_selector)
-            if libraries:
-                self._maybe_schedule_legacy_snapshot_identity_inference_retry("destination_libraries_loaded")
+        self._sync_library_selector_to_persisted_session_drive(selector_group, library_selector)
+        log_info(
+            "library_selector_hydration_completed",
+            selector_group=selector_group,
+            combo_count=int(library_selector.count()) if library_selector is not None else -1,
+            current_index=int(library_selector.currentIndex()) if library_selector is not None else -1,
+        )
+        if selector_group == "destination" and libraries:
+            self._maybe_schedule_legacy_snapshot_identity_inference_retry("destination_libraries_loaded")
 
         return True
 
@@ -25566,6 +25729,7 @@ class MainWindow(QMainWindow):
             if site_selector is None or library_selector is None:
                 return
 
+            self._saved_library_selector_hydration_attempt[selector_group] = 0
             self._populate_library_selector_for_group(selector_group)
             if selector_group == "destination":
                 site_sel = self.planning_inputs.get("Destination Site")
@@ -25680,25 +25844,38 @@ class MainWindow(QMainWindow):
                 self._log_library_restore_step("step_04b_auth_required_started", selector_group=selector_group)
                 return
 
-            if selector_group == "destination":
-                _dst_guard = self._destination_should_defer_or_block_wrong_library_bind(
-                    selected_library=selected_library,
-                    library_selector=library_selector,
-                )
-                if _dst_guard == "deferred":
+            _bind_guard = self._planning_should_defer_or_block_wrong_library_bind(
+                selector_group,
+                selected_library=selected_library,
+                library_selector=library_selector,
+            )
+            if _bind_guard == "deferred":
+                if selector_group == "destination":
                     self.set_tree_placeholder(
                         "destination",
                         "Waiting for the saved destination library to appear in the list…",
                     )
-                    self.update_selector_context_labels()
-                    return
-                if _dst_guard == "blocked":
+                else:
+                    self.set_tree_placeholder(
+                        "source",
+                        "Waiting for the saved source library to appear in the list…",
+                    )
+                self.update_selector_context_labels()
+                self._schedule_saved_library_selector_hydration_retry(selector_group)
+                return
+            if _bind_guard == "blocked":
+                if selector_group == "destination":
                     self.set_tree_placeholder(
                         "destination",
                         "Choose the destination library that matches your session — the current selection is not the saved destination drive.",
                     )
-                    self.update_selector_context_labels()
-                    return
+                else:
+                    self.set_tree_placeholder(
+                        "source",
+                        "Choose the source library that matches your session — the current selection is not the saved source drive.",
+                    )
+                self.update_selector_context_labels()
+                return
 
             self._log_library_restore_step("step_05_update_labels_enter", selector_group=selector_group)
             self.update_selector_context_labels()
