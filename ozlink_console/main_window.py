@@ -3452,6 +3452,9 @@ class MainWindow(QMainWindow):
         self._post_tick_deferred_boundary_log_counter = 0
         self._shutdown_descendant_tick_skip_logs_suppressed = 0
         self._shutdown_descendant_tick_skip_event_logged = False
+        # Defer overlay projection invariant repair while descendant apply is active (coalesce, reduce log spam).
+        self._destination_projection_repair_pending_after_descendant_apply: bool = False
+        self._destination_projection_repair_defer_suppress_count: int = 0
         # When an allocation has more than this many collected descendants, file-level
         # projected_descendant rows are deferred until the user expands the allocation
         # (folders still projected eagerly for structure). planned_moves stays authoritative.
@@ -34023,6 +34026,86 @@ class MainWindow(QMainWindow):
             "post_mutate",
         )
 
+    def _destination_planned_bind_find_existing_planned_row_under_parent(
+        self, parent_ix: QModelIndex, next_branch: str, model
+    ) -> QModelIndex | None:
+        """Return an existing planned overlay row for ``next_branch`` already attached under ``parent_ix`` (dedupe)."""
+        if model is None or not parent_ix.isValid():
+            return None
+        nb = (
+            self._canonical_planned_memory_path_for_graph_match(str(next_branch or "").strip())
+            or self._canonical_destination_projection_path(str(next_branch or "").strip())
+            or str(next_branch or "").strip()
+        )
+        p0 = parent_ix.siblingAtColumn(0) if parent_ix.column() != 0 else parent_ix
+        try:
+            for r in range(model.rowCount(p0)):
+                ix = model.index(r, 0, p0)
+                if not ix.isValid():
+                    continue
+                pl = dict(ix.data(Qt.UserRole) or {})
+                if pl.get("placeholder"):
+                    continue
+                if destination_payload_is_live_graph_row(pl):
+                    log_info(
+                        "destination_planned_duplicate_runtime_merge_skipped_live_graph",
+                        canonical_path_excerpt=str(nb)[:400],
+                    )
+                    continue
+                if not destination_payload_is_planned_workspace_row(pl):
+                    continue
+                vis = (
+                    self._canonical_planned_memory_path_for_graph_match(
+                        str(self._tree_item_path(pl) or self._destination_row_raw_path_for_path_lookup_match(pl) or "")
+                    )
+                    or ""
+                ).strip()
+                if vis.casefold() == nb.casefold():
+                    log_info(
+                        "destination_planned_folder_canonical_path_key",
+                        canonical_path_excerpt=str(nb)[:400],
+                        under_parent_excerpt=str(
+                            self._canonical_planned_memory_path_for_graph_match(
+                                str(self._tree_item_path(self._destination_model_index_user_role_dict(p0)) or "")
+                            )
+                            or ""
+                        )[:400],
+                    )
+                    log_info(
+                        "destination_planned_duplicate_runtime_merge_started",
+                        canonical_path_excerpt=str(nb)[:400],
+                        reason="reuse_existing_child_under_parent",
+                    )
+                    log_info(
+                        "destination_planned_duplicate_runtime_merge_completed",
+                        canonical_path_excerpt=str(nb)[:400],
+                        outcome="reuse_existing_planned",
+                    )
+                    return ix.siblingAtColumn(0) if ix.column() != 0 else ix
+                dup_name = str(pl.get("name") or pl.get("real_name") or "").strip().casefold()
+                want_seg = [s for s in str(nb).split("\\") if s][-1:][:1]
+                if want_seg and dup_name == want_seg[0].strip().casefold():
+                    log_info(
+                        "destination_planned_folder_duplicate_sibling_detected",
+                        parent_path_excerpt=str(
+                            self._tree_item_path(self._destination_model_index_user_role_dict(p0)) or ""
+                        )[:400],
+                        duplicate_name_excerpt=str(dup_name)[:200],
+                        canonical_path_excerpt=str(nb)[:400],
+                    )
+                    log_info(
+                        "destination_planned_folder_duplicate_insert_blocked",
+                        canonical_path_excerpt=str(nb)[:400],
+                    )
+                    log_info(
+                        "destination_planned_folder_existing_reused_for_descendant",
+                        canonical_path_excerpt=str(nb)[:400],
+                    )
+                    return ix.siblingAtColumn(0) if ix.column() != 0 else ix
+        except RuntimeError:
+            return None
+        return None
+
     def _sharepoint_bind_planned_segment_chain(
         self,
         parent_ix: QModelIndex,
@@ -34254,6 +34337,15 @@ class MainWindow(QMainWindow):
                 return None
 
             existing = self._find_destination_child_by_path(cur, next_branch, overlay_path_strict=graph_strict)
+            if (
+                existing is None
+                and graph_strict
+                and str(bind_kind or "").strip().lower() == "allocation_descendant"
+                and model is not None
+            ):
+                dup = self._destination_planned_bind_find_existing_planned_row_under_parent(cur, next_branch, model)
+                if dup is not None and dup.isValid():
+                    existing = dup
             exact_hit = False
             row_inserted = False
             inserted_path = ""
@@ -34402,6 +34494,27 @@ class MainWindow(QMainWindow):
             last_next_branch = next_branch
 
         raw_tp = str(projection_target_canonical or "").strip()
+        if (
+            str(bind_kind or "").strip().lower() == "allocation_descendant"
+            and graph_strict
+            and str(last_next_branch or "").strip()
+        ):
+            lb_full = (
+                self._canonical_planned_memory_path_for_graph_match(str(last_next_branch).strip())
+                or self._canonical_destination_projection_path(str(last_next_branch).strip())
+                or str(last_next_branch).strip()
+            )
+            rp_full = (
+                self._canonical_planned_memory_path_for_graph_match(raw_tp) if raw_tp else ""
+            ) or (self._canonical_destination_projection_path(raw_tp) if raw_tp else "")
+            if (not raw_tp) or (lb_full and rp_full and len(lb_full) > len(rp_full)):
+                raw_tp = str(last_next_branch).strip()
+                log_info(
+                    "destination_descendant_leaf_intended_path_calculated",
+                    intended_path=str(lb_full)[:400],
+                    prior_projection_target_excerpt=str(rp_full)[:400],
+                    bind_context_excerpt=str(bind_context_excerpt or "")[:220],
+                )
         if raw_tp:
             term_resolved = (
                 self._canonical_destination_projection_path(raw_tp) or self.normalize_memory_path(raw_tp) or raw_tp
@@ -43798,7 +43911,14 @@ class MainWindow(QMainWindow):
         """Graph-authority allocation descendant projection: chunked (see :meth:`_decorate_destination_graph_subtree_for_allocation_move`)."""
         self._alloc_apply_sibling_reconcile_coalesce_key = None
         model = getattr(self, "destination_planning_model", None)
-        if model is None or not parent_ix.isValid():
+        if model is None:
+            return None
+        resolved_parent, _resolve_s = self._find_destination_allocation_descendant_parent_index(move)
+        if resolved_parent is not None and resolved_parent.isValid():
+            rp0 = resolved_parent.siblingAtColumn(0) if resolved_parent.column() != 0 else resolved_parent
+            if not hasattr(model, "is_index_live") or model.is_index_live(rp0):
+                parent_ix = rp0
+        if not parent_ix.isValid():
             return None
         if hasattr(model, "is_index_live") and not model.is_index_live(parent_ix):
             ap_try = self._destination_graph_descendant_expected_allocation_folder_anchor_path(move)
@@ -44239,14 +44359,156 @@ class MainWindow(QMainWindow):
                 _add(k)
         return out
 
+    def _allocation_effective_destination_allocation_root_path(self, move: dict | None) -> str:
+        """Canonical graph-relative allocation destination root (honors planned-parent fields when authoritative)."""
+        if not isinstance(move, dict):
+            return ""
+        raw_path = self._allocation_projection_path(move)
+        out = (
+            self._canonical_planned_memory_path_for_graph_match(str(raw_path or "").strip())
+            or self._canonical_destination_projection_path(str(raw_path or "").strip())
+            or str(raw_path or "").strip()
+        ).strip()
+        ppp = str(move.get("DestinationParentPlannedPath") or "").strip()
+        if ppp and str(move.get("LegacyMigrationPlannedParentResolved", "")).strip().lower() in (
+            "true",
+            "1",
+            "yes",
+        ):
+            tn = str(self._move_target_name(move) or "").strip()
+            if tn:
+                joined = self.normalize_memory_path(f"{ppp}\\{tn}")
+                jp = (
+                    self._canonical_planned_memory_path_for_graph_match(joined)
+                    or self._canonical_destination_projection_path(joined)
+                    or joined
+                ).strip()
+                if jp:
+                    out = jp
+        return out
+
+    def _find_destination_allocation_descendant_parent_index(self, move: dict | None) -> tuple[QModelIndex | None, str]:
+        """Resolve QModelIndex for the allocation folder (overlay or live) under selected destination drive."""
+        log_info(
+            "destination_allocation_descendant_parent_resolve_started",
+            move_key_excerpt=str(
+                self._allocation_move_key(move) if isinstance(move, dict) else ""
+            )[:120],
+        )
+        if not isinstance(move, dict):
+            log_info("destination_allocation_descendant_parent_resolve_missing", reason="not_a_move_dict")
+            return None, "not_a_move_dict"
+        ap = self._allocation_effective_destination_allocation_root_path(move)
+        if not ap:
+            log_info("destination_allocation_descendant_parent_resolve_missing", reason="empty_effective_destination_root")
+            return None, "empty_effective_destination_root"
+        dm = getattr(self, "destination_planning_model", None)
+        if dm is None:
+            log_info("destination_allocation_descendant_parent_resolve_missing", reason="no_destination_model")
+            return None, "no_destination_model"
+        dst_drive = str(self._current_selected_destination_drive_id() or "").strip()
+        find_fn = getattr(dm, "find_indices_for_canonical_destination_path", None)
+        if not callable(find_fn):
+            log_info("destination_allocation_descendant_parent_resolve_missing", reason="no_find_indices")
+            return None, "no_find_indices"
+        target_cf = ap.casefold()
+        best: tuple[int, QModelIndex] | None = None  # (score, index) higher score wins
+        try:
+            for c in self._destination_graph_descendant_model_index_keys_for_lookup(ap):
+                for h in find_fn(c) or []:
+                    if not isinstance(h, QModelIndex) or not h.isValid():
+                        continue
+                    h0 = h.siblingAtColumn(0) if h.column() != 0 else h
+                    if hasattr(dm, "is_index_live") and not dm.is_index_live(h0):
+                        continue
+                    pl = dict(h0.data(Qt.UserRole) or {})
+                    if pl.get("placeholder"):
+                        continue
+                    if not bool(pl.get("is_folder", True)):
+                        log_info(
+                            "destination_allocation_descendant_parent_resolve_not_folder",
+                            path_excerpt=str(self._tree_item_path(pl))[:400],
+                        )
+                        continue
+                    row_drive = str(pl.get("drive_id") or pl.get("library_id") or "").strip()
+                    if dst_drive and row_drive and row_drive != dst_drive:
+                        log_info(
+                            "destination_allocation_descendant_parent_resolve_wrong_drive",
+                            expected_drive_excerpt=dst_drive[:48],
+                            row_drive_excerpt=row_drive[:48],
+                            path_excerpt=str(self._tree_item_path(pl))[:400],
+                        )
+                        continue
+                    vis_raw = self._tree_item_path(pl) or ""
+                    if destination_authority_contract.graph_owns_visible_real_destination_structure(self):
+                        vis = (
+                            self._canonical_planned_memory_path_for_graph_match(str(vis_raw).strip())
+                            or self._canonical_destination_projection_path(str(vis_raw).strip())
+                            or str(vis_raw).strip()
+                        )
+                    else:
+                        vis = (
+                            self._canonical_destination_projection_path(str(vis_raw).strip())
+                            or str(vis_raw).strip()
+                        )
+                    md = self._destination_parent_match_details(ap, vis)
+
+                    score = 0
+                    if destination_payload_is_live_graph_row(pl) and md.get("exact_match"):
+                        score = 4
+                        log_info(
+                            "destination_allocation_descendant_parent_resolve_live_parent_allowed",
+                            path_excerpt=str(vis)[:400],
+                        )
+                    elif destination_payload_is_structural_row_for_planned_workspace_bind(pl) and md.get("exact_match"):
+                        score = 3
+                        log_info(
+                            "destination_allocation_descendant_parent_resolve_overlay_parent_allowed",
+                            path_excerpt=str(vis)[:400],
+                        )
+                    elif md.get("exact_match"):
+                        score = 2
+                        log_info(
+                            "destination_allocation_descendant_parent_resolve_overlay_parent_allowed",
+                            path_excerpt=str(vis)[:400],
+                        )
+                    elif vis.casefold() == target_cf:
+                        score = 1
+                    if score <= 0:
+                        continue
+                    if best is None or score > best[0]:
+                        best = (score, h0)
+        except RuntimeError:
+            log_info("destination_allocation_descendant_parent_resolve_missing", reason="runtime_errorenumerate")
+            return None, "runtime_errorenumerate"
+        if best is not None and best[1].isValid():
+            log_info(
+                "destination_allocation_descendant_parent_resolve_found",
+                path_excerpt=str(ap)[:400],
+                score=int(best[0]),
+            )
+            return best[1], "ok"
+        log_info("destination_allocation_descendant_parent_resolve_missing", reason="no_matching_row", path_excerpt=ap[:400])
+        return None, "no_matching_row"
+
     def _destination_graph_descendant_resolve_model_index_for_path(self, dm, canonical_path: str) -> QModelIndex | None:
-        """Fresh QModelIndex for a canonical destination path; never reuse stale indices across ticks."""
+        """Fresh QModelIndex for a canonical destination path; prefers exact canonical matches over ambiguous keys."""
         if dm is None:
             return None
         raw = (canonical_path or "").strip()
         if not raw:
             return None
+        if destination_authority_contract.graph_owns_visible_real_destination_structure(self):
+            want = (
+                self._canonical_planned_memory_path_for_graph_match(raw)
+                or self._canonical_destination_projection_path(raw)
+                or raw
+            ).strip()
+        else:
+            want = (self._canonical_destination_projection_path(raw) or self.normalize_memory_path(raw) or raw).strip()
         find_fn = getattr(dm, "find_indices_for_canonical_destination_path", None)
+        best_any: QModelIndex | None = None
+        best_len = -1
         if callable(find_fn):
             try:
                 for c in self._destination_graph_descendant_model_index_keys_for_lookup(raw):
@@ -44256,9 +44518,30 @@ class MainWindow(QMainWindow):
                         h0 = h.siblingAtColumn(0) if h.column() != 0 else h
                         if hasattr(dm, "is_index_live") and not dm.is_index_live(h0):
                             continue
-                        return h0
+                        pl = dict(h0.data(Qt.UserRole) or {})
+                        vis_raw = self._tree_item_path(pl) or ""
+                        if destination_authority_contract.graph_owns_visible_real_destination_structure(self):
+                            vis = (
+                                self._canonical_planned_memory_path_for_graph_match(str(vis_raw).strip())
+                                or self._canonical_destination_projection_path(str(vis_raw).strip())
+                                or str(vis_raw).strip()
+                            )
+                        else:
+                            vis = (
+                                self._canonical_destination_projection_path(str(vis_raw).strip())
+                                or str(vis_raw).strip()
+                            )
+                        md = self._destination_parent_match_details(want, vis)
+                        if md.get("exact_match"):
+                            return h0
+                        seg_ct = len([s for s in (vis or "").split("\\") if s])
+                        if best_any is None or seg_ct > best_len:
+                            best_any = h0
+                            best_len = seg_ct
             except RuntimeError:
                 return None
+            if best_any is not None:
+                return best_any
         c0 = (self._canonical_destination_projection_path(raw) or self.normalize_memory_path(raw) or raw).strip()
         try:
             vis = self._find_visible_destination_item_by_path(c0)
@@ -44440,15 +44723,51 @@ class MainWindow(QMainWindow):
             cur_canon = self._canonical_destination_projection_path(cur_raw) or ""
         walk_md = self._destination_parent_match_details(expected_parent_before, cur_canon)
         if not walk_md.get("exact_match"):
-            self._log_restore_phase(
-                "sharepoint_allocation_descendant_walk_mismatch",
+            log_info(
+                "destination_allocation_descendant_walk_mismatch_detected",
                 expected_parent_canonical=str(expected_parent_before)[:260],
                 actual_current_canonical=str(cur_canon)[:260],
+                cursor_path_excerpt=str(cursor_path)[:400],
                 descendant_source_excerpt=str(descendant_source_path)[:220],
             )
-            st["desc_index"] += 1
-            st["walk_phase"] = "next_descendant"
-            return "next_descendant"
+            fix_ix = self._destination_graph_descendant_resolve_model_index_for_path(model, str(expected_parent_before))
+            mv = st.get("move")
+            if (fix_ix is None or not fix_ix.isValid()) and isinstance(mv, dict):
+                fb, _fbr = self._find_destination_allocation_descendant_parent_index(mv)
+                if fb is not None and fb.isValid():
+                    fix_ix = fb.siblingAtColumn(0) if fb.column() != 0 else fb
+            if fix_ix is not None and fix_ix.isValid():
+                fix_pl = self._destination_model_index_user_role_dict(fix_ix)
+                fix_raw = self._tree_item_path(fix_pl) or ""
+                if graph_auth:
+                    fix_canon = self._canonical_planned_memory_path_for_graph_match(fix_raw) or ""
+                else:
+                    fix_canon = self._canonical_destination_projection_path(fix_raw) or ""
+                if self._destination_parent_match_details(expected_parent_before, fix_canon).get("exact_match"):
+                    cur_ix = fix_ix
+                    cur_canon = fix_canon
+                    walk_md = {"exact_match": True}
+                    log_info(
+                        "destination_allocation_descendant_walk_mismatch_fixed",
+                        expected_parent_canonical=str(expected_parent_before)[:260],
+                        resolved_canonical=str(fix_canon)[:260],
+                        descendant_source_excerpt=str(descendant_source_path)[:220],
+                    )
+            if not walk_md.get("exact_match"):
+                self._log_restore_phase(
+                    "sharepoint_allocation_descendant_walk_mismatch",
+                    expected_parent_canonical=str(expected_parent_before)[:260],
+                    actual_current_canonical=str(cur_canon)[:260],
+                    descendant_source_excerpt=str(descendant_source_path)[:220],
+                )
+                log_info(
+                    "destination_allocation_descendant_walk_mismatch_unresolved",
+                    expected_parent_canonical=str(expected_parent_before)[:260],
+                    actual_current_canonical=str(cur_canon)[:260],
+                )
+                st["desc_index"] += 1
+                st["walk_phase"] = "next_descendant"
+                return "next_descendant"
 
         join_child = "\\".join(base_parts + rel_clean[: i + 1])
         join_child_bare = (
@@ -44931,6 +45250,27 @@ class MainWindow(QMainWindow):
                 self._destination_maybe_clear_stale_descendant_apply_state_if_idle()
             except Exception:
                 pass
+            try:
+                self._destination_maybe_flush_projection_repair_after_descendant_apply_idle()
+            except Exception:
+                pass
+
+    def _destination_maybe_flush_projection_repair_after_descendant_apply_idle(self) -> None:
+        """Run one deferred overlay projection repair after descendant-apply queue drains (coalesced)."""
+        if not getattr(self, "_destination_projection_repair_pending_after_descendant_apply", False):
+            return
+        dq = getattr(self, "_destination_descendant_apply_queue", None)
+        if dq and len(dq) > 0:
+            return
+        if getattr(self, "_destination_descendant_apply_state", None) is not None:
+            return
+        self._destination_projection_repair_pending_after_descendant_apply = False
+        self._destination_projection_repair_defer_suppress_count = 0
+        log_info("destination_projection_repair_resumed_after_descendant_apply")
+        try:
+            self._run_overlay_projection_invariant_pass("projection_repair_after_descendant_apply_flush")
+        except Exception as exc:
+            self._log_restore_exception("destination_projection_repair_resumed_after_descendant_apply", exc)
 
     def _destination_maybe_clear_stale_descendant_apply_state_if_idle(self) -> None:
         """Clear orphaned active apply state when queues are drained and no graph walk is in progress."""
@@ -45293,6 +45633,10 @@ class MainWindow(QMainWindow):
             except RuntimeError:
                 prev_bad = True
         fresh = self._destination_graph_descendant_resolve_model_index_for_path(dm, ap)
+        if (fresh is None or not fresh.isValid()) and isinstance(move, dict):
+            fb, _fbr = self._find_destination_allocation_descendant_parent_index(move)
+            if fb is not None and fb.isValid():
+                fresh = fb.siblingAtColumn(0) if fb.column() != 0 else fb
         if fresh is not None and fresh.isValid():
             try:
                 if hasattr(dm, "is_index_live") and not dm.is_index_live(fresh):
@@ -45352,6 +45696,11 @@ class MainWindow(QMainWindow):
         if model is None or not parent_ix.isValid():
             return False
         parent_ix = parent_ix.siblingAtColumn(0) if parent_ix.column() != 0 else parent_ix
+        rp, _rq = self._find_destination_allocation_descendant_parent_index(move)
+        if rp is not None and rp.isValid():
+            rp0 = rp.siblingAtColumn(0) if rp.column() != 0 else rp
+            if not hasattr(model, "is_index_live") or model.is_index_live(rp0):
+                parent_ix = rp0
         if hasattr(model, "is_index_live") and not model.is_index_live(parent_ix):
             return False
         dq = getattr(self, "_destination_descendant_apply_queue", None)
@@ -51613,9 +51962,39 @@ class MainWindow(QMainWindow):
                 rel = descendant_source_path[len(source_root_path) :].lstrip("\\/")
                 relative_segments = self._path_segments(rel)
         if not relative_segments:
-            if len(descendant_segments) <= len(source_root_segments):
+            c_ds = self._canonical_source_projection_path(descendant_source_path)
+            c_sr = self._canonical_source_projection_path(source_root_path)
+            if (
+                c_ds
+                and c_sr
+                and (c_ds.casefold().startswith(c_sr.casefold() + "\\") or c_ds.casefold() == c_sr.casefold())
+            ):
+                rel_tail = c_ds[len(c_sr) :].lstrip("\\/") if c_ds.casefold() != c_sr.casefold() else ""
+                relative_segments = self._path_segments(rel_tail) if rel_tail else []
+                if relative_segments:
+                    log_info(
+                        "destination_descendant_relative_path_validated_under_source_root",
+                        source_root_excerpt=str(c_sr)[:400],
+                        descendant_source_excerpt=str(c_ds)[:400],
+                    )
+            elif len(descendant_segments) > len(source_root_segments):
+                log_info(
+                    "destination_descendant_relative_path_rejected_not_under_source_root",
+                    source_root_excerpt=str(c_sr)[:400],
+                    descendant_source_excerpt=str(c_ds)[:400],
+                    note="length_only_fallback_blocked",
+                )
                 return False
-            relative_segments = descendant_segments[len(source_root_segments) :]
+            if not relative_segments:
+                if len(descendant_segments) <= len(source_root_segments):
+                    return False
+                log_info(
+                    "destination_descendant_relative_path_rejected_not_under_source_root",
+                    source_root_excerpt=str(source_root_path)[:400],
+                    descendant_source_excerpt=str(descendant_source_path)[:400],
+                    note="no_relative_after_canonical",
+                )
+                return False
         descendant_destination_path = self.normalize_memory_path(
             "\\".join([allocation_destination_path] + relative_segments)
         )
@@ -63059,10 +63438,20 @@ class MainWindow(QMainWindow):
                     and dest_lookup
                     and self._destination_descendant_apply_pending_graph_walk_for_dest_lookup(dest_lookup, move)
                 ):
-                    log_info(
-                        "destination_overlay_projection_repair_skipped_descendant_apply_in_flight",
-                        destination_path_excerpt=str(self._tree_item_path(pl) or "")[:400],
-                    )
+                    self._destination_projection_repair_pending_after_descendant_apply = True
+                    n_sup = int(getattr(self, "_destination_projection_repair_defer_suppress_count", 0) or 0)
+                    if n_sup < 4:
+                        log_info(
+                            "destination_projection_repair_deferred_descendant_apply_active",
+                            destination_path_excerpt=str(self._tree_item_path(pl) or "")[:400],
+                        )
+                    else:
+                        log_info(
+                            "destination_projection_repair_suppressed_duplicate_defer",
+                            suppress_index=int(n_sup),
+                            destination_path_excerpt=str(self._tree_item_path(pl) or "")[:400],
+                        )
+                    self._destination_projection_repair_defer_suppress_count = n_sup + 1
                     continue
                 if not self._destination_overlay_folder_row_needs_source_descendant_reproject(ix, pl, move):
                     continue
