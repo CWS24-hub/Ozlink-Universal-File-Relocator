@@ -313,6 +313,21 @@ from ozlink_console.destination_path_bridge import (
 )
 
 
+def _safe_call_destination_overlay_after_import_skipped(
+    host: Any, *, skip_reason: str, overlay_reason: str | None = None
+) -> None:
+    """Unit-test materialize hosts may omit import-followup diagnostics; avoid AttributeError."""
+    fn = getattr(host, "_log_destination_overlay_after_import_skipped", None)
+    if callable(fn):
+        fn(skip_reason=skip_reason, overlay_reason=overlay_reason)
+
+
+def _safe_call_destination_overlay_entry_context(host: Any, reason: str) -> None:
+    fn = getattr(host, "_log_destination_overlay_entry_context", None)
+    if callable(fn):
+        fn(reason)
+
+
 def _destination_fingerprint_path_segments(path: str) -> List[str]:
     normalized = normalize_manifest_path(path)
     if not normalized:
@@ -13029,6 +13044,109 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._log_restore_state_snapshot("restore_runtime_applied")
+        self._log_restored_planning_runtime_counts(context="restore_memory_payload")
+
+    def _log_restored_planning_runtime_counts(self, *, context: str = "") -> None:
+        """Summarize restored draft rows for diagnostics (runtime ``planned_moves`` / ``proposed_folders``)."""
+        pm = list(getattr(self, "planned_moves", None) or [])
+        pfolders = list(getattr(self, "proposed_folders", None) or [])
+        by_res: Counter[str] = Counter()
+        dest_parent_item_nonempty = 0
+        dest_parent_planned_nonempty = 0
+        requested_dest_nonempty = 0
+        for m in pm:
+            if not isinstance(m, dict):
+                continue
+            r = str(m.get("LegacyMigrationDestinationParentResolution", "") or "").strip().casefold()
+            if not r:
+                r = "(blank)"
+            elif r not in ("graph", "planned_parent"):
+                r = "other"
+            by_res[r] += 1
+            if str(m.get("destination_id", "") or "").strip():
+                dest_parent_item_nonempty += 1
+            if str(m.get("DestinationParentPlannedPath", "") or "").strip():
+                dest_parent_planned_nonempty += 1
+            if str(m.get("destination_path", "") or "").strip():
+                requested_dest_nonempty += 1
+        log_info(
+            "restored_planning_runtime_counts",
+            context=str(context or "")[:120],
+            allocation_row_count=len(pm),
+            proposed_folder_row_count=len(pfolders),
+            planned_moves_runtime=len(pm),
+            proposed_folders_runtime=len(pfolders),
+        )
+        log_info(
+            "restored_planning_resolution_summary",
+            context=str(context or "")[:120],
+            legacy_migration_destination_parent_resolution=dict(by_res),
+            destination_parent_item_id_nonempty=int(dest_parent_item_nonempty),
+            destination_parent_planned_path_nonempty=int(dest_parent_planned_nonempty),
+            destination_path_or_requested_nonempty=int(requested_dest_nonempty),
+        )
+
+    def _log_destination_overlay_entry_context(self, reason: str) -> None:
+        """Single place for overlay entry diagnostics (``destination_overlay_entry_counts``)."""
+        did = str(
+            (getattr(self, "pending_root_drive_ids", None) or {}).get("destination")
+            or (
+                self._current_selected_destination_drive_id()
+                if hasattr(self, "_current_selected_destination_drive_id")
+                else ""
+            )
+            or ""
+        ).strip()
+        sid = str(
+            (getattr(self, "pending_root_drive_ids", None) or {}).get("source")
+            or (
+                self._current_selected_source_drive_id()
+                if hasattr(self, "_current_selected_source_drive_id")
+                else ""
+            )
+            or ""
+        ).strip()
+        mod_n = -1
+        dm = getattr(self, "destination_planning_model", None)
+        if dm is not None and hasattr(dm, "iter_depth_first"):
+            try:
+                mod_n = sum(1 for _ in dm.iter_depth_first())
+            except Exception:
+                mod_n = -1
+        root_bound = bool(
+            getattr(self, "_root_tree_bind_in_progress", False) is False
+            and getattr(self, "_destination_root_prime_pending", True) is not True
+        )
+        try:
+            root_bound = root_bound and bool(getattr(self, "destination_tree_widget", None) is not None)
+        except Exception:
+            pass
+        log_info(
+            "destination_overlay_entry_counts",
+            overlay_reason=str(reason or "")[:220],
+            planned_moves_count=len(getattr(self, "planned_moves", None) or []),
+            proposed_folders_count=len(getattr(self, "proposed_folders", None) or []),
+            unresolved_allocation_queue_size=int(self._unresolved_allocation_queue_size() or 0),
+            unresolved_proposed_queue_size=int(self._unresolved_proposed_queue_size() or 0),
+            selected_destination_drive_id_suffix=did[-16:] if len(did) > 16 else did,
+            selected_source_drive_id_suffix=sid[-16:] if len(sid) > 16 else sid,
+            destination_model_node_count=int(mod_n),
+            destination_live_root_ready_hint=bool(root_bound),
+            restore_destination_overlay_pending=bool(getattr(self, "_restore_destination_overlay_pending", False)),
+            memory_restore_in_progress=bool(getattr(self, "_memory_restore_in_progress", False)),
+            full_tree_ready=bool(self._destination_full_tree_ready()) if hasattr(self, "_destination_full_tree_ready") else False,
+        )
+        self._planned_parent_overlay_diag_count = 0
+        self._recoverable_graph_overlay_diag_count = 0
+
+    def _log_destination_overlay_after_import_skipped(self, *, skip_reason: str, overlay_reason: str | None = None) -> None:
+        if not getattr(self, "_overlay_followup_after_import", False):
+            return
+        log_info(
+            "destination_overlay_after_import_skipped",
+            skip_reason=str(skip_reason)[:160],
+            overlay_reason=str(overlay_reason or getattr(self, "_destination_materialize_active_reason", "") or "")[:220],
+        )
 
     def _load_draft_shell_into_runtime(self):
         if self.memory_manager is None:
@@ -13161,6 +13279,12 @@ class MainWindow(QMainWindow):
                 "import_restore_overlay_scheduled",
                 planned_moves=len(self.planned_moves),
                 proposed_folders=len(self.proposed_folders),
+            )
+            self._overlay_followup_after_import = True
+            self._import_overlay_started_logged = False
+            log_info(
+                "destination_overlay_after_import_pending",
+                note="next_destination_overlay_pass_will_emit_entry_and_completion_logs",
             )
             _ok = True
         except Exception as exc:
@@ -40079,12 +40203,42 @@ class MainWindow(QMainWindow):
         data = getattr(self, "unresolved_proposed_by_parent_path", None) or {}
         return sum(len(entries) for entries in data.values())
 
+    def _allocation_projection_destination_path_source(self, move) -> str:
+        """Canonical destination path for overlay geometry (parent path, projection, queue keys).
+
+        When legacy migration resolved a **planned parent** (Graph id absent), ``destination_path`` may still
+        carry a pre–re-anchor ``Root\\...`` prefix while ``DestinationParentPlannedPath`` matches the visible
+        library layout (e.g. ``Root3\\...``). Overlay and unresolved replay must use the planned-parent
+        composition so file/folder rows bucket and paint under the same canonical parents as Graph skeleton.
+        """
+        if not isinstance(move, dict):
+            return ""
+        raw_in = str(move.get("destination_path", "") or "").strip()
+        planned_parent = str(move.get("DestinationParentPlannedPath", "") or "").strip()
+        res = str(move.get("LegacyMigrationDestinationParentResolution", "") or "").strip().casefold()
+        legacy_pp = bool(move.get("LegacyMigrationPlannedParentResolved"))
+        leaf = str(self._move_target_name(move) or "").strip()
+        use_pp = (res == "planned_parent" or legacy_pp) and bool(planned_parent) and bool(leaf)
+        if use_pp:
+            combined = self.normalize_memory_path(f"{planned_parent}\\{leaf}")
+            out = self._normalize_to_graph_canonical_path(combined) or combined
+            if out and raw_in and out.casefold() != self._normalize_to_graph_canonical_path(raw_in).casefold():
+                log_info(
+                    "destination_planned_parent_path_override_applied",
+                    request_excerpt=str(move.get("request_id", "") or "")[:80],
+                    legacy_destination_excerpt=str(raw_in)[:260],
+                    effective_destination_excerpt=str(out)[:260],
+                    planned_parent_excerpt=str(planned_parent)[:260],
+                )
+            return out
+        raw = self._normalize_to_graph_canonical_path(raw_in)
+        return raw
+
     def _allocation_destination_path_canonical_segments(self, move) -> list[str]:
-        """Segments of ``move['destination_path']`` after graph-authoritative planned-path canonicalization."""
+        """Segments of the planned destination path after graph-authoritative planned-path canonicalization."""
         if not isinstance(move, dict):
             return []
-        raw = str(move.get("destination_path", "") or "").strip()
-        raw = self._normalize_to_graph_canonical_path(raw)
+        raw = str(self._allocation_projection_destination_path_source(move) or "").strip()
         if not raw:
             return []
         canon = self._canonical_planned_memory_path_for_graph_match(raw)
@@ -40109,8 +40263,7 @@ class MainWindow(QMainWindow):
     def _allocation_parent_path(self, move):
         if not isinstance(move, dict):
             return ""
-        raw = str(move.get("destination_path", "") or "").strip()
-        raw = self._normalize_to_graph_canonical_path(raw)
+        raw = str(self._allocation_projection_destination_path_source(move) or "").strip()
         if not raw:
             return ""
         if self._allocation_destination_path_includes_target_leaf(move):
@@ -40332,8 +40485,7 @@ class MainWindow(QMainWindow):
     def _allocation_projection_path(self, move):
         if not isinstance(move, dict):
             return ""
-        raw = str(move.get("destination_path", "") or "").strip()
-        raw = self._normalize_to_graph_canonical_path(raw)
+        raw = str(self._allocation_projection_destination_path_source(move) or "").strip()
         target_name = str(self._move_target_name(move) or "").strip()
         if raw and target_name and self._allocation_destination_path_includes_target_leaf(move):
             out = self._canonical_destination_projection_path(self.normalize_memory_path(raw)) or self.normalize_memory_path(
@@ -43703,6 +43855,27 @@ class MainWindow(QMainWindow):
         descendants = self._sort_descendants_for_allocation_apply(
             self._collect_source_descendants_for_projection(source_root_data, move, collect_reason=cr)
         )
+        if not descendants:
+            log_info(
+                "destination_allocation_descendant_source_data_available",
+                graph_authority=True,
+                descendant_count=0,
+                source_item_bound=bool(source_item is not None),
+                move_key_excerpt=str(self._allocation_move_key(move) or "")[:120],
+            )
+            if source_item is None:
+                log_info(
+                    "destination_allocation_descendant_source_data_missing",
+                    graph_authority=True,
+                    source_path_excerpt=str(move.get("source_path", "") or "")[:400],
+                    move_key_excerpt=str(self._allocation_move_key(move) or "")[:120],
+                )
+                log_info(
+                    "destination_allocation_descendant_waiting_for_source_branch",
+                    graph_authority=True,
+                    reason="source_tree_row_not_resolved_for_move",
+                    source_path_excerpt=str(move.get("source_path", "") or "")[:400],
+                )
         cur_token = self._destination_allocation_projection_resume_token(move, source_root_data)
         resume_tok = str(parent_data.get("allocation_projection_resume_source_token") or "").strip()
         try:
@@ -43815,6 +43988,26 @@ class MainWindow(QMainWindow):
         cr = str(collect_reason or "").strip() or str(enqueue_reason or "").strip() or "destination_descendant_apply_non_graph"
         descendants = self._collect_source_descendants_for_projection(source_root_data, move, collect_reason=cr)
         descendants = self._sort_descendants_for_allocation_apply(descendants)
+        if not descendants:
+            log_info(
+                "destination_allocation_descendant_source_data_available",
+                graph_authority=False,
+                descendant_count=0,
+                source_item_bound=bool(source_item is not None),
+                move_key_excerpt=str(self._allocation_move_key(move) or "")[:120],
+            )
+            if source_item is None:
+                log_info(
+                    "destination_allocation_descendant_source_data_missing",
+                    graph_authority=False,
+                    source_path_excerpt=str(move.get("source_path", "") or "")[:400],
+                )
+                log_info(
+                    "destination_allocation_descendant_waiting_for_source_branch",
+                    graph_authority=False,
+                    reason="source_tree_row_not_resolved_for_move",
+                    source_path_excerpt=str(move.get("source_path", "") or "")[:400],
+                )
         return {
             "parent_ix": parent_ix,
             "move": move,
@@ -44672,6 +44865,12 @@ class MainWindow(QMainWindow):
                         reason="callback_exception_graph_walk",
                     )
             self._post_tick_snapshot_refresh_pending = True
+            log_info(
+                "destination_allocation_descendant_replay_completed",
+                graph_walk=True,
+                overlay_count=int(overlay_count),
+                allocation_destination_path_excerpt=str(ap)[:400],
+            )
             return
 
         model = st["model"]
@@ -44699,6 +44898,12 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         self._post_tick_snapshot_refresh_pending = True
+        log_info(
+            "destination_allocation_descendant_replay_completed",
+            graph_walk=False,
+            added_count=int(added_count or 0),
+            descendant_total=int(len(descendants) if descendants is not None else 0),
+        )
 
     def _run_destination_descendant_apply_tick(self) -> None:
         if _shutdown_mutation_skip_for_host(self, "_run_destination_descendant_apply_tick"):
@@ -44833,6 +45038,12 @@ class MainWindow(QMainWindow):
                                 )
                         continue
                     self._destination_descendant_apply_state = st
+                    log_info(
+                        "destination_allocation_descendant_replay_tick",
+                        enqueue_reason_excerpt=str(enq_r or "")[:160],
+                        phase=str(st.get("walk_phase") or "")[:40],
+                        graph_walk=bool(st.get("graph_walk")),
+                    )
 
                 st = self._destination_descendant_apply_state
                 phase = st.get("walk_phase")
@@ -45177,6 +45388,21 @@ class MainWindow(QMainWindow):
             collect_reason=str(collect_reason or "")[:200],
             queue_len=len(dq),
         )
+        log_info(
+            "destination_allocation_descendant_replay_enqueued",
+            enqueue_reason=str(enqueue_reason or "")[:200],
+            collect_reason=str(collect_reason or "")[:200],
+            queue_len=len(dq),
+            move_key_excerpt=str(self._allocation_move_key(move) or "")[:120],
+        )
+        if getattr(self, "_overlay_followup_after_import", False) and not getattr(
+            self, "_descendant_replay_after_import_started_logged", False
+        ):
+            log_info(
+                "destination_allocation_descendant_replay_started_after_import",
+                queue_len=len(dq),
+            )
+            self._descendant_replay_after_import_started_logged = True
         self._schedule_destination_descendant_apply_tick()
         return True
 
@@ -55152,6 +55378,11 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         if str(reason or "").startswith("startup_planned_workspace_memory_truth"):
+            _safe_call_destination_overlay_after_import_skipped(
+                self,
+                skip_reason="delegated_startup_planned_workspace_memory_truth",
+                overlay_reason=str(reason or ""),
+            )
             return self._apply_destination_planning_overlays_body_memory_truth_startup(
                 reason,
                 allow_defer=allow_defer,
@@ -55160,6 +55391,11 @@ class MainWindow(QMainWindow):
                 force_authoritative_bind=force_authoritative_bind,
             )
         if str(reason or "").startswith("local_first_edit_"):
+            _safe_call_destination_overlay_after_import_skipped(
+                self,
+                skip_reason="delegated_local_first_edit",
+                overlay_reason=str(reason or ""),
+            )
             return self._apply_destination_planning_overlays_body_local_first_edit(
                 reason,
                 allow_defer=allow_defer,
@@ -55179,6 +55415,11 @@ class MainWindow(QMainWindow):
                 else _rn
             )
             log_info("drag_move_full_materialize_blocked", reason=_base[:220])
+            _safe_call_destination_overlay_after_import_skipped(
+                self,
+                skip_reason="delegated_narrow_planned_item_move",
+                overlay_reason=str(reason or ""),
+            )
             return self._apply_destination_planning_overlays_body_local_first_edit(
                 f"local_first_edit_{_base}",
                 allow_defer=allow_defer,
@@ -55202,6 +55443,11 @@ class MainWindow(QMainWindow):
                 reason=str(reason or ""),
                 skip_reason="incremental_merge_in_progress",
             )
+            _safe_call_destination_overlay_after_import_skipped(
+                self,
+                skip_reason="incremental_merge_in_progress",
+                overlay_reason=str(reason or ""),
+            )
             return 0
 
         try:
@@ -55213,8 +55459,25 @@ class MainWindow(QMainWindow):
         # (e.g. drfws idle expand block returns 0 from _try_skip): unresolved overlays still need real rows.
         self._schedule_proactive_graph_parent_chains_for_unresolved_overlays(reason=str(reason or ""))
 
+        _safe_call_destination_overlay_entry_context(self, str(reason or ""))
+        if getattr(self, "_overlay_followup_after_import", False) and not getattr(
+            self, "_import_overlay_started_logged", False
+        ):
+            log_info(
+                "destination_overlay_after_import_started",
+                overlay_reason=str(reason or "")[:220],
+                planned_moves_count=len(getattr(self, "planned_moves", None) or []),
+                proposed_folders_count=len(getattr(self, "proposed_folders", None) or []),
+            )
+            self._import_overlay_started_logged = True
+
         _redundant_skip = self._try_skip_redundant_destination_future_model_materialize(reason)
         if _redundant_skip is not None:
+            _safe_call_destination_overlay_after_import_skipped(
+                self,
+                skip_reason="redundant_or_idle_tree_guard_ran_unified_destination_overlay",
+                overlay_reason=str(reason or ""),
+            )
             return _redundant_skip
 
         self._cancel_destination_future_async_projection(reason or "overlay_pass")
@@ -55235,6 +55498,11 @@ class MainWindow(QMainWindow):
                 "destination_future_model_materialize_deferred",
                 reason=reason,
                 waiting_for_root_prime=True,
+            )
+            _safe_call_destination_overlay_after_import_skipped(
+                self,
+                skip_reason="waiting_for_root_prime",
+                overlay_reason=str(reason or ""),
             )
             return 0
         if (
@@ -55299,6 +55567,11 @@ class MainWindow(QMainWindow):
                     sharepoint_authoritative_structure_gate=bool(_spo_authoritative),
                     full_tree_worker_running=bool(_full_tree_worker_running),
                 )
+                _safe_call_destination_overlay_after_import_skipped(
+                self,
+                    skip_reason="waiting_for_full_tree",
+                    overlay_reason=str(reason or ""),
+                )
                 return 0
         if self._destination_sharepoint_planning_destination_active():
             cur_did = str(
@@ -55335,6 +55608,11 @@ class MainWindow(QMainWindow):
                     waiting_for_snapshot_trust=True,
                     drive_id_suffix=cur_did[-16:] if len(cur_did) > 16 else cur_did,
                 )
+                _safe_call_destination_overlay_after_import_skipped(
+                self,
+                    skip_reason="waiting_for_snapshot_trust",
+                    overlay_reason=str(reason or ""),
+                )
                 return 0
         if not force_authoritative_bind and self._destination_future_model_blocked_by_source_restore(reason):
             self._destination_future_model_pending_after_source_restore = True
@@ -55346,6 +55624,11 @@ class MainWindow(QMainWindow):
                 source_restore_queue_size=len(getattr(self, "_source_restore_materialization_queue", None) or []),
                 pending_source_folder_loads=len(self.pending_folder_loads.get("source", set())),
                 memory_restore_in_progress=bool(getattr(self, "_memory_restore_in_progress", False)),
+            )
+            _safe_call_destination_overlay_after_import_skipped(
+                self,
+                skip_reason="waiting_for_source_restore",
+                overlay_reason=str(reason or ""),
             )
             return 0
         if not force_authoritative_bind and getattr(self, "_destination_snapshot_chunked_restore_active", False):
@@ -55364,6 +55647,11 @@ class MainWindow(QMainWindow):
                 )
 
             QTimer.singleShot(0, _retry_materialize)
+            _safe_call_destination_overlay_after_import_skipped(
+                self,
+                skip_reason="waiting_for_destination_snapshot_chunked_restore",
+                overlay_reason=str(reason or ""),
+            )
             return 0
         if force_authoritative_bind:
             _idle_t = getattr(self, "_destination_idle_materialize_timer", None)
@@ -55389,6 +55677,11 @@ class MainWindow(QMainWindow):
                 expand_all_pending=bool(self._expand_all_pending.get("destination")),
             )
             self._schedule_deferred_destination_materialization(reason)
+            _safe_call_destination_overlay_after_import_skipped(
+                self,
+                skip_reason="should_defer_destination_materialization_idle_window",
+                overlay_reason=str(reason or ""),
+            )
             return 0
 
         self._log_restore_phase(
@@ -55498,6 +55791,15 @@ class MainWindow(QMainWindow):
         )
         if getattr(self, "_destination_full_tree_idle_light_overlay", False):
             self._destination_full_tree_idle_light_overlay = False
+        if getattr(self, "_overlay_followup_after_import", False):
+            log_info(
+                "destination_overlay_after_import_completed",
+                overlay_reason=str(ctx)[:220],
+                applied_proposed_replay=int(n_prop),
+                applied_allocation_replay=int(n_alloc),
+            )
+            self._overlay_followup_after_import = False
+            self._descendant_replay_after_import_started_logged = False
         return int(n_prop + n_alloc)
 
     def _destination_is_future_state_node(self, node_data):
@@ -58098,6 +58400,57 @@ class MainWindow(QMainWindow):
             return 0
         return self._apply_allocation_children_to_model_index(parent_item)
 
+    def _allocation_row_is_planned_parent_resolution(self, move) -> bool:
+        if not isinstance(move, dict):
+            return False
+        if str(move.get("LegacyMigrationDestinationParentResolution", "") or "").strip().casefold() == "planned_parent":
+            return True
+        if bool(move.get("LegacyMigrationPlannedParentResolved")):
+            return True
+        return bool(str(move.get("DestinationParentPlannedPath", "") or "").strip())
+
+    def _allocation_row_recoverable_missing_destination_graph_parent(self, move) -> bool:
+        if not isinstance(move, dict):
+            return False
+        if str(move.get("destination_id", "") or "").strip():
+            return False
+        return self._allocation_row_is_planned_parent_resolution(move)
+
+    def _maybe_log_planned_parent_overlay(self, move, event: str, **fields: Any) -> None:
+        if not self._allocation_row_is_planned_parent_resolution(move):
+            return
+        n = int(getattr(self, "_planned_parent_overlay_diag_count", 0) or 0)
+        if n >= 48:
+            return
+        self._planned_parent_overlay_diag_count = n + 1
+        rid = str(move.get("request_id", "") or "")[:80]
+        log_info(f"destination_planned_parent_overlay_{event}", request_id_excerpt=rid, **fields)
+
+    def _maybe_log_recoverable_graph_parent_overlay_outcome(
+        self, move, *, allowed: bool | None, blocked_reason: str = ""
+    ) -> None:
+        """TASK 6: recoverable rows without Graph parent id must not be treated as invisible for overlay."""
+        if not self._allocation_row_recoverable_missing_destination_graph_parent(move):
+            return
+        n = int(getattr(self, "_recoverable_graph_overlay_diag_count", 0) or 0)
+        if n >= 48:
+            return
+        self._recoverable_graph_overlay_diag_count = n + 1
+        rid = str(move.get("request_id", "") or "")[:80]
+        if allowed is True:
+            log_info(
+                "destination_overlay_recoverable_graph_missing_row_allowed",
+                request_id_excerpt=rid,
+                destination_path_excerpt=str(move.get("destination_path", "") or "")[:260],
+            )
+        elif allowed is False:
+            log_info(
+                "destination_overlay_recoverable_graph_missing_row_blocked",
+                request_id_excerpt=rid,
+                reason=str(blocked_reason or "")[:200],
+                destination_path_excerpt=str(move.get("destination_path", "") or "")[:260],
+            )
+
     def _apply_allocation_children_to_model_index(self, parent_ix: QModelIndex) -> int:
         model = getattr(self, "destination_planning_model", None)
         if model is None:
@@ -58120,6 +58473,13 @@ class MainWindow(QMainWindow):
         applied_count = 0
         need_graph_child_load = False
         for move in matching_moves:
+            self._maybe_log_planned_parent_overlay(
+                move,
+                "row_considered",
+                parent_path_excerpt=str(parent_path)[:260],
+                projected_path_excerpt=str(self._allocation_projection_path(move) or "")[:260],
+                planned_parent_excerpt=str(move.get("DestinationParentPlannedPath", "") or "")[:260],
+            )
             allocation_path = self._allocation_projection_path(move)
             raw_dest_incoming = str(move.get("destination_path", "") or "").strip() or allocation_path
             lookup_alloc = allocation_path
@@ -58151,6 +58511,12 @@ class MainWindow(QMainWindow):
             elif existing_child is None:
                 existing_child = self._find_destination_child_by_allocation_equivalence(attach_ix, move)
             if existing_child is not None:
+                self._maybe_log_planned_parent_overlay(
+                    move,
+                    "parent_found",
+                    outcome="existing_child",
+                    parent_path_excerpt=str(parent_path)[:220],
+                )
                 if isinstance(existing_child, QModelIndex):
                     self._ensure_planned_allocation_overlay_on_real_model_index(attach_ix, existing_child, move)
                 nd_after = self._destination_model_index_user_role_dict(existing_child)
@@ -58168,6 +58534,7 @@ class MainWindow(QMainWindow):
                     verify_visible_outcome=bool(graph_auth),
                 ):
                     applied_count += 1
+                    self._maybe_log_recoverable_graph_parent_overlay_outcome(move, allowed=True)
                 continue
             if graph_auth:
                 col0 = attach_ix.siblingAtColumn(0) if attach_ix.column() != 0 else attach_ix
@@ -58230,6 +58597,33 @@ class MainWindow(QMainWindow):
                         verify_visible_outcome=True,
                     ):
                         applied_count += 1
+                        self._maybe_log_planned_parent_overlay(
+                            move,
+                            "inserted",
+                            bind_kind="sharepoint_planned_chain",
+                            parent_path_excerpt=str(parent_path)[:220],
+                        )
+                        self._maybe_log_recoverable_graph_parent_overlay_outcome(move, allowed=True)
+                else:
+                    self._maybe_log_planned_parent_overlay(
+                        move,
+                        "parent_missing",
+                        bind_kind="sharepoint_planned_chain_unresolved",
+                        parent_path_excerpt=str(parent_path)[:220],
+                        acanon_excerpt=str(acanon)[:260],
+                    )
+                    self._maybe_log_planned_parent_overlay(
+                        move,
+                        "skipped",
+                        skip_reason="graph_auth_leaf_unresolved",
+                        parent_path_excerpt=str(parent_path)[:220],
+                        acanon_excerpt=str(acanon)[:260],
+                    )
+                    self._maybe_log_recoverable_graph_parent_overlay_outcome(
+                        move,
+                        allowed=False,
+                        blocked_reason="graph_auth_planned_chain_or_projection_unresolved",
+                    )
                 need_graph_child_load = True
                 continue
             self._remove_placeholder_children(attach_ix)
@@ -58245,6 +58639,13 @@ class MainWindow(QMainWindow):
                 verify_visible_outcome=False,
             ):
                 applied_count += 1
+                self._maybe_log_planned_parent_overlay(
+                    move,
+                    "inserted",
+                    bind_kind="local_overlay_append",
+                    parent_path_excerpt=str(parent_path)[:220],
+                )
+                self._maybe_log_recoverable_graph_parent_overlay_outcome(move, allowed=True)
         if graph_auth and need_graph_child_load:
             col0_ld = attach_ix.siblingAtColumn(0) if attach_ix.column() != 0 else attach_ix
             if col0_ld.isValid():

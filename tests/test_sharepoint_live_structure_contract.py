@@ -250,6 +250,8 @@ def test_ensure_full_tree_not_blocked_by_memory_restore_when_graph_authority_act
     mw = MainWindow.__new__(MainWindow)
     mw._log_restore_phase = lambda *a, **k: None  # type: ignore[method-assign]
     mw.pending_root_drive_ids = {"source": "", "destination": "d-graph"}
+    mw._destination_sharepoint_root_graph_bound_drive_id = "d-graph"
+    mw._destination_library_context_unresolved_for_graph_display = lambda: False  # type: ignore[method-assign]
     mw._destination_non_authoritative_shell_active = False
     mw._memory_restore_in_progress = True
     mw._destination_expand_burst_ctx = None
@@ -274,6 +276,8 @@ def test_ensure_full_tree_not_blocked_by_memory_restore_when_authority_shell_act
     mw = MainWindow.__new__(MainWindow)
     mw._log_restore_phase = lambda *a, **k: None  # type: ignore[method-assign]
     mw.pending_root_drive_ids = {"source": "", "destination": "d-mem"}
+    mw._destination_sharepoint_root_graph_bound_drive_id = "d-mem"
+    mw._destination_library_context_unresolved_for_graph_display = lambda: False  # type: ignore[method-assign]
     mw._destination_non_authoritative_shell_active = True
     mw._memory_restore_in_progress = True
     mw._destination_expand_burst_ctx = None
@@ -294,6 +298,8 @@ def test_ensure_full_tree_not_blocked_by_expand_burst_when_authority_shell_activ
     mw = MainWindow.__new__(MainWindow)
     mw._log_restore_phase = lambda *a, **k: None  # type: ignore[method-assign]
     mw.pending_root_drive_ids = {"source": "", "destination": "d-burst"}
+    mw._destination_sharepoint_root_graph_bound_drive_id = "d-burst"
+    mw._destination_library_context_unresolved_for_graph_display = lambda: False  # type: ignore[method-assign]
     mw._destination_non_authoritative_shell_active = True
     mw._destination_expand_burst_ctx = {"run_id": 1}
     mw._destination_future_bind_sync_active = False
@@ -314,6 +320,8 @@ def test_ensure_full_tree_when_shell_active_bypasses_ready_short_circuit():
     mw = MainWindow.__new__(MainWindow)
     mw._log_restore_phase = lambda *a, **k: None  # type: ignore[method-assign]
     mw.pending_root_drive_ids = {"source": "", "destination": "d-shell"}
+    mw._destination_sharepoint_root_graph_bound_drive_id = "d-shell"
+    mw._destination_library_context_unresolved_for_graph_display = lambda: False  # type: ignore[method-assign]
     mw._destination_full_tree_snapshot = [{"semantic_path": "Root\\A"}]
     mw._destination_full_tree_completed_drive_id = "d-shell"
     mw._destination_non_authoritative_shell_active = True
@@ -403,6 +411,8 @@ def test_expand_gesture_blocked_for_sharepoint_until_full_tree_ready():
     mw.pending_folder_loads = {"destination": set()}
     mw.pending_root_drive_ids = {"destination": ""}
     mw._planning_browse_mode = lambda key: "graph" if key == "destination" else "local"
+    mw._destination_deferred_expand_destination_root_ready = lambda: True  # type: ignore[method-assign]
+    mw._destination_library_context_unresolved_for_graph_display = lambda: False  # type: ignore[method-assign]
     mw._destination_chunked_bind_state = None
     mw._destination_future_bind_sync_active = False
     mw._destination_incremental_merge_in_progress = False
@@ -412,6 +422,7 @@ def test_expand_gesture_blocked_for_sharepoint_until_full_tree_ready():
     assert MainWindow._destination_pipeline_blocks_user_expand_gesture(mw) is True
     mw._destination_full_tree_ready = lambda: True
     mw._destination_snapshot_light_validation_worker = None
+    mw._destination_snapshot_spo_trust_valid = lambda _d: True  # type: ignore[method-assign]
     assert MainWindow._destination_pipeline_blocks_user_expand_gesture(mw) is False
 
 
@@ -570,6 +581,7 @@ def test_light_validation_structure_mismatch_schedules_full_walk():
 
 def test_full_tree_success_flushes_non_auth_shell_via_non_deferring_materialize():
     mw = MainWindow.__new__(MainWindow)
+    mw.pending_root_drive_ids = {"destination": "d1", "source": ""}
     mw._log_restore_phase = lambda *a, **k: None  # type: ignore[method-assign]
     mw.normalize_memory_path = MethodType(MainWindow.normalize_memory_path, mw)
     mw._path_segments = MethodType(MainWindow._path_segments, mw)
