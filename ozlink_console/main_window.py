@@ -9681,6 +9681,33 @@ class MainWindow(QMainWindow):
         )
         return True
 
+    def _destination_graph_skeleton_schedule_after_live_root_bind(
+        self,
+        drive_id: str,
+        worker_id: Any,
+        *,
+        worker_tag: str,
+        schedule_phase: str,
+    ) -> None:
+        """Wrap skeleton scheduling with entry/exit logs; call while root worker is still registered (sync path)."""
+        log_info(
+            "destination_graph_skeleton_schedule_entry",
+            phase=str(schedule_phase)[:160],
+            worker_tag=str(worker_tag)[:80],
+            drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+        )
+        try:
+            self._destination_schedule_skeleton_first_level_graph_child_loads(
+                str(drive_id or ""), worker_id, worker_tag=worker_tag
+            )
+        finally:
+            log_info(
+                "destination_graph_skeleton_schedule_exit",
+                phase=str(schedule_phase)[:160],
+                worker_tag=str(worker_tag)[:80],
+                drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+            )
+
     def _destination_schedule_skeleton_first_level_graph_child_loads(
         self, drive_id: str, worker_id: Any, *, worker_tag: str = "post_root"
     ) -> None:
@@ -9701,15 +9728,46 @@ class MainWindow(QMainWindow):
             )
             return
         active_entry = self.root_load_workers.get("destination")
-        if not active_entry or active_entry.get("id") != worker_id:
+        _dcf = str(drive_id or "").strip().casefold()
+        pend = str((self.pending_root_drive_ids or {}).get("destination") or "").strip()
+        pend_matches = bool(_dcf and pend and pend.casefold() == _dcf)
+        if active_entry:
+            if active_entry.get("id") != worker_id:
+                log_info(
+                    "destination_graph_skeleton_schedule_blocked",
+                    reason="stale_root_worker_id_active_registry_mismatch",
+                    worker_tag=str(worker_tag)[:80],
+                    drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+                )
+                log_info(
+                    "destination_graph_skeleton_child_load_skipped",
+                    reason="stale_root_worker_id",
+                    worker_tag=str(worker_tag)[:80],
+                    drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+                )
+                return
+        else:
+            # Root worker often cleans up before deferred timers fire; pending drive match is authoritative.
+            if not pend_matches:
+                log_info(
+                    "destination_graph_skeleton_schedule_blocked",
+                    reason="no_active_root_worker_pending_mismatch",
+                    worker_tag=str(worker_tag)[:80],
+                    drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+                )
+                log_info(
+                    "destination_graph_skeleton_child_load_skipped",
+                    reason="stale_root_worker_id",
+                    worker_tag=str(worker_tag)[:80],
+                    drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+                )
+                return
             log_info(
-                "destination_graph_skeleton_child_load_skipped",
-                reason="stale_root_worker_id",
-                worker_tag=str(worker_tag)[:80],
+                "destination_root_worker_success_accepted_for_selected_drive",
+                context="skeleton_child_load",
+                note="root_worker_registry_cleared_after_thread_finished_pending_drive_matches",
                 drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
             )
-            return
-        pend = str((self.pending_root_drive_ids or {}).get("destination") or "").strip()
         if pend and str(drive_id or "").strip() and pend.casefold() != str(drive_id or "").strip().casefold():
             log_info(
                 "destination_graph_skeleton_child_load_skipped",
@@ -27907,12 +27965,27 @@ class MainWindow(QMainWindow):
         if self._restore_abort_active():
             return
         active_entry = self.root_load_workers.get(panel_key)
-        if not active_entry or active_entry.get("id") != worker_id:
+        if active_entry and active_entry.get("id") != worker_id:
             self._log_worker_lifecycle("stale_success_skipped", "root", worker_id, panel_key, drive_id=drive_id)
+            log_info(
+                "destination_root_worker_success_skipped_stale_generation",
+                drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+            )
             return
         if self.pending_root_drive_ids.get(panel_key) != drive_id:
             self._log_restore_phase("root_worker_success stale_payload_skipped", panel_key=panel_key, drive_id=drive_id)
+            log_info(
+                "destination_root_worker_success_skipped_wrong_drive",
+                drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+            )
             return
+        if not active_entry:
+            log_info(
+                "destination_root_worker_success_accepted_for_selected_drive",
+                context="deferred_destination_post_root_tail",
+                note="worker_finished_cleanup_before_idle_deferred_handler",
+                drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+            )
 
         self._destination_merge_planning_bootstrap_folder_paths_if_needed(phase="on_root_load_success")
         self._refresh_tree_column_width(panel_key)
@@ -28049,17 +28122,8 @@ class MainWindow(QMainWindow):
                 drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
                 note="after_refresh_tree_ui_after_root_bind",
             )
-            _wid = worker_id
-            _did = str(drive_id or "")
-            QTimer.singleShot(
-                0,
-                lambda: self._safe_invoke(
-                    "destination_skeleton_first_level_after_root",
-                    lambda w=_wid, d=_did: self._destination_schedule_skeleton_first_level_graph_child_loads(
-                        d, w, worker_tag="post_root_deferred"
-                    ),
-                ),
-            )
+            # Skeleton scheduling runs synchronously in on_root_load_success before this deferred tail;
+            # do not QTimer — on_root_worker_finished cleanup invalidates worker_id before the timer fires.
 
         pending_refresh_panels = self._pending_cache_refresh_panels if self._cache_refresh_restore_active else set()
         if self._cache_refresh_restore_active and panel_key in pending_refresh_panels:
@@ -28128,6 +28192,13 @@ class MainWindow(QMainWindow):
             active_entry = self.root_load_workers.get(panel_key)
             if not active_entry or active_entry.get("id") != worker_id:
                 self._log_worker_lifecycle("stale_success_skipped", "root", worker_id, panel_key, drive_id=drive_id)
+                if panel_key == "destination":
+                    log_info(
+                        "destination_root_worker_success_skipped_stale_generation",
+                        active_registry_id=active_entry.get("id") if active_entry else None,
+                        payload_worker_id=str(worker_id),
+                        drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+                    )
                 return
             if self.pending_root_drive_ids.get(panel_key) != drive_id:
                 self._log_restore_phase("root_worker_success stale_payload_skipped", panel_key=panel_key, drive_id=drive_id)
@@ -28223,6 +28294,14 @@ class MainWindow(QMainWindow):
                     panel_key=panel_key,
                     drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
                     item_count=len(items or []),
+                )
+                # Skeleton child load must run in this success handler while root_load_workers still matches
+                # worker_id. QTimer(0) deferred + on_root_worker_finished cleanup otherwise yields stale_success_skipped.
+                self._destination_graph_skeleton_schedule_after_live_root_bind(
+                    str(drive_id),
+                    worker_id,
+                    worker_tag="post_root_sync_startup_snapshot",
+                    schedule_phase="startup_snapshot_early_return",
                 )
                 QTimer.singleShot(
                     0,
@@ -28384,6 +28463,19 @@ class MainWindow(QMainWindow):
                     destination_top_level_rows=_n2,
                     drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
                     note="after_refresh_tree_ui_after_root_bind",
+                )
+                if not self._destination_library_context_unresolved_for_graph_display():
+                    log_info(
+                        "destination_root_display_allowed_library_resolved",
+                        note="live_graph_root_bind_skeleton_next",
+                        destination_top_level_rows=_n2,
+                        drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+                    )
+                self._destination_graph_skeleton_schedule_after_live_root_bind(
+                    str(drive_id),
+                    worker_id,
+                    worker_tag="post_root_sync",
+                    schedule_phase="on_root_load_success",
                 )
             pending_refresh_panels = self._pending_cache_refresh_panels if self._cache_refresh_restore_active else set()
             if self._cache_refresh_restore_active and panel_key in pending_refresh_panels:
