@@ -38,11 +38,20 @@ def test_provisional_snapshot_rows_are_not_live_graph_rows():
     assert not destination_payload_is_live_graph_row(pl)
 
 
+def _mock_destination_library_selector_resolved(drive_id: str = "d1"):
+    """Minimal combo so ``_destination_library_context_unresolved_for_graph_display`` is False in unit tests."""
+    lib_sel = MagicMock()
+    lib_sel.currentIndex = MagicMock(return_value=0)
+    lib_sel.currentData = MagicMock(return_value={"id": drive_id, "drive_id": drive_id})
+    return lib_sel
+
+
 def _provisional_startup_test_mw_with_snapshot():
     """Shared harness: SharePoint destination model-view + one-root cached snapshot + library id."""
     mw = MainWindow.__new__(MainWindow)
     mw._planning_browse_mode = lambda k: "sharepoint" if k == "destination" else "local"
     mw._destination_tree_model_view = True
+    mw.planning_inputs = {"Destination Library": _mock_destination_library_selector_resolved("d1")}
     dm = DestinationPlanningTreeModel(destination_index_key_fn=MainWindow._destination_payload_index_key.__get__(mw, MainWindow))
     mw.destination_planning_model = dm
     tw = QTreeView()

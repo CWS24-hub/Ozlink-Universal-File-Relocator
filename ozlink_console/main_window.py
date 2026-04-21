@@ -9935,6 +9935,39 @@ class MainWindow(QMainWindow):
                 worker_tag=str(worker_tag)[:80],
                 top_level_rows=int(rc),
             )
+            try:
+                _deleg = False
+                for _r in range(min(int(rc), 48)):
+                    try:
+                        _six = model.index(_r, 0, inv)
+                    except Exception:
+                        continue
+                    if not _six.isValid():
+                        continue
+                    _spl = self._destination_model_index_user_role_dict(_six)
+                    if not isinstance(_spl, dict):
+                        continue
+                    if self._destination_row_needs_live_graph_child_refresh(_spl):
+                        _deleg = True
+                        break
+                if _deleg:
+                    log_info(
+                        "destination_skeleton_skip_delegated_to_snapshot_branch_refresh",
+                        worker_tag=str(worker_tag)[:80],
+                        drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+                    )
+                    QTimer.singleShot(
+                        0,
+                        lambda d=str(drive_id or ""): self._safe_invoke(
+                            "destination_skeleton_delegated_snapshot_branch_refresh",
+                            lambda: self._destination_schedule_unverified_snapshot_branches_live_refresh(
+                                drive_id=d,
+                                reason=f"skeleton_skip_delegate:{worker_tag}",
+                            ),
+                        ),
+                    )
+            except Exception:
+                pass
             return
         targets: list[int] = []
         if len(eligible) == 1:
@@ -26880,7 +26913,7 @@ class MainWindow(QMainWindow):
                             tree_kind="destination_qtreeview_model",
                         )
                     return
-                if self._destination_startup_snapshot_mount_seen:
+                if getattr(self, "_destination_startup_snapshot_mount_seen", False):
                     self._destination_startup_lifecycle_temp_post_snapshot_mutation(
                         "set_tree_placeholder",
                         "set_empty_library_message",
@@ -31879,6 +31912,24 @@ class MainWindow(QMainWindow):
                                 root_rows=len(roots_pp),
                                 snapshot_nodes=int(self._count_tree_snapshot_nodes(pending_dest_snaps)),
                             )
+                            self._destination_stamp_destination_model_rows_for_snapshot_live_refresh(
+                                context="destination_pending_session_snapshot_bind_before_graph_root",
+                            )
+                            _pre_gr_bind_did = str(
+                                (getattr(self, "pending_root_drive_ids", {}) or {}).get("destination")
+                                or self._current_selected_destination_drive_id()
+                                or ""
+                            ).strip()
+                            QTimer.singleShot(
+                                0,
+                                lambda d=_pre_gr_bind_did: self._safe_invoke(
+                                    "destination_snapshot_branch_live_refresh_after_pre_graph_session_bind",
+                                    lambda: self._destination_schedule_unverified_snapshot_branches_live_refresh(
+                                        drive_id=str(d or ""),
+                                        reason="pending_session_pre_graph_bind",
+                                    ),
+                                ),
+                            )
                             self._destination_prune_pending_snapshot_branch_refresh_after_provisional_mount(
                                 list(pending_dest_snaps)
                             )
@@ -32167,6 +32218,18 @@ class MainWindow(QMainWindow):
                     except Exception:
                         pass
                     if preserve_success:
+                        self._destination_stamp_destination_model_rows_for_snapshot_live_refresh(
+                            context="startup_snapshot_preservation_finished",
+                        )
+                        log_info(
+                            "destination_snapshot_preservation_live_refresh_stamp_applied",
+                            root_bind_mode=str(_pres_mode)[:80],
+                            model_nodes_after=int(nodes_after_merge),
+                        )
+                        log_info(
+                            "destination_snapshot_preservation_live_refresh_schedule_requested",
+                            drive_id_suffix=did_shell_early[-16:] if len(did_shell_early) > 16 else did_shell_early,
+                        )
                         QTimer.singleShot(
                             0,
                             lambda d=did_shell_early: self._safe_invoke(
@@ -32963,31 +33026,194 @@ class MainWindow(QMainWindow):
             return True
         return False
 
+    def _destination_model_row_eligible_for_snapshot_live_refresh_stamp(self, pl: dict) -> bool:
+        """Graph-identity folders that may be stamped as unverified snapshot shells (not planned/proposed scaffolding)."""
+        if not isinstance(pl, dict) or pl.get("placeholder"):
+            return False
+        if not bool(pl.get("is_folder", True)):
+            return False
+        if destination_payload_is_planned_workspace_row(pl):
+            return False
+        if str(pl.get("workspace_row_state") or "").strip() == WORKSPACE_ROW_STATE_PLANNED_ONLY:
+            return False
+        vs = str(pl.get("verification_state") or "").strip().lower()
+        if vs == "planned_only":
+            return False
+        rk = str(pl.get("row_kind") or "").strip().lower()
+        if rk.startswith("proposed_") or "proposed" in rk:
+            return False
+        if pl.get("non_graph_structural_authority"):
+            return False
+        if not str(pl.get("id") or "").strip():
+            return False
+        rd = self._resolve_tree_item_drive_id("destination", pl)
+        if not str(rd or "").strip():
+            return False
+        return True
+
+    def _destination_stamp_destination_model_rows_for_snapshot_live_refresh(self, *, context: str) -> dict[str, int]:
+        """Walk the destination model and mark Graph-identity folder rows as snapshot shell pending live verification."""
+        stats = {
+            "rows_scanned": 0,
+            "folders_marked": 0,
+            "skipped_planned": 0,
+            "skipped_missing_graph_identity": 0,
+        }
+        dm = getattr(self, "destination_planning_model", None)
+        if dm is None or not hasattr(dm, "iter_depth_first"):
+            log_info(
+                "destination_snapshot_live_refresh_stamp_skipped",
+                context=str(context)[:120],
+                reason="no_model",
+            )
+            return stats
+        try:
+            indices = list(dm.iter_depth_first())
+        except Exception:
+            indices = []
+        for ix in indices:
+            if not ix.isValid():
+                continue
+            col0 = ix.siblingAtColumn(0) if ix.column() != 0 else ix
+            pl0 = dict(col0.data(Qt.UserRole) or {})
+            stats["rows_scanned"] += 1
+            if not self._destination_model_row_eligible_for_snapshot_live_refresh_stamp(pl0):
+                if isinstance(pl0, dict) and destination_payload_is_planned_workspace_row(pl0):
+                    stats["skipped_planned"] += 1
+                else:
+                    stats["skipped_missing_graph_identity"] += 1
+                continue
+
+            def _mut(payload: dict[str, Any]) -> None:
+                payload["destination_snapshot_cached"] = True
+                payload["graph_children_verified"] = False
+                payload["needs_live_child_refresh"] = True
+
+            try:
+                dm.update_payload_for_index(col0, _mut)
+                stats["folders_marked"] += 1
+            except Exception:
+                stats["skipped_missing_graph_identity"] += 1
+        log_info(
+            "destination_snapshot_children_marked_needs_live_refresh",
+            context=str(context)[:120],
+            rows_scanned=int(stats["rows_scanned"]),
+            folders_marked=int(stats["folders_marked"]),
+            skipped_planned=int(stats["skipped_planned"]),
+            skipped_missing_graph_identity=int(stats["skipped_missing_graph_identity"]),
+        )
+        log_info(
+            "destination_snapshot_live_refresh_stamp_applied",
+            context=str(context)[:120],
+            folders_marked=int(stats["folders_marked"]),
+        )
+        return stats
+
     def _destination_schedule_unverified_snapshot_branches_live_refresh(
         self, *, drive_id: str, reason: str = "post_snapshot_or_bind"
     ) -> None:
-        """Request Graph /children for expanded folders whose children are snapshot-cached, not full-tree."""
+        """Request Graph /children for folders whose children are snapshot-cached (not full-tree)."""
+        _dsuf = str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id)
+
+        def _blocked(msg: str) -> None:
+            log_info(
+                "destination_snapshot_branch_live_refresh_skipped",
+                reason=str(msg)[:120],
+                schedule_reason=str(reason)[:120],
+                drive_id_suffix=_dsuf,
+                phase="pre_walk_guard",
+            )
+
         if self._planning_browse_mode("destination") == "local":
-            return
+            return _blocked("local_browse_mode")
         if self._destination_library_context_unresolved_for_graph_display():
-            return
+            return _blocked("destination_library_unresolved")
         if not destination_authority_contract.graph_owns_visible_real_destination_structure(self):
-            return
+            return _blocked("graph_structure_authority_inactive")
         dcf = str(drive_id or "").strip().casefold()
         if not dcf:
-            return
+            return _blocked("empty_drive_id")
         dm = getattr(self, "destination_planning_model", None)
         tw = getattr(self, "destination_tree_widget", None)
-        if dm is None or tw is None:
-            return
+        if dm is None:
+            return _blocked("no_destination_model")
+        if tw is None:
+            return _blocked("no_destination_tree_widget")
+        log_info(
+            "destination_snapshot_live_refresh_schedule_requested",
+            reason=str(reason)[:120],
+            drive_id_suffix=_dsuf,
+        )
         log_info(
             "destination_snapshot_branch_live_refresh_started",
             reason=str(reason)[:120],
-            drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+            drive_id_suffix=_dsuf,
         )
         _cap = 128
         _scheduled = 0
         inv = QModelIndex()
+        _seen = 0
+        # Phase A: top-level folders — schedule live refresh even when collapsed (library root must verify).
+        try:
+            rc_top = int(dm.rowCount(inv))
+        except Exception:
+            rc_top = 0
+        for r in range(min(rc_top, 48)):
+            if _scheduled >= _cap:
+                break
+            try:
+                tix = dm.index(r, 0, inv)
+            except Exception:
+                continue
+            if not tix.isValid():
+                continue
+            col0 = tix
+            pl = dict(col0.data(Qt.UserRole) or {})
+            _seen += 1
+            if not pl.get("is_folder", True) or not self._destination_row_needs_live_graph_child_refresh(pl):
+                continue
+            rd = self._resolve_tree_item_drive_id("destination", pl)
+            if not rd or str(rd).strip().casefold() != dcf or not str(pl.get("id") or "").strip():
+                continue
+            try:
+                nchild = int(dm.rowCount(col0))
+            except Exception:
+                nchild = 0
+            log_info(
+                "destination_snapshot_branch_live_refresh_scheduled",
+                mode="top_level_unverified",
+                expanded=False,
+                semantic_path_excerpt=str(
+                    self._destination_semantic_path(pl) or pl.get("item_path") or ""
+                )[:400],
+                drive_id_suffix=str(rd)[-16:] if len(str(rd)) > 16 else str(rd),
+                item_id_suffix=str(pl.get("id") or "")[-16:],
+                subtree_child_rows=int(nchild),
+                reason=str(reason)[:120],
+            )
+            ok = self._request_graph_destination_children_load(
+                col0,
+                reason="snapshot_branch_live_refresh",
+                trigger=f"snapshot_live_refresh:{reason}",
+            )
+            if ok:
+                _scheduled += 1
+                log_info(
+                    "destination_snapshot_branch_live_refresh_completed",
+                    queued_or_started=True,
+                    semantic_path_excerpt=str(
+                        self._destination_semantic_path(pl) or pl.get("item_path") or ""
+                    )[:400],
+                )
+            else:
+                log_info(
+                    "destination_snapshot_branch_live_refresh_skipped",
+                    semantic_path_excerpt=str(
+                        self._destination_semantic_path(pl) or pl.get("item_path") or ""
+                    )[:400],
+                    reason="queue_or_worker_or_row_state",
+                    phase="top_level",
+                )
         stack: list[QModelIndex] = []
         try:
             rc0 = int(dm.rowCount(inv))
@@ -33000,7 +33226,6 @@ class MainWindow(QMainWindow):
                 continue
             if _ix.isValid():
                 stack.append(_ix)
-        _seen = 0
         while stack and _scheduled < _cap and _seen < 4000:
             cur = stack.pop()
             _seen += 1
@@ -33016,11 +33241,19 @@ class MainWindow(QMainWindow):
                 nchild = int(dm.rowCount(col0))
             except Exception:
                 nchild = 0
-            if expanded and pl.get("is_folder", True) and self._destination_row_needs_live_graph_child_refresh(pl):
+            depth_gt0 = bool(col0.parent().isValid())
+            if (
+                expanded
+                and depth_gt0
+                and pl.get("is_folder", True)
+                and self._destination_row_needs_live_graph_child_refresh(pl)
+            ):
                 rd = self._resolve_tree_item_drive_id("destination", pl)
                 if rd and str(rd).strip().casefold() == dcf and str(pl.get("id") or "").strip():
                     log_info(
                         "destination_snapshot_branch_live_refresh_scheduled",
+                        mode="nested_expanded",
+                        expanded=True,
                         semantic_path_excerpt=str(
                             self._destination_semantic_path(pl) or pl.get("item_path") or ""
                         )[:400],
@@ -33050,6 +33283,7 @@ class MainWindow(QMainWindow):
                                 self._destination_semantic_path(pl) or pl.get("item_path") or ""
                             )[:400],
                             reason="queue_or_worker_or_row_state",
+                            phase="nested",
                         )
             try:
                 if expanded:
@@ -33069,6 +33303,14 @@ class MainWindow(QMainWindow):
             scheduled_folder_count=int(_scheduled),
             walk_nodes_seen=int(_seen),
         )
+        if _scheduled == 0:
+            log_info(
+                "destination_snapshot_branch_live_refresh_skipped",
+                reason="no_unverified_matching_folders",
+                schedule_reason=str(reason)[:120],
+                drive_id_suffix=_dsuf,
+                phase="walk_empty",
+            )
 
     def _destination_row_may_lazy_enumerate_graph_children(self, pl: dict) -> bool:
         """Graph-backed or snapshot-shell folders that may still need a per-folder Graph child fetch."""
@@ -51798,8 +52040,8 @@ class MainWindow(QMainWindow):
             return True
         return bool(getattr(self, "_destination_future_bind_sync_active", False))
 
-    def _destination_pipeline_blocks_user_expand_gesture(self) -> bool:
-        """True while destination bind or incremental merge session could starve the GUI thread."""
+    def _destination_deferred_expand_queue_hard_blocks(self) -> bool:
+        """Blocks that must clear before user deferred expand drain (narrower than full-tree gating)."""
         if self._destination_future_tree_bind_busy():
             return True
         if getattr(self, "_destination_incremental_merge_in_progress", False):
@@ -51809,8 +52051,6 @@ class MainWindow(QMainWindow):
         if getattr(self, "_destination_future_projection_async_state", None) is not None:
             return True
         if self._destination_sharepoint_planning_destination_active():
-            if not self._destination_full_tree_ready():
-                return True
             if self.pending_folder_loads.get("destination"):
                 return True
             if getattr(self, "_destination_descendant_apply_paused_for_finalize_alloc", False):
@@ -51825,6 +52065,15 @@ class MainWindow(QMainWindow):
                 return True
             _lv = getattr(self, "_destination_snapshot_light_validation_worker", None)
             if _lv is not None and _lv.isRunning():
+                return True
+        return False
+
+    def _destination_pipeline_blocks_user_expand_gesture(self) -> bool:
+        """True while destination bind or incremental merge session could starve the GUI thread."""
+        if self._destination_deferred_expand_queue_hard_blocks():
+            return True
+        if self._destination_sharepoint_planning_destination_active():
+            if not self._destination_full_tree_ready():
                 return True
         return False
 
@@ -51879,7 +52128,22 @@ class MainWindow(QMainWindow):
                 "destination_expand_deferred_queue_process_started",
                 queue_len=len(q),
             )
-        if self._destination_pipeline_blocks_user_expand_gesture():
+        if self._destination_deferred_expand_queue_hard_blocks():
+            log_info(
+                "destination_expand_deferred_queue_blocked",
+                reason="destination_pipeline_hard_block",
+                full_tree_ready=bool(self._destination_full_tree_ready()),
+                queue_len=len(q),
+            )
+            self._schedule_destination_expand_user_deferred_drain()
+            return
+        if self._planning_browse_mode("destination") != "local" and self._destination_library_context_unresolved_for_graph_display():
+            log_info(
+                "destination_expand_deferred_queue_blocked",
+                reason="destination_library_unresolved",
+                full_tree_ready=bool(self._destination_full_tree_ready()),
+                queue_len=len(q),
+            )
             self._schedule_destination_expand_user_deferred_drain()
             return
         if not q:
@@ -51899,19 +52163,22 @@ class MainWindow(QMainWindow):
                         "destination_expand_user_deferred_drop_stale",
                         semantic_path=path[:240],
                     )
-                elif tree.isExpanded(ix):
+                else:
+                    try:
+                        if not tree.isExpanded(ix):
+                            tree.expand(ix)
+                            log_info(
+                                "destination_expand_deferred_expand_applied",
+                                semantic_path=path[:400],
+                            )
+                    except Exception:
+                        pass
                     log_info(
                         "destination_expand_deferred_graph_load_requested",
                         semantic_path=path[:400],
-                        note="invoke_expand_handler",
+                        note="invoke_expand_handler_after_expand",
                     )
                     self._on_destination_planning_model_expanded(ix)
-                else:
-                    log_info(
-                        "destination_expand_deferred_graph_load_skipped",
-                        semantic_path=path[:400],
-                        reason="row_not_expanded_in_tree",
-                    )
             else:
                 log_info(
                     "destination_expand_deferred_graph_load_skipped",
