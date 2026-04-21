@@ -9474,10 +9474,224 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(delay_ms, lambda: self._safe_invoke(f"saved_library_hydration_retry.{selector_group}", _run))
 
+    def _planning_sharepoint_site_selector_resolved_for_libraries(self, site_selector) -> bool:
+        """Site combo must expose a dict with a Graph site id before list_site_drives / library restore."""
+        if site_selector is None:
+            return False
+        try:
+            raw = site_selector.currentData()
+        except Exception:
+            raw = None
+        if not isinstance(raw, dict):
+            return False
+        sid = str(raw.get("id") or raw.get("site_id") or "").strip()
+        return bool(sid)
+
+    def _schedule_selector_restore_library_retry_after_site_resolved(self, selector_group: str) -> None:
+        """Retry library hydrate/load after site context becomes resolvable (async site lists, lazy dict)."""
+        att = getattr(self, "_selector_restore_site_retry_attempt", None)
+        if not isinstance(att, dict):
+            att = {}
+            self._selector_restore_site_retry_attempt = att
+        n = int(att.get(selector_group, 0) or 0)
+        if n >= 10:
+            log_warn(
+                "selector_restore_library_retry_after_site_exhausted",
+                selector_group=selector_group,
+                attempts=int(n),
+            )
+            return
+        att[selector_group] = n + 1
+        delay_ms = min(3200, 150 + 220 * n)
+
+        def _run() -> None:
+            self._run_selector_restore_library_retry_after_site_resolved(selector_group)
+
+        QTimer.singleShot(
+            delay_ms,
+            lambda g=selector_group: self._safe_invoke(f"selector_restore_library_retry_after_site.{g}", _run),
+        )
+
+    def _run_selector_restore_library_retry_after_site_resolved(self, selector_group: str) -> None:
+        if self._planning_browse_mode(selector_group) != "sharepoint":
+            return
+        site_sel = (
+            self.planning_inputs.get("Source Site")
+            if selector_group == "source"
+            else self.planning_inputs.get("Destination Site")
+        )
+        lib_sel = (
+            self.planning_inputs.get("Source Library")
+            if selector_group == "source"
+            else self.planning_inputs.get("Destination Library")
+        )
+        if not self._planning_sharepoint_site_selector_resolved_for_libraries(site_sel):
+            self._schedule_selector_restore_library_retry_after_site_resolved(selector_group)
+            return
+        log_info("selector_restore_library_retry_after_site_resolved", selector_group=selector_group)
+        try:
+            self._populate_library_selector_for_group(selector_group)
+        except Exception as exc:
+            log_warn(
+                "selector_restore_library_retry_populate_failed",
+                selector_group=selector_group,
+                error=str(exc)[:400],
+            )
+            self._schedule_selector_restore_library_retry_after_site_resolved(selector_group)
+            return
+        intended = (
+            self._persisted_source_library_drive_id_from_session()
+            if selector_group == "source"
+            else self._persisted_destination_library_drive_id_from_session()
+        )
+        if intended and self._planning_library_selector_has_drive_id(lib_sel, intended):
+            self.on_library_selector_changed(selector_group, force=True)
+            return
+        if str(intended or "").strip():
+            self._schedule_saved_library_selector_hydration_retry(selector_group)
+
+    def _destination_library_context_unresolved_for_graph_display(self) -> bool:
+        """True when we must not treat the destination explorer model as authoritative Graph structure."""
+        if self._planning_browse_mode("destination") == "local":
+            return False
+        sel = self.planning_inputs.get("Destination Library") if hasattr(self, "planning_inputs") else None
+        if sel is None:
+            return True
+        try:
+            ix = int(sel.currentIndex())
+        except Exception:
+            ix = -1
+        try:
+            data = sel.currentData()
+        except Exception:
+            data = None
+        if ix < 0 or not isinstance(data, dict):
+            return True
+        lid = str(data.get("id") or data.get("drive_id") or "").strip()
+        if not lid:
+            return True
+        persisted = self._persisted_destination_library_drive_id_from_session()
+        if persisted and str(lid).strip().casefold() != persisted.casefold():
+            return True
+        return False
+
+    def _destination_suppress_stale_visible_tree_if_needed(self) -> None:
+        """Clear destination model rows when library selector is not bound to the saved/resolved drive."""
+        if self._planning_browse_mode("destination") == "local":
+            return
+        if not self._destination_library_context_unresolved_for_graph_display():
+            return
+        dm = getattr(self, "destination_planning_model", None)
+        rows = 0
+        try:
+            rows = int(dm.rowCount(QModelIndex())) if dm is not None else 0
+        except Exception:
+            rows = -1
+        log_info(
+            "destination_snapshot_display_blocked_library_unresolved",
+            model_top_level_rows=int(rows),
+        )
+        if rows <= 0:
+            self.set_tree_placeholder("destination", "Select a destination library to load root content.")
+            log_info(
+                "destination_stale_visible_tree_hidden_until_library_resolved",
+                cleared_model=False,
+                reason="already_empty",
+            )
+            return
+        log_info(
+            "destination_stale_visible_tree_hidden_until_library_resolved",
+            cleared_model=True,
+            model_top_level_rows=int(rows),
+        )
+        try:
+            if dm is not None:
+                dm.clear()
+        except Exception:
+            pass
+        try:
+            self.pending_root_drive_ids["destination"] = ""
+            self._destination_sharepoint_root_graph_bound_drive_id = ""
+            self.active_root_request_signatures["destination"] = None
+            self.loaded_root_request_signatures["destination"] = None
+        except Exception:
+            pass
+        self.set_tree_placeholder("destination", "Select a destination library to load root content.")
+
+    def _destination_skeleton_pending_top_level_for_watchdog(self, did: str) -> bool:
+        if self._destination_library_context_unresolved_for_graph_display():
+            return False
+        dcf = str(did or "").strip().casefold()
+        if not dcf:
+            return False
+        pend = str((self.pending_root_drive_ids or {}).get("destination") or "").strip()
+        if pend and pend.casefold() != dcf:
+            return False
+        dm = getattr(self, "destination_planning_model", None)
+        if dm is None:
+            return False
+        inv = QModelIndex()
+        try:
+            rc = int(dm.rowCount(inv))
+        except Exception:
+            return False
+        for r in range(min(rc, 48)):
+            try:
+                ix = dm.index(r, 0, inv)
+            except Exception:
+                continue
+            if not ix.isValid():
+                continue
+            pl = self._destination_model_index_user_role_dict(ix)
+            if not isinstance(pl, dict):
+                continue
+            if not self._destination_row_is_live_graph_structure(pl) or not pl.get("is_folder", True):
+                continue
+            if pl.get("children_loaded") or pl.get("load_failed"):
+                continue
+            return True
+        return False
+
+    def _destination_try_watchdog_skeleton_child_retry_instead_of_full_tree(self, did: str) -> bool:
+        if self._destination_library_context_unresolved_for_graph_display():
+            return False
+        if not self._destination_skeleton_pending_top_level_for_watchdog(did):
+            return False
+        if not destination_graph_delta_cursor_present(getattr(self, "graph", None), did):
+            return False
+        root_w = (self.root_load_workers or {}).get("destination")
+        if not isinstance(root_w, dict):
+            return False
+        wid = root_w.get("id")
+        if wid is None:
+            return False
+        try:
+            self._destination_schedule_skeleton_first_level_graph_child_loads(
+                str(did), wid, worker_tag="watchdog_stall_recovery"
+            )
+        except Exception:
+            return False
+        log_info(
+            "destination_authority_stall_recovered_by_skeleton_child_retry",
+            drive_id_suffix=str(did)[-16:] if len(str(did)) > 16 else str(did),
+        )
+        log_info(
+            "destination_full_tree_recovery_suppressed_skeleton_child_pending",
+            drive_id_suffix=str(did)[-16:] if len(str(did)) > 16 else str(did),
+        )
+        return True
+
     def _destination_schedule_skeleton_first_level_graph_child_loads(
         self, drive_id: str, worker_id: Any, *, worker_tag: str = "post_root"
     ) -> None:
         """Load first-level Graph children for a single top-level folder (e.g. library root) without full-tree."""
+        if self._destination_library_context_unresolved_for_graph_display():
+            log_info(
+                "destination_skeleton_child_load_blocked_library_unresolved",
+                worker_tag=str(worker_tag)[:80],
+                drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+            )
+            return
         if self._planning_browse_mode("destination") == "local":
             log_info(
                 "destination_graph_skeleton_child_load_skipped",
@@ -16536,6 +16750,8 @@ class MainWindow(QMainWindow):
         if ready and trust_ok:
             self._flush_destination_authority_shell_if_ready("destination_authority_shell_watchdog_flush")
         elif stall_kind == "worker_not_running" and did:
+            if self._destination_try_watchdog_skeleton_child_retry_instead_of_full_tree(did):
+                return
             log_info(
                 "destination_full_tree_worker_rekick_after_stall",
                 drive_id_suffix=did[-16:] if len(did) > 16 else did,
@@ -18967,6 +19183,15 @@ class MainWindow(QMainWindow):
             self._log_restore_phase(
                 "destination_full_tree_worker_not_scheduled",
                 reason="missing_drive_id",
+            )
+            return
+        if self._destination_library_context_unresolved_for_graph_display() and not (
+            bool(explicit_refresh) or bool(force_refresh)
+        ):
+            log_info(
+                "destination_full_tree_blocked_library_unresolved",
+                schedule_reason=str(schedule_reason)[:160],
+                drive_id_suffix=did[-16:] if len(did) > 16 else did,
             )
             return
         _shell_waiting_authority = bool(
@@ -22630,6 +22855,28 @@ class MainWindow(QMainWindow):
             or getattr(self, "_memory_ui_rebind_in_progress", False)
         )
 
+    def _planning_library_display_text_is_placeholder(self, text: str) -> bool:
+        """True when combo shows loading/waiting instructional text — not a real library name for draft shell."""
+        raw = str(text or "").strip()
+        if not raw:
+            return True
+        cf = raw.casefold()
+        blobs = (
+            "loading sharepoint",
+            "select a site first",
+            "not selected",
+            "no usable libraries",
+            "waiting for the saved source library",
+            "waiting for the saved destination library",
+            "choose the source library that matches",
+            "choose the destination library that matches",
+        )
+        if any(b in cf for b in blobs):
+            return True
+        if raw in ("—", "-"):
+            return True
+        return False
+
     def _extract_sharepoint_planning_library_fields_for_save(self, group: str, library_selector) -> tuple[str, str]:
         """Return (display_name, graph_drive_id) for Draft-SessionState library fields."""
         name, did = "", ""
@@ -22691,6 +22938,14 @@ class MainWindow(QMainWindow):
                     did = pid
                     name = str(payload.get("name") or text or "").strip()
                     break
+        try:
+            ct_chk = (library_selector.currentText() or "").strip()
+        except Exception:
+            ct_chk = ""
+        if self._planning_library_display_text_is_placeholder(ct_chk) and not did:
+            return "", ""
+        if self._planning_library_display_text_is_placeholder(name) and not did:
+            return "", ""
         return name, did
 
     def _merge_persisted_library_fields_for_draft_shell(
@@ -22717,7 +22972,22 @@ class MainWindow(QMainWindow):
         id_n = str(id_new or "").strip()
         nm_n = str(name_new or "").strip()
         if id_n:
+            if self._planning_library_display_text_is_placeholder(nm_n) and ex_name and ex_id:
+                log_info(
+                    "draft_shell_selector_placeholder_name_preserved",
+                    group=group,
+                    existing_library_name_excerpt=ex_name[:160],
+                )
+                return ex_name, id_n
             return nm_n, id_n
+        if self._planning_library_display_text_is_placeholder(nm_n):
+            nm_n = ""
+            log_info(
+                "draft_shell_selector_placeholder_name_blocked",
+                group=group,
+                had_blank_id=True,
+                existing_library_id_suffix=ex_id[-24:] if len(ex_id) > 24 else ex_id if ex_id else "",
+            )
         if self._planning_library_combo_has_explicit_empty_catalog(library_selector):
             if ex_id:
                 log_info(
@@ -23146,11 +23416,14 @@ class MainWindow(QMainWindow):
 
     def _restore_selector_matches(self):
         self._log_restore_phase("phase2_restore_selector_matches_start")
+        self._selector_restore_site_retry_attempt = {"source": 0, "destination": 0}
         state = self._draft_shell_state if isinstance(self._draft_shell_state, SessionState) else SessionState()
         source_site_selector = self.planning_inputs.get("Source Site")
         destination_site_selector = self.planning_inputs.get("Destination Site")
         source_library_selector = self.planning_inputs.get("Source Library")
         destination_library_selector = self.planning_inputs.get("Destination Library")
+        if self._planning_browse_mode("destination") == "sharepoint":
+            self._destination_suppress_stale_visible_tree_if_needed()
 
         source_site_index = self._find_selector_index(
             source_site_selector,
@@ -23191,97 +23464,274 @@ class MainWindow(QMainWindow):
                 destination_site_clear_reason="restore_rebind",
             )
 
-        src_rows = self._planning_library_selector_item_rows(source_library_selector)
-        src_idx, src_tag = library_combo_index_for_session_restore(
-            stored_drive_id=str(getattr(state, "SelectedSourceLibraryId", "") or ""),
-            stored_display_name=str(getattr(state, "SelectedSourceLibrary", "") or ""),
-            item_rows=src_rows,
-        )
-        source_library_matched = False
-        if src_idx >= 0:
-            if self._set_selector_index_safely(source_library_selector, src_idx):
-                source_library_matched = True
+        src_sp = self._planning_browse_mode("source") == "sharepoint"
+        dst_sp = self._planning_browse_mode("destination") == "sharepoint"
+        if src_sp and source_site_matched and self._planning_sharepoint_site_selector_resolved_for_libraries(source_site_selector):
+            _raw_s = source_site_selector.currentData() if source_site_selector is not None else None
+            _sid_s = str(_raw_s.get("id", ""))[:48] if isinstance(_raw_s, dict) else ""
+            if _sid_s:
                 log_info(
-                    "source_library_restore_match_success",
-                    outcome_tag=src_tag,
-                    index=src_idx,
-                    stored_drive_id=str(getattr(state, "SelectedSourceLibraryId", "") or ""),
-                    stored_name=str(getattr(state, "SelectedSourceLibrary", "") or ""),
-                    selector_item_count=len(src_rows),
+                    "selector_restore_site_context_resolved",
+                    selector_group="source",
+                    site_id_excerpt=_sid_s,
                 )
-                if src_tag == "legacy_name_only":
+        if dst_sp and destination_site_matched and self._planning_sharepoint_site_selector_resolved_for_libraries(destination_site_selector):
+            _raw_d = destination_site_selector.currentData() if destination_site_selector is not None else None
+            _sid_d = str(_raw_d.get("id", ""))[:48] if isinstance(_raw_d, dict) else ""
+            if _sid_d:
+                log_info(
+                    "selector_restore_site_context_resolved",
+                    selector_group="destination",
+                    site_id_excerpt=_sid_d,
+                )
+
+        source_library_matched = False
+        src_idx = -1
+        src_tag = "no_session_hint"
+        persisted_src_lib_id = str(getattr(state, "SelectedSourceLibraryId", "") or "").strip()
+
+        if src_sp:
+            if not source_site_matched:
+                if persisted_src_lib_id:
                     log_info(
-                        "source_library_restore_legacy_name_only",
+                        "source_library_restore_deferred_site_context_missing",
+                        reason="source_site_selector_not_matched_yet",
+                        intended_drive_suffix=persisted_src_lib_id[-16:]
+                        if len(persisted_src_lib_id) > 16
+                        else persisted_src_lib_id,
+                    )
+                    self._schedule_selector_restore_library_retry_after_site_resolved("source")
+                src_idx, src_tag = -1, "deferred_source_site_not_matched"
+            elif not self._planning_sharepoint_site_selector_resolved_for_libraries(source_site_selector):
+                if persisted_src_lib_id:
+                    log_info(
+                        "source_library_restore_deferred_site_context_missing",
+                        reason="source_site_dict_or_site_id_missing",
+                        intended_drive_suffix=persisted_src_lib_id[-16:]
+                        if len(persisted_src_lib_id) > 16
+                        else persisted_src_lib_id,
+                    )
+                    self._schedule_selector_restore_library_retry_after_site_resolved("source")
+                src_idx, src_tag = -1, "deferred_site_context"
+            else:
+                self._populate_library_selector_for_group("source")
+                src_rows = self._planning_library_selector_item_rows(source_library_selector)
+                src_idx, src_tag = library_combo_index_for_session_restore(
+                    stored_drive_id=str(getattr(state, "SelectedSourceLibraryId", "") or ""),
+                    stored_display_name=str(getattr(state, "SelectedSourceLibrary", "") or ""),
+                    item_rows=src_rows,
+                )
+                if src_idx >= 0:
+                    if self._set_selector_index_safely(source_library_selector, src_idx):
+                        source_library_matched = True
+                        log_info(
+                            "source_library_restore_match_success",
+                            outcome_tag=src_tag,
+                            index=src_idx,
+                            stored_drive_id=str(getattr(state, "SelectedSourceLibraryId", "") or ""),
+                            stored_name=str(getattr(state, "SelectedSourceLibrary", "") or ""),
+                            selector_item_count=len(src_rows),
+                        )
+                        if src_tag == "legacy_name_only":
+                            log_info(
+                                "source_library_restore_legacy_name_only",
+                                stored_name=str(getattr(state, "SelectedSourceLibrary", "") or ""),
+                                selector_item_count=len(src_rows),
+                            )
+                            log_info(
+                                "source_library_restore_used_fallback_name_match",
+                                stored_name=str(getattr(state, "SelectedSourceLibrary", "") or ""),
+                            )
+                elif src_tag == "no_session_hint":
+                    pass
+                else:
+                    self._set_planning_library_selector_unresolved(
+                        "source", selector=source_library_selector, outcome_tag=src_tag
+                    )
+                    log_info(
+                        "source_library_restore_match_failed",
+                        stored_name=str(getattr(state, "SelectedSourceLibrary", "") or ""),
+                        stored_drive_id=str(getattr(state, "SelectedSourceLibraryId", "") or ""),
+                        outcome_tag=src_tag,
+                        selector_item_count=len(src_rows),
+                        source_site_context=str(getattr(state, "SelectedSourceSite", "") or ""),
+                    )
+
+        if not src_sp:
+            src_rows = self._planning_library_selector_item_rows(source_library_selector)
+            src_idx, src_tag = library_combo_index_for_session_restore(
+                stored_drive_id=str(getattr(state, "SelectedSourceLibraryId", "") or ""),
+                stored_display_name=str(getattr(state, "SelectedSourceLibrary", "") or ""),
+                item_rows=src_rows,
+            )
+            source_library_matched = False
+            if src_idx >= 0:
+                if self._set_selector_index_safely(source_library_selector, src_idx):
+                    source_library_matched = True
+                    log_info(
+                        "source_library_restore_match_success",
+                        outcome_tag=src_tag,
+                        index=src_idx,
+                        stored_drive_id=str(getattr(state, "SelectedSourceLibraryId", "") or ""),
                         stored_name=str(getattr(state, "SelectedSourceLibrary", "") or ""),
                         selector_item_count=len(src_rows),
                     )
-                    log_info(
-                        "source_library_restore_used_fallback_name_match",
-                        stored_name=str(getattr(state, "SelectedSourceLibrary", "") or ""),
-                    )
-        elif src_tag == "no_session_hint":
-            source_library_matched = False
-        else:
-            self._set_planning_library_selector_unresolved("source", selector=source_library_selector, outcome_tag=src_tag)
-            log_info(
-                "source_library_restore_match_failed",
-                stored_name=str(getattr(state, "SelectedSourceLibrary", "") or ""),
-                stored_drive_id=str(getattr(state, "SelectedSourceLibraryId", "") or ""),
-                outcome_tag=src_tag,
-                selector_item_count=len(src_rows),
-                source_site_context=str(getattr(state, "SelectedSourceSite", "") or ""),
-            )
+                    if src_tag == "legacy_name_only":
+                        log_info(
+                            "source_library_restore_legacy_name_only",
+                            stored_name=str(getattr(state, "SelectedSourceLibrary", "") or ""),
+                            selector_item_count=len(src_rows),
+                        )
+                        log_info(
+                            "source_library_restore_used_fallback_name_match",
+                            stored_name=str(getattr(state, "SelectedSourceLibrary", "") or ""),
+                        )
+            elif src_tag == "no_session_hint":
+                source_library_matched = False
+            else:
+                self._set_planning_library_selector_unresolved("source", selector=source_library_selector, outcome_tag=src_tag)
+                log_info(
+                    "source_library_restore_match_failed",
+                    stored_name=str(getattr(state, "SelectedSourceLibrary", "") or ""),
+                    stored_drive_id=str(getattr(state, "SelectedSourceLibraryId", "") or ""),
+                    outcome_tag=src_tag,
+                    selector_item_count=len(src_rows),
+                    source_site_context=str(getattr(state, "SelectedSourceSite", "") or ""),
+                )
 
-        dst_rows = self._planning_library_selector_item_rows(destination_library_selector)
-        dst_idx, dst_tag = library_combo_index_for_session_restore(
-            stored_drive_id=preserved_dst_lib_id,
-            stored_display_name=preserved_dst_lib_name,
-            item_rows=dst_rows,
-        )
         destination_library_matched = False
-        if dst_idx >= 0:
-            if self._set_selector_index_safely(destination_library_selector, dst_idx):
-                destination_library_matched = True
-                log_info(
-                    "destination_restore_selector_library_match_using_preserved_values",
-                    outcome_tag=dst_tag,
-                    index=dst_idx,
-                    stored_drive_id=preserved_dst_lib_id,
-                    stored_name=preserved_dst_lib_name,
-                    selector_item_count=len(dst_rows),
-                )
-                log_info(
-                    "destination_library_restore_match_success",
-                    outcome_tag=dst_tag,
-                    index=dst_idx,
-                    stored_drive_id=preserved_dst_lib_id,
-                    stored_name=preserved_dst_lib_name,
-                    selector_item_count=len(dst_rows),
-                )
-                if dst_tag == "legacy_name_only":
+        dst_idx = -1
+        dst_tag = "no_session_hint"
+
+        if dst_sp:
+            if not destination_site_matched:
+                if preserved_dst_lib_id:
                     log_info(
-                        "destination_library_restore_legacy_name_only",
-                        stored_name=str(getattr(state, "SelectedDestinationLibrary", "") or ""),
+                        "destination_library_restore_deferred_site_context_missing",
+                        reason="destination_site_selector_not_matched_yet",
+                        intended_drive_suffix=preserved_dst_lib_id[-16:]
+                        if len(preserved_dst_lib_id) > 16
+                        else preserved_dst_lib_id,
+                    )
+                    self._schedule_selector_restore_library_retry_after_site_resolved("destination")
+                dst_idx, dst_tag = -1, "deferred_destination_site_not_matched"
+            elif not self._planning_sharepoint_site_selector_resolved_for_libraries(destination_site_selector):
+                if preserved_dst_lib_id:
+                    log_info(
+                        "destination_library_restore_deferred_site_context_missing",
+                        reason="destination_site_dict_or_site_id_missing",
+                        intended_drive_suffix=preserved_dst_lib_id[-16:]
+                        if len(preserved_dst_lib_id) > 16
+                        else preserved_dst_lib_id,
+                    )
+                    self._schedule_selector_restore_library_retry_after_site_resolved("destination")
+                dst_idx, dst_tag = -1, "deferred_site_context"
+            else:
+                self._populate_library_selector_for_group("destination")
+                dst_rows = self._planning_library_selector_item_rows(destination_library_selector)
+                dst_idx, dst_tag = library_combo_index_for_session_restore(
+                    stored_drive_id=preserved_dst_lib_id,
+                    stored_display_name=preserved_dst_lib_name,
+                    item_rows=dst_rows,
+                )
+                if dst_idx >= 0:
+                    if self._set_selector_index_safely(destination_library_selector, dst_idx):
+                        destination_library_matched = True
+                        log_info(
+                            "destination_restore_selector_library_match_using_preserved_values",
+                            outcome_tag=dst_tag,
+                            index=dst_idx,
+                            stored_drive_id=preserved_dst_lib_id,
+                            stored_name=preserved_dst_lib_name,
+                            selector_item_count=len(dst_rows),
+                        )
+                        log_info(
+                            "destination_library_restore_match_success",
+                            outcome_tag=dst_tag,
+                            index=dst_idx,
+                            stored_drive_id=preserved_dst_lib_id,
+                            stored_name=preserved_dst_lib_name,
+                            selector_item_count=len(dst_rows),
+                        )
+                        if dst_tag == "legacy_name_only":
+                            log_info(
+                                "destination_library_restore_legacy_name_only",
+                                stored_name=str(getattr(state, "SelectedDestinationLibrary", "") or ""),
+                                selector_item_count=len(dst_rows),
+                            )
+                            log_info(
+                                "destination_library_restore_used_fallback_name_match",
+                                stored_name=str(getattr(state, "SelectedDestinationLibrary", "") or ""),
+                            )
+                elif dst_tag == "no_session_hint":
+                    pass
+                else:
+                    self._set_planning_library_selector_unresolved(
+                        "destination", selector=destination_library_selector, outcome_tag=dst_tag
+                    )
+                    log_info(
+                        "destination_library_restore_match_failed",
+                        stored_name=preserved_dst_lib_name,
+                        stored_drive_id=preserved_dst_lib_id,
+                        outcome_tag=dst_tag,
+                        selector_item_count=len(dst_rows),
+                        destination_site_context=str(getattr(state, "SelectedDestinationSite", "") or ""),
+                    )
+
+        if not dst_sp:
+            dst_rows = self._planning_library_selector_item_rows(destination_library_selector)
+            dst_idx, dst_tag = library_combo_index_for_session_restore(
+                stored_drive_id=preserved_dst_lib_id,
+                stored_display_name=preserved_dst_lib_name,
+                item_rows=dst_rows,
+            )
+            destination_library_matched = False
+            if dst_idx >= 0:
+                if self._set_selector_index_safely(destination_library_selector, dst_idx):
+                    destination_library_matched = True
+                    log_info(
+                        "destination_restore_selector_library_match_using_preserved_values",
+                        outcome_tag=dst_tag,
+                        index=dst_idx,
+                        stored_drive_id=preserved_dst_lib_id,
+                        stored_name=preserved_dst_lib_name,
                         selector_item_count=len(dst_rows),
                     )
                     log_info(
-                        "destination_library_restore_used_fallback_name_match",
-                        stored_name=str(getattr(state, "SelectedDestinationLibrary", "") or ""),
+                        "destination_library_restore_match_success",
+                        outcome_tag=dst_tag,
+                        index=dst_idx,
+                        stored_drive_id=preserved_dst_lib_id,
+                        stored_name=preserved_dst_lib_name,
+                        selector_item_count=len(dst_rows),
                     )
-        elif dst_tag == "no_session_hint":
-            destination_library_matched = False
-        else:
-            self._set_planning_library_selector_unresolved(
-                "destination", selector=destination_library_selector, outcome_tag=dst_tag
-            )
-            log_info(
-                "destination_library_restore_match_failed",
-                stored_name=preserved_dst_lib_name,
-                stored_drive_id=preserved_dst_lib_id,
-                outcome_tag=dst_tag,
-                selector_item_count=len(dst_rows),
-                destination_site_context=str(getattr(state, "SelectedDestinationSite", "") or ""),
-            )
+                    if dst_tag == "legacy_name_only":
+                        log_info(
+                            "destination_library_restore_legacy_name_only",
+                            stored_name=str(getattr(state, "SelectedDestinationLibrary", "") or ""),
+                            selector_item_count=len(dst_rows),
+                        )
+                        log_info(
+                            "destination_library_restore_used_fallback_name_match",
+                            stored_name=str(getattr(state, "SelectedDestinationLibrary", "") or ""),
+                        )
+            elif dst_tag == "no_session_hint":
+                destination_library_matched = False
+            else:
+                self._set_planning_library_selector_unresolved(
+                    "destination", selector=destination_library_selector, outcome_tag=dst_tag
+                )
+                log_info(
+                    "destination_library_restore_match_failed",
+                    stored_name=preserved_dst_lib_name,
+                    stored_drive_id=preserved_dst_lib_id,
+                    outcome_tag=dst_tag,
+                    selector_item_count=len(dst_rows),
+                    destination_site_context=str(getattr(state, "SelectedDestinationSite", "") or ""),
+                )
+
+        if self._planning_browse_mode("destination") == "sharepoint" and not destination_library_matched:
+            self._destination_suppress_stale_visible_tree_if_needed()
 
         self._log_restore_phase(
             "phase2_library_match",
@@ -25816,6 +26266,8 @@ class MainWindow(QMainWindow):
                     selector_group,
                     "Select a library to load root content.",
                 )
+                if selector_group == "destination" and self._planning_browse_mode("destination") == "sharepoint":
+                    self._destination_suppress_stale_visible_tree_if_needed()
                 self.update_selector_context_labels()
                 self._log_library_restore_step("step_04_invalid_selection_exit", selector_group=selector_group)
                 return
@@ -25855,6 +26307,8 @@ class MainWindow(QMainWindow):
                         "destination",
                         "Waiting for the saved destination library to appear in the list…",
                     )
+                    if self._planning_browse_mode("destination") == "sharepoint":
+                        self._destination_suppress_stale_visible_tree_if_needed()
                 else:
                     self.set_tree_placeholder(
                         "source",
@@ -25869,6 +26323,8 @@ class MainWindow(QMainWindow):
                         "destination",
                         "Choose the destination library that matches your session — the current selection is not the saved destination drive.",
                     )
+                    if self._planning_browse_mode("destination") == "sharepoint":
+                        self._destination_suppress_stale_visible_tree_if_needed()
                 else:
                     self.set_tree_placeholder(
                         "source",
@@ -27206,6 +27662,17 @@ class MainWindow(QMainWindow):
             self._log_library_restore_step("load_root_step_01b_signature", panel_key=panel_key, request_signature=request_signature)
             drive_id = library.get("id", "")
             self._log_library_restore_step("load_root_step_02_drive_id", panel_key=panel_key, drive_id=drive_id)
+            if (
+                panel_key == "destination"
+                and self._planning_browse_mode("destination") != "local"
+                and self._destination_library_context_unresolved_for_graph_display()
+                and not force_refresh
+            ):
+                log_info(
+                    "destination_root_load_blocked_library_unresolved",
+                    drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+                )
+                return
             if not drive_id:
                 self._log_library_restore_step("load_root_step_03_missing_drive_enter", panel_key=panel_key)
                 self.active_root_request_signatures[panel_key] = None
@@ -31741,6 +32208,9 @@ class MainWindow(QMainWindow):
 
     def _on_destination_planning_model_expanded(self, index):
         panel_key = "destination"
+        if self._planning_browse_mode(panel_key) != "local" and self._destination_library_context_unresolved_for_graph_display():
+            log_info("destination_expand_blocked_library_unresolved")
+            return
         if self._full_trace_enabled():
             self._ui_trace("tree", "expand_signal", panel_key=panel_key, item=None)
         node_data = index.data(Qt.UserRole) or {}
