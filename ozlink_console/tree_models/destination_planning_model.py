@@ -1100,6 +1100,15 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
                 else:
                     merged.append(dict(inc))
             child_payloads = merged
+        # Graph /children inserts new folder rows at any depth: ensure workspace state so expand/lazy-load
+        # eligibility (reconcile merge-target predicates) is not lost on rows that did not merge into a
+        # cached_provisional shell.
+        if graph_child_bind:
+            for pl in child_payloads:
+                if not isinstance(pl, dict) or not pl.get("is_folder"):
+                    continue
+                if str(pl.get("id") or "").strip() and not str(pl.get("workspace_row_state") or "").strip():
+                    pl["workspace_row_state"] = WORKSPACE_ROW_STATE_LIVE_CONFIRMED
         if old_count:
             for old_child in list(parent_node._children or []):
                 self._unregister_subtree_paths(old_child)

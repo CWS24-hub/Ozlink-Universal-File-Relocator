@@ -76,6 +76,9 @@ class MemoryManager:
         self.legacy_compatibility_root = legacy_compatibility_root()
         self.current_restore_source = "python"
         self.current_write_root = self.root
+        # After Memory bundle import: block empty persisted planning until runtime confirms (see save_*).
+        self._import_restore_empty_guard: tuple[int, int] | None = None
+        self._import_restore_runtime_confirmed: bool = False
 
         self.paths = {
             "allocations": self.root / "Draft-AllocationQueue.json",
@@ -1039,6 +1042,22 @@ class MemoryManager:
             )
 
         if new_count == 0 and existing_count > 0:
+            # Post-import: do not allow even "explicit" empty persist until runtime has hydrated matching counts.
+            if (
+                allow_empty_planning_persist
+                and self._import_restore_empty_guard is not None
+                and not self._import_restore_runtime_confirmed
+            ):
+                log_info(
+                    "import_restore_empty_write_blocked",
+                    channel="allocations",
+                    previous_count=int(existing_count),
+                    new_count=int(new_count),
+                    save_reason=str(save_reason or "")[:240],
+                    guard_expected_alloc=int(self._import_restore_empty_guard[0]),
+                    guard_expected_proposed=int(self._import_restore_empty_guard[1]),
+                )
+                return
             log_info(
                 "allocation_queue_empty_write_attempt",
                 previous_count=int(existing_count),
@@ -1110,6 +1129,21 @@ class MemoryManager:
             )
 
         if new_count == 0 and existing_count > 0:
+            if (
+                allow_empty_planning_persist
+                and self._import_restore_empty_guard is not None
+                and not self._import_restore_runtime_confirmed
+            ):
+                log_info(
+                    "import_restore_empty_write_blocked",
+                    channel="proposed",
+                    previous_count=int(existing_count),
+                    new_count=int(new_count),
+                    save_reason=str(save_reason or "")[:240],
+                    guard_expected_alloc=int(self._import_restore_empty_guard[0]),
+                    guard_expected_proposed=int(self._import_restore_empty_guard[1]),
+                )
+                return
             log_info(
                 "proposed_folders_empty_write_attempt",
                 previous_count=int(existing_count),
@@ -1146,6 +1180,62 @@ class MemoryManager:
             row_count=len(payload),
             allow_empty_planning_persist=allow_empty_planning_persist,
         )
+
+    def confirm_import_restore_runtime_loaded(self) -> None:
+        """Call after runtime planned_moves/proposed_folders match imported disk rows so empty saves may proceed."""
+        self._import_restore_runtime_confirmed = True
+        self._import_restore_empty_guard = None
+        log_info("import_restore_runtime_load_confirmed")
+
+    def clear_import_restore_empty_guard(self) -> None:
+        """Clear import guard without confirming (e.g. failed load path)."""
+        self._import_restore_empty_guard = None
+        self._import_restore_runtime_confirmed = False
+
+    def log_planning_recovery_hint_if_primary_empty_after_import(self) -> None:
+        """Read-only diagnostic: if primary queues are empty, log best quarantine ImportBefore snapshot counts."""
+        try:
+            pa = self._json_count(self.paths["allocations"])
+            pp = self._json_count(self.paths["proposed"])
+            if pa > 0 or pp > 0:
+                return
+            best: tuple[int, int, str] | None = None
+            if not self.quarantine.is_dir():
+                return
+            for sub in sorted(self.quarantine.iterdir(), reverse=True):
+                if not sub.is_dir() or not sub.name.startswith("ImportBefore_"):
+                    continue
+                ap = sub / "Draft-AllocationQueue.json"
+                ppth = sub / "Draft-ProposedFolders.json"
+                if not ap.is_file():
+                    continue
+                ac = self._json_count(ap)
+                pc = self._json_count(ppth) if ppth.is_file() else 0
+                if ac + pc == 0:
+                    continue
+                cand = (ac, pc, str(sub))
+                if best is None or (ac + pc) > (best[0] + best[1]):
+                    best = cand
+            if best is not None:
+                log_info(
+                    "planning_memory_recovery_candidate_found_after_import",
+                    active_primary_count=int(pa),
+                    backup_folder=best[2],
+                    backup_allocation_count=int(best[0]),
+                    backup_proposed_count=int(best[1]),
+                    memory_write_root=str(self.root),
+                )
+        except Exception:
+            return
+
+    def load_session_raw_and_allocations_proposed(self) -> tuple[dict[str, Any], list[AllocationRow], list[ProposedFolder]]:
+        """Load session JSON plus allocation/proposed rows directly from primary paths (no restore-candidate selection)."""
+        session_raw = self._read_json_path(self.paths["session"], {})
+        if not isinstance(session_raw, dict):
+            session_raw = {}
+        allocations = self.load_allocations()
+        proposed = self.load_proposed()
+        return session_raw, allocations, proposed
 
     def load_session(self) -> SessionState:
         state = SessionState.from_dict(self._read_json(self.paths["session"], {}))
@@ -1367,12 +1457,32 @@ class MemoryManager:
         return destination_zip
 
     def import_bundle(self, source_folder: Path) -> None:
+        source_folder = Path(source_folder)
+        global_mem = memory_root()
+        log_info(
+            "import_memory_write_root_resolved",
+            memory_write_root=str(self.root),
+            active_tenant=self.tenant_domain,
+            active_upn=self.operator_upn,
+            expected_fingerprint=str(self.expected_fingerprint or "")[:120],
+            destination_memory_folder=str(self.root),
+            global_memory_root=str(global_mem),
+            scope_is_user_scoped=bool(self.expected_fingerprint),
+            import_targets_global_root_only=not bool(self.expected_fingerprint),
+        )
+        if not self.expected_fingerprint:
+            log_info(
+                "import_migrated_bundle_wrong_scope_detected",
+                note="no_tenant_upn_fingerprint_Memory_writes_global_root_not_per_user",
+                memory_write_root=str(self.root),
+            )
         required = ["Draft-SessionState.json", "Draft-AllocationQueue.json", "Draft-ProposedFolders.json"]
         session_payload_preview: dict[str, Any] | None = None
         allocations_preview: list[Any] = []
         proposed_preview: list[Any] = []
         for name in required:
             if not (source_folder / name).exists():
+                log_info("import_migrated_bundle_missing_expected_file", filename=name, source_folder=str(source_folder))
                 raise FileNotFoundError(f"Import bundle missing required file: {name}")
             raw = json.loads((source_folder / name).read_text(encoding="utf-8"))
             if name == "Draft-SessionState.json" and isinstance(raw, dict):
@@ -1381,6 +1491,15 @@ class MemoryManager:
                 allocations_preview = raw
             elif name == "Draft-ProposedFolders.json" and isinstance(raw, list):
                 proposed_preview = raw
+
+        src_alloc_n = self._list_count(allocations_preview)
+        src_prop_n = self._list_count(proposed_preview)
+        log_info(
+            "import_migrated_bundle_source_counts",
+            import_source_folder=str(source_folder),
+            import_source_allocation_count=int(src_alloc_n),
+            import_source_proposed_count=int(src_prop_n),
+        )
 
         if session_payload_preview is not None:
             from .legacy_backup_migration.shape import is_legacy_shaped_bundle
@@ -1426,6 +1545,7 @@ class MemoryManager:
             "Draft-ProposedFolders.json": self.paths["proposed"],
             "MemoryManifest.json": self.paths["manifest"],
         }
+        imported_names: list[str] = []
         for name, target in mapping.items():
             src = source_folder / name
             if src.exists():
@@ -1437,6 +1557,17 @@ class MemoryManager:
                 elif name == "Draft-ProposedFolders.json":
                     payload = self._normalize_imported_proposed_payload(payload)
                 self._atomic_write_text(target, json.dumps(payload, indent=2))
+                imported_names.append(name)
+
+        for extra in ("LegacyMigrationReport.json", "LegacyMigrationReport.md"):
+            src = source_folder / extra
+            if src.is_file():
+                try:
+                    shutil.copy2(src, self.root / extra)
+                    imported_names.append(extra)
+                    log_info("import_bundle_sidecar_copied", filename=extra, dest=str(self.root / extra))
+                except OSError as exc:
+                    log_warn("import_bundle_sidecar_copy_failed", filename=extra, error=str(exc))
 
         ws_src = source_folder / "WorkspaceSnapshot.json"
         if ws_src.is_file():
@@ -1447,6 +1578,7 @@ class MemoryManager:
                         self.paths["workspace_snapshot"],
                         json.dumps(ws_payload, indent=2, ensure_ascii=False),
                     )
+                    imported_names.append("WorkspaceSnapshot.json")
                     log_info("WorkspaceSnapshot.json imported with bundle.", source=str(ws_src))
             except Exception as exc:
                 log_warn("WorkspaceSnapshot.json import skipped.", error=str(exc))
@@ -1467,6 +1599,45 @@ class MemoryManager:
             fingerprint=self.expected_fingerprint,
             status="Healthy",
         )
+
+        post_a = self._json_count(self.paths["allocations"])
+        post_p = self._json_count(self.paths["proposed"])
+        post_session = self.paths["session"].is_file()
+        post_rep = (self.root / "LegacyMigrationReport.json").is_file()
+        log_info(
+            "import_migrated_bundle_post_copy_counts",
+            post_import_allocation_count=int(post_a),
+            post_import_proposed_count=int(post_p),
+            post_import_session_exists=bool(post_session),
+            post_import_report_exists=bool(post_rep),
+            imported_files_list=imported_names[:80],
+        )
+        log_info(
+            "migrated_package_restore_confirmed",
+            import_source_folder=str(source_folder),
+            post_import_allocation_count=int(post_a),
+            post_import_proposed_count=int(post_p),
+            memory_write_root=str(self.root),
+        )
+        if src_alloc_n != post_a or src_prop_n != post_p:
+            log_warn(
+                "import_migrated_bundle_post_copy_mismatch",
+                source_alloc=int(src_alloc_n),
+                source_prop=int(src_prop_n),
+                post_alloc=int(post_a),
+                post_prop=int(post_p),
+            )
+
+        self.clear_import_restore_empty_guard()
+        self._import_restore_runtime_confirmed = False
+        if post_a > 0 or post_p > 0:
+            self._import_restore_empty_guard = (int(post_a), int(post_p))
+            log_info(
+                "import_restore_expected_counts",
+                expected_allocations=int(post_a),
+                expected_proposed=int(post_p),
+            )
+
         log_info("Memory bundle imported.", source=str(source_folder))
         log_trace("memory", "import_bundle", source_excerpt=str(source_folder)[-100:])
 

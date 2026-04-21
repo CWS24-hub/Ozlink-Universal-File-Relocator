@@ -13111,6 +13111,66 @@ class MainWindow(QMainWindow):
         finally:
             self._memory_restore_in_progress = False
 
+    def _hydrate_runtime_from_import_bundle_primary_memory(self) -> None:
+        """After :meth:`MemoryManager.import_bundle`, hydrate runtime from active primary JSON (no restore-candidate promotion).
+
+        Restore-candidate selection can prefer backups or mis-score the freshly imported primary; the import path must
+        reflect exactly what was just written under ``memory_write_root``.
+        """
+        mm = self.memory_manager
+        if mm is None:
+            return
+        log_info("import_restore_runtime_load_started", memory_write_root=str(mm.root))
+        _ok = False
+        try:
+            self._restore_abort_mode = False
+            self._restore_abort_reason = ""
+            self._destination_restore_completed_once = False
+            self._memory_restore_in_progress = True
+            self._memory_restore_complete = False
+            self._suppress_autosave = True
+            self._restore_finalization_deferred_active = False
+            self._restore_finalization_deferred_reason = ""
+            self._graph_dest_parent_negative_cache.clear()
+            session_raw, allocations, proposed = mm.load_session_raw_and_allocations_proposed()
+            session_state = SessionState.from_dict(session_raw if isinstance(session_raw, dict) else {})
+            log_info("import_restore_runtime_allocations_loaded", count=len(allocations))
+            log_info("import_restore_runtime_proposed_loaded", count=len(proposed))
+            self._memory_restore_candidate = {
+                "name": "import_primary_memory",
+                "allocation_count": len(allocations),
+                "proposed_count": len(proposed),
+                "session_path": str(mm.paths.get("session") or ""),
+                "populated": bool(allocations or proposed),
+                "valid": True,
+            }
+            self._restore_payload_source = "python_import_bundle"
+            self._restore_selected_candidate_path = str(mm.paths.get("session") or "")
+            self._run_restore_phase(
+                "import_load_primary_memory",
+                lambda: self._restore_memory_payload(session_state, allocations, proposed, session_raw or {}),
+                fatal=True,
+            )
+            log_info(
+                "import_restore_runtime_counts",
+                planned_moves=len(self.planned_moves),
+                proposed_folders=len(self.proposed_folders),
+            )
+            self.update_progress_summaries()
+            log_info(
+                "import_restore_overlay_scheduled",
+                planned_moves=len(self.planned_moves),
+                proposed_folders=len(self.proposed_folders),
+            )
+            _ok = True
+        except Exception as exc:
+            self._log_restore_exception("import_hydrate_primary_memory", exc)
+            mm.clear_import_restore_empty_guard()
+        finally:
+            self._memory_restore_in_progress = False
+            if _ok:
+                mm.confirm_import_restore_runtime_loaded()
+
     def _build_memory_allocation_rows(self):
         rows = []
         for index, move in enumerate(self.planned_moves):
@@ -14629,8 +14689,10 @@ class MainWindow(QMainWindow):
             self._import_tree_reload_retry_used = False
             self._close_post_import_graph_enrichment_generator()
             self._post_import_graph_enrich_run_id += 1
-            self._load_draft_shell_into_runtime()
-            self._import_ok_timing("after_load_draft_shell_into_runtime", _import_t0)
+            self._hydrate_runtime_from_import_bundle_primary_memory()
+            if self.memory_manager is not None:
+                self.memory_manager.log_planning_recovery_hint_if_primary_empty_after_import()
+            self._import_ok_timing("after_hydrate_runtime_from_import_bundle_primary_memory", _import_t0)
             _cand = self._memory_restore_candidate if isinstance(self._memory_restore_candidate, dict) else {}
             log_info(
                 "planning_state_snapshot",
@@ -25799,11 +25861,34 @@ class MainWindow(QMainWindow):
                 n_np += 1
         return {"model_nodes_iter_depth_first": n_iter, "model_nodes_non_placeholder": n_np}
 
+    def _destination_model_index_tree_depth(self, col0: QModelIndex) -> int:
+        """Tree depth under the model root (0 = top-level rows under invisible root)."""
+        d = -1
+        ix = col0
+        while ix is not None and ix.isValid():
+            d += 1
+            ix = ix.parent()
+        return max(0, d)
+
     def _destination_expand_request_live_graph_folder_child_load(self, col0: QModelIndex) -> None:
         """Graph authority: request /children for the expanded folder (any nesting depth)."""
         if not col0.isValid():
             log_info("destination_expand_live_folder_child_load_skipped", reason="invalid_index", gate="invalid_index")
             return
+        _depth = self._destination_model_index_tree_depth(col0)
+        pl_preview = dict(col0.data(Qt.UserRole) or {})
+        log_info(
+            "destination_deep_expand_handler_entered",
+            depth=int(_depth),
+            path_excerpt=str(
+                self._destination_semantic_path(pl_preview)
+                or pl_preview.get("item_path")
+                or pl_preview.get("name")
+                or ""
+            )[:400],
+            item_id_suffix=str(pl_preview.get("id") or "")[-16:],
+            drive_id_suffix=str(self._resolve_tree_item_drive_id("destination", pl_preview) or "")[-16:],
+        )
         pl = dict(col0.data(Qt.UserRole) or {})
         name_excerpt = str(pl.get("name", "") or "")[:120]
         drive_id = self._resolve_tree_item_drive_id("destination", pl)
@@ -25906,7 +25991,33 @@ class MainWindow(QMainWindow):
         ok = self._request_graph_destination_children_load(
             col0, reason="user_expand", trigger="tree_expanded_live_graph_folder"
         )
+        log_info(
+            "destination_deep_expand_request_result",
+            depth=int(_depth),
+            path_excerpt=str(
+                self._destination_semantic_path(pl) or pl.get("item_path") or pl.get("name") or ""
+            )[:400],
+            item_id_suffix=isfx,
+            drive_id_suffix=dsfx,
+            children_loaded=cl,
+            graph_children_verified=pl.get("graph_children_verified"),
+            needs_live_child_refresh=bool(self._destination_row_needs_live_graph_child_refresh(pl)),
+            workspace_row_state=ws,
+            raw_child_count=int(n_child_raw),
+            substantive_child_count=int(n_child),
+            selected_drive_match=bool(
+                str(drive_id or "").strip().casefold()
+                == str(self._current_selected_destination_drive_id() or "").strip().casefold()
+            ),
+            request_result=bool(ok),
+        )
         if ok:
+            log_info(
+                "destination_deep_graph_child_load_scheduled",
+                depth=int(_depth),
+                item_id_suffix=isfx,
+                drive_id_suffix=dsfx,
+            )
             log_info(
                 "destination_expand_live_folder_child_load_completed",
                 name_excerpt=name_excerpt,
@@ -25920,6 +26031,12 @@ class MainWindow(QMainWindow):
                 item_id_suffix=isfx,
             )
         else:
+            log_info(
+                "destination_deep_expand_blocked",
+                depth=int(_depth),
+                reason="queue_or_worker_or_authority_gate",
+                item_id_suffix=isfx,
+            )
             log_info(
                 "destination_expand_live_folder_child_load_skipped",
                 reason="queue_or_worker",

@@ -347,3 +347,54 @@ def test_empty_write_guard_still_blocks_after_import(monkeypatch: pytest.MonkeyP
     mm.save_allocations([], save_reason="_on_planning_mutation_autosave_timer", persist_context={"suppress_autosave": False})
     assert "allocation_queue_empty_write_blocked" in events
 
+
+def test_migrated_import_copies_report_and_blocks_empty_until_confirm(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Migrated-style import copies LegacyMigrationReport.json; explicit empty save blocked until confirm."""
+    from ozlink_console import memory as memory_mod
+
+    events: list[str] = []
+
+    def cap(msg: str, **_kw):
+        events.append(msg)
+
+    monkeypatch.setattr(memory_mod, "log_info", cap)
+    mm = _scoped_mm(tmp_path)
+    src = tmp_path / "mig"
+    _write_modern_session(src)
+    (src / "LegacyMigrationReport.json").write_text(json.dumps({"counts": {"allocations_input": 1}}), encoding="utf-8")
+    mm.import_bundle(src)
+    dest_rep = mm.root / "LegacyMigrationReport.json"
+    assert dest_rep.is_file()
+    mm.save_allocations(
+        [],
+        allow_empty_planning_persist=True,
+        save_reason="draft_save force",
+    )
+    assert "import_restore_empty_write_blocked" in events
+    assert mm._json_count(mm.paths["allocations"]) == 1
+    mm.confirm_import_restore_runtime_loaded()
+    mm.save_allocations([], allow_empty_planning_persist=True, save_reason="user_clear")
+    assert mm._json_count(mm.paths["allocations"]) == 0
+
+
+def test_recover_hint_log_when_primary_empty_after_import(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    events: list[str] = []
+
+    def cap(msg: str, **_kw):
+        events.append(msg)
+
+    from ozlink_console import memory as memory_mod
+
+    monkeypatch.setattr(memory_mod, "log_info", cap)
+    mm = _scoped_mm(tmp_path)
+    q = mm.quarantine / "ImportBefore_20990101-120000"
+    q.mkdir(parents=True, exist_ok=True)
+    (q / "Draft-AllocationQueue.json").write_text(json.dumps([{"RequestId": "x"}]), encoding="utf-8")
+    (q / "Draft-ProposedFolders.json").write_text("[]", encoding="utf-8")
+    mm.paths["allocations"].write_text("[]", encoding="utf-8")
+    mm.paths["proposed"].write_text("[]", encoding="utf-8")
+    mm.log_planning_recovery_hint_if_primary_empty_after_import()
+    assert "planning_memory_recovery_candidate_found_after_import" in events
+

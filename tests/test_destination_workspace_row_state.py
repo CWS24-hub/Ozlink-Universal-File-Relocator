@@ -160,3 +160,32 @@ def test_replace_all_children_graph_child_bind_upgrades_provisional_in_place():
     assert merged.get("web_url") == "https://example/updated"
     assert model.rowCount(root_ix) == 1
     _ = app
+
+
+def test_graph_child_bind_stamps_workspace_row_on_new_child_without_provisional_row():
+    """Deep Graph /children rows that do not merge into cached_provisional must still be merge-target eligible."""
+    app = QApplication.instance() or QApplication([])
+    model = DestinationPlanningTreeModel()
+    parent_pl = {
+        "name": "Root",
+        "is_folder": True,
+        "item_path": "Root",
+        "id": "root1",
+        "workspace_row_state": WORKSPACE_ROW_STATE_LIVE_CONFIRMED,
+        "drive_id": "d1",
+    }
+    model.reset_root_payloads([parent_pl])
+    root_ix = model.index(0, 0, QModelIndex())
+    graph_only = {
+        "name": "Deep",
+        "is_folder": True,
+        "item_path": "Root\\Deep",
+        "id": "deep-id",
+        "drive_id": "d1",
+    }
+    model.replace_all_children(root_ix, [graph_only], graph_child_bind=True)
+    deep_ix = model.index(0, 0, root_ix)
+    pl = deep_ix.data(Qt.UserRole) or {}
+    assert pl.get("workspace_row_state") == WORKSPACE_ROW_STATE_LIVE_CONFIRMED
+    assert destination_payload_is_reconcile_merge_target_row(pl)
+    _ = app
