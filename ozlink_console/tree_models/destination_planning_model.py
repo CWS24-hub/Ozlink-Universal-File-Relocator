@@ -691,6 +691,31 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
                     )
         return pruned, pruned_missing
 
+    def substantive_destination_folder_child_row_count(self, index: QModelIndex) -> int:
+        """Child rows excluding ``loading_in_progress`` placeholders (treated as empty for load eligibility)."""
+        if not index.isValid():
+            return 0
+        try:
+            rc = int(self.rowCount(index))
+        except Exception:
+            return 0
+        n = 0
+        for r in range(rc):
+            try:
+                ix = self.index(r, 0, index)
+            except Exception:
+                continue
+            if not ix.isValid():
+                continue
+            pl = ix.data(Qt.UserRole) or {}
+            if not isinstance(pl, dict):
+                n += 1
+                continue
+            if pl.get("placeholder") and str(pl.get("placeholder_role") or "") == "loading_in_progress":
+                continue
+            n += 1
+        return n
+
     def reconcile_top_level_live_graph_children_loaded_when_subtree_empty(self, *, reason: str = "unspecified") -> int:
         """Clear ``children_loaded`` on live top-level folders when the model has zero child rows.
 
@@ -710,10 +735,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
                 continue
             if not pl.get("children_loaded"):
                 continue
-            try:
-                n_sub = int(self.rowCount(ix))
-            except Exception:
-                n_sub = 0
+            n_sub = self.substantive_destination_folder_child_row_count(ix)
             if n_sub > 0:
                 continue
 
@@ -734,6 +756,39 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
                 drive_id_suffix=_did[-16:] if len(_did) > 16 else _did,
             )
         return reset
+
+    def reconcile_folder_children_loaded_if_empty_subtree(self, index: QModelIndex, *, reason: str = "unspecified") -> bool:
+        """Clear ``children_loaded`` for a single live folder row when it has no substantive child rows."""
+        if not index.isValid():
+            return False
+        pl = index.data(Qt.UserRole) or {}
+        if not isinstance(pl, dict) or pl.get("placeholder"):
+            return False
+        if not pl.get("is_folder"):
+            return False
+        if not destination_payload_is_live_graph_row(pl):
+            return False
+        if not pl.get("children_loaded"):
+            return False
+        n_sub = self.substantive_destination_folder_child_row_count(index)
+        if n_sub > 0:
+            return False
+
+        def _mut(p: Dict[str, Any]) -> None:
+            p["children_loaded"] = False
+
+        self.update_payload_for_index(index, _mut)
+        _iid = str(pl.get("id", "") or "")
+        _did = str(pl.get("drive_id", "") or "")
+        log_info(
+            "destination_graph_skeleton_children_loaded_reset_for_empty_row",
+            reason=str(reason)[:160],
+            eligibility_tag="children_loaded_but_empty_reset_nested",
+            name_excerpt=str(pl.get("name", "") or "")[:120],
+            item_id_suffix=_iid[-16:] if len(_iid) > 16 else _iid,
+            drive_id_suffix=_did[-16:] if len(_did) > 16 else _did,
+        )
+        return True
 
     def merge_sharepoint_library_root_graph_children(
         self,

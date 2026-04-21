@@ -25765,6 +25765,122 @@ class MainWindow(QMainWindow):
                 n_np += 1
         return {"model_nodes_iter_depth_first": n_iter, "model_nodes_non_placeholder": n_np}
 
+    def _destination_expand_request_live_graph_folder_child_load(self, col0: QModelIndex) -> None:
+        """Graph authority: request /children for the expanded folder (any nesting depth)."""
+        if not col0.isValid():
+            log_info("destination_expand_live_folder_child_load_skipped", reason="invalid_index", gate="invalid_index")
+            return
+        pl = dict(col0.data(Qt.UserRole) or {})
+        name_excerpt = str(pl.get("name", "") or "")[:120]
+        drive_id = self._resolve_tree_item_drive_id("destination", pl)
+        item_id = str(pl.get("id", "") or "").strip()
+        dsfx = str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id)
+        isfx = str(item_id)[-16:] if len(str(item_id)) > 16 else str(item_id)
+        model = getattr(self, "destination_planning_model", None)
+        try:
+            n_child_raw = int(model.rowCount(col0)) if model is not None else -1
+        except Exception:
+            n_child_raw = -1
+        n_child = n_child_raw
+        if model is not None and hasattr(model, "substantive_destination_folder_child_row_count"):
+            try:
+                n_child = int(model.substantive_destination_folder_child_row_count(col0))
+            except Exception:
+                n_child = n_child_raw
+        ws = str(pl.get("workspace_row_state") or "").strip()
+        is_live = self._destination_row_is_live_graph_structure(pl)
+        cl = bool(pl.get("children_loaded"))
+        lf = bool(pl.get("load_failed"))
+        log_info(
+            "destination_expand_live_folder_child_load_requested",
+            name_excerpt=name_excerpt,
+            drive_id_suffix=dsfx,
+            item_id_suffix=isfx,
+            is_live_graph_row=bool(is_live),
+            workspace_row_state=ws,
+            children_loaded_before_expand=cl,
+            subtree_row_count_before_expand=int(n_child_raw),
+            substantive_subtree_row_count_before_expand=int(n_child),
+            load_failed=lf,
+        )
+        if lf:
+            log_info(
+                "destination_expand_live_folder_child_load_skipped",
+                reason="load_failed",
+                gate="load_failed",
+                item_id_suffix=isfx,
+            )
+            return
+        if not is_live:
+            log_info(
+                "destination_expand_live_folder_child_load_skipped",
+                reason="not_live_graph_row",
+                gate="not_live_graph_row",
+                item_id_suffix=isfx,
+            )
+            return
+        if not item_id:
+            log_info("destination_expand_live_folder_missing_item_id", name_excerpt=name_excerpt, phase="expand_direct")
+            log_info(
+                "destination_expand_live_folder_child_load_skipped",
+                reason="missing_item_id",
+                gate="missing_item_id",
+            )
+            return
+        if not drive_id:
+            log_info(
+                "destination_expand_live_folder_child_load_skipped",
+                reason="missing_drive_id",
+                gate="missing_drive_id",
+            )
+            return
+        if cl and n_child > 0:
+            log_info(
+                "destination_expand_live_folder_already_loaded",
+                name_excerpt=name_excerpt,
+                subtree_row_count=int(n_child),
+            )
+            return
+        if cl and n_child == 0:
+            log_info(
+                "destination_expand_live_folder_child_load_skipped",
+                reason="children_loaded_but_subtree_empty_unexpected",
+                gate="children_loaded_but_empty_after_preflight",
+                item_id_suffix=isfx,
+            )
+            try:
+                if model is not None and hasattr(model, "reconcile_folder_children_loaded_if_empty_subtree"):
+                    model.reconcile_folder_children_loaded_if_empty_subtree(col0, reason="expand_inflight_reconcile")
+                    pl2 = dict(col0.data(Qt.UserRole) or {})
+                    if pl2.get("children_loaded"):
+                        return
+            except Exception:
+                return
+        ok = self._request_graph_destination_children_load(
+            col0, reason="user_expand", trigger="tree_expanded_live_graph_folder"
+        )
+        if ok:
+            log_info(
+                "destination_expand_live_folder_child_load_completed",
+                name_excerpt=name_excerpt,
+                queued_or_started=True,
+                item_id_suffix=isfx,
+                drive_id_suffix=dsfx,
+            )
+            log_info(
+                "destination_expand_live_folder_child_load_scheduled",
+                name_excerpt=name_excerpt,
+                item_id_suffix=isfx,
+            )
+        else:
+            log_info(
+                "destination_expand_live_folder_child_load_skipped",
+                reason="queue_or_worker",
+                gate="queue_or_worker",
+                item_id_suffix=isfx,
+                name_excerpt=name_excerpt,
+            )
+
     def _destination_expand_has_materialized_non_placeholder_children(self, index: QModelIndex) -> bool:
         """True if folder already has real child rows — never replace with a loading placeholder row."""
         model = getattr(self, "destination_planning_model", None)
@@ -32424,9 +32540,18 @@ class MainWindow(QMainWindow):
         if self._planning_browse_mode(panel_key) != "local" and self._destination_library_context_unresolved_for_graph_display():
             log_info("destination_expand_blocked_library_unresolved")
             return
+        col0 = index.siblingAtColumn(0) if index.column() != 0 else index
+        if not col0.isValid():
+            return
+        try:
+            _dm = getattr(self, "destination_planning_model", None)
+            if _dm is not None and hasattr(_dm, "reconcile_folder_children_loaded_if_empty_subtree"):
+                _dm.reconcile_folder_children_loaded_if_empty_subtree(col0, reason="destination_expand_preflight")
+        except Exception as exc:
+            log_warn("destination_expand_reconcile_folder_children_loaded_failed", error=str(exc)[:240])
         if self._full_trace_enabled():
             self._ui_trace("tree", "expand_signal", panel_key=panel_key, item=None)
-        node_data = index.data(Qt.UserRole) or {}
+        node_data = col0.data(Qt.UserRole) or {}
         base_label = str(node_data.get("base_display_label", "") or "").strip().lower()
         tree_label = str(node_data.get("tree_label", "") or "").strip().lower()
         text_label = str(node_data.get("base_display_label", "") or "").strip().lower()
@@ -32609,7 +32734,8 @@ class MainWindow(QMainWindow):
                 drive_id_suffix=str(drive_id)[-16:],
                 worker_key=worker_key,
             )
-            self._schedule_graph_subtree_hydration(sp_req)
+            self._destination_expand_request_live_graph_folder_child_load(col0)
+            self._schedule_graph_subtree_hydration(sp_req, preferred_root_index=col0)
             return
 
         pending_count = len(self.pending_folder_loads.get(panel_key, set()))
@@ -36829,6 +36955,14 @@ class MainWindow(QMainWindow):
         col0 = index.siblingAtColumn(0) if index.column() != 0 else index
         if not col0.isValid():
             return False
+        _dm = getattr(self, "destination_planning_model", None)
+        if _dm is not None and hasattr(_dm, "reconcile_folder_children_loaded_if_empty_subtree"):
+            try:
+                _dm.reconcile_folder_children_loaded_if_empty_subtree(
+                    col0, reason="graph_child_request_preflight"
+                )
+            except Exception:
+                pass
         node_data = dict(col0.data(Qt.UserRole) or {})
         if node_data.get("placeholder"):
             return False
@@ -37033,7 +37167,9 @@ class MainWindow(QMainWindow):
             )
         return out
 
-    def _schedule_graph_subtree_hydration(self, root_path: str) -> None:
+    def _schedule_graph_subtree_hydration(
+        self, root_path: str, *, preferred_root_index: QModelIndex | None = None
+    ) -> None:
         """Primary entry: schedule Graph /children for every live folder in the expanded visible subtree."""
         root_path = str(root_path or "").strip()
         if not root_path:
@@ -37057,6 +37193,23 @@ class MainWindow(QMainWindow):
         if idxs:
             ix0 = idxs[0]
             root_ix = ix0.siblingAtColumn(0) if ix0.column() != 0 else ix0
+        if not root_ix.isValid() and preferred_root_index is not None:
+            p0 = (
+                preferred_root_index.siblingAtColumn(0)
+                if preferred_root_index.column() != 0
+                else preferred_root_index
+            )
+            if p0.isValid():
+                try:
+                    nd = dict(p0.data(Qt.UserRole) or {})
+                    sp = self._destination_semantic_path(nd) or self._tree_item_path(nd) or ""
+                    sp_canon = str(
+                        self._canonical_destination_projection_path(sp) or self.normalize_memory_path(sp) or ""
+                    ).strip()
+                    if canon and sp_canon and sp_canon.casefold() == canon.casefold():
+                        root_ix = p0
+                except Exception:
+                    pass
         if not root_ix.isValid():
             log_info(
                 "graph_subtree_hydration_start",
@@ -62424,6 +62577,14 @@ class MainWindow(QMainWindow):
                                 tw_ue.viewport().update()
                         except Exception:
                             pass
+                        log_info(
+                            "destination_expand_live_folder_no_children",
+                            worker_key=worker_key,
+                            graph_item_id_suffix=str(item_id)[-16:],
+                            parent_path_excerpt=str(
+                                (parent_index.data(Qt.UserRole) or {}).get("item_path") or ""
+                            )[:400],
+                        )
                     if (
                         not len(child_payloads)
                         and destination_authority_contract.graph_owns_visible_real_destination_structure(self)
