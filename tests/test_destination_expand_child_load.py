@@ -438,6 +438,83 @@ def test_expand_maybe_reset_cached_provisional_finance_then_request_schedules_lo
     mw._request_graph_destination_children_load.assert_called_once()
 
 
+def test_request_graph_child_load_proceeds_when_snapshot_unverified_despite_substantive_children():
+    """TASK4: graph_children_verified False bypasses children_loaded block for Graph request."""
+    from ozlink_console.main_window import MainWindow
+
+    fin = _live_folder(
+        name="Finance",
+        item_id="fin1",
+        drive_id="drvA",
+        item_path=r"Lib\Root3\Finance",
+        children_loaded=True,
+    )
+    fin["graph_children_verified"] = False
+    fin["needs_live_child_refresh"] = True
+    fin["destination_snapshot_cached"] = True
+    model = DestinationPlanningTreeModel()
+    model.reset_root_payloads([fin])
+    fin_ix = model.index(0, 0, QModelIndex())
+    model.replace_all_children(
+        fin_ix,
+        [
+            {
+                "name": "SnapChild",
+                "id": "snap1",
+                "drive_id": "drvA",
+                "is_folder": True,
+                "item_path": r"Lib\Root3\Finance\SnapChild",
+                "workspace_row_state": WORKSPACE_ROW_STATE_LIVE_CONFIRMED,
+                "base_display_label": "Folder: SnapChild",
+                "tree_role": "destination",
+            }
+        ],
+    )
+
+    mw = MainWindow.__new__(MainWindow)
+    mw.destination_planning_model = model
+    mw.graph = MagicMock()
+    mw.graph.token = "t"
+    mw.folder_load_workers = {}
+    mw.pending_folder_loads = {"destination": set()}
+    mw._resolve_tree_item_drive_id = lambda panel, pl: str(pl.get("drive_id") or "")
+    mw._destination_row_is_live_graph_structure = MainWindow._destination_row_is_live_graph_structure.__get__(mw)
+    mw._destination_row_is_graph_derived_dest_child_fetch_eligible = (
+        MainWindow._destination_row_is_graph_derived_dest_child_fetch_eligible.__get__(mw)
+    )
+    mw._destination_library_context_unresolved_for_graph_display = lambda: False
+    mw._current_selected_destination_drive_id = lambda: "drvA"
+    mw._folder_load_worker_thread_running = lambda wk: False
+    mw._destination_row_raw_path_for_path_lookup_match = lambda nd: nd.get("item_path") or ""
+    mw._destination_graph_child_load_backlog_keys = set()
+    mw._destination_graph_child_load_backlog_hi = []
+    mw._destination_graph_child_load_backlog_lo = []
+    mw._destination_start_graph_folder_load_worker_if_eligible = MagicMock(return_value=True)
+
+    assert MainWindow._destination_row_needs_live_graph_child_refresh(
+        mw, dict(fin_ix.data(Qt.UserRole) or {})
+    )
+
+    with patch(
+        "ozlink_console.main_window.destination_authority_contract.graph_owns_visible_real_destination_structure",
+        return_value=True,
+    ):
+        MainWindow._request_graph_destination_children_load(mw, fin_ix, reason="test", trigger="test")
+
+    mw._destination_start_graph_folder_load_worker_if_eligible.assert_called_once()
+
+
+def test_destination_row_needs_live_graph_child_refresh_defaults():
+    from ozlink_console.main_window import MainWindow
+
+    mw = MainWindow.__new__(MainWindow)
+    pl = _live_folder(name="A", item_id="a", drive_id="d", item_path="p", children_loaded=True)
+    assert MainWindow._destination_row_needs_live_graph_child_refresh(mw, pl) is False
+    pl2 = dict(pl)
+    pl2["graph_children_verified"] = False
+    assert MainWindow._destination_row_needs_live_graph_child_refresh(mw, pl2) is True
+
+
 def test_planned_only_row_blocked_from_graph_lazy_load_reset():
     from ozlink_console.main_window import MainWindow
 

@@ -872,6 +872,14 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
                     # Shallow Graph library-root listing does not load folder children; never carry
                     # snapshot ``children_loaded=True`` forward unless subtree rows already exist in-model.
                     payload["children_loaded"] = bool(n_sub > 0)
+                    if enrich_only and n_sub > 0:
+                        payload["graph_children_verified"] = False
+                        payload["needs_live_child_refresh"] = True
+                        payload["destination_snapshot_cached"] = True
+                    elif n_sub == 0:
+                        payload["graph_children_verified"] = True
+                        payload["needs_live_child_refresh"] = False
+                        payload["destination_snapshot_cached"] = False
 
             self.update_payload_for_index(ix, mutator)
             stats["updated"] += 1
@@ -915,6 +923,14 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
                                 except Exception:
                                     n_sub = 0
                                 payload["children_loaded"] = bool(n_sub > 0)
+                                if enrich_only and n_sub > 0:
+                                    payload["graph_children_verified"] = False
+                                    payload["needs_live_child_refresh"] = True
+                                    payload["destination_snapshot_cached"] = True
+                                elif n_sub == 0:
+                                    payload["graph_children_verified"] = True
+                                    payload["needs_live_child_refresh"] = False
+                                    payload["destination_snapshot_cached"] = False
 
                         self.update_payload_for_index(ix, mutator_path)
                         used.add(inc_gid)

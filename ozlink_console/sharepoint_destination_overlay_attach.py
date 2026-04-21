@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from ozlink_console.logger import log_info
+
 # Single source of truth for destination workspace row authority (Phase 0).
 WORKSPACE_ROW_STATE_LIVE_CONFIRMED = "live_confirmed"
 WORKSPACE_ROW_STATE_CACHED_PROVISIONAL = "cached_provisional"
@@ -130,9 +132,16 @@ def destination_stamp_snapshot_tree_workspace_state(snapshot_list: list[Any] | N
     Planned workspace rows stay ``planned_only``; all other rows become ``cached_provisional``.
     Graph ids are preserved; they carry no live authority until upgraded.
     """
-    for root in list(snapshot_list or []):
+    roots = list(snapshot_list or [])
+    for root in roots:
         if isinstance(root, dict):
             _destination_stamp_snapshot_branch(root)
+    if roots:
+        log_info(
+            "destination_snapshot_children_marked_needs_live_refresh",
+            root_count=len(roots),
+            note="destination_snapshot_cached_graph_children_verified_false",
+        )
 
 
 def _destination_stamp_snapshot_branch(snap: dict[str, Any]) -> None:
@@ -142,6 +151,11 @@ def _destination_stamp_snapshot_branch(snap: dict[str, Any]) -> None:
             data["workspace_row_state"] = WORKSPACE_ROW_STATE_PLANNED_ONLY
         else:
             data["workspace_row_state"] = WORKSPACE_ROW_STATE_CACHED_PROVISIONAL
+        # Visual cache only — live Graph /children must still refresh expanded branches.
+        if not destination_payload_is_planned_workspace_row(data):
+            data["destination_snapshot_cached"] = True
+            data["graph_children_verified"] = False
+            data["needs_live_child_refresh"] = True
     for ch in list(snap.get("children") or []):
         if isinstance(ch, dict):
             _destination_stamp_snapshot_branch(ch)

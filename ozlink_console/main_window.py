@@ -9889,7 +9889,7 @@ class MainWindow(QMainWindow):
                 _tag = "not_folder"
             elif not self._destination_row_is_live_graph_structure(pl):
                 _tag = "not_live_graph_row"
-            elif _cl:
+            elif _cl and not self._destination_row_needs_live_graph_child_refresh(pl):
                 _tag = "already_children_loaded"
             elif not _did:
                 _tag = "missing_drive_id"
@@ -25847,7 +25847,7 @@ class MainWindow(QMainWindow):
                 gate="missing_drive_id",
             )
             return
-        if cl and n_child > 0:
+        if cl and n_child > 0 and not self._destination_row_needs_live_graph_child_refresh(pl):
             log_info(
                 "destination_expand_live_folder_already_loaded",
                 name_excerpt=name_excerpt,
@@ -31787,6 +31787,13 @@ class MainWindow(QMainWindow):
         node_data.setdefault("base_display_label", base_label)
         node_data.setdefault("tree_role", "destination")
         node_data["workspace_row_state"] = WORKSPACE_ROW_STATE_LIVE_CONFIRMED
+        node_data.setdefault("destination_snapshot_cached", False)
+        if node_data.get("is_folder", True):
+            node_data.setdefault("graph_children_verified", False)
+            node_data.setdefault("needs_live_child_refresh", True)
+        else:
+            node_data.setdefault("graph_children_verified", True)
+            node_data.setdefault("needs_live_child_refresh", False)
         return node_data
 
     def _destination_root_payloads_from_graph_items(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -32159,6 +32166,17 @@ class MainWindow(QMainWindow):
                         )
                     except Exception:
                         pass
+                    if preserve_success:
+                        QTimer.singleShot(
+                            0,
+                            lambda d=did_shell_early: self._safe_invoke(
+                                "destination_snapshot_branch_live_refresh_after_preservation",
+                                lambda: self._destination_schedule_unverified_snapshot_branches_live_refresh(
+                                    drive_id=str(d or ""),
+                                    reason="startup_snapshot_preservation",
+                                ),
+                            ),
+                        )
                 else:
                     log_info(
                         "destination_authority_handoff_summary",
@@ -32674,7 +32692,16 @@ class MainWindow(QMainWindow):
             return
         node_data = dict(col0.data(Qt.UserRole) or {})
         node_data = self._destination_expand_maybe_reset_stale_graph_children_loaded(col0, node_data)
-        if node_data.get("children_loaded") or node_data.get("load_failed"):
+        _needs_live_expand = self._destination_row_needs_live_graph_child_refresh(node_data)
+        if _needs_live_expand and (node_data.get("children_loaded") or node_data.get("load_failed")):
+            log_info(
+                "destination_expand_snapshot_cached_row_forces_graph_refresh",
+                semantic_path_excerpt=str(
+                    self._destination_semantic_path(node_data) or node_data.get("item_path") or ""
+                )[:400],
+                item_id_suffix=str(node_data.get("id") or "")[-16:],
+            )
+        if (node_data.get("children_loaded") or node_data.get("load_failed")) and not _needs_live_expand:
             return
 
         drive_id = self._resolve_tree_item_drive_id(panel_key, node_data)
@@ -32925,6 +32952,123 @@ class MainWindow(QMainWindow):
             drive_id_suffix=str(self._resolve_tree_item_drive_id("destination", pl))[-16:],
         )
         return dict(col0.data(Qt.UserRole) or {})
+
+    def _destination_row_needs_live_graph_child_refresh(self, pl: dict) -> bool:
+        """True when snapshot or stale listing requires a Graph /children fetch for this folder."""
+        if not isinstance(pl, dict) or pl.get("placeholder"):
+            return False
+        if pl.get("needs_live_child_refresh") is True:
+            return True
+        if pl.get("graph_children_verified") is False:
+            return True
+        return False
+
+    def _destination_schedule_unverified_snapshot_branches_live_refresh(
+        self, *, drive_id: str, reason: str = "post_snapshot_or_bind"
+    ) -> None:
+        """Request Graph /children for expanded folders whose children are snapshot-cached, not full-tree."""
+        if self._planning_browse_mode("destination") == "local":
+            return
+        if self._destination_library_context_unresolved_for_graph_display():
+            return
+        if not destination_authority_contract.graph_owns_visible_real_destination_structure(self):
+            return
+        dcf = str(drive_id or "").strip().casefold()
+        if not dcf:
+            return
+        dm = getattr(self, "destination_planning_model", None)
+        tw = getattr(self, "destination_tree_widget", None)
+        if dm is None or tw is None:
+            return
+        log_info(
+            "destination_snapshot_branch_live_refresh_started",
+            reason=str(reason)[:120],
+            drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+        )
+        _cap = 128
+        _scheduled = 0
+        inv = QModelIndex()
+        stack: list[QModelIndex] = []
+        try:
+            rc0 = int(dm.rowCount(inv))
+        except Exception:
+            rc0 = 0
+        for r in range(min(rc0, 48)):
+            try:
+                _ix = dm.index(r, 0, inv)
+            except Exception:
+                continue
+            if _ix.isValid():
+                stack.append(_ix)
+        _seen = 0
+        while stack and _scheduled < _cap and _seen < 4000:
+            cur = stack.pop()
+            _seen += 1
+            if not cur.isValid():
+                continue
+            col0 = cur.siblingAtColumn(0) if cur.column() != 0 else cur
+            pl = dict(col0.data(Qt.UserRole) or {})
+            try:
+                expanded = bool(tw.isExpanded(col0))
+            except Exception:
+                expanded = False
+            try:
+                nchild = int(dm.rowCount(col0))
+            except Exception:
+                nchild = 0
+            if expanded and pl.get("is_folder", True) and self._destination_row_needs_live_graph_child_refresh(pl):
+                rd = self._resolve_tree_item_drive_id("destination", pl)
+                if rd and str(rd).strip().casefold() == dcf and str(pl.get("id") or "").strip():
+                    log_info(
+                        "destination_snapshot_branch_live_refresh_scheduled",
+                        semantic_path_excerpt=str(
+                            self._destination_semantic_path(pl) or pl.get("item_path") or ""
+                        )[:400],
+                        drive_id_suffix=str(rd)[-16:] if len(str(rd)) > 16 else str(rd),
+                        item_id_suffix=str(pl.get("id") or "")[-16:],
+                        subtree_child_rows=int(nchild),
+                        reason=str(reason)[:120],
+                    )
+                    ok = self._request_graph_destination_children_load(
+                        col0,
+                        reason="snapshot_branch_live_refresh",
+                        trigger=f"snapshot_live_refresh:{reason}",
+                    )
+                    if ok:
+                        _scheduled += 1
+                        log_info(
+                            "destination_snapshot_branch_live_refresh_completed",
+                            queued_or_started=True,
+                            semantic_path_excerpt=str(
+                                self._destination_semantic_path(pl) or pl.get("item_path") or ""
+                            )[:400],
+                        )
+                    else:
+                        log_info(
+                            "destination_snapshot_branch_live_refresh_skipped",
+                            semantic_path_excerpt=str(
+                                self._destination_semantic_path(pl) or pl.get("item_path") or ""
+                            )[:400],
+                            reason="queue_or_worker_or_row_state",
+                        )
+            try:
+                if expanded:
+                    for r in range(min(int(dm.rowCount(col0)), 64)):
+                        try:
+                            six = dm.index(r, 0, col0)
+                        except Exception:
+                            continue
+                        if six.isValid():
+                            stack.append(six)
+            except Exception:
+                pass
+        log_info(
+            "destination_snapshot_branch_live_refresh_walk_finished",
+            phase="walk_done",
+            reason=str(reason)[:120],
+            scheduled_folder_count=int(_scheduled),
+            walk_nodes_seen=int(_seen),
+        )
 
     def _destination_row_may_lazy_enumerate_graph_children(self, pl: dict) -> bool:
         """Graph-backed or snapshot-shell folders that may still need a per-folder Graph child fetch."""
@@ -36901,7 +37045,8 @@ class MainWindow(QMainWindow):
         _derived_ok = self._destination_row_is_graph_derived_dest_child_fetch_eligible(node_data)
         if not _live_row and not _derived_ok:
             return False
-        if node_data.get("children_loaded") or node_data.get("load_failed"):
+        _needs_live = self._destination_row_needs_live_graph_child_refresh(node_data)
+        if (node_data.get("children_loaded") or node_data.get("load_failed")) and not _needs_live:
             return False
         drive_id = self._resolve_tree_item_drive_id(panel_key, node_data)
         item_id = str(node_data.get("id") or "").strip()
@@ -36925,8 +37070,20 @@ class MainWindow(QMainWindow):
         )[:400]
         model = self.destination_planning_model
         has_future_children = self._destination_parent_has_future_state_children_model(col0)
-        if not has_future_children:
+        try:
+            _rc_vis = int(model.rowCount(col0))
+        except Exception:
+            _rc_vis = 0
+        _keep_snapshot_visible = bool(_needs_live and _rc_vis > 0)
+        if not has_future_children and not _keep_snapshot_visible:
             model.set_loading_children(col0)
+        elif _keep_snapshot_visible:
+            log_info(
+                "destination_graph_child_load_keeps_snapshot_visible_until_live_bind",
+                path_excerpt=path_excerpt[:400],
+                graph_item_id_suffix=str(item_id)[-16:],
+                visible_child_rows=int(_rc_vis),
+            )
         item_path = self._tree_item_path(node_data)
         if item_path and item_path in self._pending_snapshot_branch_refresh.get(panel_key, set()):
             self._snapshot_branch_refresh_baseline_by_worker[worker_key] = (
@@ -36935,7 +37092,7 @@ class MainWindow(QMainWindow):
         preserved_children = self._preserve_destination_future_state_children_model(col0)
         if preserved_children:
             self._destination_preserved_children_by_worker[worker_key] = preserved_children
-        if has_future_children:
+        if has_future_children and not _keep_snapshot_visible:
             model.set_loading_children(col0)
         use_cache_only = False
         _t_req = time.perf_counter()
@@ -37114,7 +37271,8 @@ class MainWindow(QMainWindow):
         _derived_ok = self._destination_row_is_graph_derived_dest_child_fetch_eligible(node_data)
         if not _live_row and not _derived_ok:
             return False
-        if node_data.get("children_loaded") or node_data.get("load_failed"):
+        _needs_live_rq = self._destination_row_needs_live_graph_child_refresh(node_data)
+        if (node_data.get("children_loaded") or node_data.get("load_failed")) and not _needs_live_rq:
             return False
         drive_id = self._resolve_tree_item_drive_id(panel_key, node_data)
         item_id = str(node_data.get("id") or "").strip()
@@ -51715,13 +51873,19 @@ class MainWindow(QMainWindow):
 
     def _drain_destination_expand_user_deferred_queue(self) -> None:
         self._destination_expand_user_deferred_scheduled = False
+        q = self._destination_expand_user_deferred_queue
+        if q:
+            log_info(
+                "destination_expand_deferred_queue_process_started",
+                queue_len=len(q),
+            )
         if self._destination_pipeline_blocks_user_expand_gesture():
             self._schedule_destination_expand_user_deferred_drain()
             return
-        q = self._destination_expand_user_deferred_queue
         if not q:
             return
         path = q.popleft()
+        log_info("destination_expand_deferred_queue_item", semantic_path=path[:400])
         self._destination_expand_user_deferred_seen.discard(path)
         tree = getattr(self, "destination_tree_widget", None)
         dm = getattr(self, "destination_planning_model", None)
@@ -51729,13 +51893,31 @@ class MainWindow(QMainWindow):
             idxs = dm.find_indices_for_canonical_destination_path(path)
             if idxs and idxs[0].isValid():
                 ix = idxs[0]
+                log_info("destination_expand_deferred_path_found", semantic_path=path[:400])
                 if hasattr(dm, "is_index_live") and not dm.is_index_live(ix):
                     log_info(
                         "destination_expand_user_deferred_drop_stale",
                         semantic_path=path[:240],
                     )
                 elif tree.isExpanded(ix):
+                    log_info(
+                        "destination_expand_deferred_graph_load_requested",
+                        semantic_path=path[:400],
+                        note="invoke_expand_handler",
+                    )
                     self._on_destination_planning_model_expanded(ix)
+                else:
+                    log_info(
+                        "destination_expand_deferred_graph_load_skipped",
+                        semantic_path=path[:400],
+                        reason="row_not_expanded_in_tree",
+                    )
+            else:
+                log_info(
+                    "destination_expand_deferred_graph_load_skipped",
+                    semantic_path=path[:400],
+                    reason="path_not_found_in_model",
+                )
         log_info(
             "destination_expand_user_deferred_drained_one",
             semantic_path=path[:240],
@@ -51743,6 +51925,12 @@ class MainWindow(QMainWindow):
         )
         if q:
             self._schedule_destination_expand_user_deferred_drain()
+        elif not self._destination_expand_user_deferred_queue:
+            log_info(
+                "destination_expand_deferred_queue_process_completed",
+                queue_empty=True,
+                reason="drain_complete",
+            )
 
     def _folder_worker_heavy_upstream_busy(self) -> bool:
         """True while destination bind or large source projection chunking could overlap folder success work."""
@@ -62699,6 +62887,9 @@ class MainWindow(QMainWindow):
                         self._apply_tree_item_visual_state(None, pl)
                         child_payloads.append(pl)
                     bind_ms = int(max(0.0, (time.perf_counter() - t_bind_start) * 1000.0))
+                    _child_name_sample = [
+                        str((cp or {}).get("name") or "")[:80] for cp in (child_payloads[:12] or [])
+                    ]
                     log_info(
                         "graph_child_bind_count",
                         panel_key=panel_key,
@@ -62710,6 +62901,7 @@ class MainWindow(QMainWindow):
                         parent_path_excerpt=str(
                             (parent_index.data(Qt.UserRole) or {}).get("item_path") or ""
                         )[:400],
+                        returned_child_names_sample=_child_name_sample,
                     )
                     self._destination_graph_folder_replace_active = True
                     try:
@@ -62751,8 +62943,20 @@ class MainWindow(QMainWindow):
                     def _mut_ok(p):
                         p["children_loaded"] = True
                         p["load_failed"] = False
+                        p["graph_children_verified"] = True
+                        p["needs_live_child_refresh"] = False
+                        p["destination_snapshot_cached"] = False
 
                     model.update_payload_for_index(parent_index, _mut_ok)
+                    log_info(
+                        "destination_graph_children_verified_after_live_bind",
+                        parent_path_excerpt=str(
+                            (parent_index.data(Qt.UserRole) or {}).get("item_path") or ""
+                        )[:400],
+                        graph_item_id_suffix=str(item_id)[-16:],
+                        returned_child_count=int(len(child_payloads)),
+                        returned_child_names_sample=_child_name_sample,
+                    )
                     if destination_authority_contract.graph_owns_visible_real_destination_structure(self):
                         self._destination_graph_subtree_schedule_new_folders_after_bind(parent_index)
                     col0_planned = (
@@ -62770,6 +62974,9 @@ class MainWindow(QMainWindow):
                     def _mut_partial(p):
                         p["children_loaded"] = True
                         p["load_failed"] = False
+                        p["graph_children_verified"] = True
+                        p["needs_live_child_refresh"] = False
+                        p["destination_snapshot_cached"] = False
 
                     model.update_payload_for_index(parent_index, _mut_partial)
                     col0_planned = (
