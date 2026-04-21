@@ -13,10 +13,15 @@ from ozlink_console.tree_models.destination_planning_model import DestinationPla
 
 def _mw_bare():
     mw = MainWindow.__new__(MainWindow)
+    mw.pending_folder_loads = {"destination": set(), "source": set()}
+    mw.folder_load_workers = {}
     mw._planning_browse_mode = lambda k: "sharepoint" if k == "destination" else "local"
     mw._destination_library_context_unresolved_for_graph_display = lambda: False
     mw._resolve_tree_item_drive_id = lambda panel, pl: str(pl.get("drive_id") or "")
     mw._destination_semantic_path = lambda pl: str(pl.get("item_path") or "")
+    mw._current_selected_destination_drive_id = lambda: "d1"
+    mw.pending_root_drive_ids = {"destination": "d1"}
+    mw.normalize_memory_path = MainWindow.normalize_memory_path.__get__(mw, MainWindow)
     return mw
 
 
@@ -141,6 +146,7 @@ def test_deferred_expand_drain_not_blocked_by_full_tree_only_gate():
     mw._destination_descendant_apply_state = None
     mw._current_selected_destination_drive_id = lambda: "d1"
     mw.pending_root_drive_ids = {"destination": "d1"}
+    mw._destination_sharepoint_root_graph_bound_drive_id = "d1"
     mw._destination_snapshot_spo_trust_valid = lambda _d: True
     mw._destination_snapshot_light_validation_worker = None
     mw._destination_library_context_unresolved_for_graph_display = lambda: False
@@ -213,3 +219,159 @@ def test_full_tree_worker_not_invoked_by_branch_refresh_schedule():
     ):
         MainWindow._destination_schedule_unverified_snapshot_branches_live_refresh(mw, drive_id="d1", reason="unit")
     ft.assert_not_called()
+
+
+def test_duplicate_inflight_skips_graph_request_logs_path_not_terminal():
+    """Inflight pending_root destination folder load → duplicate_inflight, no duplicate _request_graph."""
+    mw = _mw_bare()
+    dm = DestinationPlanningTreeModel(destination_index_key_fn=MainWindow._destination_payload_index_key.__get__(mw, MainWindow))
+    mw.destination_planning_model = dm
+    tw = MagicMock()
+    tw.isExpanded = lambda _ix: False
+    mw.destination_tree_widget = tw
+    root = {
+        "name": "Root3",
+        "id": "r1",
+        "drive_id": "d1",
+        "is_folder": True,
+        "item_path": r"Lib\Root3",
+        "workspace_row_state": WORKSPACE_ROW_STATE_CACHED_PROVISIONAL,
+        "destination_snapshot_cached": True,
+        "graph_children_verified": False,
+        "needs_live_child_refresh": True,
+        "children_loaded": True,
+    }
+    dm.reset_root_payloads([root])
+    mw.pending_folder_loads["destination"].add("d1:r1")
+    mock_req = MagicMock(return_value=True)
+    mw._request_graph_destination_children_load = mock_req
+    with patch(
+        "ozlink_console.main_window.destination_authority_contract.graph_owns_visible_real_destination_structure",
+        return_value=True,
+    ):
+        MainWindow._destination_schedule_unverified_snapshot_branches_live_refresh(
+            mw, drive_id="d1", reason="unit_duplicate_inflight"
+        )
+    mock_req.assert_not_called()
+
+
+def test_nested_refresh_after_parent_bind_expanded_unverified_requests_graph():
+    """After parent Graph bind, expanded unverified child folders get nested_after_parent_graph_bind."""
+    mw = _mw_bare()
+    dm = DestinationPlanningTreeModel(destination_index_key_fn=MainWindow._destination_payload_index_key.__get__(mw, MainWindow))
+    mw.destination_planning_model = dm
+    r_ix = QModelIndex()
+    parent = {
+        "name": "Root3",
+        "id": "r1",
+        "drive_id": "d1",
+        "is_folder": True,
+        "item_path": r"Lib\Root3",
+        "workspace_row_state": WORKSPACE_ROW_STATE_CACHED_PROVISIONAL,
+        "graph_children_verified": True,
+        "children_loaded": True,
+    }
+    child = {
+        "name": "Finance",
+        "id": "f1",
+        "drive_id": "d1",
+        "is_folder": True,
+        "item_path": r"Lib\Root3\Finance",
+        "workspace_row_state": WORKSPACE_ROW_STATE_CACHED_PROVISIONAL,
+        "destination_snapshot_cached": True,
+        "graph_children_verified": False,
+        "needs_live_child_refresh": True,
+        "children_loaded": True,
+    }
+    dm.reset_root_payloads([parent])
+    pr_ix = dm.index(0, 0, r_ix)
+    dm.replace_all_children(pr_ix, [child])
+    fin_ix = dm.index(0, 0, pr_ix)
+    tw = MagicMock()
+    tw.isExpanded = lambda ix: ix == fin_ix
+    mw.destination_tree_widget = tw
+    mock_req = MagicMock(return_value=True)
+    mw._request_graph_destination_children_load = mock_req
+    with patch(
+        "ozlink_console.main_window.destination_authority_contract.graph_owns_visible_real_destination_structure",
+        return_value=True,
+    ):
+        MainWindow._destination_try_schedule_nested_branch_refresh_after_parent_graph_bind(
+            mw, parent_drive_id="d1", parent_item_id="r1"
+        )
+    mock_req.assert_called_once()
+    assert mock_req.call_args.kwargs.get("reason") == "nested_after_parent_graph_bind"
+
+
+def test_deferred_expand_queue_block_reason_library_unresolved():
+    mw = MainWindow.__new__(MainWindow)
+    mw._planning_browse_mode = lambda k: "sharepoint" if k == "destination" else "local"
+    mw._destination_future_tree_bind_busy = lambda: False
+    mw._destination_incremental_merge_in_progress = False
+    mw._destination_incremental_merge_session = None
+    mw._destination_future_projection_async_state = None
+    mw._destination_library_context_unresolved_for_graph_display = lambda: True
+    assert MainWindow._destination_deferred_expand_queue_block_reason(mw) == "library_unresolved"
+
+
+def test_deferred_expand_queue_block_reason_root_not_bound():
+    mw = MainWindow.__new__(MainWindow)
+    mw._planning_browse_mode = lambda k: "sharepoint" if k == "destination" else "local"
+    mw._destination_future_tree_bind_busy = lambda: False
+    mw._destination_incremental_merge_in_progress = False
+    mw._destination_incremental_merge_session = None
+    mw._destination_future_projection_async_state = None
+    mw._destination_library_context_unresolved_for_graph_display = lambda: False
+    mw._current_selected_destination_drive_id = lambda: "d1"
+    mw.pending_root_drive_ids = {"destination": "d1"}
+    mw._destination_sharepoint_root_graph_bound_drive_id = ""
+    assert MainWindow._destination_deferred_expand_queue_block_reason(mw) == "root_not_graph_bound"
+
+
+def test_deferred_expand_queue_block_reason_drive_mismatch():
+    mw = MainWindow.__new__(MainWindow)
+    mw._planning_browse_mode = lambda k: "sharepoint" if k == "destination" else "local"
+    mw._destination_future_tree_bind_busy = lambda: False
+    mw._destination_incremental_merge_in_progress = False
+    mw._destination_incremental_merge_session = None
+    mw._destination_future_projection_async_state = None
+    mw._destination_library_context_unresolved_for_graph_display = lambda: False
+    mw._current_selected_destination_drive_id = lambda: "d1"
+    mw.pending_root_drive_ids = {"destination": "d2"}
+    assert MainWindow._destination_deferred_expand_queue_block_reason(mw) == "selected_pending_drive_mismatch"
+
+
+def test_deferred_expand_blocked_schedules_backoff_not_busy_spin(monkeypatch):
+    """When blocked, drain reschedules with positive delay (throttle), not immediate loop."""
+    mw = MainWindow.__new__(MainWindow)
+    mw._destination_expand_user_deferred_scheduled = False
+    mw._destination_expand_user_deferred_queue = __import__("collections").deque(["X"])
+    mw._destination_expand_user_deferred_seen = set()
+    mw._planning_browse_mode = lambda k: "sharepoint" if k == "destination" else "local"
+    mw._destination_future_tree_bind_busy = lambda: False
+    mw._destination_incremental_merge_in_progress = False
+    mw._destination_incremental_merge_session = None
+    mw._destination_future_projection_async_state = None
+    mw._destination_sharepoint_planning_destination_active = lambda: True
+    mw._destination_full_tree_ready = lambda: False
+    mw.pending_folder_loads = {"destination": set(), "source": set()}
+    mw._destination_descendant_apply_paused_for_finalize_alloc = False
+    mw._destination_descendant_apply_queue = None
+    mw._destination_descendant_apply_state = None
+    mw._current_selected_destination_drive_id = lambda: "d1"
+    mw.pending_root_drive_ids = {"destination": "d1"}
+    mw._destination_sharepoint_root_graph_bound_drive_id = ""
+    mw._destination_snapshot_spo_trust_valid = lambda _d: True
+    mw._destination_snapshot_light_validation_worker = None
+    mw._destination_library_context_unresolved_for_graph_display = lambda: False
+
+    delays = []
+
+    def _capture_single_shot(delay_ms, fn):
+        delays.append(int(delay_ms))
+
+    monkeypatch.setattr("ozlink_console.main_window.QTimer.singleShot", _capture_single_shot)
+    MainWindow._drain_destination_expand_user_deferred_queue(mw)
+    assert delays, "expected backoff reschedule"
+    assert delays[0] > 0
+    assert len(mw._destination_expand_user_deferred_queue) == 1

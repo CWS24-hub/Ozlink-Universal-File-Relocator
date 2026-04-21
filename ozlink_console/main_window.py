@@ -3410,6 +3410,7 @@ class MainWindow(QMainWindow):
         self._destination_expand_user_deferred_queue: deque = deque()
         self._destination_expand_user_deferred_seen: set = set()
         self._destination_expand_user_deferred_scheduled = False
+        self._destination_expand_deferred_block_count = 0
         # Expand All clicked while destination bind / merge / async projection is still running.
         self._destination_expand_all_start_pending = False
         self._destination_preview_complete_retry_generation = 0
@@ -12672,7 +12673,7 @@ class MainWindow(QMainWindow):
 
     def _folder_load_worker_thread_running(self, worker_key: str) -> bool:
         """True when an active folder worker slot still has a running QThread (in-flight load)."""
-        entry = (self.folder_load_workers or {}).get(worker_key)
+        entry = (getattr(self, "folder_load_workers", None) or {}).get(worker_key)
         if not entry:
             return False
         w = entry.get("worker")
@@ -33109,6 +33110,248 @@ class MainWindow(QMainWindow):
         )
         return stats
 
+    def _destination_path_in_deferred_expand_queue(self, path_cf: str) -> bool:
+        q = getattr(self, "_destination_expand_user_deferred_queue", None)
+        if not q:
+            return False
+        try:
+            for p in list(q):
+                if str(p or "").strip().casefold() == path_cf:
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def _destination_expand_semantic_path_restore_or_deferred(self, semantic_path: str) -> bool:
+        """True when path was restored-expanded intent or deferred-expand queued."""
+        sp = self.normalize_memory_path(str(semantic_path or "").strip())
+        if not sp:
+            return False
+        cf = sp.casefold()
+        if self._destination_path_in_deferred_expand_queue(cf):
+            return True
+        intent = getattr(self, "_destination_restore_session_expanded_paths_intent", None) or set()
+        for raw in intent:
+            s = self.normalize_memory_path(str(raw or "").strip())
+            if s and s.casefold() == cf:
+                return True
+            try:
+                ek = self._destination_expansion_state_key(s)
+                if ek and self.normalize_memory_path(ek).casefold() == cf:
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _destination_try_schedule_nested_branch_refresh_after_parent_graph_bind(
+        self, *, parent_drive_id: str, parent_item_id: str
+    ) -> None:
+        """After a parent folder's Graph children are bound, refresh nested unverified folders on expanded/deferred paths."""
+        log_info(
+            "destination_snapshot_branch_live_refresh_after_parent_bind_started",
+            parent_drive_id_suffix=str(parent_drive_id)[-16:] if len(str(parent_drive_id)) > 16 else str(parent_drive_id),
+            parent_item_id_suffix=str(parent_item_id)[-16:],
+        )
+        if self._planning_browse_mode("destination") == "local":
+            log_info(
+                "destination_snapshot_branch_live_refresh_after_parent_bind_completed",
+                scheduled_count=0,
+                reason="local_browse_mode",
+            )
+            return
+        dm = getattr(self, "destination_planning_model", None)
+        tw = getattr(self, "destination_tree_widget", None)
+        if dm is None or tw is None:
+            log_info(
+                "destination_snapshot_branch_live_refresh_after_parent_bind_completed",
+                scheduled_count=0,
+                reason="no_model_or_tree",
+            )
+            return
+        sel_drive = str(self._current_selected_destination_drive_id() or "").strip().casefold()
+        pend_drive = str((self.pending_root_drive_ids or {}).get("destination") or "").strip().casefold()
+        ref_drive = sel_drive or pend_drive
+        parent_ix = dm.find_index_by_drive_item(str(parent_drive_id or ""), str(parent_item_id or ""))
+        if not parent_ix.isValid():
+            log_info(
+                "destination_snapshot_branch_live_refresh_after_parent_bind_completed",
+                scheduled_count=0,
+                reason="parent_index_not_found",
+            )
+            return
+        col_parent = parent_ix.siblingAtColumn(0) if parent_ix.column() != 0 else parent_ix
+        pl_parent = dict(col_parent.data(Qt.UserRole) or {})
+        if not pl_parent.get("graph_children_verified", False):
+            log_info(
+                "destination_snapshot_branch_live_refresh_after_parent_bind_completed",
+                scheduled_count=0,
+                reason="parent_not_verified",
+            )
+            return
+        scheduled = 0
+        skipped = 0
+        try:
+            rc = int(dm.rowCount(col_parent))
+        except Exception:
+            rc = 0
+        for r in range(min(rc, 128)):
+            try:
+                cix = dm.index(int(r), 0, col_parent)
+            except Exception:
+                continue
+            if not cix.isValid():
+                continue
+            pl = dict(cix.data(Qt.UserRole) or {})
+            if not isinstance(pl, dict) or pl.get("placeholder"):
+                continue
+            if not pl.get("is_folder", True):
+                continue
+            rd = self._resolve_tree_item_drive_id("destination", pl)
+            iid = str(pl.get("id") or "").strip()
+            if not rd or not iid:
+                log_info(
+                    "destination_snapshot_branch_live_refresh_after_parent_bind_skipped",
+                    reason="missing_graph_identity",
+                    path=str(self._destination_semantic_path(pl) or pl.get("item_path") or "")[:400],
+                )
+                skipped += 1
+                continue
+            if str(rd).strip().casefold() != ref_drive:
+                log_info(
+                    "destination_snapshot_branch_live_refresh_after_parent_bind_skipped",
+                    reason="drive_mismatch",
+                    path=str(self._destination_semantic_path(pl) or pl.get("item_path") or "")[:400],
+                    drive_id_suffix=str(rd)[-16:] if len(str(rd)) > 16 else str(rd),
+                )
+                skipped += 1
+                continue
+            sem_path = str(self._destination_semantic_path(pl) or pl.get("item_path") or "").strip()
+            try:
+                expanded_now = bool(tw.isExpanded(cix))
+            except Exception:
+                expanded_now = False
+            deferred_expanded = bool(sem_path and self._destination_expand_semantic_path_restore_or_deferred(sem_path))
+            need_unverified = bool(
+                pl.get("destination_snapshot_cached")
+                or pl.get("graph_children_verified") is False
+                or pl.get("needs_live_child_refresh")
+            )
+            want_refresh = bool(need_unverified or (deferred_expanded and pl.get("is_folder", True)))
+            try:
+                n_raw = int(dm.rowCount(cix))
+            except Exception:
+                n_raw = -1
+            try:
+                n_sub = int(dm.substantive_destination_folder_child_row_count(cix))
+            except Exception:
+                n_sub = -1
+            log_info(
+                "destination_nested_live_refresh_candidate_state",
+                path=str(sem_path)[:400],
+                item_id_suffix=str(iid)[-16:],
+                drive_id_suffix=str(rd)[-16:] if len(str(rd)) > 16 else str(rd),
+                workspace_row_state=str(pl.get("workspace_row_state") or ""),
+                destination_snapshot_cached=bool(pl.get("destination_snapshot_cached")),
+                graph_children_verified=pl.get("graph_children_verified"),
+                needs_live_child_refresh=bool(pl.get("needs_live_child_refresh")),
+                children_loaded=bool(pl.get("children_loaded")),
+                load_failed=bool(pl.get("load_failed")),
+                raw_child_count=int(n_raw),
+                substantive_child_count=int(n_sub),
+                expanded=bool(expanded_now),
+                deferred_expanded=bool(deferred_expanded),
+                selected_drive_match=bool(str(rd).strip().casefold() == sel_drive) if sel_drive else False,
+                request_result="pending",
+            )
+            log_info(
+                "destination_snapshot_branch_live_refresh_after_parent_bind_candidate",
+                path=str(sem_path)[:400],
+                item_id_suffix=str(iid)[-16:],
+                drive_id_suffix=str(rd)[-16:] if len(str(rd)) > 16 else str(rd),
+                expanded=bool(expanded_now),
+                deferred_expanded=bool(deferred_expanded),
+                graph_children_verified=pl.get("graph_children_verified"),
+                needs_live_child_refresh=bool(pl.get("needs_live_child_refresh")),
+                children_loaded=bool(pl.get("children_loaded")),
+                raw_child_count=int(n_raw),
+                substantive_child_count=int(n_sub),
+            )
+            if not want_refresh:
+                log_info(
+                    "destination_snapshot_branch_live_refresh_after_parent_bind_skipped",
+                    reason="already_verified_no_snapshot_refresh_need",
+                    path=str(sem_path)[:400],
+                )
+                skipped += 1
+                continue
+            if not expanded_now and not deferred_expanded:
+                log_info(
+                    "destination_snapshot_branch_live_refresh_after_parent_bind_skipped",
+                    reason="not_expanded_or_restored_path",
+                    path=str(sem_path)[:400],
+                )
+                skipped += 1
+                continue
+            log_info(
+                "destination_snapshot_branch_live_refresh_after_parent_bind_scheduled",
+                path=str(sem_path)[:400],
+                item_id_suffix=str(iid)[-16:],
+            )
+            ok = self._request_graph_destination_children_load(
+                cix,
+                reason="nested_after_parent_graph_bind",
+                trigger="after_parent_bind_nested_unverified"
+            )
+            log_info(
+                "destination_nested_live_refresh_candidate_state",
+                path=str(sem_path)[:400],
+                item_id_suffix=str(iid)[-16:],
+                drive_id_suffix=str(rd)[-16:] if len(str(rd)) > 16 else str(rd),
+                workspace_row_state=str(pl.get("workspace_row_state") or ""),
+                destination_snapshot_cached=bool(pl.get("destination_snapshot_cached")),
+                graph_children_verified=pl.get("graph_children_verified"),
+                needs_live_child_refresh=bool(pl.get("needs_live_child_refresh")),
+                children_loaded=bool(pl.get("children_loaded")),
+                load_failed=bool(pl.get("load_failed")),
+                raw_child_count=int(n_raw),
+                substantive_child_count=int(n_sub),
+                expanded=bool(expanded_now),
+                selected_drive_match=bool(str(rd).strip().casefold() == sel_drive) if sel_drive else False,
+                request_result=bool(ok),
+            )
+            if ok:
+                scheduled += 1
+            else:
+                log_info(
+                    "destination_snapshot_branch_live_refresh_after_parent_bind_skipped",
+                    reason="request_returned_false",
+                    path=str(sem_path)[:400],
+                )
+                skipped += 1
+        log_info(
+            "destination_snapshot_branch_live_refresh_after_parent_bind_completed",
+            scheduled_count=int(scheduled),
+            skipped_count=int(skipped),
+            parent_item_id_suffix=str(parent_item_id)[-16:],
+        )
+
+    def _destination_snapshot_branch_refresh_duplicate_inflight(self, pl: dict) -> bool:
+        """True when Graph child load already pending/running for this folder (branch refresh collision)."""
+        if not isinstance(pl, dict):
+            return False
+        did = self._resolve_tree_item_drive_id("destination", pl)
+        iid = str(pl.get("id") or "").strip()
+        if not did or not iid:
+            return False
+        pk = f"{did}:{iid}"
+        wk = f"destination:{iid}"
+        if self._folder_load_worker_thread_running(wk):
+            return True
+        _pfl = getattr(self, "pending_folder_loads", None) or {}
+        if pk in (_pfl.get("destination") or set()):
+            return True
+        return False
+
     def _destination_schedule_unverified_snapshot_branches_live_refresh(
         self, *, drive_id: str, reason: str = "post_snapshot_or_bind"
     ) -> None:
@@ -33191,6 +33434,17 @@ class MainWindow(QMainWindow):
                 subtree_child_rows=int(nchild),
                 reason=str(reason)[:120],
             )
+            if self._destination_snapshot_branch_refresh_duplicate_inflight(pl):
+                log_info(
+                    "destination_snapshot_branch_live_refresh_skipped_duplicate_inflight",
+                    semantic_path_excerpt=str(
+                        self._destination_semantic_path(pl) or pl.get("item_path") or ""
+                    )[:400],
+                    item_id_suffix=str(pl.get("id") or "")[-16:],
+                    phase="top_level",
+                    schedule_reason=str(reason)[:120],
+                )
+                continue
             ok = self._request_graph_destination_children_load(
                 col0,
                 reason="snapshot_branch_live_refresh",
@@ -33262,29 +33516,40 @@ class MainWindow(QMainWindow):
                         subtree_child_rows=int(nchild),
                         reason=str(reason)[:120],
                     )
-                    ok = self._request_graph_destination_children_load(
-                        col0,
-                        reason="snapshot_branch_live_refresh",
-                        trigger=f"snapshot_live_refresh:{reason}",
-                    )
-                    if ok:
-                        _scheduled += 1
+                    if self._destination_snapshot_branch_refresh_duplicate_inflight(pl):
                         log_info(
-                            "destination_snapshot_branch_live_refresh_completed",
-                            queued_or_started=True,
+                            "destination_snapshot_branch_live_refresh_skipped_duplicate_inflight",
                             semantic_path_excerpt=str(
                                 self._destination_semantic_path(pl) or pl.get("item_path") or ""
                             )[:400],
+                            item_id_suffix=str(pl.get("id") or "")[-16:],
+                            phase="nested",
+                            schedule_reason=str(reason)[:120],
                         )
                     else:
-                        log_info(
-                            "destination_snapshot_branch_live_refresh_skipped",
-                            semantic_path_excerpt=str(
-                                self._destination_semantic_path(pl) or pl.get("item_path") or ""
-                            )[:400],
-                            reason="queue_or_worker_or_row_state",
-                            phase="nested",
+                        ok = self._request_graph_destination_children_load(
+                            col0,
+                            reason="snapshot_branch_live_refresh",
+                            trigger=f"snapshot_live_refresh:{reason}",
                         )
+                        if ok:
+                            _scheduled += 1
+                            log_info(
+                                "destination_snapshot_branch_live_refresh_completed",
+                                queued_or_started=True,
+                                semantic_path_excerpt=str(
+                                    self._destination_semantic_path(pl) or pl.get("item_path") or ""
+                                )[:400],
+                            )
+                        else:
+                            log_info(
+                                "destination_snapshot_branch_live_refresh_skipped",
+                                semantic_path_excerpt=str(
+                                    self._destination_semantic_path(pl) or pl.get("item_path") or ""
+                                )[:400],
+                                reason="queue_or_worker_or_row_state",
+                                phase="nested",
+                            )
             try:
                 if expanded:
                     for r in range(min(int(dm.rowCount(col0)), 64)):
@@ -52040,33 +52305,53 @@ class MainWindow(QMainWindow):
             return True
         return bool(getattr(self, "_destination_future_bind_sync_active", False))
 
-    def _destination_deferred_expand_queue_hard_blocks(self) -> bool:
-        """Blocks that must clear before user deferred expand drain (narrower than full-tree gating)."""
+    def _destination_deferred_expand_destination_root_ready(self) -> bool:
+        """True when Graph root bind for the active destination drive has completed (skeleton/delta-first)."""
+        sel = str(self._current_selected_destination_drive_id() or "").strip()
+        bound = str(getattr(self, "_destination_sharepoint_root_graph_bound_drive_id", "") or "").strip()
+        pend = str((self.pending_root_drive_ids or {}).get("destination") or "").strip()
+        ref = sel or pend
+        if not ref or not bound:
+            return False
+        return bound.casefold() == ref.casefold()
+
+    def _destination_deferred_expand_queue_block_reason(self) -> str | None:
+        """If set, deferred expand drain must wait (throttled retry). Omit folder-pending-block — expand handler dedupes."""
         if self._destination_future_tree_bind_busy():
-            return True
+            return "chunked_or_future_bind"
         if getattr(self, "_destination_incremental_merge_in_progress", False):
-            return True
+            return "incremental_merge"
         if getattr(self, "_destination_incremental_merge_session", None) is not None:
-            return True
+            return "incremental_merge_session"
         if getattr(self, "_destination_future_projection_async_state", None) is not None:
-            return True
+            return "future_projection_async"
+        if self._planning_browse_mode("destination") != "local":
+            if self._destination_library_context_unresolved_for_graph_display():
+                return "library_unresolved"
+            sel_drive = str(self._current_selected_destination_drive_id() or "").strip().casefold()
+            pend_drive = str((self.pending_root_drive_ids or {}).get("destination") or "").strip().casefold()
+            if sel_drive and pend_drive and sel_drive != pend_drive:
+                return "selected_pending_drive_mismatch"
+            if not self._destination_deferred_expand_destination_root_ready():
+                return "root_not_graph_bound"
         if self._destination_sharepoint_planning_destination_active():
-            if self.pending_folder_loads.get("destination"):
-                return True
             if getattr(self, "_destination_descendant_apply_paused_for_finalize_alloc", False):
-                return True
+                return "descendant_apply_paused_finalize_alloc"
             _dq = getattr(self, "_destination_descendant_apply_queue", None)
             if _dq is not None and len(_dq) > 0:
-                return True
+                return "descendant_apply_queue_non_empty"
             if getattr(self, "_destination_descendant_apply_state", None) is not None:
-                return True
+                return "descendant_apply_state_active"
             cur_did = self._current_selected_destination_drive_id() or self.pending_root_drive_ids.get("destination", "")
             if cur_did and not self._destination_snapshot_spo_trust_valid(cur_did):
-                return True
+                return "snapshot_spo_trust_invalid"
             _lv = getattr(self, "_destination_snapshot_light_validation_worker", None)
             if _lv is not None and _lv.isRunning():
-                return True
-        return False
+                return "snapshot_light_validation_worker_running"
+        return None
+
+    def _destination_deferred_expand_queue_hard_blocks(self) -> bool:
+        return self._destination_deferred_expand_queue_block_reason() is not None
 
     def _destination_pipeline_blocks_user_expand_gesture(self) -> bool:
         """True while destination bind or incremental merge session could starve the GUI thread."""
@@ -52114,11 +52399,11 @@ class MainWindow(QMainWindow):
             queue_len=len(self._destination_expand_user_deferred_queue),
         )
 
-    def _schedule_destination_expand_user_deferred_drain(self) -> None:
+    def _schedule_destination_expand_user_deferred_drain(self, *, delay_ms: int = 0) -> None:
         if self._destination_expand_user_deferred_scheduled:
             return
         self._destination_expand_user_deferred_scheduled = True
-        QTimer.singleShot(0, self._drain_destination_expand_user_deferred_queue)
+        QTimer.singleShot(int(delay_ms), self._drain_destination_expand_user_deferred_queue)
 
     def _drain_destination_expand_user_deferred_queue(self) -> None:
         self._destination_expand_user_deferred_scheduled = False
@@ -52128,24 +52413,55 @@ class MainWindow(QMainWindow):
                 "destination_expand_deferred_queue_process_started",
                 queue_len=len(q),
             )
-        if self._destination_deferred_expand_queue_hard_blocks():
+        _blk = self._destination_deferred_expand_queue_block_reason()
+        log_info(
+            "destination_expand_deferred_queue_hard_block_evaluated",
+            block_reason=str(_blk)[:120] if _blk else "",
+            blocked=bool(_blk),
+            full_tree_ready=bool(self._destination_full_tree_ready()),
+            root_graph_bound=bool(self._destination_deferred_expand_destination_root_ready()),
+            queue_len=len(q),
+        )
+        if _blk:
+            if _blk == "library_unresolved":
+                log_info(
+                    "destination_expand_deferred_queue_blocked_library_unresolved",
+                    queue_len=len(q),
+                )
+            elif _blk == "root_not_graph_bound":
+                log_info(
+                    "destination_expand_deferred_queue_blocked_root_not_bound",
+                    queue_len=len(q),
+                    bound_suffix=str(getattr(self, "_destination_sharepoint_root_graph_bound_drive_id", "") or "")[-16:],
+                    selected_suffix=str(self._current_selected_destination_drive_id() or "")[-16:],
+                )
+            elif _blk == "selected_pending_drive_mismatch":
+                log_info(
+                    "destination_expand_deferred_queue_blocked_drive_mismatch",
+                    queue_len=len(q),
+                )
+            else:
+                log_info(
+                    "destination_expand_deferred_queue_blocked",
+                    reason=str(_blk)[:120],
+                    full_tree_ready=bool(self._destination_full_tree_ready()),
+                    queue_len=len(q),
+                )
+            self._destination_expand_deferred_block_count = int(
+                getattr(self, "_destination_expand_deferred_block_count", 0) or 0
+            ) + 1
+            _nbc = int(self._destination_expand_deferred_block_count)
+            _backoff = int(min(500, 35 * (2 ** min(_nbc, 4))))
+            self._schedule_destination_expand_user_deferred_drain(delay_ms=_backoff)
+            return
+        self._destination_expand_deferred_block_count = 0
+        if self._planning_browse_mode("destination") != "local" and self._destination_sharepoint_planning_destination_active():
             log_info(
-                "destination_expand_deferred_queue_blocked",
-                reason="destination_pipeline_hard_block",
+                "destination_expand_deferred_queue_allowed_skeleton_mode",
                 full_tree_ready=bool(self._destination_full_tree_ready()),
+                root_graph_bound=bool(self._destination_deferred_expand_destination_root_ready()),
                 queue_len=len(q),
             )
-            self._schedule_destination_expand_user_deferred_drain()
-            return
-        if self._planning_browse_mode("destination") != "local" and self._destination_library_context_unresolved_for_graph_display():
-            log_info(
-                "destination_expand_deferred_queue_blocked",
-                reason="destination_library_unresolved",
-                full_tree_ready=bool(self._destination_full_tree_ready()),
-                queue_len=len(q),
-            )
-            self._schedule_destination_expand_user_deferred_drain()
-            return
         if not q:
             return
         path = q.popleft()
@@ -63224,6 +63540,22 @@ class MainWindow(QMainWindow):
                         returned_child_count=int(len(child_payloads)),
                         returned_child_names_sample=_child_name_sample,
                     )
+                    if (
+                        child_payloads
+                        and destination_authority_contract.graph_owns_visible_real_destination_structure(self)
+                    ):
+                        _par_d = str(drive_id or "")
+                        _par_i = str(item_id or "")
+                        QTimer.singleShot(
+                            0,
+                            lambda d_bind=_par_d, i_bind=_par_i: self._safe_invoke(
+                                "destination_nested_branch_refresh_after_parent_bind",
+                                lambda: self._destination_try_schedule_nested_branch_refresh_after_parent_graph_bind(
+                                    parent_drive_id=d_bind,
+                                    parent_item_id=i_bind,
+                                ),
+                            ),
+                        )
                     if destination_authority_contract.graph_owns_visible_real_destination_structure(self):
                         self._destination_graph_subtree_schedule_new_folders_after_bind(parent_index)
                     col0_planned = (
