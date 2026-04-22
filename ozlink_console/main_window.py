@@ -2902,8 +2902,10 @@ class MainWindow(QMainWindow):
     # Destination deferred user-expand replay: avoid QTimer(0) storms, sync re-entry, and unbounded not-found spin.
     _DEFERRED_EXPAND_MAX_PATH_RETRIES: int = 25
     _DEFERRED_EXPAND_PARK_PARENT_AFTER: int = 5
-    _DEFERRED_EXPAND_ENQUEUE_DELAY_MS: int = 8
-    _DEFERRED_EXPAND_TAIL_DELAY_MS: int = 32
+    _DEFERRED_EXPAND_ENQUEUE_DELAY_MS: int = 50
+    _DEFERRED_EXPAND_TAIL_DELAY_MS: int = 50
+    _DESTINATION_MEMORY_MIN_EXPECTED_SNAPSHOT_NODES: int = 60
+    _DESTINATION_IDLE_REPLAY_MAX_ESTIMATED_DESCENDANTS: int = 200
     _DEFERRED_EXPAND_REENTRY_COALESCE_MS: int = 64
     _DEFERRED_EXPAND_NO_PROGRESS_FLOOR_BACKOFF_MS: int = 100
     _DEFERRED_EXPAND_NO_PROGRESS_MAX_BACKOFF_MS: int = 250
@@ -3109,6 +3111,11 @@ class MainWindow(QMainWindow):
         self._destination_startup_overlay_snapshot_persist_ready: bool = False
         self._destination_last_overlay_audit_total_rows: int = 0
         self._destination_overlay_visibility_gate_reschedule_count: int = 0
+        self._destination_startup_phase_active: bool = True
+        self._destination_startup_replay_enqueued_count: int = 0
+        self._destination_startup_replay_blocked_count: int = 0
+        self._destination_startup_replay_summary_logged: bool = False
+        self._destination_idle_replay_ops_this_slice: int = 0
         # Read-only: ensure startup memory vs rich-candidate audit runs at most once per restore pass.
         self._destination_memory_active_rich_candidate_audit_ran: bool = False
         self._destination_last_startup_status_reason: str = ""
@@ -3472,6 +3479,9 @@ class MainWindow(QMainWindow):
         self._destination_expand_deferred_cumulative_summary_drains: int = 0
         self._destination_expand_deferred_duplicate_zero_suppressed: int = 0
         self._destination_expand_deferred_no_progress_log_streak: int = 0
+        self._destination_expand_deferred_stagnation_ticks: int = 0
+        self._destination_expand_deferred_stagnation_last_qlen: int = -1
+        self._destination_expand_queue_paused: bool = False
         # Expand All clicked while destination bind / merge / async projection is still running.
         self._destination_expand_all_start_pending = False
         self._destination_preview_complete_retry_generation = 0
@@ -9119,6 +9129,7 @@ class MainWindow(QMainWindow):
         collect_reason: str,
         expected_n: int,
         defer_code: str,
+        idle_bounded: bool = False,
     ) -> None:
         mk = str(self._allocation_move_key(move) or "")[:220]
         dq = getattr(self, "_destination_deferred_heavy_replay_queue", None)
@@ -9137,7 +9148,16 @@ class MainWindow(QMainWindow):
             except Exception:
                 continue
         dq.append(
-            (parent_ix, move, on_complete, str(enqueue_reason or ""), str(collect_reason or ""), mk, int(expected_n or 0))
+            (
+                parent_ix,
+                move,
+                on_complete,
+                str(enqueue_reason or ""),
+                str(collect_reason or ""),
+                mk,
+                int(expected_n or 0),
+                bool(idle_bounded),
+            )
         )
         log_info(
             "destination_heavy_descendant_classified_deferred",
@@ -9181,7 +9201,11 @@ class MainWindow(QMainWindow):
         hdq = getattr(self, "_destination_deferred_heavy_replay_queue", None)
         if not hdq or len(hdq) == 0:
             return
-        peek = int(hdq[0][-1] or 0)
+        _ent0 = hdq[0]
+        try:
+            peek = int(_ent0[6] or 0) if len(_ent0) > 6 else int(_ent0[-1] or 0)
+        except Exception:
+            peek = 0
         defer, code = self._destination_heavy_replay_should_defer_enqueue(peek)
         if defer:
             log_info(
@@ -9196,9 +9220,14 @@ class MainWindow(QMainWindow):
                 self._destination_schedule_deferred_heavy_replay_drain(650)
             return
         ent = hdq.popleft()
-        if len(ent) < 6:
+        if len(ent) < 7:
             return
-        parent_ix, move, on_complete, enq_r, col_r, _mk, exp_n = ent[0], ent[1], ent[2], ent[3], ent[4], ent[5], ent[6]
+        parent_ix, move, on_complete, enq_r, col_r, _mk = ent[0], ent[1], ent[2], ent[3], ent[4], ent[5]
+        try:
+            exp_n = int(ent[6] or 0)
+        except Exception:
+            exp_n = 0
+        idle_b = bool(ent[7]) if len(ent) > 7 else False
         log_info(
             "destination_heavy_replay_resumed_after_idle",
             expected_descendant_count=int(exp_n),
@@ -9213,6 +9242,7 @@ class MainWindow(QMainWindow):
             collect_reason=str(col_r or ""),
             skip_heavy_replay_defer=True,
             user_initiated=True,
+            idle_bounded=idle_b,
         )
 
     def _destination_after_descendant_apply_job_slot_cleared(self) -> None:
@@ -12162,6 +12192,11 @@ class MainWindow(QMainWindow):
             fresh = list(self._capture_tree_items_snapshot("destination") or [])
             snap_n = int(self._count_tree_snapshot_nodes(fresh))
             thin_capture_nodes = int(snap_n)
+            try:
+                mqual0 = self._destination_memory_snapshot_quality_metrics(fresh)
+                log_info("destination_memory_snapshot_quality_metrics", context="force_live_preflight", **mqual0)
+            except Exception:
+                pass
             n_applied_inconsistent = int(
                 self._destination_snapshot_has_applied_planned_allocations_with_empty_subtrees(fresh)
             )
@@ -20881,7 +20916,7 @@ class MainWindow(QMainWindow):
                 "post_full_tree_3s",
             ),
         )
-        if self._ozlink_destination_graph_overlay_mode():
+        if self._destination_memory_overlay_mode_enabled():
             QTimer.singleShot(
                 0,
                 lambda: self._safe_invoke(
@@ -27065,7 +27100,7 @@ class MainWindow(QMainWindow):
         return int(n_bad)
 
     def _destination_thin_planned_memory_over_rich_reference(self, proposed_recursive_nodes: int) -> bool:
-        if not self._ozlink_destination_graph_overlay_mode():
+        if not self._destination_memory_overlay_mode_enabled():
             return False
         baseline = self._destination_rich_reference_snapshot_node_count_baseline()
         if baseline < 120 or proposed_recursive_nodes < 0:
@@ -27089,7 +27124,7 @@ class MainWindow(QMainWindow):
         """In Graph overlay mode, do not run allocation source replay on cold session paths; user explict expand unlocks."""
         if user_initiated or getattr(self, "_overlay_followup_after_import", False):
             return False
-        if not self._ozlink_destination_graph_overlay_mode():
+        if not self._destination_memory_overlay_mode_enabled():
             return False
         if not destination_authority_contract.graph_owns_visible_real_destination_structure(self):
             return False
@@ -27109,6 +27144,72 @@ class MainWindow(QMainWindow):
         if "load_projected_descendants" in er and "bypass" in er:
             return True
         return False
+
+    def _destination_on_startup_replay_guard_idle_ready(self, *, reason: str) -> None:
+        """End startup replay hard-block after UI is ready for non-user work (or local destination first tick)."""
+        if not bool(getattr(self, "_destination_startup_phase_active", True)):
+            return
+        self._destination_startup_phase_active = False
+        log_info(
+            "destination_startup_replay_summary",
+            replay_enqueued_count=int(getattr(self, "_destination_startup_replay_enqueued_count", 0) or 0),
+            replay_blocked_count=int(getattr(self, "_destination_startup_replay_blocked_count", 0) or 0),
+            reason=str(reason or "")[:200],
+        )
+
+    def _destination_memory_snapshot_quality_metrics(self, roots_list: list) -> dict[str, int]:
+        """Snapshot JSON counts for ``destination_memory_snapshot_quality_metrics`` diagnostics (lightweight)."""
+        total = int(self._count_tree_snapshot_nodes(roots_list or []))
+        planned = int(self._count_planned_workspace_rows_in_destination_snapshot_roots(roots_list or []))
+        alloc_marked = 0
+        planned_alloc_pending = 0
+        stack: list[dict] = [r for r in (roots_list or []) if isinstance(r, dict)]
+        while stack:
+            n = stack.pop()
+            d = n.get("data") if isinstance(n.get("data"), dict) else None
+            if not isinstance(d, dict) or d.get("placeholder"):
+                for ch in n.get("children") or []:
+                    if isinstance(ch, dict):
+                        stack.append(ch)
+                continue
+            if bool(d.get("allocation_descendants_applied")):
+                alloc_marked += 1
+            if d.get("allocation_descendant_projection_pending") or d.get("planned_allocation_subtree_stale"):
+                planned_alloc_pending += 1
+            for ch in n.get("children") or []:
+                if isinstance(ch, dict):
+                    stack.append(ch)
+        applied_empty = int(
+            self._destination_snapshot_has_applied_planned_allocations_with_empty_subtrees(roots_list or [], log_event=False)
+        )
+        return {
+            "total_nodes": total,
+            "planned_nodes": int(planned),
+            "allocation_nodes": int(planned_alloc_pending),
+            "allocation_descendant_stamped": int(alloc_marked),
+            "applied_but_empty_count": int(applied_empty),
+        }
+
+    def _destination_classify_thin_active_snapshot(
+        self, metrics: dict[str, int] | None, *, ref_baseline: int
+    ) -> tuple[bool, str]:
+        """``reason``: ``too_small`` | ``applied_empty`` | ``missing_descendants`` (stable ordering)."""
+        m = dict(metrics or {})
+        total = int(m.get("total_nodes") or 0)
+        planned = int(m.get("planned_nodes") or 0)
+        applied_empty = int(m.get("applied_but_empty_count") or 0)
+        if applied_empty > 0:
+            return True, "applied_empty"
+        min_n = int(getattr(self, "_DESTINATION_MEMORY_MIN_EXPECTED_SNAPSHOT_NODES", 60) or 60)
+        if ref_baseline > 0 and min_n > 0 and int(total) < int(min_n) and int(ref_baseline) > int(total) + 40:
+            return True, "too_small"
+        if planned > 0 and int(total) > 0 and int(total) - int(planned) == 0:
+            return True, "missing_descendants"
+        if int(planned) > 0 and int(m.get("allocation_nodes") or 0) > 0 and int(m.get("allocation_descendant_stamped") or 0) == 0:
+            return True, "missing_descendants"
+        if int(total) > 0 and int(total) < int(min_n) and int(ref_baseline) > 2 * int(total) and int(ref_baseline) >= 120:
+            return True, "too_small"
+        return False, ""
 
     def _destination_planned_replay_deferred_marker(
         self,
@@ -27155,6 +27256,8 @@ class MainWindow(QMainWindow):
         best = 0
         best_lbl = ""
         path_ws = path_sess = ""
+        snap_for_metrics: list = []
+        dtn_ws: list = []
         if mm is not None:
             mpaths = getattr(mm, "paths", None) or {}
             path_ws = str(mpaths.get("workspace_snapshot") or "")
@@ -27166,6 +27269,7 @@ class MainWindow(QMainWindow):
                 wso = None
             if isinstance(wso, dict):
                 dtn = wso.get("destination_tree_snapshot") or []
+                dtn_ws = list(dtn) if isinstance(dtn, list) else []
                 if isinstance(dtn, list):
                     try:
                         active_ws = int(self._count_tree_snapshot_nodes(dtn))
@@ -27183,6 +27287,8 @@ class MainWindow(QMainWindow):
                             session_dst = int(self._count_tree_snapshot_nodes(dt))
                         except Exception:
                             session_dst = 0
+                        if dt:
+                            snap_for_metrics = list(dt)
         try:
             for cand, lbl in ((active_ws, "WorkspaceSnapshot"), (session_dst, "Draft_SessionState")):
                 if cand > best:
@@ -27236,10 +27342,28 @@ class MainWindow(QMainWindow):
                 node_count=int(best),
                 where=str(best_lbl)[:200],
             )
-        thin = max(session_dst, active_ws) < 80 and ref > 0 and int(ref) > 2 * max(int(session_dst), int(active_ws))
-        if thin and max(int(session_dst), int(active_ws)) < int(ref) - 20:
+        if not snap_for_metrics and dtn_ws:
+            snap_for_metrics = list(dtn_ws)
+        mqual: dict[str, int] = {}
+        if snap_for_metrics:
+            mqual = self._destination_memory_snapshot_quality_metrics(snap_for_metrics)
+            log_info("destination_memory_snapshot_quality_metrics", **mqual)
+        is_thin, th_reason = self._destination_classify_thin_active_snapshot(
+            mqual or None, ref_baseline=int(ref)
+        )
+        if is_thin and th_reason and mqual:
             log_info(
                 "destination_memory_active_snapshot_is_thin",
+                reason=str(th_reason)[:40],
+                reference_baseline=int(ref),
+                **mqual,
+            )
+        elif (not mqual) and max(session_dst, active_ws) < 80 and ref > 0 and int(ref) > 2 * max(
+            int(session_dst), int(active_ws)
+        ) and max(int(session_dst), int(active_ws)) < int(ref) - 20:
+            log_info(
+                "destination_memory_active_snapshot_is_thin",
+                reason="legacy_size_heuristic",
                 active_max=int(max(session_dst, active_ws)),
                 reference_baseline=int(ref),
             )
@@ -29035,7 +29159,7 @@ class MainWindow(QMainWindow):
             model = getattr(self, "destination_planning_model", None)
             if model is not None:
                 msg_s = str(message or "").strip()
-                if self._ozlink_destination_graph_overlay_mode() and not msg_s.lower().startswith("loading"):
+                if self._destination_memory_overlay_mode_enabled() and not msg_s.lower().startswith("loading"):
                     try:
                         _n_top = int(model.rowCount(QModelIndex()))
                     except Exception:
@@ -34190,16 +34314,28 @@ class MainWindow(QMainWindow):
                 error=str(exc)[:240],
             )
 
-    def _ozlink_destination_graph_overlay_mode(self) -> bool:
-        v = str(os.environ.get("OZLINK_DESTINATION_GRAPH_OVERLAY_MODE", "") or "").strip().lower()
-        on = v in ("1", "true", "yes", "on")
-        if on and not self._destination_graph_overlay_mode_log_once:
+    def _destination_memory_overlay_mode_enabled(self) -> bool:
+        """Graph memory overlay is ON by default; env can force off (not ``1`` / truthy) or on."""
+        env = os.environ.get("OZLINK_DESTINATION_GRAPH_OVERLAY_MODE")
+        if env is not None:
+            v = str(env).strip().lower()
+            on = v in ("1", "true", "yes", "on")
+        else:
+            on = True
+        if on and not bool(getattr(self, "_destination_graph_overlay_mode_log_once", False)):
             self._destination_graph_overlay_mode_log_once = True
-            log_info("destination_graph_overlay_mode_enabled", env_value=str(v)[:20])
+            log_info(
+                "destination_graph_overlay_mode_enabled",
+                source="default_on_unless_env_overrides" if env is None else "env",
+                env_value=(str(env).strip()[:20] if env is not None else ""),
+            )
         return on
 
+    def _ozlink_destination_graph_overlay_mode(self) -> bool:
+        return self._destination_memory_overlay_mode_enabled()
+
     def _destination_load_full_overlay_store(self, session_snaps: list | None) -> None:
-        if not self._ozlink_destination_graph_overlay_mode():
+        if not self._destination_memory_overlay_mode_enabled():
             return
 
         def _n(s: str) -> str:
@@ -34215,13 +34351,13 @@ class MainWindow(QMainWindow):
         )
 
     def _destination_graph_overlay_log_root_anchor_once(self) -> None:
-        if not self._ozlink_destination_graph_overlay_mode() or self._destination_graph_root_anchor_log_once:
+        if not self._destination_memory_overlay_mode_enabled() or self._destination_graph_root_anchor_log_once:
             return
         self._destination_graph_root_anchor_log_once = True
         log_info("destination_graph_root_anchor_established", source="graph_root_rows_bound")
 
     def _destination_graph_overlay_enforce_top_level_hub_uniqueness(self) -> None:
-        if not self._ozlink_destination_graph_overlay_mode():
+        if not self._destination_memory_overlay_mode_enabled():
             return
         model = getattr(self, "destination_planning_model", None)
         if model is None:
@@ -34297,7 +34433,7 @@ class MainWindow(QMainWindow):
         return None
 
     def _attach_destination_overlays_for_visible_branch(self, parent_canonical_path: str) -> None:
-        if not self._ozlink_destination_graph_overlay_mode():
+        if not self._destination_memory_overlay_mode_enabled():
             return
         st = self._destination_overlay_store
         if st is None:
@@ -34501,7 +34637,7 @@ class MainWindow(QMainWindow):
             panel_key, f"{len(sorted_items or [])} root item(s) loaded (overlay root merge).", loading=False
         )
         m = model
-        if m is not None and self._ozlink_destination_graph_overlay_mode():
+        if m is not None and self._destination_memory_overlay_mode_enabled():
             for r in range(min(64, int(m.rowCount(QModelIndex())))):
                 try:
                     pth = self._destination_folder_index_canonical_path(m.index(r, 0, QModelIndex()))
@@ -34546,7 +34682,7 @@ class MainWindow(QMainWindow):
 
     def _destination_graph_overlay_promote_rows_from_full_tree_snapshot(self) -> None:
         """In graph overlay mode, upgrade cached/planned-structural rows to live graph ownership when a full-tree path matches."""
-        if not self._ozlink_destination_graph_overlay_mode():
+        if not self._destination_memory_overlay_mode_enabled():
             return
         if self._planning_browse_mode("destination") == "local":
             return
@@ -34860,7 +34996,7 @@ class MainWindow(QMainWindow):
             selected_drive_id_suffix=_allow_drv[-16:] if len(_allow_drv) > 16 else _allow_drv,
         )
         node_ct = self._count_tree_snapshot_nodes(snaps)
-        if self._ozlink_destination_graph_overlay_mode():
+        if self._destination_memory_overlay_mode_enabled():
             self._destination_load_full_overlay_store(snaps)
             for i, snap in enumerate(list(snaps or [])):
                 if not isinstance(snap, dict):
@@ -35086,6 +35222,7 @@ class MainWindow(QMainWindow):
             )
         except Exception:
             self._destination_destination_snapshot_persist_startup_unlocked = True
+        self._destination_on_startup_replay_guard_idle_ready(reason="background_hydration_completed:" + str(reason or "")[:120])
 
     def _destination_schedule_background_hydration_after_minimal_restore(self, *, reason: str) -> None:
         raw = str(os.environ.get("OZLINK_STARTUP_BACKGROUND_HYDRATION_DELAY_MS", "") or "").strip()
@@ -35127,6 +35264,10 @@ class MainWindow(QMainWindow):
                 startup_ui_phase=str(getattr(self, "_destination_startup_ui_phase", "") or ""),
                 provisional_applied=bool(getattr(self, "_destination_provisional_startup_applied", False)),
             )
+            if self._planning_browse_mode("destination") == "local":
+                self._destination_on_startup_replay_guard_idle_ready(
+                    reason="local_destination_first_interactable_tick"
+                )
 
         QTimer.singleShot(0, lambda: self._safe_invoke("startup_first_interactable", _go))
 
@@ -35365,7 +35506,7 @@ class MainWindow(QMainWindow):
                                 reason="no_valid_nested_specs_after_pre_graph_sanitize",
                                 pending_top_level_roots=int(len(pending_dest_snaps or [])),
                             )
-                        if roots_pp and not self._ozlink_destination_graph_overlay_mode():
+                        if roots_pp and not self._destination_memory_overlay_mode_enabled():
                             destination_stamp_snapshot_tree_workspace_state(list(pending_dest_snaps))
                             model.reset_nested(roots_pp)
                             self._destination_startup_snapshot_mount_seen = True
@@ -35410,7 +35551,7 @@ class MainWindow(QMainWindow):
                                 step="after_pre_graph_snapshot_reset_nested",
                                 **self._destination_forensic_destination_model_counts(),
                             )
-                        elif roots_pp and self._ozlink_destination_graph_overlay_mode():
+                        elif roots_pp and self._destination_memory_overlay_mode_enabled():
                             pds = list(pending_dest_snaps or [])
                             self._destination_load_full_overlay_store(pds)
                             destination_stamp_snapshot_tree_workspace_state(pds)
@@ -35526,7 +35667,7 @@ class MainWindow(QMainWindow):
                         graph_root_items=len(items or []),
                     )
             if not items:
-                if not self._ozlink_destination_graph_overlay_mode():
+                if not self._destination_memory_overlay_mode_enabled():
                     self._destination_startup_lifecycle_temp_post_snapshot_mutation(
                         "_apply_root_payload_to_destination_model_view",
                         "model.clear",
@@ -35590,6 +35731,7 @@ class MainWindow(QMainWindow):
                 else:
                     self._destination_startup_deferred_overlay_reasons.clear()
                 self._destination_startup_indicator_refresh_pending_after_cached = False
+                self._destination_on_startup_replay_guard_idle_ready(reason="empty_graph_library_destination_inactive")
                 return
             if self._planning_browse_mode("destination") != "local":
                 sorted_items = sorted(
@@ -35828,7 +35970,7 @@ class MainWindow(QMainWindow):
                         )
                     self._destination_full_library_reconcile_pending = True
                     self._destination_authority_pending_shell = True
-                    if self._ozlink_destination_graph_overlay_mode():
+                    if self._destination_memory_overlay_mode_enabled():
                         self._destination_nondestructive_shallow_graph_root_bind_in_overlay_mode(
                             model, payloads, did_shell_early
                         )
@@ -35963,7 +36105,7 @@ class MainWindow(QMainWindow):
                     )
 
                 QTimer.singleShot(0, lambda: self._safe_invoke("destination_authority_full_tree_kick", _kick_authority))
-                if self._ozlink_destination_graph_overlay_mode() and items:
+                if self._destination_memory_overlay_mode_enabled() and items:
                     self._destination_load_full_overlay_store(
                         (getattr(self, "_pending_session_tree_snapshots", {}) or {}).get("destination")
                     )
@@ -35997,7 +36139,7 @@ class MainWindow(QMainWindow):
                 pl = self._destination_payload_from_graph_item(it)
                 self._apply_tree_item_visual_state(None, pl)
                 payloads.append(pl)
-            if self._ozlink_destination_graph_overlay_mode():
+            if self._destination_memory_overlay_mode_enabled():
                 self._destination_load_full_overlay_store(
                     (getattr(self, "_pending_session_tree_snapshots", {}) or {}).get("destination")
                 )
@@ -36024,7 +36166,7 @@ class MainWindow(QMainWindow):
             self._destination_suppress_steady_materialize_skip_once = True
             self._destination_require_deferred_full_materialize_once = True
             self._mark_destination_real_tree_snapshot_stale()
-            if not self._ozlink_destination_graph_overlay_mode():
+            if not self._destination_memory_overlay_mode_enabled():
                 self._set_tree_status_message(panel_key, f"{len(sorted_items)} root item(s) loaded.", loading=False)
         finally:
             tree.setUpdatesEnabled(True)
@@ -46741,6 +46883,7 @@ class MainWindow(QMainWindow):
         enqueue_reason: str = "",
         collect_reason: str = "",
         user_initiated: bool = False,
+        idle_bounded: bool = False,
     ) -> int:
         """Project source subtree under a Graph-auth allocation folder (chunked; no single-wave bind).
 
@@ -46753,6 +46896,7 @@ class MainWindow(QMainWindow):
             enqueue_reason=enqueue_reason,
             collect_reason=collect_reason,
             user_initiated=bool(user_initiated),
+            idle_bounded=bool(idle_bounded),
         )
         return 0
 
@@ -47390,6 +47534,8 @@ class MainWindow(QMainWindow):
         *,
         enqueue_reason: str = "",
         collect_reason: str = "",
+        user_initiated: bool = False,
+        idle_bounded: bool = False,
     ):
         """Graph-authority allocation descendant projection: chunked (see :meth:`_decorate_destination_graph_subtree_for_allocation_move`)."""
         self._alloc_apply_sibling_reconcile_coalesce_key = None
@@ -47520,7 +47666,20 @@ class MainWindow(QMainWindow):
                 expected_descendant_count=_dtot,
                 threshold=int(_hth),
             )
-        return {
+        _g_bs = float(getattr(self, "_destination_graph_descendant_apply_budget_s", 0.01) or 0.01)
+        if bool(idle_bounded):
+            _g_bs = 0.025
+            try:
+                self._destination_idle_replay_ops_this_slice = 0
+            except Exception:
+                pass
+            log_info(
+                "destination_idle_replay_budget_applied",
+                max_ms=25,
+                max_nodes=50,
+                expected_descendant_count=int(_dtot),
+            )
+        out = {
             "parent_ix": parent_ix,
             "move": move,
             "on_complete": on_complete,
@@ -47544,12 +47703,17 @@ class MainWindow(QMainWindow):
             "descendant_data": None,
             "descendant_source_path": "",
             "seg_index": 0,
-            "graph_budget_s": float(getattr(self, "_destination_graph_descendant_apply_budget_s", 0.01) or 0.01),
+            "graph_budget_s": _g_bs,
             "graph_model_structure_generation_snap": _gen_snap,
             "_snapshot_drain_graph_liveness": 0,
             "heavy_replay": _heavy,
             "expected_descendant_total": _dtot,
+            "user_initiated_replay": bool(user_initiated),
         }
+        if bool(idle_bounded):
+            out["idle_replay_bounded"] = True
+            out["idle_replay_max_ops_per_slice"] = 50
+        return out
 
     def _build_destination_descendant_apply_state(
         self,
@@ -47559,6 +47723,8 @@ class MainWindow(QMainWindow):
         *,
         enqueue_reason: str = "",
         collect_reason: str = "",
+        user_initiated: bool = False,
+        idle_bounded: bool = False,
     ):
         self._alloc_apply_sibling_reconcile_coalesce_key = None
         model = getattr(self, "destination_planning_model", None)
@@ -47580,6 +47746,8 @@ class MainWindow(QMainWindow):
                 on_complete,
                 enqueue_reason=enqueue_reason,
                 collect_reason=collect_reason,
+                user_initiated=bool(user_initiated),
+                idle_bounded=bool(idle_bounded),
             )
         parent_data = parent_ix.data(Qt.UserRole) or {}
         allocation_destination_path = self._canonical_destination_projection_path(
@@ -48857,6 +49025,12 @@ class MainWindow(QMainWindow):
             )
         deadline = time.perf_counter() + budget_s
         max_graph_ops = int(getattr(self, "_destination_graph_descendant_apply_max_ops_per_tick", 8) or 8)
+        if isinstance(st_gate, dict) and st_gate.get("graph_walk") and st_gate.get("idle_replay_bounded"):
+            try:
+                cap_idle = int(st_gate.get("idle_replay_max_ops_per_slice") or 50)
+            except Exception:
+                cap_idle = 50
+            max_graph_ops = min(int(max_graph_ops), cap_idle)
         _heavy_replay_ops_capped = False
         graph_ops = 0
         _coalesced = False
@@ -48910,12 +49084,19 @@ class MainWindow(QMainWindow):
                     else:
                         parent_ix, move, on_complete = ent[0], ent[1], ent[2]
                         enq_r, col_r = "", ""
+                    u_i, idle_b = False, False
+                    if len(ent) >= 6:
+                        u_i = bool(ent[5])
+                    if len(ent) >= 7:
+                        idle_b = bool(ent[6])
                     st = self._build_destination_descendant_apply_state(
                         parent_ix,
                         move,
                         on_complete,
                         enqueue_reason=str(enq_r or ""),
                         collect_reason=str(col_r or ""),
+                        user_initiated=u_i,
+                        idle_bounded=idle_b,
                     )
                     if st is None:
                         if on_complete is not None:
@@ -49239,6 +49420,7 @@ class MainWindow(QMainWindow):
         collect_reason: str = "",
         skip_heavy_replay_defer: bool = False,
         user_initiated: bool = False,
+        idle_bounded: bool = False,
     ) -> bool:
         """Queue incremental allocation-descendant application for a QModelIndex. State is built when the job runs."""
         if _shutdown_mutation_skip_for_host(
@@ -49247,11 +49429,34 @@ class MainWindow(QMainWindow):
             enqueue_reason=str(enqueue_reason or "")[:200],
         ):
             return False
+        if (
+            hasattr(self, "_destination_startup_phase_active")
+            and bool(getattr(self, "_destination_startup_phase_active"))
+            and not bool(user_initiated)
+        ):
+            try:
+                self._destination_startup_replay_blocked_count = int(
+                    getattr(self, "_destination_startup_replay_blocked_count", 0) or 0
+                ) + 1
+            except Exception:
+                pass
+            log_info("destination_startup_replay_hard_blocked", enqueue_reason=str(enqueue_reason or "")[:200])
+            return False
         if self._destination_should_block_cold_planned_descendant_replay(
             enqueue_reason=str(enqueue_reason or ""),
             collect_reason=str(collect_reason or ""),
             user_initiated=bool(user_initiated),
         ):
+            if (
+                hasattr(self, "_destination_startup_phase_active")
+                and bool(getattr(self, "_destination_startup_phase_active"))
+            ):
+                try:
+                    self._destination_startup_replay_blocked_count = int(
+                        getattr(self, "_destination_startup_replay_blocked_count", 0) or 0
+                    ) + 1
+                except Exception:
+                    pass
             self._destination_planned_replay_deferred_marker(
                 parent_ix,
                 move,
@@ -49359,7 +49564,7 @@ class MainWindow(QMainWindow):
                     reason="partial_subtree_missing_only_apply_not_seeded_from_snapshot_audit",
                     enqueue_reason=str(enqueue_reason or "")[:200],
                 )
-        if _graph_auth_enqueue and _assess_enq and self._ozlink_destination_graph_overlay_mode():
+        if _graph_auth_enqueue and _assess_enq and self._destination_memory_overlay_mode_enabled():
             _er_ov = str(enqueue_reason or "").lower()
             _st_ov = self._destination_overlay_store
             _dp3 = ""
@@ -49394,6 +49599,27 @@ class MainWindow(QMainWindow):
                     )
         _exp_defer = int((_assess_enq or {}).get("expected_descendant_count") or 0) if _assess_enq else 0
         if (
+            bool(user_initiated)
+            and bool(idle_bounded)
+            and int(_exp_defer) > int(self._DESTINATION_IDLE_REPLAY_MAX_ESTIMATED_DESCENDANTS)
+        ):
+            if (
+                hasattr(self, "_destination_startup_phase_active")
+                and bool(getattr(self, "_destination_startup_phase_active"))
+            ):
+                try:
+                    self._destination_startup_replay_blocked_count = int(
+                        getattr(self, "_destination_startup_replay_blocked_count", 0) or 0
+                    ) + 1
+                except Exception:
+                    pass
+            log_info(
+                "destination_idle_replay_blocked_large_allocation",
+                expected_descendant_count=int(_exp_defer),
+                threshold=int(self._DESTINATION_IDLE_REPLAY_MAX_ESTIMATED_DESCENDANTS),
+            )
+            return False
+        if (
             not _skip_heavy_replay
             and _graph_auth_enqueue
             and _assess_enq
@@ -49409,6 +49635,7 @@ class MainWindow(QMainWindow):
                     collect_reason=str(collect_reason or ""),
                     expected_n=int(_exp_defer),
                     defer_code=str(_dcode)[:100],
+                    idle_bounded=bool(idle_bounded),
                 )
                 log_info(
                     "destination_descendant_replay_deferred_by_heavy_gate",
@@ -49432,7 +49659,24 @@ class MainWindow(QMainWindow):
                 else "graph_authority_false_enqueue_without_assessor"
             ),
         )
-        dq.append((parent_ix, move, on_complete, str(enqueue_reason or ""), str(collect_reason or "")))
+        dq.append(
+            (
+                parent_ix,
+                move,
+                on_complete,
+                str(enqueue_reason or ""),
+                str(collect_reason or ""),
+                bool(user_initiated),
+                bool(idle_bounded),
+            )
+        )
+        if not bool(user_initiated):
+            try:
+                self._destination_startup_replay_enqueued_count = int(
+                    getattr(self, "_destination_startup_replay_enqueued_count", 0) or 0
+                ) + 1
+            except Exception:
+                pass
         log_info(
             "destination_descendant_apply_enqueued",
             enqueue_reason=str(enqueue_reason or "")[:200],
@@ -49445,6 +49689,8 @@ class MainWindow(QMainWindow):
             collect_reason=str(collect_reason or "")[:200],
             queue_len=len(dq),
             move_key_excerpt=str(self._allocation_move_key(move) or "")[:120],
+            user_initiated=bool(user_initiated),
+            idle_bounded=bool(idle_bounded),
         )
         if getattr(self, "_overlay_followup_after_import", False) and not getattr(
             self, "_descendant_replay_after_import_started_logged", False
@@ -49466,6 +49712,7 @@ class MainWindow(QMainWindow):
         enqueue_reason: str = "",
         collect_reason: str = "",
         user_initiated: bool = False,
+        idle_bounded: bool = False,
     ) -> int:
         """Apply projected allocation descendants under parent_ix. Work is incremental; return value is always 0."""
         self._enqueue_destination_descendant_apply_to_model(
@@ -49475,6 +49722,7 @@ class MainWindow(QMainWindow):
             enqueue_reason=enqueue_reason,
             collect_reason=collect_reason,
             user_initiated=bool(user_initiated),
+            idle_bounded=bool(idle_bounded),
         )
         return 0
 
@@ -56810,6 +57058,16 @@ class MainWindow(QMainWindow):
         else:
             self._begin_destination_model_expand_all()
 
+    def _clear_destination_expand_queue_paused(self, reason: str) -> None:
+        if not bool(getattr(self, "_destination_expand_queue_paused", False)):
+            return
+        self._destination_expand_queue_paused = False
+        log_info("destination_expand_queue_resumed", reason=str(reason or "")[:120])
+        if self._destination_expand_user_deferred_queue:
+            self._schedule_destination_expand_user_deferred_drain(
+                delay_ms=int(self._DEFERRED_EXPAND_TAIL_DELAY_MS)
+            )
+
     def _enqueue_destination_expand_deferred(self, semantic_path: str) -> None:
         p = (semantic_path or "").strip()
         if not p:
@@ -56831,7 +57089,7 @@ class MainWindow(QMainWindow):
 
     def _schedule_destination_expand_user_deferred_drain(self, *, delay_ms: int) -> None:
         """Coalesce: only one singleShot outstanding; never stack duplicate zero-delay timers."""
-        d = int(max(0, delay_ms))
+        d = int(max(50, int(delay_ms)))
         if self._destination_expand_user_deferred_scheduled:
             if d <= 0:
                 n = int(getattr(self, "_destination_expand_deferred_duplicate_zero_suppressed", 0) or 0) + 1
@@ -56851,17 +57109,14 @@ class MainWindow(QMainWindow):
         self._destination_expand_user_deferred_scheduled = False
         t_mono = time.perf_counter()
         q = self._destination_expand_user_deferred_queue
+        if bool(getattr(self, "_destination_expand_queue_paused", False)):
+            log_info(
+                "destination_expand_deferred_queue_skipped_due_to_pause",
+                queue_len=len(q),
+            )
+            return
         if getattr(self, "_destination_expand_deferred_drain_running", False):
-            if not self._destination_expand_deferred_drain_reentry_pended:
-                self._destination_expand_deferred_drain_reentry_pended = True
-                self._schedule_destination_expand_user_deferred_drain(
-                    delay_ms=int(self._DEFERRED_EXPAND_REENTRY_COALESCE_MS)
-                )
-                log_info(
-                    "destination_expand_deferred_queue_drain_reentry_suppressed",
-                    coalesce_ms=int(self._DEFERRED_EXPAND_REENTRY_COALESCE_MS),
-                    queue_len=len(q),
-                )
+            log_info("destination_expand_queue_reentry_blocked", queue_len=len(q))
             return
         _queue_len_before = len(q)
         _processed = 0
@@ -57166,6 +57421,29 @@ class MainWindow(QMainWindow):
         finally:
             self._destination_expand_deferred_drain_running = False
             self._destination_expand_deferred_drain_reentry_pended = False
+        _ql_final = int(len(q))
+        if int(_sum_id) > 50 and _ql_final == int(_queue_len_before) and int(_queue_len_before) > 0 and int(_popped) == 0:
+            self._destination_expand_deferred_stagnation_ticks = int(
+                getattr(self, "_destination_expand_deferred_stagnation_ticks", 0) or 0
+            ) + 1
+        else:
+            self._destination_expand_deferred_stagnation_ticks = 0
+        if int(getattr(self, "_destination_expand_deferred_stagnation_ticks", 0) or 0) > 50:
+            log_info(
+                "destination_expand_queue_spin_detected",
+                drain_id=_sum_id,
+                queue_len=int(_ql_final),
+            )
+            log_info(
+                "destination_expand_queue_paused",
+                reason="spin_detected",
+                queue_len=int(_ql_final),
+            )
+            self._destination_expand_queue_paused = True
+            self._destination_expand_deferred_stagnation_ticks = 0
+            QTimer.singleShot(5000, lambda: self._clear_destination_expand_queue_paused("spin_cooloff"))
+            return
+        _sched_delay_out = int(max(50, int(_sched_delay_out)))
         if q:
             self._schedule_destination_expand_user_deferred_drain(delay_ms=int(_sched_delay_out))
         else:
@@ -66367,7 +66645,9 @@ class MainWindow(QMainWindow):
                 p.pop("allocation_projection_children_signature", None)
 
             dm.update_payload_for_index(col0, _mut_retry)
-            self._load_destination_projected_descendants_index(col0, user_initiated=True)
+            self._load_destination_projected_descendants_index(
+                col0, user_initiated=True, idle_bounded=True
+            )
 
     def _apply_overlay_projection_invariant_repair_to_index(self, col0: QModelIndex, move) -> None:
         """Repair one overlay folder row using the same projection primitive as Graph-auth load (no Graph I/O).
@@ -67206,7 +67486,7 @@ class MainWindow(QMainWindow):
             p.pop("allocation_projection_children_signature", None)
 
         dm.update_payload_for_index(col0, _mut_retry)
-        self._load_destination_projected_descendants_index(col0, user_initiated=True)
+        self._load_destination_projected_descendants_index(col0, user_initiated=True, idle_bounded=True)
 
     def _schedule_coalesced_overlay_invariant(self, reason: str, *, source_driven: bool = False) -> None:
         """Collapse many rapid notifications into one :meth:`_on_destination_state_mutation` on the next event-loop tick.
@@ -67589,7 +67869,7 @@ class MainWindow(QMainWindow):
         self._run_overlay_projection_invariant_pass(reason or "debounced_overlay_projection_invariant")
 
     def _load_destination_projected_descendants_index(
-        self, ix: QModelIndex, *, user_initiated: bool = False
+        self, ix: QModelIndex, *, user_initiated: bool = False, idle_bounded: bool = False
     ) -> None:
         dmodel = getattr(self, "destination_planning_model", None)
         tree = getattr(self, "destination_tree_widget", None)
@@ -67667,7 +67947,7 @@ class MainWindow(QMainWindow):
                 _is_folder_alloc
                 and _direct_n == 0
                 and graph_auth
-                and self._ozlink_destination_graph_overlay_mode()
+                and self._destination_memory_overlay_mode_enabled()
             ):
 
                 def _mut_thin(p):
@@ -67991,6 +68271,7 @@ class MainWindow(QMainWindow):
                 enqueue_reason="load_projected_descendants_children_loaded_graph_auth",
                 collect_reason="load_projected_descendants_children_loaded_graph_auth",
                 user_initiated=bool(user_initiated),
+                idle_bounded=bool(idle_bounded),
             )
             return
         self._remove_placeholder_children(ix)
@@ -68076,6 +68357,7 @@ class MainWindow(QMainWindow):
             enqueue_reason="deferred_projected_descendants_after_placeholder_strip",
             collect_reason="deferred_projected_descendants_after_placeholder_strip",
             user_initiated=bool(user_initiated),
+            idle_bounded=bool(idle_bounded),
         ):
             move_src = move.get("source", {}) or {}
             if bool(move_src.get("is_folder", True)):
@@ -68633,7 +68915,7 @@ class MainWindow(QMainWindow):
                         returned_child_count=int(len(child_payloads)),
                         returned_child_names_sample=_child_name_sample,
                     )
-                    if self._ozlink_destination_graph_overlay_mode():
+                    if self._destination_memory_overlay_mode_enabled():
                         _ovl_parent = str(_pp_snap or "").strip() or self._destination_folder_index_canonical_path(
                             parent_index.siblingAtColumn(0) if parent_index.column() != 0 else parent_index
                         )
