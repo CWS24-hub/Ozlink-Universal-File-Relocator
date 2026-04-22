@@ -52,8 +52,20 @@ def destination_payload_is_memory_overlay_row_for_reuse(pl: Any) -> bool:
         return True
     if bool(pl.get("planned_allocation_descendant")):
         return True
+    if bool(pl.get("planned_allocation")):
+        return True
+    origin = str(pl.get("node_origin", "") or "").strip().casefold()
+    if origin in ("plannedallocation", "proposed", "projecteddestination"):
+        return True
+    ovl = str(pl.get("overlay_state", "") or "").strip().casefold()
+    if ovl == "plannedallocation":
+        return True
+    if bool(pl.get("proposed")):
+        return True
     lbl = f"{pl.get('base_display_label', '')!s} {pl.get('tree_label', '')!s}".casefold()
     if "[planned]" in lbl or "[allocated]" in lbl:
+        return True
+    if " planned" in f" {lbl}" or lbl.startswith("planned") or " allocated" in f" {lbl}":
         return True
     rk = str(pl.get("row_kind") or "").strip().lower()
     if rk.startswith("planned_") or rk in ("planned_folder", "planned_file"):
@@ -64,6 +76,11 @@ def destination_payload_is_memory_overlay_row_for_reuse(pl: Any) -> bool:
         return True
     vs = str(pl.get("verification_state") or "").strip().casefold()
     if vs == "planned_only" and rk.startswith("planned"):
+        return True
+    if ws == WORKSPACE_ROW_STATE_CACHED_PROVISIONAL and (
+        bool(pl.get("allocation_id") or pl.get("request_id") or pl.get("RequestId"))
+        or bool(pl.get("allocation_projection_destination_path_saved"))
+    ):
         return True
     return False
 
@@ -80,12 +97,28 @@ def destination_snapshot_rehydrate_overlay_payload(pl: dict[str, Any]) -> bool:
     mutated = False
     lbl = f"{pl.get('base_display_label', '')!s} {pl.get('tree_label', '')!s}".casefold()
     rk = str(pl.get("row_kind") or "").strip().lower()
+    ws0 = destination_payload_workspace_row_state(pl)
+    origin_cf = str(pl.get("node_origin", "") or "").strip().casefold()
     looks_planned = bool(
         pl.get("planned_allocation_descendant")
         or pl.get("workspace_planned_row")
+        or pl.get("planned_allocation")
         or rk.startswith("planned_")
         or "[planned]" in lbl
         or "[allocated]" in lbl
+        or " planned" in f" {lbl}"
+        or " allocated" in f" {lbl}"
+        or bool(pl.get("proposed"))
+        or origin_cf in ("plannedallocation", "proposed", "projecteddestination")
+        or str(pl.get("overlay_state", "") or "").strip().casefold() == "plannedallocation"
+        or ws0 == WORKSPACE_ROW_STATE_PLANNED_ONLY
+        or (
+            ws0 == WORKSPACE_ROW_STATE_CACHED_PROVISIONAL
+            and (
+                bool(pl.get("allocation_id") or pl.get("request_id") or pl.get("RequestId"))
+                or bool(pl.get("allocation_projection_destination_path_saved"))
+            )
+        )
     )
     if not looks_planned:
         return False

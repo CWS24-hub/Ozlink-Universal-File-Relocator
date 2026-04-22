@@ -3092,6 +3092,9 @@ class MainWindow(QMainWindow):
         self._destination_workspace_sidecar_destination_node_count_at_startup: int = 0
         self._destination_final_startup_destination_snapshot_node_count: int = -1
         self._destination_destination_snapshot_persist_startup_unlocked: bool = False
+        self._destination_snapshot_overlay_classification_startup_complete: bool = False
+        self._destination_last_overlay_audit_total_rows: int = 0
+        self._destination_overlay_visibility_gate_reschedule_count: int = 0
         self._destination_last_startup_status_reason: str = ""
         self._restore_abort_mode = False
         self._restore_abort_reason = ""
@@ -26374,7 +26377,7 @@ class MainWindow(QMainWindow):
         return {"model_nodes_iter_depth_first": n_iter, "model_nodes_non_placeholder": n_np}
 
     def _destination_rich_reference_snapshot_node_count_baseline(self) -> int:
-        """Max of workspace-sidecar and selected startup snapshot node counts (forensic persist guard)."""
+        """Max of workspace-sidecar, selected startup snapshot, and last overlay audit row count (persist guard)."""
         try:
             a = int(getattr(self, "_destination_workspace_sidecar_destination_node_count_at_startup", 0) or 0)
         except Exception:
@@ -26383,7 +26386,11 @@ class MainWindow(QMainWindow):
             b = int(getattr(self, "_destination_final_startup_destination_snapshot_node_count", 0) or 0)
         except Exception:
             b = 0
-        return int(max(a, b, 0))
+        try:
+            c = int(getattr(self, "_destination_last_overlay_audit_total_rows", 0) or 0)
+        except Exception:
+            c = 0
+        return int(max(a, b, c, 0))
 
     def _destination_should_block_thin_destination_snapshot_over_rich_sidecar(
         self, proposed_recursive_nodes: int
@@ -26392,7 +26399,7 @@ class MainWindow(QMainWindow):
         if getattr(self, "_application_shutting_down", False):
             return False, ""
         baseline = self._destination_rich_reference_snapshot_node_count_baseline()
-        if baseline < 80:
+        if baseline < 40:
             return False, ""
         if bool(getattr(self, "_destination_destination_snapshot_persist_startup_unlocked", False)):
             return False, ""
@@ -26460,6 +26467,10 @@ class MainWindow(QMainWindow):
             ):
                 tp = self._tree_item_path(pl) or pl.get("item_path") or pl.get("destination_path") or ""
                 sample_planned.append(str(tp)[:420])
+        try:
+            self._destination_last_overlay_audit_total_rows = int(out.get("total_rows") or 0)
+        except Exception:
+            self._destination_last_overlay_audit_total_rows = 0
         log_info("destination_loaded_snapshot_overlay_classification_audit", **out)
         log_info(
             "destination_loaded_snapshot_overlay_row_sample",
@@ -26573,6 +26584,50 @@ class MainWindow(QMainWindow):
                 phase="destination_model_walk",
             )
         return n
+
+    def _destination_run_post_snapshot_bind_overlay_pipeline(self, *, reason: str) -> None:
+        """Classification + subtree audit + model rehydrate after ``reset_nested`` (provisional or pre-graph bind)."""
+        self._destination_snapshot_overlay_classification_startup_complete = False
+        try:
+            self._destination_loaded_snapshot_overlay_classification_audit()
+            self._destination_loaded_snapshot_allocation_subtree_audit()
+            self._destination_rehydrate_overlay_payloads_in_destination_model()
+            self._destination_loaded_snapshot_overlay_classification_audit()
+        except Exception as exc:
+            self._log_restore_exception("destination_loaded_snapshot_overlay_audit", exc)
+            log_info(
+                "destination_startup_overlay_classification_pipeline_failed",
+                reason=str(reason or "")[:120],
+                error_excerpt=str(exc)[:200],
+            )
+        finally:
+            self._destination_snapshot_overlay_classification_startup_complete = True
+            self._destination_overlay_visibility_gate_reschedule_count = 0
+            log_info(
+                "destination_startup_overlay_classification_pipeline_finished",
+                reason=str(reason or "")[:200],
+                overlay_audit_total_rows=int(getattr(self, "_destination_last_overlay_audit_total_rows", 0) or 0),
+            )
+
+    def _destination_retry_load_projected_descendants_after_overlay_gate(self, dest_lookup_cf: str) -> None:
+        """Resume visibility-bypass descendant load after overlay classification completed."""
+        if not getattr(self, "_destination_snapshot_overlay_classification_startup_complete", False):
+            n = int(getattr(self, "_destination_overlay_visibility_gate_reschedule_count", 0) or 0)
+            if n < 100:
+                self._destination_overlay_visibility_gate_reschedule_count = n + 1
+                QTimer.singleShot(
+                    40,
+                    lambda p=str(dest_lookup_cf or ""): self._safe_invoke(
+                        "destination_visibility_bypass_post_overlay_classification_retry",
+                        lambda: self._destination_retry_load_projected_descendants_after_overlay_gate(p),
+                    ),
+                )
+            return
+        self._destination_overlay_visibility_gate_reschedule_count = 0
+        ix = self._find_visible_destination_item_by_path(str(dest_lookup_cf or "").strip())
+        if ix is None or not ix.isValid():
+            return
+        self._load_destination_projected_descendants_index(ix)
 
     def _destination_graph_bind_presnapshot_classify_row(
         self, pl: dict, *, parent_path_cf: str
@@ -32915,9 +32970,6 @@ class MainWindow(QMainWindow):
                 tree.setUpdatesEnabled(True)
             except Exception:
                 pass
-        self._destination_provisional_startup_applied = True
-        msg = "Loaded saved workspace snapshot. Verifying live SharePoint content…"
-        self._destination_provisional_startup_status_message = msg
         self._destination_startup_snapshot_mount_seen = True
         self._destination_session_snapshot_path_cf_set_cache = None
         self._destination_snapshot_mount_drive_id = str(
@@ -32926,6 +32978,10 @@ class MainWindow(QMainWindow):
             or ""
         ).strip()
         self._destination_startup_promotion_scope_drive_id = str(self._destination_snapshot_mount_drive_id or "").strip()
+        self._destination_run_post_snapshot_bind_overlay_pipeline(reason="provisional_startup_reset_nested")
+        self._destination_provisional_startup_applied = True
+        msg = "Loaded saved workspace snapshot. Verifying live SharePoint content…"
+        self._destination_provisional_startup_status_message = msg
         self._destination_last_startup_status_reason = "provisional_snapshot_first_paint"
         self._set_tree_status_message("destination", msg, loading=False)
         self._startup_post_snapshot_trace_reset()
@@ -33383,6 +33439,9 @@ class MainWindow(QMainWindow):
                             self._destination_stamp_destination_model_rows_for_snapshot_live_refresh(
                                 context="destination_pending_session_snapshot_bind_before_graph_root",
                             )
+                            self._destination_run_post_snapshot_bind_overlay_pipeline(
+                                reason="pre_graph_session_bind_reset_nested",
+                            )
                             _pre_gr_bind_did = str(
                                 (getattr(self, "pending_root_drive_ids", {}) or {}).get("destination")
                                 or self._current_selected_destination_drive_id()
@@ -33406,13 +33465,6 @@ class MainWindow(QMainWindow):
                                 step="after_pre_graph_snapshot_reset_nested",
                                 **self._destination_forensic_destination_model_counts(),
                             )
-                            try:
-                                self._destination_loaded_snapshot_overlay_classification_audit()
-                                self._destination_loaded_snapshot_allocation_subtree_audit()
-                                self._destination_rehydrate_overlay_payloads_in_destination_model()
-                                self._destination_loaded_snapshot_overlay_classification_audit()
-                            except Exception as exc:
-                                self._log_restore_exception("destination_loaded_snapshot_overlay_audit", exc)
             prov_by_id: dict[str, dict] = {}
             if (
                 panel_key == "destination"
@@ -64773,6 +64825,14 @@ class MainWindow(QMainWindow):
         dm = getattr(self, "destination_planning_model", None)
         if dm is None:
             return 0
+        if getattr(self, "_destination_startup_snapshot_mount_seen", False) and not getattr(
+            self, "_destination_snapshot_overlay_classification_startup_complete", False
+        ):
+            log_info(
+                "destination_overlay_repair_waiting_for_snapshot_overlay_classification",
+                reason_excerpt=str(reason or "")[:120],
+            )
+            return 0
         try:
             self._overlay_inv_pass_stamp_skip = 0
             self._overlay_inv_pass_stamp_force_backlog = 0
@@ -65235,6 +65295,23 @@ class MainWindow(QMainWindow):
                         self._refresh_destination_item_visibility_index(ix)
                     return
                 if self._destination_row_allows_structural_folder_child_load(nd_graph) and _bypass_graph:
+                    if getattr(self, "_destination_startup_snapshot_mount_seen", False) and not getattr(
+                        self, "_destination_snapshot_overlay_classification_startup_complete", False
+                    ):
+                        log_info(
+                            "destination_descendant_replay_blocked_until_snapshot_overlay_classified",
+                            folder_path_excerpt=row_path_ex[:400],
+                        )
+                        log_info(
+                            "destination_startup_visibility_bypass_waiting_for_snapshot_overlay_classification",
+                            folder_path_excerpt=row_path_ex[:400],
+                        )
+                        _dl_cf = str(
+                            self._canonical_planned_memory_path_for_graph_match(row_path_ex) or row_path_ex or ""
+                        ).strip()
+                        if _dl_cf:
+                            self._destination_retry_load_projected_descendants_after_overlay_gate(_dl_cf)
+                        return
                     log_info(
                         "destination_startup_projection_bypassed_graph_child_load_gate",
                         folder_path_excerpt=row_path_ex[:400],

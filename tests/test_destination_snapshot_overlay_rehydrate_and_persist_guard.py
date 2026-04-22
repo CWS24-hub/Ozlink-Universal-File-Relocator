@@ -65,6 +65,39 @@ def test_thin_persist_blocked_against_rich_sidecar_until_unlock():
     assert blocked_after is False
 
 
+def test_memory_overlay_predicate_proposed_and_planned_allocation_origin():
+    pl = {
+        "tree_role": "destination",
+        "is_folder": True,
+        "proposed": True,
+        "workspace_row_state": "cached_provisional",
+        "verification_state": "",
+        "row_kind": "cached_provisional_shell",
+    }
+    assert destination_payload_is_memory_overlay_row_for_reuse(pl)
+    pl2 = {
+        "tree_role": "destination",
+        "is_folder": True,
+        "planned_allocation": True,
+        "workspace_row_state": "cached_provisional",
+        "id": "x",
+        "drive_id": "d",
+    }
+    assert destination_payload_is_memory_overlay_row_for_reuse(pl2)
+
+
+def test_rehydrate_from_workspace_row_state_planned_only():
+    pl = {
+        "workspace_row_state": "planned_only",
+        "row_kind": "cached_provisional_shell",
+        "verification_state": "",
+        "is_folder": True,
+        "base_display_label": "Folder",
+    }
+    assert destination_snapshot_rehydrate_overlay_payload(pl)
+    assert destination_payload_is_planned_workspace_row(pl)
+
+
 def test_thin_persist_not_blocked_when_baseline_small():
     mw = MainWindow.__new__(MainWindow)
     mw._application_shutting_down = False
