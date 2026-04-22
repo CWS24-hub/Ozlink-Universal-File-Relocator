@@ -36,6 +36,69 @@ def destination_payload_is_planned_workspace_row(pl: Any) -> bool:
     return rk in {"planned_folder", "planned_file"}
 
 
+def destination_payload_is_memory_overlay_row_for_reuse(pl: Any) -> bool:
+    """Broader than :func:`destination_payload_is_planned_workspace_row` for reuse/presnapshot counts.
+
+    Includes restored rows that may still carry cached/provisional stamping from snapshots that lost
+    strict ``verification_state`` / ``row_kind`` pairing, but are clearly not live Graph rows.
+    """
+    if destination_payload_is_planned_workspace_row(pl):
+        return True
+    if not isinstance(pl, dict) or pl.get("placeholder"):
+        return False
+    if destination_payload_is_live_graph_row(pl):
+        return False
+    if bool(pl.get("workspace_planned_row")):
+        return True
+    if bool(pl.get("planned_allocation_descendant")):
+        return True
+    lbl = f"{pl.get('base_display_label', '')!s} {pl.get('tree_label', '')!s}".casefold()
+    if "[planned]" in lbl or "[allocated]" in lbl:
+        return True
+    rk = str(pl.get("row_kind") or "").strip().lower()
+    if rk.startswith("planned_") or rk in ("planned_folder", "planned_file"):
+        if str(pl.get("verification_state") or "").strip().casefold() in ("planned_only", ""):
+            return True
+    ws = destination_payload_workspace_row_state(pl)
+    if ws == WORKSPACE_ROW_STATE_PLANNED_ONLY:
+        return True
+    vs = str(pl.get("verification_state") or "").strip().casefold()
+    if vs == "planned_only" and rk.startswith("planned"):
+        return True
+    return False
+
+
+def destination_snapshot_rehydrate_overlay_payload(pl: dict[str, Any]) -> bool:
+    """Restore strict planned-workspace markers when snapshot rows lost pairing. Returns True if mutated."""
+    if not isinstance(pl, dict) or pl.get("placeholder"):
+        return False
+    if destination_payload_is_planned_workspace_row(pl):
+        pl.setdefault("workspace_row_state", WORKSPACE_ROW_STATE_PLANNED_ONLY)
+        return False
+    if destination_payload_is_live_graph_row(pl):
+        return False
+    mutated = False
+    lbl = f"{pl.get('base_display_label', '')!s} {pl.get('tree_label', '')!s}".casefold()
+    rk = str(pl.get("row_kind") or "").strip().lower()
+    looks_planned = bool(
+        pl.get("planned_allocation_descendant")
+        or pl.get("workspace_planned_row")
+        or rk.startswith("planned_")
+        or "[planned]" in lbl
+        or "[allocated]" in lbl
+    )
+    if not looks_planned:
+        return False
+    if str(pl.get("verification_state") or "").strip() != "planned_only":
+        pl["verification_state"] = "planned_only"
+        mutated = True
+    if rk not in ("planned_folder", "planned_file"):
+        pl["row_kind"] = "planned_folder" if bool(pl.get("is_folder", True)) else "planned_file"
+        mutated = True
+    pl["workspace_row_state"] = WORKSPACE_ROW_STATE_PLANNED_ONLY
+    return True
+
+
 def destination_payload_workspace_row_state(pl: Any) -> str:
     if not isinstance(pl, dict):
         return ""
@@ -147,9 +210,35 @@ def destination_stamp_snapshot_tree_workspace_state(snapshot_list: list[Any] | N
 def _destination_stamp_snapshot_branch(snap: dict[str, Any]) -> None:
     data = snap.get("data")
     if isinstance(data, dict) and not data.get("placeholder"):
+        try:
+            if destination_snapshot_rehydrate_overlay_payload(data):
+                log_info(
+                    "destination_snapshot_overlay_metadata_rehydrated",
+                    path_excerpt=str(data.get("item_path") or data.get("destination_path") or "")[:400],
+                )
+        except Exception:
+            pass
         if destination_payload_is_planned_workspace_row(data):
             data["workspace_row_state"] = WORKSPACE_ROW_STATE_PLANNED_ONLY
         else:
+            # Only log skips when the row looked like a planned overlay but could not be stamped strict.
+            try:
+                _lbl = f"{data.get('base_display_label', '')!s} {data.get('tree_label', '')!s}".casefold()
+                _pseudo = bool(
+                    data.get("planned_allocation_descendant")
+                    or data.get("workspace_planned_row")
+                    or "[planned]" in _lbl
+                    or "[allocated]" in _lbl
+                )
+                if _pseudo and not destination_payload_is_live_graph_row(data):
+                    log_info(
+                        "destination_snapshot_overlay_metadata_rehydrate_skipped",
+                        path_excerpt=str(data.get("item_path") or data.get("destination_path") or "")[:400],
+                        row_kind_excerpt=str(data.get("row_kind") or "")[:40],
+                        verification_state_excerpt=str(data.get("verification_state") or "")[:24],
+                    )
+            except Exception:
+                pass
             data["workspace_row_state"] = WORKSPACE_ROW_STATE_CACHED_PROVISIONAL
         # Visual cache only — live Graph /children must still refresh expanded branches.
         if not destination_payload_is_planned_workspace_row(data):

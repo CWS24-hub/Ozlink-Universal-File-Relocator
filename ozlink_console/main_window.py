@@ -154,6 +154,7 @@ from ozlink_console.destination_full_tree_policy import (
 from ozlink_console.destination_graph_truth_export import graph_item_path_to_raw_windows_path
 from ozlink_console.destination_live_memory_conflicts import (
     REVIEW_TYPE_LIVE_MEMORY_DUPLICATE,
+    LiveMemoryConflictRecord,
     detect_conflicts_for_live_paths,
     merge_unique,
     normalize_path_key,
@@ -222,10 +223,12 @@ from ozlink_console.sharepoint_destination_overlay_attach import (
     WORKSPACE_ROW_STATE_LIVE_CONFIRMED,
     WORKSPACE_ROW_STATE_PLANNED_ONLY,
     destination_payload_is_live_graph_row,
+    destination_payload_is_memory_overlay_row_for_reuse,
     destination_payload_is_planned_workspace_row,
     destination_payload_is_reconcile_merge_target_row,
     destination_payload_is_structural_row_for_planned_workspace_bind,
     destination_payload_workspace_row_state,
+    destination_snapshot_rehydrate_overlay_payload,
     destination_stamp_snapshot_tree_workspace_state,
 )
 from ozlink_console.destination_graph_truth_export import (
@@ -3084,6 +3087,11 @@ class MainWindow(QMainWindow):
         self._destination_defer_first_terminal_planned_reconcile_pending: bool = False
         # Normal startup: bypass Graph child-load gate while materializing projection visibility.
         self._destination_startup_projection_visibility_pass_active = False
+        self._destination_descendant_reuse_audit_started_logged: bool = False
+        self._destination_snapshot_prev_recursive_node_count: int = -1
+        self._destination_workspace_sidecar_destination_node_count_at_startup: int = 0
+        self._destination_final_startup_destination_snapshot_node_count: int = -1
+        self._destination_destination_snapshot_persist_startup_unlocked: bool = False
         self._destination_last_startup_status_reason: str = ""
         self._restore_abort_mode = False
         self._restore_abort_reason = ""
@@ -3673,6 +3681,7 @@ class MainWindow(QMainWindow):
         self.apply_role_visibility()
         self.update_session_state(False)
         log_info("MainWindow build marker.", build_marker="main_window_reconcile_file_parent_v4")
+        self._log_ozlink_console_loaded_diagnostics_once()
         self._setup_developer_menu()
 
     def _setup_developer_menu(self):
@@ -8693,6 +8702,32 @@ class MainWindow(QMainWindow):
             runtime_snapshots = {"source": [], "destination": []}
             self._runtime_session_tree_snapshots = runtime_snapshots
         runtime_snapshots[panel_key] = list(snapshots or [])
+        if panel_key == "destination":
+            try:
+                _snap_n = int(self._count_tree_snapshot_nodes(snapshots or []))
+            except Exception:
+                _snap_n = -1
+            _prev_sn = int(getattr(self, "_destination_snapshot_prev_recursive_node_count", -1) or -1)
+            if _snap_n >= 0:
+                log_info(
+                    "destination_snapshot_node_count_transition",
+                    previous_recursive_nodes=int(_prev_sn),
+                    current_recursive_nodes=int(_snap_n),
+                    delta=int(_snap_n - _prev_sn) if _prev_sn >= 0 else None,
+                )
+                if _prev_sn >= 0 and _snap_n < _prev_sn:
+                    log_info(
+                        "destination_snapshot_node_drop_audit",
+                        previous_recursive_nodes=int(_prev_sn),
+                        current_recursive_nodes=int(_snap_n),
+                        drop_kind_hint="compare_placeholder_dedupe_and_metrics",
+                    )
+                    if (_prev_sn - _snap_n) <= max(1, int(_prev_sn * 0.05)):
+                        log_info(
+                            "destination_snapshot_node_drop_metric_difference",
+                            note="small_delta_may_be_placeholder_or_recursive_counting_difference",
+                        )
+                self._destination_snapshot_prev_recursive_node_count = int(_snap_n)
         if panel_key == "destination" and dirty_dest_before:
             log_info(
                 "destination_snapshot_refreshed_from_live_model",
@@ -11594,6 +11629,44 @@ class MainWindow(QMainWindow):
         self._destination_runtime_snapshot_force_refresh_during_tick = True
         try:
             fresh = list(self._capture_tree_items_snapshot("destination") or [])
+            snap_n = int(self._count_tree_snapshot_nodes(fresh))
+            thin_capture_nodes = int(snap_n)
+            block_thin, block_reason = self._destination_should_block_thin_destination_snapshot_over_rich_sidecar(
+                thin_capture_nodes
+            )
+            if block_thin:
+                rs_try = getattr(self, "_runtime_session_tree_snapshots", None)
+                rt_dest: list = (
+                    list(rs_try.get("destination") or [])
+                    if isinstance(rs_try, dict) and isinstance(rs_try.get("destination"), list)
+                    else []
+                )
+                st = getattr(self, "_draft_shell_state", None)
+                dr_alt: list = list(st.DestinationTreeSnapshot or []) if isinstance(st, SessionState) else []
+                best = fresh
+                bn = snap_n
+                best_src = "live_capture"
+                for cand, lbl in ((rt_dest, "runtime_session"), (dr_alt, "draft_shell")):
+                    cn = int(self._count_tree_snapshot_nodes(cand))
+                    if cn > bn:
+                        best, bn, best_src = list(cand), cn, lbl
+                if bn > thin_capture_nodes:
+                    fresh = best
+                    snap_n = bn
+                    log_info(
+                        "destination_snapshot_persist_blocked_during_startup_hydration",
+                        block_reason=str(block_reason or "")[:120],
+                        thin_capture_nodes=int(thin_capture_nodes),
+                        rich_baseline=int(self._destination_rich_reference_snapshot_node_count_baseline()),
+                        selected_nodes=int(snap_n),
+                        selected_source=str(best_src)[:40],
+                    )
+                    log_info(
+                        "destination_snapshot_persist_blocked_richer_sidecar_exists",
+                        thin_capture_nodes=int(thin_capture_nodes),
+                        selected_nodes=int(snap_n),
+                        selected_source=str(best_src)[:40],
+                    )
             rs = getattr(self, "_runtime_session_tree_snapshots", None)
             if isinstance(rs, dict):
                 rs["destination"] = list(fresh)
@@ -11786,7 +11859,44 @@ class MainWindow(QMainWindow):
                 )
             else:
                 workspace_tree_snapshots = dict(workspace_tree_snapshots)
-                workspace_tree_snapshots["destination"] = list(self._capture_tree_items_snapshot("destination") or [])
+                cap_dest = list(self._capture_tree_items_snapshot("destination") or [])
+                cap_n = int(self._count_tree_snapshot_nodes(cap_dest))
+                block_thin, block_reason = self._destination_should_block_thin_destination_snapshot_over_rich_sidecar(
+                    cap_n
+                )
+                if block_thin:
+                    ex_dest = list(getattr(existing_state, "DestinationTreeSnapshot", []) or [])
+                    rt = getattr(self, "_runtime_session_tree_snapshots", None)
+                    rt_dest = list(rt.get("destination") or []) if isinstance(rt, dict) else []
+                    best: list = cap_dest
+                    bn = cap_n
+                    best_src = "live_capture"
+                    for cand, lbl in ((ex_dest, "existing_draft_shell"), (rt_dest, "runtime_session")):
+                        cn = int(self._count_tree_snapshot_nodes(cand))
+                        if cn > bn:
+                            best, bn, best_src = list(cand), cn, lbl
+                    if bn > cap_n:
+                        workspace_tree_snapshots["destination"] = best
+                        log_info(
+                            "destination_snapshot_persist_blocked_during_startup_hydration",
+                            block_reason=str(block_reason or "")[:120],
+                            phase="draft_shell_partial_refresh",
+                            thin_capture_nodes=int(cap_n),
+                            rich_baseline=int(self._destination_rich_reference_snapshot_node_count_baseline()),
+                            selected_nodes=int(bn),
+                            selected_source=str(best_src)[:40],
+                        )
+                        log_info(
+                            "destination_snapshot_persist_blocked_richer_sidecar_exists",
+                            phase="draft_shell_partial_refresh",
+                            thin_capture_nodes=int(cap_n),
+                            selected_nodes=int(bn),
+                            selected_source=str(best_src)[:40],
+                        )
+                    else:
+                        workspace_tree_snapshots["destination"] = cap_dest
+                else:
+                    workspace_tree_snapshots["destination"] = cap_dest
                 log_info(
                     "destination_snapshot_refreshed_from_live_model",
                     trigger="draft_shell_partial_refresh_include_workspace_ui_false",
@@ -26263,6 +26373,277 @@ class MainWindow(QMainWindow):
                 n_np += 1
         return {"model_nodes_iter_depth_first": n_iter, "model_nodes_non_placeholder": n_np}
 
+    def _destination_rich_reference_snapshot_node_count_baseline(self) -> int:
+        """Max of workspace-sidecar and selected startup snapshot node counts (forensic persist guard)."""
+        try:
+            a = int(getattr(self, "_destination_workspace_sidecar_destination_node_count_at_startup", 0) or 0)
+        except Exception:
+            a = 0
+        try:
+            b = int(getattr(self, "_destination_final_startup_destination_snapshot_node_count", 0) or 0)
+        except Exception:
+            b = 0
+        return int(max(a, b, 0))
+
+    def _destination_should_block_thin_destination_snapshot_over_rich_sidecar(
+        self, proposed_recursive_nodes: int
+    ) -> tuple[bool, str]:
+        """Block persisting a thin destination snapshot over a richer WorkspaceSnapshot during startup."""
+        if getattr(self, "_application_shutting_down", False):
+            return False, ""
+        baseline = self._destination_rich_reference_snapshot_node_count_baseline()
+        if baseline < 80:
+            return False, ""
+        if bool(getattr(self, "_destination_destination_snapshot_persist_startup_unlocked", False)):
+            return False, ""
+        try:
+            prop = int(proposed_recursive_nodes)
+        except Exception:
+            prop = -1
+        if prop < 0:
+            return False, ""
+        if prop >= max(int(baseline * 0.42), baseline - 120):
+            return False, ""
+        if prop >= max(120, int(baseline * 0.22)):
+            return False, ""
+        return True, "thin_capture_below_rich_baseline_during_startup_hydration"
+
+    def _destination_loaded_snapshot_overlay_classification_audit(self) -> dict[str, Any]:
+        """After snapshot bind: classify destination model rows for overlay vs live Graph (forensics)."""
+        out: dict[str, Any] = {
+            "total_rows": 0,
+            "planned_workspace_strict": 0,
+            "memory_overlay_reuse": 0,
+            "live_graph": 0,
+            "placeholder": 0,
+            "workspace_row_state_nonempty": 0,
+            "verification_state_nonempty": 0,
+            "allocation_descendants_applied": 0,
+            "destination_payload_is_planned_true": 0,
+            "label_planned_tag": 0,
+            "label_allocated_tag": 0,
+        }
+        model = getattr(self, "destination_planning_model", None)
+        if model is None or not hasattr(model, "iter_depth_first"):
+            log_info("destination_loaded_snapshot_overlay_classification_audit", **out)
+            return out
+        sample_planned: list[str] = []
+        for ix in model.iter_depth_first():
+            out["total_rows"] += 1
+            pl = ix.data(Qt.UserRole) or {}
+            if not isinstance(pl, dict):
+                continue
+            if pl.get("placeholder"):
+                out["placeholder"] += 1
+                continue
+            if str(pl.get("workspace_row_state") or "").strip():
+                out["workspace_row_state_nonempty"] += 1
+            if str(pl.get("verification_state") or "").strip():
+                out["verification_state_nonempty"] += 1
+            if bool(pl.get("allocation_descendants_applied")):
+                out["allocation_descendants_applied"] += 1
+            if destination_payload_is_planned_workspace_row(pl):
+                out["planned_workspace_strict"] += 1
+                out["destination_payload_is_planned_true"] += 1
+            elif destination_payload_is_memory_overlay_row_for_reuse(pl):
+                out["memory_overlay_reuse"] += 1
+            if destination_payload_is_live_graph_row(pl):
+                out["live_graph"] += 1
+            lbl = f"{pl.get('base_display_label', '')!s} {pl.get('tree_label', '')!s}"
+            if "[planned]" in lbl.casefold():
+                out["label_planned_tag"] += 1
+            if "[allocated]" in lbl.casefold():
+                out["label_allocated_tag"] += 1
+            if len(sample_planned) < 20 and (
+                destination_payload_is_planned_workspace_row(pl)
+                or destination_payload_is_memory_overlay_row_for_reuse(pl)
+            ):
+                tp = self._tree_item_path(pl) or pl.get("item_path") or pl.get("destination_path") or ""
+                sample_planned.append(str(tp)[:420])
+        log_info("destination_loaded_snapshot_overlay_classification_audit", **out)
+        log_info(
+            "destination_loaded_snapshot_overlay_row_sample",
+            sample_paths=sample_planned,
+            sample_count=len(sample_planned),
+        )
+        return out
+
+    def _destination_loaded_snapshot_allocation_subtree_audit(self) -> None:
+        """Fixed allocation roots: subtree counts and classification after snapshot reset."""
+        roots = [
+            r"Root3\HR\Employee Files\Contractor Resumes",
+            r"Root3\Sales\Pictures",
+            r"Root3\Management\Follow up",
+            r"Root3\Management\Email attachments",
+            r"Root3\Projects\Completed Projects\Soma Building Services",
+        ]
+        model = getattr(self, "destination_planning_model", None)
+        if model is None or not hasattr(model, "iter_depth_first"):
+            log_info("destination_loaded_snapshot_allocation_subtree_audit", note="no_model", roots=roots)
+            return
+
+        def _canon(p: str) -> str:
+            return self._canonical_planned_memory_path_for_graph_match(str(p or "").strip())
+
+        index_by_path: dict[str, QModelIndex] = {}
+        for ix in model.iter_depth_first():
+            pl = ix.data(Qt.UserRole) or {}
+            if not isinstance(pl, dict) or pl.get("placeholder"):
+                continue
+            tp = self._tree_item_path(pl) or pl.get("item_path") or pl.get("destination_path") or ""
+            ck = _canon(tp)
+            if ck:
+                index_by_path[ck] = ix
+
+        for raw in roots:
+            want = _canon(raw)
+            ix_root = index_by_path.get(want)
+            exists = bool(ix_root is not None and ix_root.isValid())
+            planned_sub = 0
+            alloc_tag = 0
+            mem_ov = 0
+            strict = 0
+            live_sub = 0
+            gen_sub = 0
+            samples: list[str] = []
+            if exists and ix_root is not None:
+                stack = [ix_root]
+                while stack:
+                    cur = stack.pop()
+                    if not cur.isValid():
+                        continue
+                    for r in range(model.rowCount(cur)):
+                        ch = model.index(r, 0, cur)
+                        if not ch.isValid():
+                            continue
+                        stack.append(ch)
+                        cpl = ch.data(Qt.UserRole) or {}
+                        if not isinstance(cpl, dict) or cpl.get("placeholder"):
+                            continue
+                        pth = self._tree_item_path(cpl) or cpl.get("item_path") or ""
+                        lbl = f"{cpl.get('base_display_label', '')!s}".casefold()
+                        is_live = destination_payload_is_live_graph_row(cpl)
+                        is_strict = destination_payload_is_planned_workspace_row(cpl)
+                        is_mem = destination_payload_is_memory_overlay_row_for_reuse(cpl)
+                        if is_live:
+                            live_sub += 1
+                        elif is_strict or is_mem:
+                            if is_strict:
+                                strict += 1
+                            else:
+                                mem_ov += 1
+                            planned_sub += 1
+                        else:
+                            gen_sub += 1
+                        if "[allocated]" in lbl:
+                            alloc_tag += 1
+                        if len(samples) < 12:
+                            samples.append(str(pth)[:400])
+                log_info(
+                    "destination_loaded_snapshot_allocation_subtree_audit",
+                    allocation_root_raw=str(raw)[:420],
+                    allocation_root_canonical=str(want)[:420],
+                    root_row_exists=bool(exists),
+                    descendant_rows_under_path=int(planned_sub + gen_sub + live_sub),
+                    planned_workspace_descendant_rows=int(strict),
+                    memory_overlay_descendant_rows=int(mem_ov),
+                    generic_non_overlay_descendant_rows=int(gen_sub),
+                    label_allocated_rows_near_descendants=int(alloc_tag),
+                    live_graph_descendant_rows=int(live_sub),
+                    sample_descendant_paths=samples,
+                )
+
+    def _destination_rehydrate_overlay_payloads_in_destination_model(self) -> int:
+        """Stamp strict planned-workspace metadata onto model rows loaded from snapshots with weak pairing."""
+        model = getattr(self, "destination_planning_model", None)
+        if model is None or not hasattr(model, "iter_depth_first"):
+            return 0
+        n = 0
+        for ix in model.iter_depth_first():
+            pl = dict(ix.data(Qt.UserRole) or {})
+            if not pl or pl.get("placeholder"):
+                continue
+            if destination_snapshot_rehydrate_overlay_payload(pl):
+                n += 1
+                model.update_payload_for_index(ix, lambda p, src=pl: p.update(src))
+        if n:
+            log_info(
+                "destination_snapshot_overlay_metadata_rehydrated",
+                model_rows_mutated=int(n),
+                phase="destination_model_walk",
+            )
+        return n
+
+    def _destination_graph_bind_presnapshot_classify_row(
+        self, pl: dict, *, parent_path_cf: str
+    ) -> tuple[bool, str]:
+        """Return (include_in_overlay_snapshot, ignore_reason) for a direct model child before Graph replace."""
+        if not isinstance(pl, dict):
+            return False, "unknown"
+        if pl.get("placeholder"):
+            return False, "placeholder"
+        if destination_payload_is_live_graph_row(pl):
+            return False, "live_graph_row"
+        child_path = str(
+            self._canonical_planned_memory_path_for_graph_match(
+                str(self._tree_item_path(pl) or pl.get("item_path") or pl.get("destination_path") or "").strip()
+            )
+        ).strip()
+        parent_cf = str(parent_path_cf or "").strip()
+        if parent_cf and child_path:
+            cf_p = parent_cf.casefold()
+            cf_c = child_path.casefold()
+            if cf_c != cf_p and not cf_c.startswith(cf_p + "\\"):
+                return False, "wrong_parent_path"
+        if destination_payload_is_planned_workspace_row(pl):
+            return True, ""
+        if destination_payload_is_memory_overlay_row_for_reuse(pl):
+            if not str(pl.get("allocation_id") or pl.get("request_id") or "").strip():
+                if not (pl.get("planned_allocation_descendant") or pl.get("workspace_planned_row")):
+                    lbl = f"{pl.get('base_display_label', '')!s} {pl.get('tree_label', '')!s}".casefold()
+                    if "[planned]" not in lbl and "[allocated]" not in lbl:
+                        return False, "missing_planning_identity"
+            return True, ""
+        return False, "not_planned_workspace_row"
+
+    def _destination_graph_bind_presnapshot_overlay_scan(
+        self, parent_ix: QModelIndex, *, parent_semantic_path: str
+    ) -> None:
+        """Log why rows under a Graph bind parent are included or ignored for overlay presnapshot."""
+        model = getattr(self, "destination_planning_model", None)
+        if model is None or not parent_ix.isValid():
+            return
+        col0 = parent_ix.siblingAtColumn(0) if parent_ix.column() != 0 else parent_ix
+        parent_cf = self._canonical_planned_memory_path_for_graph_match(
+            str(parent_semantic_path or "").strip()
+        )
+        log_info(
+            "destination_graph_bind_presnapshot_overlay_scan_started",
+            parent_path_excerpt=str(parent_semantic_path or "")[:400],
+            parent_canonical_excerpt=str(parent_cf)[:400],
+            child_rows=int(model.rowCount(col0)) if col0.isValid() else 0,
+        )
+        for r in range(model.rowCount(col0) if col0.isValid() else 0):
+            ix = model.index(r, 0, col0)
+            if not ix.isValid():
+                continue
+            pl = dict(ix.data(Qt.UserRole) or {})
+            ok, reason = self._destination_graph_bind_presnapshot_classify_row(pl, parent_path_cf=parent_cf)
+            tp = str(self._tree_item_path(pl) or pl.get("item_path") or "")[:400]
+            if ok:
+                log_info(
+                    "destination_graph_bind_presnapshot_overlay_row_included",
+                    parent_path_excerpt=str(parent_semantic_path or "")[:400],
+                    row_path_excerpt=tp,
+                )
+            else:
+                log_info(
+                    "destination_graph_bind_presnapshot_overlay_row_ignored",
+                    parent_path_excerpt=str(parent_semantic_path or "")[:400],
+                    row_path_excerpt=tp,
+                    ignore_reason=str(reason or "unknown")[:80],
+                )
+
     def _destination_model_index_tree_depth(self, col0: QModelIndex) -> int:
         """Tree depth under the model root (0 = top-level rows under invisible root)."""
         d = -1
@@ -26812,6 +27193,10 @@ class MainWindow(QMainWindow):
             workspace_sidecar=sidecar,
         )
         try:
+            self._destination_workspace_sidecar_destination_node_count_at_startup = int(n_side_nodes)
+        except Exception:
+            self._destination_workspace_sidecar_destination_node_count_at_startup = 0
+        try:
             self._destination_startup_allowed_semantic_root_segments_cf = allowed_semantic_root_segments_cf_from_snapshot(
                 dest_snaps
             )
@@ -26823,6 +27208,11 @@ class MainWindow(QMainWindow):
             n_final = int(self._count_tree_snapshot_nodes(dest_snaps))
         except Exception:
             n_final = -1
+        try:
+            self._destination_final_startup_destination_snapshot_node_count = int(n_final)
+        except Exception:
+            self._destination_final_startup_destination_snapshot_node_count = -1
+        self._destination_destination_snapshot_persist_startup_unlocked = False
         mmp = getattr(mm, "paths", {}) if mm is not None else {}
         log_info(
             "snapshot_restore_forensic",
@@ -28100,6 +28490,552 @@ class MainWindow(QMainWindow):
 
         dmodel.update_payload_for_index(index, _mut)
         return nd
+
+    def _log_ozlink_console_loaded_diagnostics_once(self) -> None:
+        """One-shot forensic log proving which main_window.py and reuse helpers are in effect."""
+        if getattr(self, "_ozlink_console_loaded_logged", False):
+            return
+        self._ozlink_console_loaded_logged = True
+        try:
+            mw_path = str(Path(__file__).resolve())
+        except Exception:
+            mw_path = str(__file__ or "")
+        try:
+            cwd = os.getcwd()
+        except Exception:
+            cwd = ""
+        try:
+            sp_head = list(sys.path[:5])
+        except Exception:
+            sp_head = []
+        try:
+            has_assess = hasattr(type(self), "_destination_descendant_snapshot_reuse_assess")
+            has_mark = hasattr(type(self), "_destination_descendant_snapshot_reuse_mark_allocation_applied_index")
+        except Exception:
+            has_assess = False
+            has_mark = False
+        try:
+            pid = int(os.getpid())
+        except Exception:
+            pid = -1
+        g_commit = ""
+        g_dirty: Optional[bool] = None
+        try:
+            repo_root = Path(__file__).resolve().parent.parent
+            r = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if r.returncode == 0 and (r.stdout or "").strip():
+                g_commit = (r.stdout or "").strip()[:40]
+            r2 = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if r2.returncode == 0:
+                g_dirty = bool((r2.stdout or "").strip())
+        except Exception:
+            pass
+        log_info(
+            "ozlink_console_loaded",
+            main_window_file=mw_path,
+            cwd=cwd,
+            sys_path_head_5=sp_head,
+            has_descendant_snapshot_reuse_assess=bool(has_assess),
+            has_descendant_snapshot_reuse_mark_applied=bool(has_mark),
+            pid=int(pid),
+            git_commit_short=g_commit or "",
+            git_dirty=g_dirty,
+        )
+
+    def _destination_descendant_snapshot_reuse_assess_exit_log(
+        self,
+        *,
+        audit_context: str,
+        result: str,
+        skip_reason: str,
+        expected_count: int = -1,
+        visible_count: int = -1,
+        signature_match: Optional[bool] = None,
+        path_match: Optional[bool] = None,
+        move_key_excerpt: str = "",
+    ) -> None:
+        log_info(
+            "destination_descendant_snapshot_reuse_assess_exited",
+            audit_context=str(audit_context or "")[:120],
+            result=str(result or "")[:40],
+            skip_reason=str(skip_reason or "")[:200],
+            expected_count=int(expected_count),
+            visible_count=int(visible_count),
+            signature_match=signature_match,
+            path_match=path_match,
+            move_key_excerpt=str(move_key_excerpt or "")[:120],
+        )
+
+    def _log_destination_descendant_replay_reuse_gate_result(
+        self,
+        *,
+        enqueue_site: str,
+        enqueue_reason: str,
+        collect_reason: str,
+        move,
+        parent_ix: QModelIndex,
+        graph_authority: bool,
+        assessor_called: bool,
+        assess_outcome: str,
+        skip_reason_if_no_assessor: str = "",
+    ) -> None:
+        """Forensic only: immediately before descendant-apply queue append or snapshot-reuse short-circuit."""
+        try:
+            mk = str(self._allocation_move_key(move) if isinstance(move, dict) else "")[:120]
+        except Exception:
+            mk = ""
+        try:
+            req_id = str((move or {}).get("request_id") or (move or {}).get("RequestId") or "")[:80]
+        except Exception:
+            req_id = ""
+        src_is_folder = False
+        eff_dest = ""
+        if isinstance(move, dict):
+            try:
+                sm = move.get("source") if isinstance(move.get("source"), dict) else {}
+                src_is_folder = bool(sm.get("is_folder", True))
+                eff_dest = str(self._allocation_projection_path(move) or "")[:520]
+            except Exception:
+                pass
+        ix_ok = bool(parent_ix.isValid()) if parent_ix is not None else False
+        path_hint = ""
+        if ix_ok:
+            try:
+                path_hint = str(self._tree_item_path(dict(parent_ix.data(Qt.UserRole) or {})))[:520]
+            except Exception:
+                path_hint = ""
+        log_info(
+            "destination_descendant_replay_reuse_gate_result",
+            enqueue_site=str(enqueue_site or "")[:120],
+            enqueue_reason=str(enqueue_reason or "")[:220],
+            collect_reason=str(collect_reason or "")[:220],
+            move_key_excerpt=mk,
+            request_id_excerpt=req_id,
+            graph_authority=bool(graph_authority),
+            assessor_called=bool(assessor_called),
+            assessor_result=str(assess_outcome or "")[:40],
+            skip_reason_if_assessor_not_applicable=str(skip_reason_if_no_assessor or "")[:200],
+            move_is_dict=isinstance(move, dict),
+            source_is_folder=bool(src_is_folder),
+            index_valid=bool(ix_ok),
+            effective_destination_path_excerpt=eff_dest[:400],
+            parent_payload_path_excerpt=path_hint[:400],
+        )
+
+    def _destination_descendant_snapshot_reuse_assess(
+        self,
+        alloc_folder_ix: QModelIndex,
+        move,
+        *,
+        audit_context: str = "",
+    ) -> dict:
+        """Compare projected overlay subtree vs source-derived descendant list; no mutations."""
+        ga_entry = destination_authority_contract.graph_owns_visible_real_destination_structure(self)
+        try:
+            mk_pre = str(self._allocation_move_key(move) if isinstance(move, dict) else "")[:120]
+        except Exception:
+            mk_pre = ""
+        try:
+            sp_ex = str((move or {}).get("source_path") or "")[:400] if isinstance(move, dict) else ""
+        except Exception:
+            sp_ex = ""
+        dp_ex = ""
+        if isinstance(move, dict):
+            try:
+                dp_ex = str(self._allocation_projection_path(move) or "")[:400]
+            except Exception:
+                dp_ex = ""
+        log_info(
+            "destination_descendant_snapshot_reuse_assess_entered",
+            audit_context=str(audit_context or "")[:120],
+            graph_authority=bool(ga_entry),
+            move_key_excerpt=mk_pre,
+            request_id_excerpt=str((move or {}).get("request_id") or (move or {}).get("RequestId") or "")[:80]
+            if isinstance(move, dict)
+            else "",
+            source_path_excerpt=sp_ex,
+            destination_path_excerpt=dp_ex,
+            index_valid=bool(alloc_folder_ix is not None and alloc_folder_ix.isValid()),
+            node_path_excerpt=str(self._tree_item_path(dict(alloc_folder_ix.data(Qt.UserRole) or {})))[:400]
+            if alloc_folder_ix is not None and alloc_folder_ix.isValid()
+            else "",
+        )
+        empty = {
+            "outcome": "rejected",
+            "overlay_descendant_count": 0,
+            "expected_descendant_count": -1,
+            "path_match": False,
+            "signature_match": False,
+            "source_token_match": False,
+            "allocation_descendants_applied_flag": False,
+            "saved_projection_path": "",
+            "current_allocation_path": "",
+            "saved_children_signature": "",
+            "current_children_signature": "",
+        }
+        dm = getattr(self, "destination_planning_model", None)
+        if dm is None or not alloc_folder_ix.isValid() or not isinstance(move, dict):
+            self._destination_descendant_snapshot_reuse_assess_exit_log(
+                audit_context=str(audit_context or ""),
+                result="skipped",
+                skip_reason="no_model_or_invalid_index_or_move_not_dict",
+                expected_count=-1,
+                visible_count=-1,
+                move_key_excerpt=mk_pre,
+            )
+            return dict(empty)
+        if not destination_authority_contract.graph_owns_visible_real_destination_structure(self):
+            self._destination_descendant_snapshot_reuse_assess_exit_log(
+                audit_context=str(audit_context or ""),
+                result="skipped",
+                skip_reason="graph_authority_false",
+                expected_count=-1,
+                visible_count=-1,
+                move_key_excerpt=mk_pre,
+            )
+            return dict(empty)
+        col0 = alloc_folder_ix.siblingAtColumn(0) if alloc_folder_ix.column() != 0 else alloc_folder_ix
+        if hasattr(dm, "is_index_live") and not dm.is_index_live(col0):
+            self._destination_descendant_snapshot_reuse_assess_exit_log(
+                audit_context=str(audit_context or ""),
+                result="skipped",
+                skip_reason="allocation_index_not_live",
+                expected_count=-1,
+                visible_count=-1,
+                move_key_excerpt=mk_pre,
+            )
+            return dict(empty)
+        parent_pl = dict(col0.data(Qt.UserRole) or {})
+        if not self.node_is_planned_allocation(parent_pl) or not bool(parent_pl.get("is_folder", True)):
+            self._destination_descendant_snapshot_reuse_assess_exit_log(
+                audit_context=str(audit_context or ""),
+                result="skipped",
+                skip_reason="not_planned_allocation_or_not_folder_row",
+                expected_count=-1,
+                visible_count=-1,
+                move_key_excerpt=mk_pre,
+            )
+            return dict(empty)
+        src_move = move.get("source") if isinstance(move.get("source"), dict) else {}
+        if not bool(src_move.get("is_folder", True)):
+            self._destination_descendant_snapshot_reuse_assess_exit_log(
+                audit_context=str(audit_context or ""),
+                result="skipped",
+                skip_reason="source_move_not_folder_allocation",
+                expected_count=-1,
+                visible_count=-1,
+                move_key_excerpt=mk_pre,
+            )
+            return dict(empty)
+        if str(audit_context or "").strip().lower() in ("startup_visibility_bypass", "startup_projection", "startup"):
+            if not self._destination_descendant_reuse_audit_started_logged:
+                self._destination_descendant_reuse_audit_started_logged = True
+                log_info("destination_descendant_snapshot_reuse_audit_started", audit_context=str(audit_context or "")[:120])
+        source_item = self._find_source_item_for_planned_move(move)
+        source_root_data = self._source_tree_row_payload(source_item) if source_item is not None else {}
+        if not source_root_data:
+            source_root_data = dict(move.get("source", {}) or {})
+            source_root_data.setdefault("item_path", move.get("source_path", ""))
+            source_root_data.setdefault("display_path", move.get("source_path", ""))
+        if source_root_data and source_root_data.get("is_folder", None) is None:
+            source_root_data["is_folder"] = True
+        cr = str(audit_context or "").strip() or "destination_descendant_snapshot_reuse_assess"
+        descendants: list = []
+        try:
+            descendants = self._sort_descendants_for_allocation_apply(
+                self._collect_source_descendants_for_projection(source_root_data, move, collect_reason=cr)
+            )
+        except Exception:
+            descendants = []
+        expected_n = int(len(descendants or []))
+        overlay_tree = self._destination_collect_planned_workspace_children_under_model(col0)
+        overlay_n = int(self._destination_count_planned_snapshot_tree_nodes(overlay_tree))
+        strict_overlay_subtree = 0
+        memory_only_overlay_subtree = 0
+        _mem_row_logs = 0
+
+        def _count_ov_breakdown(nds: list | None) -> None:
+            nonlocal strict_overlay_subtree, memory_only_overlay_subtree, _mem_row_logs
+            for it in nds or []:
+                if not isinstance(it, dict):
+                    continue
+                plb = it.get("payload")
+                ch = it.get("children")
+                if isinstance(plb, dict):
+                    if destination_payload_is_planned_workspace_row(plb):
+                        strict_overlay_subtree += 1
+                    elif destination_payload_is_memory_overlay_row_for_reuse(plb):
+                        memory_only_overlay_subtree += 1
+                        if _mem_row_logs < 18:
+                            _mem_row_logs += 1
+                            log_info(
+                                "destination_descendant_snapshot_reuse_counted_restored_overlay_row",
+                                audit_context=str(audit_context or "")[:120],
+                                move_key_excerpt=mk_pre,
+                                path_excerpt=str(
+                                    self._tree_item_path(plb) or plb.get("item_path") or plb.get("destination_path") or ""
+                                )[:400],
+                            )
+                _count_ov_breakdown(list(ch) if isinstance(ch, list) else None)
+
+        _count_ov_breakdown(overlay_tree)
+        log_info(
+            "destination_descendant_snapshot_reuse_overlay_breakdown",
+            audit_context=str(audit_context or "")[:120],
+            move_key_excerpt=mk_pre,
+            overlay_total=int(overlay_n),
+            strict_planned_nodes=int(strict_overlay_subtree),
+            memory_only_restored_nodes=int(memory_only_overlay_subtree),
+        )
+        if overlay_n > 0 and (strict_overlay_subtree + memory_only_overlay_subtree) != overlay_n:
+            log_info(
+                "destination_descendant_snapshot_reuse_ignored_restored_row",
+                audit_context=str(audit_context or "")[:120],
+                move_key_excerpt=mk_pre,
+                note="breakdown_sum_mismatch_investigate_collect_predicates",
+                overlay_total=int(overlay_n),
+                strict_subtree=int(strict_overlay_subtree),
+                memory_only_subtree=int(memory_only_overlay_subtree),
+            )
+        current_path = str(
+            self._canonical_destination_projection_path(self._allocation_projection_path(move) or "") or ""
+        ).strip()
+        saved_path = str(parent_pl.get("allocation_projection_destination_path_saved") or "").strip()
+        path_match = bool(current_path and saved_path and current_path == saved_path)
+        current_sig = str(self._allocation_projection_children_signature_from_index(col0) or "").strip()
+        saved_sig = str(parent_pl.get("allocation_projection_children_signature") or "").strip()
+        signature_match = bool(saved_sig and current_sig and saved_sig == current_sig)
+        cur_tok = self._destination_allocation_projection_resume_token(move, source_root_data)
+        saved_tok = str(parent_pl.get("allocation_projection_resume_source_token") or "").strip()
+        source_token_match = bool(not saved_tok) or bool(cur_tok and saved_tok == cur_tok)
+        has_overlay = overlay_n > 0
+        applied_flag = bool(parent_pl.get("allocation_descendants_applied"))
+        mk = str(self._allocation_move_key(move) or "")[:120]
+        req_id = str(move.get("request_id") or move.get("RequestId") or "")[:80]
+        log_info(
+            "destination_descendant_snapshot_reuse_candidate",
+            audit_context=str(audit_context or "")[:120],
+            move_key_excerpt=mk,
+            allocation_request_id_excerpt=req_id,
+            allocation_destination_path_excerpt=current_path[:400],
+            source_root_excerpt=str(self._canonical_source_projection_path(self._tree_item_path(source_root_data)) or "")[
+                :400
+            ],
+            expected_descendant_count=int(expected_n),
+            overlay_descendant_count=int(overlay_n),
+            allocation_descendants_applied=bool(applied_flag),
+            saved_projection_signature_excerpt=saved_sig[:40],
+            current_children_signature_excerpt=current_sig[:40],
+            path_match=bool(path_match),
+            signature_match=bool(signature_match),
+            source_token_match=bool(source_token_match),
+            existing_overlay_descendants=bool(has_overlay),
+        )
+        log_info(
+            "destination_descendant_snapshot_reuse_existing_overlay_count",
+            audit_context=str(audit_context or "")[:120],
+            overlay_descendant_count=int(overlay_n),
+            move_key_excerpt=mk,
+        )
+        out = {
+            "outcome": "rejected",
+            "overlay_descendant_count": overlay_n,
+            "expected_descendant_count": expected_n,
+            "path_match": path_match,
+            "signature_match": signature_match,
+            "source_token_match": source_token_match,
+            "allocation_descendants_applied_flag": applied_flag,
+            "saved_projection_path": saved_path,
+            "current_allocation_path": current_path,
+            "saved_children_signature": saved_sig,
+            "current_children_signature": current_sig,
+            "descendants_list_len": expected_n,
+        }
+        if current_path and saved_path and not path_match:
+            out["outcome"] = "path_mismatch"
+            log_info(
+                "destination_descendant_snapshot_reuse_path_mismatch",
+                audit_context=str(audit_context or "")[:120],
+                saved_path_excerpt=saved_path[:400],
+                current_path_excerpt=current_path[:400],
+                move_key_excerpt=mk,
+            )
+            self._destination_descendant_snapshot_reuse_assess_exit_log(
+                audit_context=str(audit_context or ""),
+                result="path_mismatch",
+                skip_reason="saved_vs_current_allocation_path_differ",
+                expected_count=int(expected_n),
+                visible_count=int(overlay_n),
+                signature_match=bool(signature_match),
+                path_match=False,
+                move_key_excerpt=mk,
+            )
+            return out
+        if saved_sig and current_sig and not signature_match:
+            out["outcome"] = "signature_mismatch"
+            log_info(
+                "destination_descendant_snapshot_reuse_signature_mismatch",
+                audit_context=str(audit_context or "")[:120],
+                move_key_excerpt=mk,
+                saved_sig_excerpt=saved_sig[:40],
+                current_sig_excerpt=current_sig[:40],
+            )
+            self._destination_descendant_snapshot_reuse_assess_exit_log(
+                audit_context=str(audit_context or ""),
+                result="signature_mismatch",
+                skip_reason="direct_children_signature_mismatch",
+                expected_count=int(expected_n),
+                visible_count=int(overlay_n),
+                signature_match=False,
+                path_match=bool(path_match),
+                move_key_excerpt=mk,
+            )
+            return out
+        if expected_n > 0 and not source_token_match:
+            out["outcome"] = "signature_mismatch"
+            log_info(
+                "destination_descendant_snapshot_reuse_signature_mismatch",
+                audit_context=str(audit_context or "")[:120],
+                reason="allocation_projection_resume_source_token_mismatch",
+                move_key_excerpt=mk,
+            )
+            self._destination_descendant_snapshot_reuse_assess_exit_log(
+                audit_context=str(audit_context or ""),
+                result="signature_mismatch",
+                skip_reason="allocation_projection_resume_source_token_mismatch",
+                expected_count=int(expected_n),
+                visible_count=int(overlay_n),
+                signature_match=bool(signature_match),
+                path_match=bool(path_match),
+                move_key_excerpt=mk,
+            )
+            return out
+        if expected_n == 0 and overlay_n == 0:
+            out["outcome"] = "complete"
+            log_info("destination_descendant_snapshot_reuse_complete", audit_context=str(audit_context or "")[:120], move_key_excerpt=mk)
+            self._destination_descendant_snapshot_reuse_assess_exit_log(
+                audit_context=str(audit_context or ""),
+                result="complete",
+                skip_reason="empty_expected_and_empty_overlay",
+                expected_count=0,
+                visible_count=0,
+                signature_match=bool(signature_match),
+                path_match=bool(path_match),
+                move_key_excerpt=mk,
+            )
+            return out
+        if overlay_n >= expected_n and expected_n > 0 and path_match and signature_match and source_token_match:
+            out["outcome"] = "complete"
+            log_info(
+                "destination_descendant_snapshot_reuse_complete",
+                audit_context=str(audit_context or "")[:120],
+                expected_descendant_count=int(expected_n),
+                overlay_descendant_count=int(overlay_n),
+                move_key_excerpt=mk,
+            )
+            self._destination_descendant_snapshot_reuse_assess_exit_log(
+                audit_context=str(audit_context or ""),
+                result="complete",
+                skip_reason="overlay_covers_expected_counts_and_metadata_align",
+                expected_count=int(expected_n),
+                visible_count=int(overlay_n),
+                signature_match=True,
+                path_match=True,
+                move_key_excerpt=mk,
+            )
+            return out
+        if overlay_n > 0 and overlay_n < expected_n:
+            out["outcome"] = "partial"
+            miss = max(0, int(expected_n - overlay_n))
+            log_info(
+                "destination_descendant_snapshot_reuse_partial",
+                audit_context=str(audit_context or "")[:120],
+                overlay_descendant_count=int(overlay_n),
+                expected_descendant_count=int(expected_n),
+                missing_descendants=int(miss),
+                move_key_excerpt=mk,
+            )
+            self._destination_descendant_snapshot_reuse_assess_exit_log(
+                audit_context=str(audit_context or ""),
+                result="partial",
+                skip_reason="overlay_under_expected_descendant_count",
+                expected_count=int(expected_n),
+                visible_count=int(overlay_n),
+                signature_match=bool(signature_match),
+                path_match=bool(path_match),
+                move_key_excerpt=mk,
+            )
+            return out
+        log_info(
+            "destination_descendant_snapshot_reuse_rejected",
+            audit_context=str(audit_context or "")[:120],
+            overlay_descendant_count=int(overlay_n),
+            expected_descendant_count=int(expected_n),
+            move_key_excerpt=mk,
+        )
+        self._destination_descendant_snapshot_reuse_assess_exit_log(
+            audit_context=str(audit_context or ""),
+            result="rejected",
+            skip_reason="fallthrough_no_complete_partial_path_match",
+            expected_count=int(expected_n),
+            visible_count=int(overlay_n),
+            signature_match=bool(signature_match),
+            path_match=bool(path_match),
+            move_key_excerpt=mk,
+        )
+        return out
+
+    def _destination_descendant_snapshot_reuse_mark_allocation_applied_index(
+        self,
+        col0: QModelIndex,
+        move,
+        *,
+        audit_context: str,
+        overlay_count: int,
+        expected_count: int,
+        cur_token: str,
+    ) -> None:
+        """Set allocation descendant projection stamps when snapshot subtree is authoritative enough."""
+        dm = getattr(self, "destination_planning_model", None)
+        if dm is None or not col0.isValid():
+            return
+
+        def _mut(p):
+            p["allocation_descendants_applied"] = True
+            p["children_loaded"] = True
+            p["projection_unresolved_terminal"] = False
+            if cur_token:
+                p["allocation_projection_resume_source_token"] = str(cur_token)
+                p["allocation_projection_resume_descendants_total"] = int(expected_count)
+                p["allocation_projection_resume_desc_index"] = int(expected_count)
+
+        dm.update_payload_for_index(col0, _mut)
+        nd = dict(col0.data(Qt.UserRole) or {})
+        self._stamp_allocation_projection_cache_metadata_index(col0, nd, move)
+        log_info(
+            "destination_descendant_snapshot_reuse_marked_applied",
+            audit_context=str(audit_context or "")[:120],
+            overlay_descendant_count=int(overlay_count),
+            expected_descendant_count=int(expected_count),
+            move_key_excerpt=str(self._allocation_move_key(move) or "")[:120],
+        )
+        log_info(
+            "destination_descendant_replay_reused_from_snapshot",
+            audit_context=str(audit_context or "")[:120],
+            move_key_excerpt=str(self._allocation_move_key(move) or "")[:120],
+        )
 
     def _source_forensic_model_node_counts(self) -> dict:
         model = getattr(self, "source_sharepoint_model", None)
@@ -31630,6 +32566,7 @@ class MainWindow(QMainWindow):
             raise
         finally:
             self._destination_startup_projection_visibility_pass_active = False
+            self._destination_descendant_reuse_audit_started_logged = False
         self._startup_post_snapshot_trace_event(
             "startup_descendant_materialization_exit",
             phase_excerpt=str(phase)[:120],
@@ -32148,6 +33085,17 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._log_restore_exception("destination_flush_pending_graph_ids_planning_refresh", exc)
         log_info("startup_hydration_completed", reason=str(reason or "")[:200])
+        try:
+            self._destination_destination_snapshot_persist_startup_unlocked = True
+            log_info(
+                "destination_snapshot_persist_allowed_after_startup_hydration",
+                reason=str(reason or "")[:200],
+                sidecar_node_count_at_startup=int(
+                    getattr(self, "_destination_workspace_sidecar_destination_node_count_at_startup", 0) or 0
+                ),
+            )
+        except Exception:
+            self._destination_destination_snapshot_persist_startup_unlocked = True
 
     def _destination_schedule_background_hydration_after_minimal_restore(self, *, reason: str) -> None:
         raw = str(os.environ.get("OZLINK_STARTUP_BACKGROUND_HYDRATION_DELAY_MS", "") or "").strip()
@@ -32458,6 +33406,13 @@ class MainWindow(QMainWindow):
                                 step="after_pre_graph_snapshot_reset_nested",
                                 **self._destination_forensic_destination_model_counts(),
                             )
+                            try:
+                                self._destination_loaded_snapshot_overlay_classification_audit()
+                                self._destination_loaded_snapshot_allocation_subtree_audit()
+                                self._destination_rehydrate_overlay_payloads_in_destination_model()
+                                self._destination_loaded_snapshot_overlay_classification_audit()
+                            except Exception as exc:
+                                self._log_restore_exception("destination_loaded_snapshot_overlay_audit", exc)
             prov_by_id: dict[str, dict] = {}
             if (
                 panel_key == "destination"
@@ -34887,8 +35842,16 @@ class MainWindow(QMainWindow):
             )
         return cur_terminal if cur_terminal.isValid() else None
 
+    def _destination_row_is_overlay_snapshot_candidate_under_graph_folder(self, pl: Any) -> bool:
+        """Memory overlay rows preserved across Graph ``replace_all_children`` (planned + restored metadata)."""
+        if not isinstance(pl, dict) or pl.get("placeholder"):
+            return False
+        if destination_payload_is_live_graph_row(pl):
+            return False
+        return bool(destination_payload_is_memory_overlay_row_for_reuse(pl))
+
     def _destination_count_planned_snapshot_tree_nodes(self, nodes: list | None) -> int:
-        """Count planned workspace rows in a snapshot tree (see :meth:`_destination_collect_planned_workspace_children_under_model`)."""
+        """Count overlay snapshot rows in a nested tree built by :meth:`_destination_collect_planned_workspace_children_under_model`."""
         if not nodes:
             return 0
         n = 0
@@ -34896,13 +35859,13 @@ class MainWindow(QMainWindow):
             if not isinstance(node, dict):
                 continue
             pl = node.get("payload")
-            if isinstance(pl, dict) and destination_payload_is_planned_workspace_row(pl):
+            if isinstance(pl, dict) and self._destination_row_is_overlay_snapshot_candidate_under_graph_folder(pl):
                 n += 1
                 n += self._destination_count_planned_snapshot_tree_nodes(node.get("children"))
         return n
 
     def _destination_collect_planned_workspace_children_under_model(self, parent_ix: QModelIndex) -> list[dict]:
-        """Deep snapshot of planned_folder / planned_file rows under ``parent_ix`` (recursive).
+        """Deep snapshot of planned / memory overlay rows under ``parent_ix`` (recursive).
 
         Each node is ``{"payload": dict, "children": [ ... same shape ... ]}`` so nested planned
         chains survive ``replace_all_children`` (Graph folder refresh).
@@ -34915,7 +35878,7 @@ class MainWindow(QMainWindow):
         for r in range(model.rowCount(col0)):
             ix = model.index(r, 0, col0)
             pl = self._destination_model_index_user_role_dict(ix)
-            if not destination_payload_is_planned_workspace_row(pl):
+            if not self._destination_row_is_overlay_snapshot_candidate_under_graph_folder(pl):
                 continue
             children = self._destination_collect_planned_workspace_children_under_model(ix)
             out.append({"payload": dict(pl), "children": children})
@@ -34935,7 +35898,7 @@ class MainWindow(QMainWindow):
                 continue
             pl = item.get("payload")
             ch = item.get("children")
-            if isinstance(pl, dict) and destination_payload_is_planned_workspace_row(dict(pl)):
+            if isinstance(pl, dict) and self._destination_row_is_overlay_snapshot_candidate_under_graph_folder(dict(pl)):
                 pc = dict(pl)
                 for k in ("item_path", "destination_path", "display_path"):
                     pc.pop(k, None)
@@ -34945,7 +35908,7 @@ class MainWindow(QMainWindow):
                     else []
                 )
                 out.append({"payload": pc, "children": kids})
-            elif isinstance(item, dict) and destination_payload_is_planned_workspace_row(item):
+            elif isinstance(item, dict) and self._destination_row_is_overlay_snapshot_candidate_under_graph_folder(item):
                 pc = dict(item)
                 for k in ("item_path", "destination_path", "display_path"):
                     pc.pop(k, None)
@@ -35487,6 +36450,83 @@ class MainWindow(QMainWindow):
                     name_only_fallback_would_be_unsafe_under_graph=bool(graph_auth_rec and len(name_match_indices) == 1),
                 )
             target_for_children: QModelIndex | None = None
+            matched_pl_precheck = (
+                self._destination_model_index_user_role_dict(matched)
+                if matched is not None and matched.isValid()
+                else {}
+            )
+            pre_live_path_conflict = (
+                self._destination_row_raw_path_for_path_lookup_match(matched_pl_precheck)
+                or str(matched_pl_precheck.get("item_path") or matched_pl_precheck.get("destination_path") or "")
+                or ""
+            ).strip()
+            graph_bind_overlay_conflict = (
+                matched is not None
+                and matched.isValid()
+                and matched_by_exact_path
+                and graph_auth_rec
+                and destination_payload_is_live_graph_row(matched_pl_precheck)
+                and destination_payload_is_planned_workspace_row(snap)
+            )
+            if graph_bind_overlay_conflict:
+                log_info(
+                    "destination_live_memory_conflict_detected_after_graph_bind",
+                    intended_path_excerpt=str(intended_canon or snap_name)[:400],
+                    snapshot_model_path_excerpt=str(snap_path_model)[:400],
+                    live_path_excerpt=str(pre_live_path_conflict)[:400],
+                    row_kind_excerpt=str(snap.get("row_kind") or "")[:40],
+                )
+                _rec_g = LiveMemoryConflictRecord(
+                    kind=REVIEW_TYPE_LIVE_MEMORY_DUPLICATE,
+                    subtype="live_duplicate_graph_bind_planned_overlay",
+                    planned_or_proposed_path=str(intended_canon or snap_path_model or "")[:512],
+                    live_graph_path=str(pre_live_path_conflict or "")[:512],
+                    live_item_id=str(matched_pl_precheck.get("id") or matched_pl_precheck.get("graph_item_id") or "")[
+                        :240
+                    ],
+                    live_item_name=str(matched_pl_precheck.get("name") or "")[:240],
+                    live_item_type="folder" if bool(matched_pl_precheck.get("is_folder", True)) else "file",
+                    suggested_actions=(
+                        "Review: live Graph item already exists at this path while planning still has a "
+                        "pending overlay row; both are kept visible."
+                    ),
+                )
+                _merged_conf = merge_unique(
+                    [_rec_g],
+                    list(getattr(self, "_runtime_live_memory_conflict_rows", None) or []),
+                )
+                self._runtime_live_memory_conflict_rows = _merged_conf
+                log_info(
+                    "destination_live_memory_conflict_created_after_graph_bind",
+                    subtype="live_duplicate_graph_bind_planned_overlay",
+                    intended_path_excerpt=str(intended_canon or snap_name)[:400],
+                )
+                snap_payload_g = self._destination_planned_snapshot_payload_with_intended_paths(snap, intended_canon)
+                snap_payload_g["live_memory_overlay_conflict_with_live_row"] = True
+                model.remove_placeholder_children(col0)
+                model.append_child_payloads(col0, [snap_payload_g])
+                rc_g = int(model.rowCount(col0))
+                st["reattached"] += 1
+                if rc_g > 0:
+                    target_for_children = model.index(rc_g - 1, 0, col0)
+                self._apply_tree_item_visual_state(None, snap_payload_g)
+                self._refresh_destination_item_visibility_index(col0, expand=True)
+                log_info(
+                    "destination_graph_bind_overlay_conflict_row_created",
+                    intended_path_excerpt=str(intended_canon or snap_name)[:400],
+                )
+                if nested and target_for_children is not None and target_for_children.isValid():
+                    for ch_node in nested:
+                        if not isinstance(ch_node, dict):
+                            continue
+                        sub_g = _reconcile_node(target_for_children, ch_node)
+                        st["matched_live"] += sub_g["matched_live"]
+                        st["reattached"] += sub_g["reattached"]
+                        st["lost"] += sub_g["lost"]
+                        st["no_op"] += int(sub_g.get("no_op", 0) or 0)
+                elif nested:
+                    st["lost"] += self._destination_count_planned_snapshot_tree_nodes(nested)
+                return st
             if matched is not None and matched.isValid():
                 pre_live_path = self._destination_row_raw_path_for_path_lookup_match(
                     self._destination_model_index_user_role_dict(matched)
@@ -46014,6 +47054,81 @@ class MainWindow(QMainWindow):
                         reason="already_queued_same_parent_index",
                     )
                     return True
+        _graph_auth_enqueue = destination_authority_contract.graph_owns_visible_real_destination_structure(self)
+        _assess_enq: dict | None = None
+        _assessor_called_enq = False
+        _assess_out_enq = "not_called"
+        if _graph_auth_enqueue:
+            _aq = f"enqueue:{str(enqueue_reason or '')[:80]}"
+            _assess_enq = self._destination_descendant_snapshot_reuse_assess(parent_ix, move, audit_context=_aq)
+            _assessor_called_enq = True
+            _assess_out_enq = str((_assess_enq or {}).get("outcome") or "rejected")
+            if _assess_enq.get("outcome") == "complete":
+                self._log_destination_descendant_replay_reuse_gate_result(
+                    enqueue_site="_enqueue_destination_descendant_apply_to_model",
+                    enqueue_reason=str(enqueue_reason or ""),
+                    collect_reason=str(collect_reason or ""),
+                    move=move,
+                    parent_ix=parent_ix,
+                    graph_authority=True,
+                    assessor_called=True,
+                    assess_outcome="complete",
+                )
+                source_item = self._find_source_item_for_planned_move(move)
+                source_root_data = self._source_tree_row_payload(source_item) if source_item is not None else {}
+                if not source_root_data:
+                    source_root_data = dict(move.get("source", {}) or {})
+                cur_token = self._destination_allocation_projection_resume_token(move, source_root_data)
+                self._destination_descendant_snapshot_reuse_mark_allocation_applied_index(
+                    parent_ix,
+                    move,
+                    audit_context=_aq,
+                    overlay_count=int(_assess_enq.get("overlay_descendant_count") or 0),
+                    expected_count=int(_assess_enq.get("expected_descendant_count") or 0),
+                    cur_token=str(cur_token or ""),
+                )
+                tree_rc = getattr(self, "destination_tree_widget", None)
+                self._refresh_destination_item_visibility_index(parent_ix)
+                self._apply_tree_item_visual_state(None, parent_ix.data(Qt.UserRole) or {})
+                if tree_rc is not None:
+                    tree_rc.viewport().update()
+                if on_complete is not None:
+                    try:
+                        on_complete(int(_assess_enq.get("overlay_descendant_count") or 0))
+                    except Exception:
+                        log_info(
+                            "destination_descendant_apply_on_complete_failed",
+                            reason="reuse_snapshot_callback_exception",
+                        )
+                return True
+            if _assess_enq.get("outcome") == "partial":
+                log_info(
+                    "destination_descendant_replay_partial_snapshot_resume",
+                    enqueue_reason=str(enqueue_reason or "")[:200],
+                    expected_descendant_count=int(_assess_enq.get("expected_descendant_count") or -1),
+                    overlay_descendant_count=int(_assess_enq.get("overlay_descendant_count") or -1),
+                    move_key_excerpt=str(self._allocation_move_key(move) or "")[:120],
+                )
+                log_info(
+                    "destination_descendant_replay_full_replay_required",
+                    reason="partial_subtree_missing_only_apply_not_seeded_from_snapshot_audit",
+                    enqueue_reason=str(enqueue_reason or "")[:200],
+                )
+        self._log_destination_descendant_replay_reuse_gate_result(
+            enqueue_site="_enqueue_destination_descendant_apply_to_model",
+            enqueue_reason=str(enqueue_reason or ""),
+            collect_reason=str(collect_reason or ""),
+            move=move,
+            parent_ix=parent_ix,
+            graph_authority=bool(_graph_auth_enqueue),
+            assessor_called=bool(_assessor_called_enq),
+            assess_outcome=_assess_out_enq,
+            skip_reason_if_no_assessor=(
+                ""
+                if _graph_auth_enqueue
+                else "graph_authority_false_enqueue_without_assessor"
+            ),
+        )
         dq.append((parent_ix, move, on_complete, str(enqueue_reason or ""), str(collect_reason or "")))
         log_info(
             "destination_descendant_apply_enqueued",
@@ -62694,6 +63809,45 @@ class MainWindow(QMainWindow):
         col0 = col0.siblingAtColumn(0) if col0.column() != 0 else col0
         if hasattr(dm, "is_index_live") and not dm.is_index_live(col0):
             return
+        move_eff = move
+        if move_eff is None or not isinstance(move_eff, dict):
+            pl_probe = dict(col0.data(Qt.UserRole) or {})
+            move_eff = self._find_exact_planned_move_for_destination_projection_path(pl_probe)
+        if isinstance(move_eff, dict):
+            log_info(
+                "destination_overlay_repair_reuse_assess_entered",
+                move_key_excerpt=str(self._allocation_move_key(move_eff) or "")[:120],
+            )
+            assess_r = self._destination_descendant_snapshot_reuse_assess(
+                col0, move_eff, audit_context="overlay_projection_invariant_repair"
+            )
+            log_info(
+                "destination_overlay_repair_reuse_assess_result",
+                outcome=str(assess_r.get("outcome") or "")[:40],
+                move_key_excerpt=str(self._allocation_move_key(move_eff) or "")[:120],
+            )
+            if assess_r.get("outcome") == "complete":
+                log_info(
+                    "destination_overlay_repair_descendant_replay_skipped_snapshot_reused",
+                    move_key_excerpt=str(self._allocation_move_key(move_eff) or "")[:120],
+                )
+                return
+            log_info(
+                "destination_overlay_repair_descendant_replay_required",
+                outcome=str(assess_r.get("outcome") or "")[:80],
+                move_key_excerpt=str(self._allocation_move_key(move_eff) or "")[:120],
+            )
+        else:
+            log_info(
+                "destination_overlay_repair_reuse_assess_not_called",
+                skip_reason="move_not_resolved_to_dict_for_overlay_repair",
+            )
+            log_info(
+                "destination_overlay_repair_reuse_move_missing",
+                reason="find_exact_planned_move_for_destination_projection_path_returned_non_dict",
+            )
+        if move is None and isinstance(move_eff, dict):
+            move = move_eff
         self._strip_non_graph_direct_children_for_overlay_projection_reload(col0)
         source_item = self._find_source_item_for_planned_move(move)
         if source_item is not None:
@@ -64086,6 +65240,52 @@ class MainWindow(QMainWindow):
                         folder_path_excerpt=row_path_ex[:400],
                         reason="startup_visibility_pass_uses_source_subtree_projection",
                     )
+                    if _folder_alloc and isinstance(move, dict):
+                        log_info(
+                            "destination_startup_visibility_bypass_reuse_assess_entered",
+                            folder_path_excerpt=row_path_ex[:400],
+                        )
+                        _assess_bypass = self._destination_descendant_snapshot_reuse_assess(
+                            ix, move, audit_context="startup_visibility_bypass"
+                        )
+                        log_info(
+                            "destination_startup_visibility_bypass_reuse_assess_result",
+                            outcome=str(_assess_bypass.get("outcome") or "")[:40],
+                            folder_path_excerpt=row_path_ex[:400],
+                        )
+                        if _assess_bypass.get("outcome") == "complete":
+                            source_item_b = self._find_source_item_for_planned_move(move)
+                            source_root_b = (
+                                self._source_tree_row_payload(source_item_b) if source_item_b is not None else {}
+                            )
+                            if not source_root_b:
+                                source_root_b = dict(move.get("source", {}) or {})
+                            cur_tok_b = self._destination_allocation_projection_resume_token(move, source_root_b)
+                            self._destination_descendant_snapshot_reuse_mark_allocation_applied_index(
+                                ix,
+                                move,
+                                audit_context="startup_visibility_bypass",
+                                overlay_count=int(_assess_bypass.get("overlay_descendant_count") or 0),
+                                expected_count=int(_assess_bypass.get("expected_descendant_count") or 0),
+                                cur_token=str(cur_tok_b or ""),
+                            )
+                            log_info(
+                                "destination_startup_visibility_bypass_skipped_snapshot_reused",
+                                folder_path_excerpt=row_path_ex[:400],
+                                move_key_excerpt=str(self._allocation_move_key(move) or "")[:120],
+                            )
+                            self._refresh_destination_item_visibility_index(ix)
+                            self._apply_tree_item_visual_state(None, ix.data(Qt.UserRole) or {})
+                            if tree is not None:
+                                tree.viewport().update()
+                            return
+                    else:
+                        log_info(
+                            "destination_startup_visibility_bypass_reuse_assess_not_called",
+                            folder_path_excerpt=row_path_ex[:400],
+                            skip_reason=("not_folder_alloc" if not _folder_alloc else "move_not_dict"),
+                            folder_alloc=bool(_folder_alloc),
+                        )
                 src_move = move.get("source") if isinstance(move.get("source"), dict) else {}
                 if bool(src_move.get("is_folder", True)):
                     if fen_ld:
@@ -64616,6 +65816,7 @@ class MainWindow(QMainWindow):
                 model = self.destination_planning_model
                 planned_workspace_presnapshot: list[dict] = []
                 _pp_snap = ""
+                _ov_snap_n = 0
                 _col0_pre = parent_index.siblingAtColumn(0) if parent_index.column() != 0 else parent_index
                 _n_graph_items = len(items or [])
                 if destination_authority_contract.graph_owns_visible_real_destination_structure(self):
@@ -64637,6 +65838,13 @@ class MainWindow(QMainWindow):
                     _skip_snapshot_collect = (
                         _n_graph_items == 0 and not _expects_planned_under and _only_loading_placeholder
                     )
+                    if not _skip_snapshot_collect and _pp_snap:
+                        try:
+                            self._destination_graph_bind_presnapshot_overlay_scan(
+                                parent_index, parent_semantic_path=str(_pp_snap or "")
+                            )
+                        except Exception as exc:
+                            self._log_restore_exception("destination_graph_bind_presnapshot_overlay_scan", exc)
                     if not _skip_snapshot_collect:
                         planned_workspace_presnapshot = self._destination_collect_planned_workspace_children_under_model(
                             parent_index
@@ -64662,6 +65870,13 @@ class MainWindow(QMainWindow):
                             parent_path=str(_pp_snap or "")[:400],
                             note="skip_presnapshot_collect_loading_only_no_planned_under",
                         )
+                    _ov_snap_n = int(self._destination_count_planned_snapshot_tree_nodes(planned_workspace_presnapshot))
+                    log_info(
+                        "destination_graph_bind_existing_overlay_child_count",
+                        parent_path_excerpt=str(_pp_snap or "")[:400],
+                        overlay_child_count=int(_ov_snap_n),
+                        skip_graph_replace=bool(skip_destination_child_replace),
+                    )
                 t_fw_bundle_0 = time.perf_counter()
                 if not skip_destination_child_replace:
                     t_bind_start = time.perf_counter()
@@ -64765,11 +65980,43 @@ class MainWindow(QMainWindow):
                         parent_index.siblingAtColumn(0) if parent_index.column() != 0 else parent_index
                     )
                     if col0_planned.isValid() and planned_workspace_presnapshot:
-                        self._destination_invoke_planned_workspace_reconcile_after_graph_folder_load(
+                        _st_recon = self._destination_invoke_planned_workspace_reconcile_after_graph_folder_load(
                             col0_planned,
                             list(planned_workspace_presnapshot),
                             allow_reappend=True,
                         )
+                        log_info(
+                            "destination_graph_bind_preserved_overlay_children",
+                            parent_path_excerpt=str(_pp_snap or "")[:400],
+                            matched_live=int(_st_recon.get("matched_live", 0)),
+                            reattached=int(_st_recon.get("reattached", 0)),
+                            no_op=int(_st_recon.get("no_op", 0)),
+                        )
+                        _pres_sum = int(_st_recon.get("matched_live", 0)) + int(_st_recon.get("reattached", 0)) + int(
+                            _st_recon.get("no_op", 0)
+                        )
+                        log_info(
+                            "destination_graph_bind_reapplied_overlay_children",
+                            parent_path_excerpt=str(_pp_snap or "")[:400],
+                            preserved_overlay_total=int(_pres_sum),
+                            lost=int(_st_recon.get("lost", 0)),
+                        )
+                        if int(_st_recon.get("lost", 0) or 0) > 0:
+                            log_info(
+                                "destination_graph_bind_overlay_children_lost",
+                                parent_path_excerpt=str(_pp_snap or "")[:400],
+                                lost_count=int(_st_recon.get("lost", 0)),
+                            )
+                        if (
+                            int(_ov_snap_n or 0) > 0
+                            and int(_st_recon.get("lost", 0) or 0) >= int(_ov_snap_n or 0)
+                        ):
+                            log_info(
+                                "destination_graph_bind_overlay_children_wiped_detected",
+                                parent_path_excerpt=str(_pp_snap or "")[:400],
+                                presnapshot_overlay_nodes=int(_ov_snap_n),
+                                lost_nodes=int(_st_recon.get("lost", 0)),
+                            )
                 else:
                     model.remove_placeholder_children(parent_index)
 
