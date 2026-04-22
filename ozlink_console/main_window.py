@@ -20755,6 +20755,14 @@ class MainWindow(QMainWindow):
                 "post_full_tree_3s",
             ),
         )
+        if self._ozlink_destination_graph_overlay_mode():
+            QTimer.singleShot(
+                0,
+                lambda: self._safe_invoke(
+                    "destination_graph_overlay_promote_post_full_tree",
+                    self._destination_graph_overlay_promote_rows_from_full_tree_snapshot,
+                ),
+            )
         _dsuf2 = str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id)
         self._log_restore_phase(
             "destination_authority_pipeline",
@@ -33831,6 +33839,154 @@ class MainWindow(QMainWindow):
                     self._attach_destination_overlays_for_visible_branch(pth)
             self._attach_destination_overlays_for_visible_branch("")
 
+    def _destination_graph_overlay_build_full_tree_canonical_path_index(
+        self,
+    ) -> dict[str, dict[str, Any]]:
+        """
+        Map canonical path (casefold) → raw Graph item dict from ``_destination_full_tree_snapshot``
+        (same paths as a live library enumerate, read-only in-memory data).
+        """
+        out: dict[str, dict[str, Any]] = {}
+        for ent in list(getattr(self, "_destination_full_tree_snapshot", None) or []):
+            if not isinstance(ent, dict):
+                continue
+            sp = str(ent.get("semantic_path") or "").strip()
+            data = ent.get("data")
+            if not sp or not isinstance(data, dict):
+                continue
+            k = str(
+                self._canonical_planned_memory_path_for_graph_match(self.normalize_memory_path(sp)) or ""
+            ).strip()
+            if not k:
+                continue
+            out[k.casefold()] = data
+        return out
+
+    def _destination_graph_overlay_promote_rows_from_full_tree_snapshot(self) -> None:
+        """In graph overlay mode, upgrade cached/planned-structural rows to live graph ownership when a full-tree path matches."""
+        if not self._ozlink_destination_graph_overlay_mode():
+            return
+        if self._planning_browse_mode("destination") == "local":
+            return
+        model = getattr(self, "destination_planning_model", None)
+        if model is None or not hasattr(model, "iter_depth_first") or not hasattr(model, "update_payload_for_index"):
+            return
+        by_path = self._destination_graph_overlay_build_full_tree_canonical_path_index()
+        if not by_path:
+            return
+        try:
+            drive_sel = str(self._current_selected_destination_drive_id() or "").strip() or str(
+                (getattr(self, "pending_root_drive_ids", None) or {}).get("destination") or ""
+            ).strip()
+        except Exception:
+            drive_sel = ""
+        if not drive_sel:
+            return
+        promoted = 0
+        preserved_subordinates = 0
+        for ix in list(model.iter_depth_first()):
+            try:
+                if not ix.isValid():
+                    continue
+                pl = self._destination_model_index_user_role_dict(ix)
+            except Exception:
+                continue
+            if not isinstance(pl, dict) or pl.get("placeholder"):
+                continue
+            if destination_payload_is_live_graph_row(pl):
+                continue
+            rawp = str(
+                self._destination_row_raw_path_for_path_lookup_match(pl) or self._tree_item_path(pl) or ""
+            ).strip()
+            if not rawp:
+                continue
+            canon = str(
+                self._canonical_planned_memory_path_for_graph_match(self.normalize_memory_path(rawp)) or ""
+            ).strip()
+            gitem = by_path.get(canon.casefold())
+            if gitem is None or not isinstance(gitem, dict):
+                continue
+            g_row = self._destination_payload_from_graph_item(dict(gitem))
+            _did_g = str(g_row.get("drive_id") or g_row.get("library_id") or "").strip()
+            if _did_g and drive_sel and _did_g.strip().casefold() != drive_sel.strip().casefold():
+                continue
+            try:
+                nsub = int(model.substantive_destination_folder_child_row_count(ix.siblingAtColumn(0) if ix.column() != 0 else ix))
+            except Exception:
+                nsub = 0
+            if bool(pl.get("is_folder", True)) and nsub:
+                g_row["children_loaded"] = True
+                g_row["graph_children_verified"] = False
+                g_row["needs_live_child_refresh"] = True
+                g_row["destination_snapshot_cached"] = bool(pl.get("destination_snapshot_cached", False) or pl.get("needs_live_child_refresh"))
+            ws0 = str(destination_payload_workspace_row_state(pl) or "")
+            rkl = str(pl.get("row_kind") or "").strip().lower()
+            pre_shell = rkl == "cached_provisional_shell" or "cached" in rkl or "cached_provisional" in ws0
+            if bool(pl.get("is_folder", True)) and nsub:
+                preserved_subordinates += nsub
+            _preserved: dict[str, Any] = {}
+            for k in (
+                "planning_uuid",
+                "allocation_id",
+                "proposed_folder_stable_id",
+                "proposed",
+                "workspace_planned_row",
+                "planned_allocation",
+                "planned_allocation_descendant",
+                "request_id",
+                "StableKey",
+                "stable_key",
+            ):
+                if k in pl and pl.get(k) not in (None, ""):
+                    _preserved[k] = pl[k]
+            if str(pl.get("overlay_state") or "").strip():
+                _preserved["overlay_state"] = pl.get("overlay_state")
+            if str(pl.get("destination_overlay_kind") or "").strip():
+                _preserved["destination_overlay_kind"] = pl.get("destination_overlay_kind")
+
+            def _mut(
+                p,
+                _g=g_row,
+                _pre=_preserved,
+            ) -> None:
+                p.update(dict(_g))
+                p.update(_pre)
+                p["workspace_row_state"] = WORKSPACE_ROW_STATE_LIVE_CONFIRMED
+                p["verification_state"] = "live_confirmed"
+                p["row_kind"] = "live_folder" if bool(p.get("is_folder", True)) else "live_file"
+                p.pop("non_graph_structural_authority", None)
+
+            col0 = ix.siblingAtColumn(0) if ix.column() != 0 else ix
+            model.update_payload_for_index(col0, _mut)
+            try:
+                self._apply_tree_item_visual_state(None, dict(col0.data(Qt.UserRole) or {}))
+            except Exception:
+                pass
+            promoted += 1
+            log_fn = (
+                "destination_graph_overlay_row_promoted_from_cached_shell"
+                if pre_shell
+                else "destination_graph_overlay_row_promoted_from_memory_render"
+            )
+            log_info(
+                log_fn,
+                path_excerpt=str(canon)[:400],
+                graph_item_id_suffix=str(gitem.get("id", ""))[-16:],
+            )
+        if promoted:
+            try:
+                model._rebuild_path_index()  # type: ignore[attr-defined, unused-ignore]
+            except Exception:
+                pass
+            log_info(
+                "destination_graph_overlay_promotion_preserved_children_count",
+                under_promoted_folders_child_rows_total=int(preserved_subordinates),
+            )
+            log_info(
+                "destination_graph_overlay_promotion_preserved_overlay_state",
+                promoted_count=int(promoted),
+            )
+
     def _destination_apply_provisional_session_snapshot_if_eligible(self, *, phase: str) -> bool:
         """Option 3 Phase 1: paint the last saved destination snapshot immediately as cached provisional."""
         if self._planning_browse_mode("destination") == "local":
@@ -33932,15 +34088,42 @@ class MainWindow(QMainWindow):
             root_rows=len(roots),
             selected_drive_id_suffix=_allow_drv[-16:] if len(_allow_drv) > 16 else _allow_drv,
         )
+        node_ct = self._count_tree_snapshot_nodes(snaps)
         if self._ozlink_destination_graph_overlay_mode():
             self._destination_load_full_overlay_store(snaps)
+            for i, snap in enumerate(list(snaps or [])):
+                if not isinstance(snap, dict):
+                    continue
+                nch = len([c for c in (snap.get("children") or []) if isinstance(c, dict)])
+                d0 = snap.get("data")
+                nm = ""
+                if isinstance(d0, dict):
+                    nm = str(d0.get("name") or d0.get("base_display_label") or "")[:120]
+                log_info(
+                    "destination_memory_render_branch_children_count",
+                    phase=str(phase)[:80],
+                    context="provisional_startup",
+                    top_level_index=int(i),
+                    stored_children_count=int(nch),
+                    name_excerpt=nm,
+                    graph_overlay_mode=1,
+                )
             log_info(
-                "destination_provisional_startup_skipped",
+                "destination_memory_render_full_subtree_applied",
                 phase=str(phase)[:80],
-                reason="graph_overlay_mode_no_reset_nested",
+                root_rows=int(len(roots)),
+                snapshot_nodes=int(node_ct),
+                selected_drive_id_suffix=_allow_drv[-16:] if len(_allow_drv) > 16 else _allow_drv,
             )
-            return False
-        node_ct = self._count_tree_snapshot_nodes(snaps)
+        elif node_ct == 0 and any(
+            len([c for c in (s.get("children") or []) if isinstance(c, dict)]) > 0 for s in (snaps or []) if isinstance(s, dict)
+        ):
+            log_info(
+                "destination_memory_render_skipped_shell_only_blocked",
+                phase=str(phase)[:80],
+                reason="top_level_had_stored_children_but_sanitization_dropped_them",
+                snapshot_nodes=int(node_ct),
+            )
         self._startup_memory_presentation_wall_t0 = float(time.perf_counter())
         try:
             tree.setUpdatesEnabled(False)
@@ -34457,11 +34640,83 @@ class MainWindow(QMainWindow):
                                 **self._destination_forensic_destination_model_counts(),
                             )
                         elif roots_pp and self._ozlink_destination_graph_overlay_mode():
-                            self._destination_load_full_overlay_store(list(pending_dest_snaps))
+                            pds = list(pending_dest_snaps or [])
+                            self._destination_load_full_overlay_store(pds)
+                            destination_stamp_snapshot_tree_workspace_state(pds)
+                            for i, snap in enumerate(pds):
+                                if not isinstance(snap, dict):
+                                    continue
+                                nch = len([c for c in (snap.get("children") or []) if isinstance(c, dict)])
+                                d0 = snap.get("data")
+                                nm = ""
+                                if isinstance(d0, dict):
+                                    nm = str(d0.get("name") or d0.get("base_display_label") or "")[:120]
+                                log_info(
+                                    "destination_memory_render_branch_children_count",
+                                    context="pre_graph_bind",
+                                    top_level_index=int(i),
+                                    stored_children_count=int(nch),
+                                    name_excerpt=nm,
+                                    graph_overlay_mode=1,
+                                )
+                            _n_ppct = int(self._count_tree_snapshot_nodes(pds))
+                            log_info(
+                                "destination_memory_render_full_subtree_applied",
+                                context="pre_graph_session_bind",
+                                root_rows=int(len(roots_pp)),
+                                snapshot_nodes=int(_n_ppct),
+                                graph_overlay_mode=1,
+                            )
+                            try:
+                                tree.setUpdatesEnabled(False)
+                                model.reset_nested(roots_pp)
+                            finally:
+                                try:
+                                    tree.setUpdatesEnabled(True)
+                                except Exception:
+                                    pass
+                            self._destination_startup_snapshot_mount_seen = True
+                            self._destination_session_snapshot_path_cf_set_cache = None
+                            self._destination_snapshot_mount_drive_id = str(
+                                (getattr(self, "pending_root_drive_ids", {}) or {}).get("destination")
+                                or self._current_selected_destination_drive_id()
+                                or ""
+                            ).strip()
+                            pre_graph_snapshot_mount = True
                             log_info(
                                 "destination_pending_session_snapshot_bind_before_graph_root",
-                                reason="graph_overlay_mode_pre_graph_reset_nested_suppressed",
+                                reason="graph_overlay_mode_full_memory_subtree",
                                 root_rows=int(len(roots_pp)),
+                                snapshot_nodes=int(_n_ppct),
+                            )
+                            self._destination_stamp_destination_model_rows_for_snapshot_live_refresh(
+                                context="graph_overlay_pre_graph_session_bind",
+                            )
+                            self._destination_run_post_snapshot_bind_overlay_pipeline(
+                                reason="pre_graph_session_bind_reset_nested_graph_overlay",
+                            )
+                            _pre_gr_bind_did2 = str(
+                                (getattr(self, "pending_root_drive_ids", {}) or {}).get("destination")
+                                or self._current_selected_destination_drive_id()
+                                or ""
+                            ).strip()
+                            QTimer.singleShot(
+                                0,
+                                lambda d=_pre_gr_bind_did2: self._safe_invoke(
+                                    "destination_snapshot_branch_live_refresh_after_pre_graph_session_bind",
+                                    lambda: self._destination_schedule_unverified_snapshot_branches_live_refresh(
+                                        drive_id=str(d or ""),
+                                        reason="graph_overlay_pre_graph_memory_subtree",
+                                    ),
+                                ),
+                            )
+                            self._destination_prune_pending_snapshot_branch_refresh_after_provisional_mount(
+                                pds
+                            )
+                            log_info(
+                                "destination_startup_model_step",
+                                step="after_graph_overlay_pre_graph_reset_nested",
+                                **self._destination_forensic_destination_model_counts(),
                             )
                 elif (
                     pending_dest_snaps
