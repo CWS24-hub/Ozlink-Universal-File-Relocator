@@ -3882,7 +3882,9 @@ class MainWindow(QMainWindow):
             graph_stem=g_stem,
             memory_stem=m_stem,
         )
+        t_v0 = time.perf_counter()
         t, j, s = export_visible_destination_tree(self, out_dir=o, file_stem=v_stem)
+        visible_ms = round((time.perf_counter() - t_v0) * 1000.0, 2)
         combined: dict[str, Any] = dict(s)
         combined["export_pair_timestamp"] = _ts
         combined["export_site_name"] = _site
@@ -3890,16 +3892,22 @@ class MainWindow(QMainWindow):
         combined["visible_file_stem"] = v_stem
         combined["graph_file_stem"] = g_stem
         combined["memory_file_stem"] = m_stem
+        graph_ms: float | None = None
+        t_g0 = time.perf_counter()
         try:
             gt, gj, gs = export_graph_destination_tree(self, out_dir=o, file_stem=g_stem)
+            graph_ms = round((time.perf_counter() - t_g0) * 1000.0, 2)
             combined["graph_txt_path"] = str(gt)
             combined["graph_json_path"] = str(gj)
             combined["graph_summary"] = gs
         except Exception as exc:
             log_info("debug_graph_destination_tree_export_skipped", error=str(exc)[:500])
             combined["graph_error"] = str(exc)[:500]
+        memory_ms: float | None = None
+        t_m0 = time.perf_counter()
         try:
             mt, mj, ms = export_memory_destination_tree(self, out_dir=o, file_stem=m_stem)
+            memory_ms = round((time.perf_counter() - t_m0) * 1000.0, 2)
             combined["memory_txt_path"] = str(mt)
             combined["memory_json_path"] = str(mj)
             combined["memory_summary"] = ms
@@ -3907,6 +3915,80 @@ class MainWindow(QMainWindow):
             log_info("debug_memory_destination_tree_export_skipped", error=str(exc)[:500])
             combined["memory_error"] = str(exc)[:500]
         wall_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        try:
+            from ozlink_console.destination_visible_graph_export_audit import build_visible_vs_graph_path_diff_audit
+
+            if combined.get("graph_json_path") and not combined.get("graph_error"):
+                with open(Path(j), encoding="utf-8") as _vf:
+                    _vdoc = json.load(_vf)
+                with open(Path(str(combined["graph_json_path"])), encoding="utf-8") as _gf:
+                    _gdoc = json.load(_gf)
+                _audit = build_visible_vs_graph_path_diff_audit(_vdoc, _gdoc)
+                # Flatten nested flags for log_json-friendly keys (some back-ends do not like nested dicts in JSON fields).
+                _f = (_audit.get("audit_path_flags") or {}) if isinstance(_audit, dict) else {}
+                if isinstance(_f, dict) and _f:
+                    for _fk, _fv in _f.items():
+                        _audit["audit_path_flag__" + str(_fk)] = _fv
+                    if "audit_path_flags" in _audit:
+                        del _audit["audit_path_flags"]
+                log_info("destination_visible_vs_graph_path_diff_audit", **_audit)
+                _sample = _audit.get("missing_graph_sample")
+                if isinstance(_sample, list):
+                    for _cand in (
+                        r"root3\it",
+                        r"root3\marketing",
+                    ):
+                        pcf2 = str(_cand).replace("/", "\\")
+                        pcf2_cf = pcf2.casefold()
+                        if pcf2_cf in {str(x).casefold() for x in _sample} or any(
+                            pcf2_cf in str(x or "").casefold() for x in _sample
+                        ):
+                            log_info(
+                                "destination_graph_live_row_missing_from_visible_model",
+                                audit_hint="graph_only_path_in_export_diff_sample",
+                                path_excerpt=pcf2[:400],
+                            )
+        except Exception as _aexc:
+            log_info("destination_visible_vs_graph_path_diff_audit_failed", error=str(_aexc)[:500])
+        _cgp = s.get("count_graph_vs_planned")
+        if isinstance(_cgp, dict):
+            log_info(
+                "destination_visible_export_graph_row_count",
+                count_graph_vs_planned_live_graph=int(_cgp.get("live_graph") or 0),
+                count_graph_vs_planned_planned=int(_cgp.get("planned") or 0),
+                count_graph_vs_planned_other=int(_cgp.get("other") or 0),
+                total_visible_rows=int(s.get("total_visible_rows") or 0),
+            )
+        _dm = getattr(self, "destination_planning_model", None)
+        _merge_t = 0.0
+        if _dm is not None and hasattr(_dm, "_graph_root_merge_last_at_monotonic"):
+            try:
+                _merge_t = float(getattr(_dm, "_graph_root_merge_last_at_monotonic", 0.0) or 0.0)
+            except Exception:
+                _merge_t = 0.0
+        _now_m = time.monotonic()
+        log_info(
+            "destination_export_timing_visible_vs_graph",
+            order=["visible", "graph", "memory"],
+            visible_export_ms=float(visible_ms),
+            graph_export_ms=float(graph_ms) if graph_ms is not None else -1.0,
+            memory_export_ms=float(memory_ms) if memory_ms is not None else -1.0,
+            wall_total_ms=wall_ms,
+            note="visible_model_walk_happens_before_Graph_list_drive_in_same_function",
+        )
+        log_info(
+            "destination_graph_bind_completed_before_visible_export",
+            visible_export_captures_UI_before_graph_list_call_in_this_debug_routine=True,
+            seconds_since_model_root_graph_merge_at_export=(round(_now_m - _merge_t, 4) if _merge_t > 0 else None),
+            had_recorded_model_root_graph_merge=bool(_merge_t > 0),
+        )
+        try:
+            log_info(
+                "destination_graph_bind_is_authoritative_at_debug_export",
+                is_authoritative=bool(self._destination_root_bind_is_authoritative()),
+            )
+        except Exception:
+            pass
         log_info(
             "debug_destination_tree_pair_export_completed",
             out_dir=str(o.resolve()),

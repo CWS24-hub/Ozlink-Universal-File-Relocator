@@ -5,7 +5,7 @@ QAbstractItemModel for destination planning tree (v2 / QTreeView path).
 from __future__ import annotations
 
 import time
-from typing import AbstractSet, Any, Callable, Dict, List, Optional, Tuple
+from typing import AbstractSet, Any, Callable, Dict, List, Optional, Tuple, Set
 
 from PySide6.QtCore import QAbstractItemModel, QModelIndex, Qt, Signal
 from PySide6.QtGui import QBrush, QColor
@@ -925,6 +925,15 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         stats["foreign_pruned"] = int(fp)
         stats["foreign_pruned_missing_identity"] = int(fpm)
 
+        _audit_leaf_names: Set[str] = {"it", "marketing", "root3", "sales", "finance", "hr", "management"}
+        log_info(
+            "destination_graph_live_row_received",
+            event="root_merge_incoming",
+            graph_root_incoming_count=len(incoming),
+            root_names_excerpt=",".join(
+                str(p.get("name") or "")[:64] for p in incoming[:48]
+            )[:2000],
+        )
         used: set[str] = set()
         for r in range(self.rowCount(inv)):
             ix = self.index(r, 0, inv)
@@ -1046,6 +1055,15 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             self._insert_root_child_at(row_ins, inc)
             used.add(gid)
             stats["inserted"] += 1
+            _nmc = str(inc.get("name") or "").strip().casefold()
+            if _nmc in _audit_leaf_names or len(incoming) <= 48:
+                log_info(
+                    "destination_graph_live_row_inserted",
+                    level="root",
+                    name_excerpt=str(inc.get("name") or "")[:120],
+                    path_key_excerpt=str(self._merge_root_row_path_key(inc))[:400],
+                    graph_item_id_suffix=str(inc.get("id") or "")[-16:],
+                )
 
         stats["children_loaded_reset_empty_subtree"] = int(
             self.reconcile_top_level_live_graph_children_loaded_when_subtree_empty(
@@ -1054,6 +1072,16 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         )
 
         self._rebuild_path_index()
+        try:
+            self._graph_root_merge_last_at_monotonic = time.monotonic()
+        except Exception:
+            pass
+        log_info(
+            "destination_graph_live_row_skipped",
+            context="root_merge",
+            skipped_planned_root_rows=int(stats.get("skipped_planned", 0) or 0),
+            reason="planned_workspace_or_planned_only_state",
+        )
         log_info(
             "destination_root_authority_merge_summary",
             updated=int(stats.get("updated", 0) or 0),
