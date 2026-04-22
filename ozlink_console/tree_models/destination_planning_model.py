@@ -1178,6 +1178,234 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         self._rebuild_path_index()
         self._notify_structure_changed()
 
+    def merge_graph_branch_union_at_parent(
+        self,
+        parent: QModelIndex,
+        graph_child_payloads: List[Dict[str, Any]],
+        *,
+        parent_canonical_path: str = "",
+    ) -> Dict[str, int]:
+        """
+        Union-merge live Graph :meth:`/children` payloads into an *existing* parent without removing
+        model rows that Graph did not return (no replace-all, no :meth:`reset_nested`).
+
+        * Matching rows (by drive item id or full canonical child path) are upgraded in place.
+        * New Graph-only children are inserted.
+        * Existing planned/overlay/cached children stay unless explicitly matched to a Graph row.
+        """
+        parent_col0 = parent.siblingAtColumn(0) if parent.isValid() and parent.column() != 0 else parent
+        if not parent_col0.isValid():
+            return {
+                "inserted": 0,
+                "upgraded": 0,
+                "preserved": 0,
+            }
+        parent_pl = self._node(parent_col0)
+        ppl: Dict[str, Any] = (
+            parent_pl.payload if parent_pl is not None and isinstance(parent_pl.payload, dict) else {}
+        ) or {}
+        pcan = str(parent_canonical_path or "").strip()
+        if not pcan:
+            pcan = str(
+                ppl.get("semantic_path") or ppl.get("item_path") or ppl.get("destination_path") or ""
+            ).strip()
+        pcan = normalize_manifest_path(pcan) if pcan else ""
+
+        _PRES = (
+            "planning_uuid",
+            "allocation_id",
+            "proposed_folder_stable_id",
+            "proposed",
+            "workspace_planned_row",
+            "planned_allocation",
+            "planned_allocation_descendant",
+            "request_id",
+            "StableKey",
+            "stable_key",
+        )
+
+        def _child_cpath(n: str) -> str:
+            nm = str(n or "").strip()
+            if not nm or not pcan:
+                return ""
+            return normalize_manifest_path(f"{pcan}\\{nm}")
+
+        log_info(
+            "destination_graph_branch_union_started",
+            parent_path_excerpt=pcan[:500],
+            graph_incoming_count=int(len(graph_child_payloads or [])),
+        )
+
+        self.remove_placeholder_children(parent_col0)
+        n_before = int(self.rowCount(parent_col0))
+
+        by_id: Dict[str, QModelIndex] = {}
+        by_path: Dict[str, QModelIndex] = {}
+        for r in range(n_before):
+            cix = self.index(r, 0, parent_col0)
+            pl0 = cix.data(Qt.UserRole) or {}
+            if not isinstance(pl0, dict):
+                continue
+            if pl0.get("placeholder"):
+                continue
+            iid0 = str(pl0.get("id") or pl0.get("graph_item_id") or "").strip()
+            if iid0 and iid0 not in by_id:
+                by_id[iid0] = cix
+            pk0 = str(self._path_key_for_payload(pl0) or "").strip()
+            if not pk0:
+                pk0 = str(_child_cpath(str(pl0.get("name") or "")) or "").strip()
+            if pk0:
+                kcf0 = pk0.casefold()
+                if kcf0 and kcf0 not in by_path:
+                    by_path[kcf0] = cix  # one row per casefolded key
+
+        n_up = 0
+        n_preserved = 0
+        matched_rows: Set[int] = set()
+        to_insert: List[Dict[str, Any]] = []
+
+        for gpi0 in list(graph_child_payloads or []):
+            if not isinstance(gpi0, dict):
+                continue
+            gpi = dict(gpi0)
+            gid = str(gpi.get("id") or "").strip()
+            nm = str(gpi.get("name") or "").strip()
+            ch_path = _child_cpath(nm)
+            cix_hit: Optional[QModelIndex] = None
+            if gid and gid in by_id:
+                cix_hit = by_id[gid]
+            if cix_hit is None and ch_path:
+                cix_hit = by_path.get(str(ch_path).casefold())
+            n_desc = 0
+            if cix_hit is not None and cix_hit.isValid():
+                opl0 = cix_hit.data(Qt.UserRole) or {}
+                if (
+                    isinstance(opl0, dict)
+                    and cix_hit.isValid()
+                    and opl0.get("is_folder", True)
+                ):
+                    try:
+                        n_desc = int(self.substantive_destination_folder_child_row_count(cix_hit)) or 0
+                    except Exception:
+                        n_desc = 0
+                opl: Dict[str, Any] = dict(opl0) if isinstance(opl0, dict) else {}
+
+                def _mut(
+                    p: Dict[str, Any],
+                    _inc: Dict[str, Any] = gpi,
+                    _old: Dict[str, Any] = opl,
+                    _nd: int = n_desc,
+                ) -> None:
+                    p.update(_inc)
+                    for _k in _PRES:
+                        if _k in _old and _old.get(_k) not in (None, ""):
+                            p[_k] = _old[_k]
+                    ovl = str(_old.get("overlay_state") or "").strip()
+                    if ovl:
+                        p["overlay_state"] = ovl
+                    dok = str(_old.get("destination_overlay_kind") or "").strip()
+                    if dok:
+                        p["destination_overlay_kind"] = dok
+                    p["workspace_row_state"] = WORKSPACE_ROW_STATE_LIVE_CONFIRMED
+                    p["row_kind"] = "live_folder" if bool(p.get("is_folder", True)) else "live_file"
+                    p["verification_state"] = "live_confirmed"
+                    p.pop("non_graph_structural_authority", None)
+                    if p.get("is_folder", True):
+                        if _nd > 0:
+                            p["children_loaded"] = True
+                            p["graph_children_verified"] = False
+                            p["needs_live_child_refresh"] = True
+                        else:
+                            p["children_loaded"] = False
+                            p["graph_children_verified"] = True
+                            p["needs_live_child_refresh"] = False
+                    else:
+                        p["graph_children_verified"] = True
+                        p["needs_live_child_refresh"] = False
+
+                self.update_payload_for_index(cix_hit, _mut)  # type: ignore[union-attr, unused-ignore]
+                n_up += 1
+                if cix_hit.isValid():
+                    try:
+                        matched_rows.add(int(cix_hit.row()))
+                    except Exception:
+                        pass
+                is_common = destination_payload_is_planned_workspace_row(opl) or (
+                    not destination_payload_is_live_graph_row(opl) and n_desc > 0
+                )
+                log_info(
+                    "destination_graph_branch_union_existing_child_upgraded",
+                    child_path_excerpt=str(ch_path)[:500],
+                    graph_item_id_suffix=gid[-16:] if len(gid) > 16 else gid,
+                    had_planned=bool(is_common),
+                )
+                if is_common and ch_path:
+                    log_info(
+                        "destination_graph_branch_union_common_path_merged",
+                        child_path_excerpt=str(ch_path)[:500],
+                    )
+                if n_desc:
+                    log_info(
+                        "destination_graph_branch_union_planned_descendants_preserved",
+                        child_path_excerpt=str(ch_path)[:500],
+                        n_descendant_rows=n_desc,
+                    )
+                continue
+
+            to_insert.append(gpi)
+
+        for r in range(self.rowCount(parent_col0)):
+            cix2 = self.index(r, 0, parent_col0)
+            p2 = cix2.data(Qt.UserRole) or {}
+            if not isinstance(p2, dict) or p2.get("placeholder"):
+                continue
+            if cix2.row() in matched_rows:
+                continue
+            n_preserved += 1
+            n_sub = 0
+            if p2.get("is_folder", True) and cix2.isValid():
+                try:
+                    n_sub = int(self.substantive_destination_folder_child_row_count(cix2)) or 0
+                except Exception:
+                    n_sub = 0
+            if n_preserved <= 32:
+                log_info(
+                    "destination_graph_branch_union_overlay_child_preserved",
+                    name_excerpt=str(p2.get("name") or "")[:120],
+                    was_planned=bool(destination_payload_is_planned_workspace_row(p2)),
+                    substantive_subtree_descendants=int(n_sub),
+                )
+
+        to_insert.sort(
+            key=lambda p: (not p.get("is_folder", False), str(p.get("name") or "").casefold())
+        )
+        n_ins = 0
+        if to_insert:
+            self.append_child_payloads(parent_col0, to_insert)
+            n_ins = len(to_insert)
+            for p_ins in to_insert:
+                chp = _child_cpath(str(p_ins.get("name") or ""))
+                log_info(
+                    "destination_graph_branch_union_live_child_inserted",
+                    child_path_excerpt=str(chp)[:500],
+                    name_excerpt=str(p_ins.get("name") or "")[:120],
+                    graph_item_id_suffix=str(p_ins.get("id") or "")[-16:],
+                )
+
+        self._rebuild_path_index()
+        log_info(
+            "destination_graph_branch_union_completed",
+            parent_path_excerpt=pcan[:500],
+            inserted=int(n_ins),
+            upgraded=int(n_up),
+            overlay_preserved=int(n_preserved),
+        )
+        return {
+            "inserted": n_ins,
+            "upgraded": n_up,
+            "preserved": n_preserved,
+        }
+
     def replace_all_children(
         self,
         parent: QModelIndex,

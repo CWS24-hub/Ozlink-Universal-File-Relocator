@@ -27317,6 +27317,55 @@ class MainWindow(QMainWindow):
             ix = ix.parent()
         return max(0, d)
 
+    def _destination_try_root3_graph_child_union_bootstrap(self) -> None:
+        """Narrow: schedule a single Graph :meth:`/children` fetch for a visible *Root3* destination folder
+        (memory/overlay) so :meth:`merge_graph_branch_union_at_parent` can insert Graph-only children
+        (e.g. IT, Marketing) without ``reset_nested`` or a full drive list."""
+        if not destination_authority_contract.graph_owns_visible_real_destination_structure(self):
+            return
+        if not getattr(self, "graph", None) or not getattr(self.graph, "token", None):
+            return
+        m = getattr(self, "destination_planning_model", None)
+        if m is None or not hasattr(m, "rowCount"):
+            return
+        inv = QModelIndex()
+        try:
+            nroot = int(m.rowCount(inv))
+        except Exception:
+            return
+        for r in range(min(nroot, 256)):
+            try:
+                ix = m.index(r, 0, inv)
+            except Exception:
+                continue
+            if not ix.isValid():
+                continue
+            pl = self._destination_model_index_user_role_dict(ix)
+            if not isinstance(pl, dict) or pl.get("placeholder"):
+                continue
+            if str(pl.get("name") or "").strip().casefold() != "root3":
+                continue
+            if not bool(pl.get("is_folder", True)):
+                return
+            if not str(pl.get("id") or "").strip() or not self._resolve_tree_item_drive_id("destination", pl):
+                return
+            log_info(
+                "destination_root3_graph_child_union_requested",
+                path_excerpt=str(
+                    self._destination_semantic_path(pl)
+                    or pl.get("item_path")
+                    or pl.get("name")
+                    or ""
+                )[:500],
+            )
+            self._destination_start_graph_folder_load_worker_if_eligible(
+                ix.siblingAtColumn(0) if ix.column() != 0 else ix,
+                reason="root3_graph_child_union",
+                trigger="root3_bootstrap",
+            )
+            return
+        return
+
     def _destination_expand_request_live_graph_folder_child_load(self, col0: QModelIndex) -> None:
         """Graph authority: request /children for the expanded folder (any nesting depth)."""
         if not col0.isValid():
@@ -33920,6 +33969,16 @@ class MainWindow(QMainWindow):
                 if pth:
                     self._attach_destination_overlays_for_visible_branch(pth)
             self._attach_destination_overlays_for_visible_branch("")
+        try:
+            QTimer.singleShot(
+                500,
+                lambda: self._safe_invoke(
+                    "root3_graph_child_union_bootstrap",
+                    self._destination_try_root3_graph_child_union_bootstrap,
+                ),
+            )
+        except Exception:
+            pass
 
     def _destination_graph_overlay_build_full_tree_canonical_path_index(
         self,
@@ -40748,7 +40807,11 @@ class MainWindow(QMainWindow):
         if not _live_row and not _derived_ok:
             return False
         _needs_live = self._destination_row_needs_live_graph_child_refresh(node_data)
-        if (node_data.get("children_loaded") or node_data.get("load_failed")) and not _needs_live:
+        _root3_union = (
+            str(reason or "") == "root3_graph_child_union"
+            and str(node_data.get("name") or "").strip().casefold() == "root3"
+        )
+        if (node_data.get("children_loaded") or node_data.get("load_failed")) and not _needs_live and not _root3_union:
             return False
         drive_id = self._resolve_tree_item_drive_id(panel_key, node_data)
         item_id = str(node_data.get("id") or "").strip()
@@ -40777,7 +40840,7 @@ class MainWindow(QMainWindow):
         except Exception:
             _rc_vis = 0
         _keep_snapshot_visible = bool(_needs_live and _rc_vis > 0)
-        if not has_future_children and not _keep_snapshot_visible:
+        if not has_future_children and not _keep_snapshot_visible and not _root3_union:
             model.set_loading_children(col0)
         elif _keep_snapshot_visible:
             log_info(
@@ -40794,7 +40857,7 @@ class MainWindow(QMainWindow):
         preserved_children = self._preserve_destination_future_state_children_model(col0)
         if preserved_children:
             self._destination_preserved_children_by_worker[worker_key] = preserved_children
-        if has_future_children and not _keep_snapshot_visible:
+        if has_future_children and not _keep_snapshot_visible and not _root3_union:
             model.set_loading_children(col0)
         use_cache_only = False
         _t_req = time.perf_counter()
@@ -40974,7 +41037,11 @@ class MainWindow(QMainWindow):
         if not _live_row and not _derived_ok:
             return False
         _needs_live_rq = self._destination_row_needs_live_graph_child_refresh(node_data)
-        if (node_data.get("children_loaded") or node_data.get("load_failed")) and not _needs_live_rq:
+        _root3_queue_union = (
+            str(reason or "") == "root3_graph_child_union"
+            and str(node_data.get("name") or "").strip().casefold() == "root3"
+        )
+        if (node_data.get("children_loaded") or node_data.get("load_failed")) and not _needs_live_rq and not _root3_queue_union:
             return False
         drive_id = self._resolve_tree_item_drive_id(panel_key, node_data)
         item_id = str(node_data.get("id") or "").strip()
@@ -67837,11 +67904,27 @@ class MainWindow(QMainWindow):
                         )[:400],
                         returned_child_names_sample=_child_name_sample,
                     )
+                    _muni0 = _col0_pre if _col0_pre.isValid() else parent_index
+                    _p_union = str(_pp_snap or "").strip() or str(
+                        self._destination_semantic_path(dict((parent_index.data(Qt.UserRole) or {})))
+                    ).strip()
                     self._destination_graph_folder_replace_active = True
                     try:
-                        model.replace_all_children(parent_index, child_payloads, graph_child_bind=True)
+                        if not hasattr(model, "merge_graph_branch_union_at_parent"):
+                            model.replace_all_children(parent_index, child_payloads, graph_child_bind=True)
+                        else:
+                            model.merge_graph_branch_union_at_parent(
+                                _muni0,
+                                child_payloads,
+                                parent_canonical_path=_p_union,
+                            )
                     finally:
                         self._destination_graph_folder_replace_active = False
+                    if "root3" in str(_p_union or "").casefold():
+                        log_info(
+                            "destination_root3_graph_child_union_completed",
+                            parent_path_excerpt=str(_p_union or "")[:500],
+                        )
                     if not child_payloads:
                         try:
                             tw_ue = self.destination_tree_widget
