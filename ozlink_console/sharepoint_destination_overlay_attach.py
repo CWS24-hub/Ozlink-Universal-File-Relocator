@@ -30,10 +30,26 @@ def destination_payload_is_planned_workspace_row(pl: Any) -> bool:
     """True for workspace-layer planned rows (not live Graph, not loading placeholders)."""
     if not isinstance(pl, dict) or pl.get("placeholder"):
         return False
-    if str(pl.get("verification_state") or "").strip() != "planned_only":
+    vs = str(pl.get("verification_state") or "").strip().casefold()
+    if vs and vs != "planned_only":
         return False
     rk = str(pl.get("row_kind") or "").strip().lower()
-    return rk in {"planned_folder", "planned_file"}
+    if rk not in {"planned_folder", "planned_file"}:
+        # Persisted / Graph-bind snapshots may keep ``verification_state=planned_only`` while ``row_kind``
+        # stayed at structural ``folder`` / ``file`` (or empty) before rehydrate stamped ``planned_*``.
+        if vs == "planned_only":
+            ws = destination_payload_workspace_row_state(pl)
+            if ws == WORKSPACE_ROW_STATE_LIVE_CONFIRMED:
+                return False
+            if rk.startswith("live_"):
+                return False
+            if ws in (WORKSPACE_ROW_STATE_PLANNED_ONLY, WORKSPACE_ROW_STATE_CACHED_PROVISIONAL):
+                if rk in ("folder", "file", "", "cached_provisional_shell"):
+                    return True
+        return False
+    if not vs and destination_payload_workspace_row_state(pl) != WORKSPACE_ROW_STATE_PLANNED_ONLY:
+        return False
+    return True
 
 
 def destination_payload_is_memory_overlay_row_for_reuse(pl: Any) -> bool:
@@ -48,6 +64,22 @@ def destination_payload_is_memory_overlay_row_for_reuse(pl: Any) -> bool:
         return False
     if destination_payload_is_live_graph_row(pl):
         return False
+    ws_row = destination_payload_workspace_row_state(pl)
+    if destination_payload_is_reconcile_merge_target_row(pl):
+        planning_touch = bool(
+            pl.get("planned_allocation")
+            or pl.get("planned_allocation_descendant")
+            or pl.get("workspace_planned_row")
+            or pl.get("proposed")
+            or str(pl.get("request_id") or pl.get("RequestId") or pl.get("allocation_id") or "").strip()
+            or str(pl.get("planning_uuid") or pl.get("PlanningUuid") or "").strip()
+            or str(pl.get("StableKey") or pl.get("stable_key") or "").strip()
+            or str(pl.get("overlay_state", "") or "").strip().casefold() == "plannedallocation"
+            or str(pl.get("node_origin", "") or "").strip().casefold()
+            in ("plannedallocation", "proposed", "projecteddestination")
+        )
+        if not planning_touch and ws_row != WORKSPACE_ROW_STATE_PLANNED_ONLY:
+            return False
     if bool(pl.get("workspace_planned_row")):
         return True
     if bool(pl.get("planned_allocation_descendant")):
@@ -80,6 +112,8 @@ def destination_payload_is_memory_overlay_row_for_reuse(pl: Any) -> bool:
     if ws == WORKSPACE_ROW_STATE_CACHED_PROVISIONAL and (
         bool(pl.get("allocation_id") or pl.get("request_id") or pl.get("RequestId"))
         or bool(pl.get("allocation_projection_destination_path_saved"))
+        or bool(pl.get("planning_uuid") or pl.get("PlanningUuid"))
+        or bool(pl.get("StableKey") or pl.get("stable_key"))
     ):
         return True
     return False
@@ -99,8 +133,14 @@ def destination_snapshot_rehydrate_overlay_payload(pl: dict[str, Any]) -> bool:
     rk = str(pl.get("row_kind") or "").strip().lower()
     ws0 = destination_payload_workspace_row_state(pl)
     origin_cf = str(pl.get("node_origin", "") or "").strip().casefold()
+    vs_cf = str(pl.get("verification_state") or "").strip().casefold()
     looks_planned = bool(
-        pl.get("planned_allocation_descendant")
+        (
+            vs_cf == "planned_only"
+            and destination_payload_workspace_row_state(pl) != WORKSPACE_ROW_STATE_LIVE_CONFIRMED
+            and not str(pl.get("row_kind") or "").strip().lower().startswith("live_")
+        )
+        or pl.get("planned_allocation_descendant")
         or pl.get("workspace_planned_row")
         or pl.get("planned_allocation")
         or rk.startswith("planned_")
@@ -117,6 +157,8 @@ def destination_snapshot_rehydrate_overlay_payload(pl: dict[str, Any]) -> bool:
             and (
                 bool(pl.get("allocation_id") or pl.get("request_id") or pl.get("RequestId"))
                 or bool(pl.get("allocation_projection_destination_path_saved"))
+                or bool(pl.get("planning_uuid") or pl.get("PlanningUuid"))
+                or bool(pl.get("StableKey") or pl.get("stable_key"))
             )
         )
     )

@@ -86,6 +86,62 @@ class DestinationStartupSnapshotValidationTests(unittest.TestCase):
         self.assertEqual(int(meta.get("sidecar_raw_nodes", 0)), 2)
         self.assertGreater(int(meta.get("sidecar_sanitized_nodes", 0)), int(meta.get("session_sanitized_nodes", 0)))
 
+    def test_sanitized_tie_prefers_sidecar_when_raw_side_is_richer(self):
+        """When sanitized counts match, the workspace sidecar wins if its raw (pre-gate) node count is higher."""
+        ctx = DestinationStartupSnapshotRootContext(
+            browse_mode="sharepoint",
+            destination_drive_id="dest1",
+            source_drive_id="src1",
+        )
+        # Two good roots in session (2 raw, 2 sanitized) vs sidecar with 3 raw nodes
+        # (1 root, 1 good child, 1 pruned by nested wrong-drive) → 2 sanitized, 3 raw: tie on
+        # sanitized, win sidecar on raw, then on tie-breaker preferring workspace.
+        session = [
+            _root_snap("S1", drive_id="dest1"),
+            _root_snap("S2", drive_id="dest1"),
+        ]
+        sidecar = [
+            _root_snap(
+                "B",
+                drive_id="dest1",
+                children=[
+                    {
+                        "text": "child",
+                        "data": {
+                            "name": "child",
+                            "drive_id": "dest1",
+                            "tree_role": "destination",
+                        },
+                        "children": [],
+                    },
+                    {
+                        "text": "bad_nested",
+                        "data": {
+                            "name": "bad_nested",
+                            "drive_id": "other-drive-99",
+                            "tree_role": "destination",
+                        },
+                        "children": [],
+                    },
+                ],
+            )
+        ]
+        chosen, label, _, _, meta = select_validated_destination_startup_snapshot(
+            session,
+            sidecar,
+            ctx,
+            session_envelope_drive_id="dest1",
+            session_envelope_library_id="dest1",
+            sidecar_envelope_drive_id="dest1",
+            sidecar_envelope_library_id="dest1",
+            intended_drive_id="dest1",
+        )
+        self.assertIn("Workspace", label)
+        self.assertEqual(chosen[0]["text"], "B")
+        self.assertEqual(int(meta.get("session_sanitized_nodes", 0)), int(meta.get("sidecar_sanitized_nodes", 0)))
+        self.assertGreater(int(meta.get("sidecar_raw_nodes", 0)), int(meta.get("session_raw_nodes", 0)))
+        self.assertIn("sanitized_tie", str(meta.get("hydration_richness_decision_reason", "")))
+
     def test_promoted_paths_filtered_by_allowed_segments(self):
         allowed = {"root3".casefold()}
         paths = ["Root3\\A", "Foreign\\B"]

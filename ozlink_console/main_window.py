@@ -2896,6 +2896,15 @@ class MainWindow(QMainWindow):
     _DESTINATION_SPO_SNAPSHOT_TRUST_TTL_SEC = 300.0
     # First path segment only; persisted planning paths may prefix library-relative trees with this.
     _LEGACY_SNAPSHOT_LIBRARY_RELATIVE_ROOT_SEGMENTS = frozenset({"root"})
+    # Destination deferred user-expand replay: avoid QTimer(0) storms, sync re-entry, and unbounded not-found spin.
+    _DEFERRED_EXPAND_MAX_PATH_RETRIES: int = 25
+    _DEFERRED_EXPAND_PARK_PARENT_AFTER: int = 5
+    _DEFERRED_EXPAND_ENQUEUE_DELAY_MS: int = 8
+    _DEFERRED_EXPAND_TAIL_DELAY_MS: int = 32
+    _DEFERRED_EXPAND_REENTRY_COALESCE_MS: int = 64
+    _DEFERRED_EXPAND_NO_PROGRESS_FLOOR_BACKOFF_MS: int = 100
+    _DEFERRED_EXPAND_NO_PROGRESS_MAX_BACKOFF_MS: int = 250
+    _DEFERRED_EXPAND_BLOCK_LOG_EVERY: int = 20
 
     @staticmethod
     def _source_tree_model_view_effective() -> bool:
@@ -3093,6 +3102,8 @@ class MainWindow(QMainWindow):
         self._destination_final_startup_destination_snapshot_node_count: int = -1
         self._destination_destination_snapshot_persist_startup_unlocked: bool = False
         self._destination_snapshot_overlay_classification_startup_complete: bool = False
+        self._destination_snapshot_overlay_pipeline_in_progress: bool = False
+        self._destination_startup_overlay_snapshot_persist_ready: bool = False
         self._destination_last_overlay_audit_total_rows: int = 0
         self._destination_overlay_visibility_gate_reschedule_count: int = 0
         self._destination_last_startup_status_reason: str = ""
@@ -3437,6 +3448,19 @@ class MainWindow(QMainWindow):
         self._destination_expand_user_deferred_seen: set = set()
         self._destination_expand_user_deferred_scheduled = False
         self._destination_expand_deferred_block_count = 0
+        self._destination_expand_deferred_path_retries: dict[str, int] = {}
+        self._destination_expand_deferred_parked_paths: set[str] = set()
+        self._destination_expand_deferred_drain_running: bool = False
+        self._destination_expand_deferred_drain_reentry_pended: bool = False
+        self._destination_expand_deferred_no_progress_streak: int = 0
+        self._destination_expand_deferred_consecutive_block_logs: int = 0
+        self._destination_expand_deferred_last_block_log_mono: float = 0.0
+        self._destination_expand_deferred_cumulative_dropped: int = 0
+        self._destination_expand_deferred_cumulative_parked: int = 0
+        self._destination_expand_deferred_cumulative_dropped: int = 0
+        self._destination_expand_deferred_cumulative_summary_drains: int = 0
+        self._destination_expand_deferred_duplicate_zero_suppressed: int = 0
+        self._destination_expand_deferred_no_progress_log_streak: int = 0
         # Expand All clicked while destination bind / merge / async projection is still running.
         self._destination_expand_all_start_pending = False
         self._destination_preview_complete_retry_generation = 0
@@ -26409,6 +26433,16 @@ class MainWindow(QMainWindow):
             prop = -1
         if prop < 0:
             return False, ""
+        if bool(getattr(self, "_destination_snapshot_overlay_pipeline_in_progress", False)):
+            if prop < baseline:
+                return True, "overlay_pipeline_in_progress"
+        if (
+            getattr(self, "_destination_startup_snapshot_mount_seen", False)
+            and not bool(getattr(self, "_destination_startup_overlay_snapshot_persist_ready", False))
+            and baseline >= 80
+            and prop < max(int(baseline * 0.55), baseline - 80)
+        ):
+            return True, "startup_overlay_snapshot_persist_gate_not_ready"
         if prop >= max(int(baseline * 0.42), baseline - 120):
             return False, ""
         if prop >= max(120, int(baseline * 0.22)):
@@ -26429,6 +26463,8 @@ class MainWindow(QMainWindow):
             "destination_payload_is_planned_true": 0,
             "label_planned_tag": 0,
             "label_allocated_tag": 0,
+            # Forensic: bump when overlay audit semantics change (strict planned also increments memory_overlay_reuse).
+            "overlay_classification_counter_policy_version": 2,
         }
         model = getattr(self, "destination_planning_model", None)
         if model is None or not hasattr(model, "iter_depth_first"):
@@ -26452,7 +26488,7 @@ class MainWindow(QMainWindow):
             if destination_payload_is_planned_workspace_row(pl):
                 out["planned_workspace_strict"] += 1
                 out["destination_payload_is_planned_true"] += 1
-            elif destination_payload_is_memory_overlay_row_for_reuse(pl):
+            if destination_payload_is_memory_overlay_row_for_reuse(pl):
                 out["memory_overlay_reuse"] += 1
             if destination_payload_is_live_graph_row(pl):
                 out["live_graph"] += 1
@@ -26472,6 +26508,12 @@ class MainWindow(QMainWindow):
         except Exception:
             self._destination_last_overlay_audit_total_rows = 0
         log_info("destination_loaded_snapshot_overlay_classification_audit", **out)
+        log_info(
+            "destination_snapshot_overlay_predicate_alignment",
+            planned_workspace_strict=int(out.get("planned_workspace_strict") or 0),
+            memory_overlay_reuse_rows=int(out.get("memory_overlay_reuse") or 0),
+            note="memory_overlay_reuse_uses_destination_payload_is_memory_overlay_row_for_reuse_including_strict_planned",
+        )
         log_info(
             "destination_loaded_snapshot_overlay_row_sample",
             sample_paths=sample_planned,
@@ -26541,7 +26583,7 @@ class MainWindow(QMainWindow):
                         elif is_strict or is_mem:
                             if is_strict:
                                 strict += 1
-                            else:
+                            if is_mem:
                                 mem_ov += 1
                             planned_sub += 1
                         else:
@@ -26587,8 +26629,22 @@ class MainWindow(QMainWindow):
 
     def _destination_run_post_snapshot_bind_overlay_pipeline(self, *, reason: str) -> None:
         """Classification + subtree audit + model rehydrate after ``reset_nested`` (provisional or pre-graph bind)."""
+        self._destination_snapshot_overlay_pipeline_in_progress = True
         self._destination_snapshot_overlay_classification_startup_complete = False
+        self._destination_startup_overlay_snapshot_persist_ready = False
         try:
+            est_nodes = -1
+            try:
+                dm = getattr(self, "destination_planning_model", None)
+                if dm is not None and hasattr(dm, "iter_depth_first"):
+                    est_nodes = sum(1 for _ in dm.iter_depth_first())
+            except Exception:
+                est_nodes = -1
+            log_info(
+                "destination_memory_snapshot_authoritative_paint_started",
+                reason=str(reason or "")[:200],
+                model_rows_estimate=int(est_nodes),
+            )
             self._destination_loaded_snapshot_overlay_classification_audit()
             self._destination_loaded_snapshot_allocation_subtree_audit()
             self._destination_rehydrate_overlay_payloads_in_destination_model()
@@ -26601,12 +26657,23 @@ class MainWindow(QMainWindow):
                 error_excerpt=str(exc)[:200],
             )
         finally:
+            self._destination_snapshot_overlay_pipeline_in_progress = False
             self._destination_snapshot_overlay_classification_startup_complete = True
             self._destination_overlay_visibility_gate_reschedule_count = 0
+            rs = str(reason or "")
+            if "provisional" in rs:
+                self._destination_startup_overlay_snapshot_persist_ready = True
+            elif "pre_graph" in rs:
+                self._destination_startup_overlay_snapshot_persist_ready = bool(
+                    getattr(self, "_destination_startup_snapshot_preservation_applied", False)
+                )
+            else:
+                self._destination_startup_overlay_snapshot_persist_ready = True
             log_info(
                 "destination_startup_overlay_classification_pipeline_finished",
                 reason=str(reason or "")[:200],
                 overlay_audit_total_rows=int(getattr(self, "_destination_last_overlay_audit_total_rows", 0) or 0),
+                persist_ready=bool(getattr(self, "_destination_startup_overlay_snapshot_persist_ready", False)),
             )
 
     def _destination_retry_load_projected_descendants_after_overlay_gate(self, dest_lookup_cf: str) -> None:
@@ -26639,9 +26706,17 @@ class MainWindow(QMainWindow):
             return False, "placeholder"
         if destination_payload_is_live_graph_row(pl):
             return False, "live_graph_row"
+        child_sem = str(self._destination_semantic_path(pl) or "").strip()
         child_path = str(
             self._canonical_planned_memory_path_for_graph_match(
-                str(self._tree_item_path(pl) or pl.get("item_path") or pl.get("destination_path") or "").strip()
+                child_sem
+                or str(
+                    self._destination_row_raw_path_for_path_lookup_match(pl)
+                    or self._tree_item_path(pl)
+                    or pl.get("item_path")
+                    or pl.get("destination_path")
+                    or ""
+                ).strip()
             )
         ).strip()
         parent_cf = str(parent_path_cf or "").strip()
@@ -26690,6 +26765,15 @@ class MainWindow(QMainWindow):
                     "destination_graph_bind_presnapshot_overlay_row_included",
                     parent_path_excerpt=str(parent_semantic_path or "")[:400],
                     row_path_excerpt=tp,
+                    strict_planned_workspace=bool(destination_payload_is_planned_workspace_row(pl)),
+                    memory_overlay_reuse=bool(destination_payload_is_memory_overlay_row_for_reuse(pl)),
+                    workspace_row_state=str(pl.get("workspace_row_state") or "")[:24],
+                    verification_state=str(pl.get("verification_state") or "")[:24],
+                    row_kind=str(pl.get("row_kind") or "")[:40],
+                    node_origin=str(pl.get("node_origin") or "")[:48],
+                    overlay_state=str(pl.get("overlay_state") or "")[:48],
+                    is_live_graph=bool(destination_payload_is_live_graph_row(pl)),
+                    is_placeholder=bool(pl.get("placeholder")),
                 )
             else:
                 log_info(
@@ -26697,6 +26781,15 @@ class MainWindow(QMainWindow):
                     parent_path_excerpt=str(parent_semantic_path or "")[:400],
                     row_path_excerpt=tp,
                     ignore_reason=str(reason or "unknown")[:80],
+                    strict_planned_workspace=bool(destination_payload_is_planned_workspace_row(pl)),
+                    memory_overlay_reuse=bool(destination_payload_is_memory_overlay_row_for_reuse(pl)),
+                    workspace_row_state=str(pl.get("workspace_row_state") or "")[:24],
+                    verification_state=str(pl.get("verification_state") or "")[:24],
+                    row_kind=str(pl.get("row_kind") or "")[:40],
+                    node_origin=str(pl.get("node_origin") or "")[:48],
+                    overlay_state=str(pl.get("overlay_state") or "")[:48],
+                    is_live_graph=bool(destination_payload_is_live_graph_row(pl)),
+                    is_placeholder=bool(pl.get("placeholder")),
                 )
 
     def _destination_model_index_tree_depth(self, col0: QModelIndex) -> int:
@@ -27847,6 +27940,7 @@ class MainWindow(QMainWindow):
                     and (
                         getattr(self, "_destination_provisional_startup_applied", False)
                         or getattr(self, "_destination_startup_snapshot_mount_seen", False)
+                        or self._pending_session_destination_snapshot_drive_match(did_pending)
                     )
                 ):
                     quiet = str(
@@ -28831,6 +28925,16 @@ class MainWindow(QMainWindow):
                 if isinstance(plb, dict):
                     if destination_payload_is_planned_workspace_row(plb):
                         strict_overlay_subtree += 1
+                        if _mem_row_logs < 18:
+                            _mem_row_logs += 1
+                            log_info(
+                                "destination_descendant_snapshot_reuse_counted_strict_planned_row",
+                                audit_context=str(audit_context or "")[:120],
+                                move_key_excerpt=mk_pre,
+                                path_excerpt=str(
+                                    self._tree_item_path(plb) or plb.get("item_path") or plb.get("destination_path") or ""
+                                )[:400],
+                            )
                     elif destination_payload_is_memory_overlay_row_for_reuse(plb):
                         memory_only_overlay_subtree += 1
                         if _mem_row_logs < 18:
@@ -28863,6 +28967,27 @@ class MainWindow(QMainWindow):
                 overlay_total=int(overlay_n),
                 strict_subtree=int(strict_overlay_subtree),
                 memory_only_subtree=int(memory_only_overlay_subtree),
+            )
+        if overlay_n == 0 and expected_n > 0:
+            _rc_dir = -1
+            try:
+                _rc_dir = int(dm.rowCount(col0))
+            except Exception:
+                _rc_dir = -1
+            log_info(
+                "destination_descendant_snapshot_reuse_overlay_zero_forensic",
+                audit_context=str(audit_context or "")[:120],
+                move_key_excerpt=mk_pre,
+                expected_descendant_count=int(expected_n),
+                model_direct_child_count=int(_rc_dir),
+                allocation_folder_path_excerpt=str(self._tree_item_path(parent_pl) or "")[:400],
+                overlay_classification_startup_complete=bool(
+                    getattr(self, "_destination_snapshot_overlay_classification_startup_complete", False)
+                ),
+                persist_ready=bool(getattr(self, "_destination_startup_overlay_snapshot_persist_ready", False)),
+                parent_row_kind_excerpt=str(parent_pl.get("row_kind") or "")[:40],
+                parent_verification_state_excerpt=str(parent_pl.get("verification_state") or "")[:24],
+                parent_workspace_row_state_excerpt=str(parent_pl.get("workspace_row_state") or "")[:24],
             )
         current_path = str(
             self._canonical_destination_projection_path(self._allocation_projection_path(move) or "") or ""
@@ -29022,6 +29147,18 @@ class MainWindow(QMainWindow):
                 missing_descendants=int(miss),
                 move_key_excerpt=mk,
             )
+            log_info(
+                "destination_descendant_replay_partial_existing_count",
+                audit_context=str(audit_context or "")[:120],
+                overlay_descendant_count=int(overlay_n),
+                move_key_excerpt=mk,
+            )
+            log_info(
+                "destination_descendant_replay_partial_expected_count",
+                audit_context=str(audit_context or "")[:120],
+                expected_descendant_count=int(expected_n),
+                move_key_excerpt=mk,
+            )
             self._destination_descendant_snapshot_reuse_assess_exit_log(
                 audit_context=str(audit_context or ""),
                 result="partial",
@@ -29033,6 +29170,24 @@ class MainWindow(QMainWindow):
                 move_key_excerpt=mk,
             )
             return out
+        log_info(
+            "destination_descendant_replay_full_replay_reason",
+            audit_context=str(audit_context or "")[:120],
+            reason_excerpt="fallthrough_no_complete_or_partial_branch_matched",
+            overlay_descendant_count=int(overlay_n),
+            expected_descendant_count=int(expected_n),
+            path_match=bool(path_match),
+            signature_match=bool(signature_match),
+            source_token_match=bool(source_token_match),
+            move_key_excerpt=mk,
+        )
+        log_info(
+            "destination_descendant_replay_full_replay_required",
+            audit_context=str(audit_context or "")[:120],
+            overlay_descendant_count=int(overlay_n),
+            expected_descendant_count=int(expected_n),
+            move_key_excerpt=mk,
+        )
         log_info(
             "destination_descendant_snapshot_reuse_rejected",
             audit_context=str(audit_context or "")[:120],
@@ -29192,6 +29347,22 @@ class MainWindow(QMainWindow):
             if not isinstance(d, dict):
                 continue
             sd = str(d.get("drive_id") or "").strip()
+            if sd and sd.casefold() == did.casefold():
+                return True
+        return False
+
+    def _pending_session_destination_snapshot_drive_match(self, drive_id: str) -> bool:
+        """True when pending destination session snapshots have a root payload matching the bound library id."""
+        did = str(drive_id or "").strip()
+        if not did:
+            return False
+        for snap in list((getattr(self, "_pending_session_tree_snapshots", {}) or {}).get("destination") or []):
+            if not isinstance(snap, dict):
+                continue
+            d = snap.get("data")
+            if not isinstance(d, dict):
+                continue
+            sd = str(d.get("drive_id") or d.get("library_id") or "").strip()
             if sd and sd.casefold() == did.casefold():
                 return True
         return False
@@ -29633,6 +29804,17 @@ class MainWindow(QMainWindow):
                     or self._pending_session_source_snapshot_drive_match(drive_id)
                 )
             )
+            _skip_destination_loading_placeholder = (
+                panel_key == "destination"
+                and not force_refresh
+                and self._planning_browse_mode("destination") != "local"
+                and not getattr(self, "_destination_suppress_provisional_placeholder_preservation", False)
+                and (
+                    getattr(self, "_destination_startup_snapshot_mount_seen", False)
+                    or getattr(self, "_destination_provisional_startup_applied", False)
+                    or self._pending_session_destination_snapshot_drive_match(drive_id)
+                )
+            )
             if _skip_source_loading_placeholder:
                 self._log_restore_phase(
                     "root_load placeholder_skipped_source_snapshot_shell",
@@ -29642,6 +29824,16 @@ class MainWindow(QMainWindow):
                     snapshot_mount_seen=bool(getattr(self, "_source_startup_snapshot_mount_seen", False)),
                     pending_session_snapshot=bool(self._pending_session_source_snapshot_drive_match(drive_id)),
                 )
+            elif _skip_destination_loading_placeholder:
+                _pend_match = self._pending_session_destination_snapshot_drive_match(drive_id)
+                log_info(
+                    "root_load placeholder_skipped_destination_memory_first_shell",
+                    request_signature=str(request_signature)[:120],
+                    drive_id_suffix=str(drive_id)[-16:] if len(str(drive_id)) > 16 else str(drive_id),
+                    mount_seen=bool(getattr(self, "_destination_startup_snapshot_mount_seen", False)),
+                    provisional_applied=bool(getattr(self, "_destination_provisional_startup_applied", False)),
+                    pending_session_destination_drive_match=bool(_pend_match),
+                )
             else:
                 self.set_tree_placeholder(panel_key, "Loading root content...")
             if panel_key == "destination":
@@ -29649,6 +29841,7 @@ class MainWindow(QMainWindow):
                 log_info(
                     "destination_startup_model_step",
                     step="after_set_tree_placeholder_loading_root",
+                    memory_first_shell_placeholder_suppressed=bool(_skip_destination_loading_placeholder),
                     model_nodes_non_placeholder_before=int(_before_ph.get("model_nodes_non_placeholder") or 0),
                     model_nodes_iter_depth_first_before=int(_before_ph.get("model_nodes_iter_depth_first") or 0),
                     model_nodes_non_placeholder_after=int(_after_ph.get("model_nodes_non_placeholder") or 0),
@@ -33412,7 +33605,12 @@ class MainWindow(QMainWindow):
                         )
                     except Exception as exc:
                         self._log_restore_exception("destination_pre_graph_bind_snapshot_sanitize", exc)
-                    if pending_dest_snaps:
+                    if not pending_dest_snaps:
+                        log_info(
+                            "destination_snapshot_overlay_pipeline_skipped",
+                            reason="pre_graph_sanitize_removed_all_destination_roots",
+                        )
+                    else:
                         roots_pp: list = []
                         for snap in pending_dest_snaps:
                             spec = self._destination_tree_snapshot_dict_to_nested_spec(
@@ -33420,6 +33618,12 @@ class MainWindow(QMainWindow):
                             )
                             if spec is not None:
                                 roots_pp.append(spec)
+                        if not roots_pp:
+                            log_info(
+                                "destination_snapshot_overlay_pipeline_skipped",
+                                reason="no_valid_nested_specs_after_pre_graph_sanitize",
+                                pending_top_level_roots=int(len(pending_dest_snaps or [])),
+                            )
                         if roots_pp:
                             destination_stamp_snapshot_tree_workspace_state(list(pending_dest_snaps))
                             model.reset_nested(roots_pp)
@@ -33465,6 +33669,15 @@ class MainWindow(QMainWindow):
                                 step="after_pre_graph_snapshot_reset_nested",
                                 **self._destination_forensic_destination_model_counts(),
                             )
+                elif (
+                    pending_dest_snaps
+                    and items
+                    and getattr(self, "_destination_provisional_startup_applied", False)
+                ):
+                    log_info(
+                        "destination_snapshot_overlay_pipeline_skipped",
+                        reason="provisional_startup_already_applied_pre_graph_reset_nested_skipped",
+                    )
             prov_by_id: dict[str, dict] = {}
             if (
                 panel_key == "destination"
@@ -33583,6 +33796,7 @@ class MainWindow(QMainWindow):
                         or bool(pre_graph_snapshot_mount)
                         or bool(getattr(self, "_destination_startup_snapshot_mount_seen", False))
                         or self._destination_startup_snapshot_identity_matches_active(did_shell_early)
+                        or self._pending_session_destination_snapshot_drive_match(did_shell_early)
                     )
                     and hasattr(model, "merge_sharepoint_library_root_graph_children")
                 )
@@ -33724,6 +33938,7 @@ class MainWindow(QMainWindow):
                         inserted_root_rows=int(_ins),
                     )
                     self._destination_startup_snapshot_preservation_applied = True
+                    self._destination_startup_overlay_snapshot_persist_ready = True
                     log_info(
                         "destination_authority_handoff_preserved_valid_startup_descendants",
                         drive_id_suffix=did_shell[-16:] if len(did_shell) > 16 else did_shell,
@@ -33832,6 +34047,7 @@ class MainWindow(QMainWindow):
                         merge_exception=False,
                     )
                     self._destination_startup_snapshot_preservation_applied = True
+                    self._destination_startup_overlay_snapshot_persist_ready = True
                 self._log_restore_phase(
                     "destination_root_bind_live_graph_children",
                     shallow_graph_root_children=len(sorted_items),
@@ -45783,11 +45999,16 @@ class MainWindow(QMainWindow):
             log_info("destination_allocation_descendant_parent_resolve_missing", reason="no_find_indices")
             return None, "no_find_indices"
         target_cf = ap.casefold()
-        best: tuple[int, QModelIndex] | None = None  # (score, index) higher score wins
+        candidates: list[tuple[int, int, Any]] = []  # (score, overlay_subtree_nodes, index)
         try:
             for c in self._destination_graph_descendant_model_index_keys_for_lookup(ap):
                 for h in find_fn(c) or []:
-                    if not isinstance(h, QModelIndex) or not h.isValid():
+                    if h is None or not hasattr(h, "isValid") or not callable(getattr(h, "isValid", None)):
+                        continue
+                    try:
+                        if not h.isValid():
+                            continue
+                    except Exception:
                         continue
                     h0 = h.siblingAtColumn(0) if h.column() != 0 else h
                     if hasattr(dm, "is_index_live") and not dm.is_index_live(h0):
@@ -45847,18 +46068,31 @@ class MainWindow(QMainWindow):
                         score = 1
                     if score <= 0:
                         continue
-                    if best is None or score > best[0]:
-                        best = (score, h0)
+                    ov_n = 0
+                    try:
+                        ov_n = int(
+                            self._destination_count_planned_snapshot_tree_nodes(
+                                self._destination_collect_planned_workspace_children_under_model(h0)
+                            )
+                        )
+                    except Exception:
+                        ov_n = 0
+                    candidates.append((score, ov_n, h0))
         except RuntimeError:
             log_info("destination_allocation_descendant_parent_resolve_missing", reason="runtime_errorenumerate")
             return None, "runtime_errorenumerate"
-        if best is not None and best[1].isValid():
-            log_info(
-                "destination_allocation_descendant_parent_resolve_found",
-                path_excerpt=str(ap)[:400],
-                score=int(best[0]),
-            )
-            return best[1], "ok"
+        if candidates:
+            score_ov_ix = max(candidates, key=lambda t: (t[1], t[0]))
+            best_score, best_ov, best_ix = score_ov_ix
+            if best_ix.isValid():
+                log_info(
+                    "destination_allocation_descendant_parent_resolve_found",
+                    path_excerpt=str(ap)[:400],
+                    score=int(best_score),
+                    overlay_descendant_count_for_choice=int(best_ov),
+                    candidate_count=int(len(candidates)),
+                )
+                return best_ix, "ok"
         log_info("destination_allocation_descendant_parent_resolve_missing", reason="no_matching_row", path_excerpt=ap[:400])
         return None, "no_matching_row"
 
@@ -54564,128 +54798,379 @@ class MainWindow(QMainWindow):
             return
         self._destination_expand_user_deferred_seen.add(p)
         self._destination_expand_user_deferred_queue.append(p)
+        self._destination_expand_deferred_path_retries.pop(p, None)
         if not self._destination_expand_user_deferred_scheduled:
-            self._schedule_destination_expand_user_deferred_drain()
+            self._schedule_destination_expand_user_deferred_drain(
+                delay_ms=int(self._DEFERRED_EXPAND_ENQUEUE_DELAY_MS)
+            )
         log_info(
             "destination_expand_user_deferred_enqueued",
             semantic_path=p[:240],
             queue_len=len(self._destination_expand_user_deferred_queue),
         )
 
-    def _schedule_destination_expand_user_deferred_drain(self, *, delay_ms: int = 0) -> None:
+    def _schedule_destination_expand_user_deferred_drain(self, *, delay_ms: int) -> None:
+        """Coalesce: only one singleShot outstanding; never stack duplicate zero-delay timers."""
+        d = int(max(0, delay_ms))
         if self._destination_expand_user_deferred_scheduled:
+            if d <= 0:
+                n = int(getattr(self, "_destination_expand_deferred_duplicate_zero_suppressed", 0) or 0) + 1
+                self._destination_expand_deferred_duplicate_zero_suppressed = n
+                if n <= 4 or n % 200 == 0:
+                    log_info(
+                        "destination_expand_deferred_queue_duplicate_schedule_suppressed",
+                        requested_delay_ms=d,
+                        total_suppressed=int(n),
+                    )
             return
         self._destination_expand_user_deferred_scheduled = True
-        QTimer.singleShot(int(delay_ms), self._drain_destination_expand_user_deferred_queue)
+        QTimer.singleShot(d, self._drain_destination_expand_user_deferred_queue)
 
     def _drain_destination_expand_user_deferred_queue(self) -> None:
+        """Process at most one deferred path per tick; use non-zero follow-up delay to avoid QTimer(0) storms."""
         self._destination_expand_user_deferred_scheduled = False
+        t_mono = time.perf_counter()
         q = self._destination_expand_user_deferred_queue
-        if q:
+        if getattr(self, "_destination_expand_deferred_drain_running", False):
+            if not self._destination_expand_deferred_drain_reentry_pended:
+                self._destination_expand_deferred_drain_reentry_pended = True
+                self._schedule_destination_expand_user_deferred_drain(
+                    delay_ms=int(self._DEFERRED_EXPAND_REENTRY_COALESCE_MS)
+                )
+                log_info(
+                    "destination_expand_deferred_queue_drain_reentry_suppressed",
+                    coalesce_ms=int(self._DEFERRED_EXPAND_REENTRY_COALESCE_MS),
+                    queue_len=len(q),
+                )
+            return
+        _queue_len_before = len(q)
+        _processed = 0
+        _popped = 0
+        _requeued = 0
+        _no_progress = 0
+        _reason = "ok"
+        self._destination_expand_deferred_drain_running = True
+        _sched_delay_out = int(self._DEFERRED_EXPAND_TAIL_DELAY_MS)
+        self._destination_expand_deferred_cumulative_summary_drains = int(
+            getattr(self, "_destination_expand_deferred_cumulative_summary_drains", 0) or 0
+        ) + 1
+        _sum_id = int(self._destination_expand_deferred_cumulative_summary_drains)
+        try:
+            log_info(
+                "destination_expand_deferred_queue_drain_entered",
+                drain_id=_sum_id,
+                queue_len_before=_queue_len_before,
+            )
+            if not q:
+                return
             log_info(
                 "destination_expand_deferred_queue_process_started",
-                queue_len=len(q),
+                drain_id=_sum_id,
+                queue_len=_queue_len_before,
+                mode="deferred_user_expand",
             )
-        _blk = self._destination_deferred_expand_queue_block_reason()
-        log_info(
-            "destination_expand_deferred_queue_hard_block_evaluated",
-            block_reason=str(_blk)[:120] if _blk else "",
-            blocked=bool(_blk),
-            full_tree_ready=bool(self._destination_full_tree_ready()),
-            root_graph_bound=bool(self._destination_deferred_expand_destination_root_ready()),
-            queue_len=len(q),
-        )
-        if _blk:
-            if _blk == "library_unresolved":
-                log_info(
-                    "destination_expand_deferred_queue_blocked_library_unresolved",
-                    queue_len=len(q),
-                )
-            elif _blk == "root_not_graph_bound":
-                log_info(
-                    "destination_expand_deferred_queue_blocked_root_not_bound",
-                    queue_len=len(q),
-                    bound_suffix=str(getattr(self, "_destination_sharepoint_root_graph_bound_drive_id", "") or "")[-16:],
-                    selected_suffix=str(self._current_selected_destination_drive_id() or "")[-16:],
-                )
-            elif _blk == "selected_pending_drive_mismatch":
-                log_info(
-                    "destination_expand_deferred_queue_blocked_drive_mismatch",
-                    queue_len=len(q),
-                )
-            else:
-                log_info(
-                    "destination_expand_deferred_queue_blocked",
-                    reason=str(_blk)[:120],
-                    full_tree_ready=bool(self._destination_full_tree_ready()),
-                    queue_len=len(q),
-                )
-            self._destination_expand_deferred_block_count = int(
-                getattr(self, "_destination_expand_deferred_block_count", 0) or 0
-            ) + 1
-            _nbc = int(self._destination_expand_deferred_block_count)
-            _backoff = int(min(500, 35 * (2 ** min(_nbc, 4))))
-            self._schedule_destination_expand_user_deferred_drain(delay_ms=_backoff)
-            return
-        self._destination_expand_deferred_block_count = 0
-        if self._planning_browse_mode("destination") != "local" and self._destination_sharepoint_planning_destination_active():
-            log_info(
-                "destination_expand_deferred_queue_allowed_skeleton_mode",
-                full_tree_ready=bool(self._destination_full_tree_ready()),
-                root_graph_bound=bool(self._destination_deferred_expand_destination_root_ready()),
-                queue_len=len(q),
-            )
-        if not q:
-            return
-        path = q.popleft()
-        log_info("destination_expand_deferred_queue_item", semantic_path=path[:400])
-        self._destination_expand_user_deferred_seen.discard(path)
-        tree = getattr(self, "destination_tree_widget", None)
-        dm = getattr(self, "destination_planning_model", None)
-        if dm is not None and tree is not None:
-            idxs = dm.find_indices_for_canonical_destination_path(path)
-            if idxs and idxs[0].isValid():
-                ix = idxs[0]
-                log_info("destination_expand_deferred_path_found", semantic_path=path[:400])
-                if hasattr(dm, "is_index_live") and not dm.is_index_live(ix):
+            _blk = self._destination_deferred_expand_queue_block_reason()
+            if _blk:
+                _nbc = int(getattr(self, "_destination_expand_deferred_block_count", 0) or 0) + 1
+                self._destination_expand_deferred_block_count = int(_nbc)
+                _last_m = float(getattr(self, "_destination_expand_deferred_last_block_log_mono", 0.0) or 0.0)
+                _age = t_mono - _last_m
+                _log_detail = int(_nbc) == 1 or int(_nbc) % int(self._DEFERRED_EXPAND_BLOCK_LOG_EVERY) == 0 or _age > 2.0
+                if _log_detail:
+                    self._destination_expand_deferred_last_block_log_mono = t_mono
                     log_info(
-                        "destination_expand_user_deferred_drop_stale",
-                        semantic_path=path[:240],
+                        "destination_expand_deferred_queue_hard_block_evaluated",
+                        drain_id=_sum_id,
+                        block_reason=str(_blk)[:120] if _blk else "",
+                        blocked=True,
+                        full_tree_ready=bool(self._destination_full_tree_ready()),
+                        root_graph_bound=bool(self._destination_deferred_expand_destination_root_ready()),
+                        queue_len=len(q),
+                        block_attempt_count=int(_nbc),
+                    )
+                if _log_detail:
+                    if _blk == "library_unresolved":
+                        log_info(
+                            "destination_expand_deferred_queue_blocked_library_unresolved",
+                            drain_id=_sum_id,
+                            queue_len=len(q),
+                        )
+                    elif _blk == "root_not_graph_bound":
+                        log_info(
+                            "destination_expand_deferred_queue_blocked_root_not_bound",
+                            drain_id=_sum_id,
+                            queue_len=len(q),
+                            bound_suffix=str(
+                                getattr(self, "_destination_sharepoint_root_graph_bound_drive_id", "") or ""
+                            )[-16:],
+                            selected_suffix=str(self._current_selected_destination_drive_id() or "")[-16:],
+                        )
+                    elif _blk == "selected_pending_drive_mismatch":
+                        log_info(
+                            "destination_expand_deferred_queue_blocked_drive_mismatch",
+                            drain_id=_sum_id,
+                            queue_len=len(q),
+                        )
+                    else:
+                        log_info(
+                            "destination_expand_deferred_queue_blocked",
+                            drain_id=_sum_id,
+                            reason=str(_blk)[:120],
+                            full_tree_ready=bool(self._destination_full_tree_ready()),
+                            queue_len=len(q),
+                        )
+                _expo = int(min(4, max(0, int(_nbc) - 1)))
+                _backoff = int(
+                    min(
+                        int(self._DEFERRED_EXPAND_NO_PROGRESS_MAX_BACKOFF_MS),
+                        max(
+                            int(self._DEFERRED_EXPAND_NO_PROGRESS_FLOOR_BACKOFF_MS),
+                            int(min(500, 40 * (2**_expo))),
+                        ),
+                    )
+                )
+                _no_progress = 1
+                _sched_delay_out = int(_backoff)
+                _reason = f"hard_block:{_blk}"
+                if _log_detail:
+                    log_info(
+                        "destination_expand_deferred_queue_backoff_scheduled",
+                        drain_id=_sum_id,
+                        delay_ms=int(_backoff),
+                        block_reason=str(_blk)[:120],
+                        no_progress=1,
+                    )
+                    log_info(
+                        "destination_expand_deferred_queue_no_progress",
+                        drain_id=_sum_id,
+                        reason=str(_blk)[:80],
+                        queue_unchanged_len=len(q),
+                    )
+                self._destination_expand_deferred_no_progress_streak = int(
+                    getattr(self, "_destination_expand_deferred_no_progress_streak", 0) or 0
+                ) + 1
+                self._destination_expand_deferred_consecutive_block_logs = int(
+                    getattr(self, "_destination_expand_deferred_consecutive_block_logs", 0) or 0
+                ) + 1
+                self._schedule_destination_expand_user_deferred_drain(delay_ms=_backoff)
+                return
+            self._destination_expand_deferred_consecutive_block_logs = 0
+            self._destination_expand_deferred_block_count = 0
+            if self._planning_browse_mode("destination") != "local" and self._destination_sharepoint_planning_destination_active():
+                log_info(
+                    "destination_expand_deferred_queue_allowed_skeleton_mode",
+                    drain_id=_sum_id,
+                    full_tree_ready=bool(self._destination_full_tree_ready()),
+                    root_graph_bound=bool(self._destination_deferred_expand_destination_root_ready()),
+                    queue_len=len(q),
+                )
+            if not q:
+                return
+            path = str(q.popleft())
+            _popped = 1
+            _processed = 1
+            log_info("destination_expand_deferred_queue_item", drain_id=_sum_id, semantic_path=path[:400])
+            _retry_before = int(self._destination_expand_deferred_path_retries.get(path, 0) or 0)
+            self._destination_expand_user_deferred_seen.discard(path)
+            tree = getattr(self, "destination_tree_widget", None)
+            dm = getattr(self, "destination_planning_model", None)
+            if dm is None or tree is None:
+                _r = "missing_model_or_view"
+                log_info(
+                    "destination_expand_deferred_queue_item_result",
+                    drain_id=_sum_id,
+                    result="deferred",
+                    path_excerpt=path[:400],
+                    reason=_r,
+                    retry_count=_retry_before,
+                )
+                rnext = _retry_before + 1
+                if rnext > int(self._DEFERRED_EXPAND_MAX_PATH_RETRIES):
+                    self._destination_expand_deferred_cumulative_dropped = int(
+                        getattr(self, "_destination_expand_deferred_cumulative_dropped", 0) or 0
+                    ) + 1
+                    log_info(
+                        "destination_expand_deferred_queue_item_dropped_after_retries",
+                        path_excerpt=path[:400],
+                        retry_count=rnext,
+                        max_retries=int(self._DEFERRED_EXPAND_MAX_PATH_RETRIES),
+                        reason=_r,
                     )
                 else:
-                    try:
-                        if not tree.isExpanded(ix):
-                            tree.expand(ix)
-                            log_info(
-                                "destination_expand_deferred_expand_applied",
-                                semantic_path=path[:400],
-                            )
-                    except Exception:
-                        pass
-                    log_info(
-                        "destination_expand_deferred_graph_load_requested",
-                        semantic_path=path[:400],
-                        note="invoke_expand_handler_after_expand",
-                    )
-                    self._on_destination_planning_model_expanded(ix)
+                    self._destination_expand_deferred_path_retries[path] = rnext
+                    q.append(path)
+                    self._destination_expand_user_deferred_seen.add(path)
+                    _requeued = 1
+                    if rnext >= int(self._DEFERRED_EXPAND_PARK_PARENT_AFTER) and path not in self._destination_expand_deferred_parked_paths:
+                        self._destination_expand_deferred_parked_paths.add(path)
+                        self._destination_expand_deferred_cumulative_parked = int(
+                            getattr(self, "_destination_expand_deferred_cumulative_parked", 0) or 0
+                        ) + 1
+                        log_info(
+                            "destination_expand_deferred_queue_item_parked_until_parent_loaded",
+                            path_excerpt=path[:400],
+                            retry_count=int(rnext),
+                        )
+                _no_progress = 1
             else:
-                log_info(
-                    "destination_expand_deferred_graph_load_skipped",
-                    semantic_path=path[:400],
-                    reason="path_not_found_in_model",
+                idxs = dm.find_indices_for_canonical_destination_path(path)
+                if idxs and idxs[0].isValid():
+                    ix = idxs[0]
+                    log_info("destination_expand_deferred_path_found", drain_id=_sum_id, semantic_path=path[:400])
+                    if hasattr(dm, "is_index_live") and not dm.is_index_live(ix):
+                        log_info(
+                            "destination_expand_user_deferred_drop_stale",
+                            drain_id=_sum_id,
+                            semantic_path=path[:240],
+                        )
+                        log_info(
+                            "destination_expand_deferred_queue_item_result",
+                            drain_id=_sum_id,
+                            result="dropped_stale",
+                            path_excerpt=path[:400],
+                            retry_count=_retry_before,
+                        )
+                    else:
+                        _expanded = False
+                        try:
+                            if not tree.isExpanded(ix):
+                                tree.expand(ix)
+                                _expanded = True
+                                log_info(
+                                    "destination_expand_deferred_expand_applied",
+                                    drain_id=_sum_id,
+                                    semantic_path=path[:400],
+                                )
+                        except Exception:
+                            pass
+                        log_info(
+                            "destination_expand_deferred_graph_load_requested",
+                            drain_id=_sum_id,
+                            semantic_path=path[:400],
+                            note="invoke_expand_handler_after_expand",
+                        )
+                        self._on_destination_planning_model_expanded(ix)
+                        self._destination_expand_deferred_parked_paths.discard(path)
+                        self._destination_expand_deferred_path_retries.pop(path, None)
+                        log_info(
+                            "destination_expand_deferred_queue_item_result",
+                            drain_id=_sum_id,
+                            result="expanded" if _expanded else "ok_live",
+                            path_excerpt=path[:400],
+                            graph_expand_requested=1,
+                            retry_count=_retry_before,
+                        )
+                else:
+                    rnext = _retry_before + 1
+                    self._destination_expand_deferred_path_retries[path] = rnext
+                    log_info(
+                        "destination_expand_deferred_queue_item_retry",
+                        path_excerpt=path[:400],
+                        retry_count=int(rnext),
+                        reason="path_not_found_in_model",
+                    )
+                    log_info(
+                        "destination_expand_deferred_graph_load_skipped",
+                        drain_id=_sum_id,
+                        semantic_path=path[:400],
+                        reason="path_not_found_in_model",
+                    )
+                    if rnext > int(self._DEFERRED_EXPAND_MAX_PATH_RETRIES):
+                        self._destination_expand_deferred_cumulative_dropped = int(
+                            getattr(self, "_destination_expand_deferred_cumulative_dropped", 0) or 0
+                        ) + 1
+                        log_info(
+                            "destination_expand_deferred_queue_item_dropped_after_retries",
+                            path_excerpt=path[:400],
+                            retry_count=int(rnext),
+                            max_retries=int(self._DEFERRED_EXPAND_MAX_PATH_RETRIES),
+                            reason="path_not_found_in_model",
+                        )
+                        self._destination_expand_deferred_parked_paths.discard(path)
+                        _no_progress = 1
+                    else:
+                        q.append(path)
+                        self._destination_expand_user_deferred_seen.add(path)
+                        _requeued = 1
+                        _no_progress = 1
+                        if rnext >= int(self._DEFERRED_EXPAND_PARK_PARENT_AFTER):
+                            if path not in self._destination_expand_deferred_parked_paths:
+                                self._destination_expand_deferred_parked_paths.add(path)
+                                self._destination_expand_deferred_cumulative_parked = int(
+                                    getattr(self, "_destination_expand_deferred_cumulative_parked", 0) or 0
+                                ) + 1
+                            log_info(
+                                "destination_expand_deferred_queue_item_parked_until_parent_loaded",
+                                path_excerpt=path[:400],
+                                retry_count=int(rnext),
+                            )
+            _queue_len_after = len(q)
+            if int(_popped) > 0 and int(_requeued) == 0 and int(_no_progress) == 0:
+                self._destination_expand_deferred_no_progress_streak = 0
+                self._destination_expand_deferred_no_progress_log_streak = 0
+            elif int(_requeued) > 0 or int(_no_progress) > 0:
+                self._destination_expand_deferred_no_progress_streak = int(
+                    getattr(self, "_destination_expand_deferred_no_progress_streak", 0) or 0
+                ) + 1
+                nps = int(self._destination_expand_deferred_no_progress_streak)
+                _bnp = int(
+                    min(
+                        int(self._DEFERRED_EXPAND_NO_PROGRESS_MAX_BACKOFF_MS),
+                        max(
+                            int(self._DEFERRED_EXPAND_NO_PROGRESS_FLOOR_BACKOFF_MS),
+                            90 + 15 * min(10, nps),
+                        ),
+                    )
                 )
-        log_info(
-            "destination_expand_user_deferred_drained_one",
-            semantic_path=path[:240],
-            remaining=len(q),
-        )
+                if int(_requeued) > 0 or int(_no_progress) > 0:
+                    _sched_delay_out = max(int(_sched_delay_out), int(_bnp))
+                    if _reason == "ok":
+                        _reason = f"no_progress:streak={nps}"
+                nplg = int(getattr(self, "_destination_expand_deferred_no_progress_log_streak", 0) or 0) + 1
+                self._destination_expand_deferred_no_progress_log_streak = nplg
+                if nplg <= 4 or nplg % 50 == 0:
+                    log_info(
+                        "destination_expand_deferred_queue_no_progress",
+                        drain_id=_sum_id,
+                        requeued=bool(int(_requeued) > 0),
+                        no_progress=1,
+                        queue_len_after=_queue_len_after,
+                        nplg=int(nplg),
+                    )
+            log_info(
+                "destination_expand_user_deferred_drained_one",
+                drain_id=_sum_id,
+                semantic_path=path[:240],
+                remaining=_queue_len_after,
+            )
+        finally:
+            self._destination_expand_deferred_drain_running = False
+            self._destination_expand_deferred_drain_reentry_pended = False
         if q:
-            self._schedule_destination_expand_user_deferred_drain()
-        elif not self._destination_expand_user_deferred_queue:
+            self._schedule_destination_expand_user_deferred_drain(delay_ms=int(_sched_delay_out))
+        else:
             log_info(
                 "destination_expand_deferred_queue_process_completed",
+                drain_id=_sum_id,
                 queue_empty=True,
                 reason="drain_complete",
+            )
+        if _sum_id % 25 == 0 or (int(_queue_len_before) > 0 and not q):
+            log_info(
+                "destination_expand_deferred_queue_summary",
+                drain_id=_sum_id,
+                total_drains_probed=int(_sum_id),
+                total_processed_in_tick=int(_processed),
+                queue_len_before=int(_queue_len_before),
+                queue_len_after=int(len(q)),
+                popped=int(_popped),
+                requeued=int(_requeued),
+                no_progress_in_tick=int(_no_progress),
+                schedule_delay_ms_out=int(_sched_delay_out),
+                reason=str(_reason)[:200],
+                backoff_active=bool(int(_sched_delay_out) >= int(self._DEFERRED_EXPAND_NO_PROGRESS_FLOOR_BACKOFF_MS)),
+                dropped_total=int(getattr(self, "_destination_expand_deferred_cumulative_dropped", 0) or 0),
+                parked_total=int(getattr(self, "_destination_expand_deferred_cumulative_parked", 0) or 0),
             )
 
     def _folder_worker_heavy_upstream_busy(self) -> bool:

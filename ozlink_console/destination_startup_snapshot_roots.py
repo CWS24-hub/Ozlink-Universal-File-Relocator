@@ -665,23 +665,44 @@ def select_validated_destination_startup_snapshot(
 
     label = "SessionState.DestinationTreeSnapshot"
     chosen: list = sess_san
+    selection_reason = "init"
     if usable_sess and not usable_side:
         label = "SessionState.DestinationTreeSnapshot"
         chosen = sess_san
+        selection_reason = "only_session_sanitized_usable"
     elif usable_side and not usable_sess:
         label = "WorkspaceSnapshot.destination_tree_snapshot"
         chosen = side_san
+        selection_reason = "only_sidecar_sanitized_usable"
     elif usable_sess and usable_side:
         if n_side > n_sess:
             label = "WorkspaceSnapshot.destination_tree_snapshot"
             chosen = side_san
-        else:
+            selection_reason = "sidecar_sanitized_richer"
+        elif n_sess > n_side:
             label = "SessionState.DestinationTreeSnapshot"
             chosen = sess_san
+            selection_reason = "session_sanitized_richer"
+        else:
+            # Sanitized node counts tie: prefer the candidate with more **raw** nodes; if still tied,
+            # prefer the workspace sidecar (durable on-disk) over the session JSON.
+            if n_side_raw > n_sess_raw:
+                label = "WorkspaceSnapshot.destination_tree_snapshot"
+                chosen = side_san
+                selection_reason = "sanitized_tie_raw_nodes_prefer_sidecar"
+            elif n_sess_raw > n_side_raw:
+                label = "SessionState.DestinationTreeSnapshot"
+                chosen = sess_san
+                selection_reason = "sanitized_tie_raw_nodes_prefer_session"
+            else:
+                label = "WorkspaceSnapshot.destination_tree_snapshot"
+                chosen = side_san
+                selection_reason = "sanitized_and_raw_tie_prefer_sidecar_persistence"
     else:
         # Both empty after sanitization — prefer session (usually fewer stale sidecars).
         chosen = sess_san
         label = "SessionState.DestinationTreeSnapshot_fallback_empty"
+        selection_reason = "both_sanitized_empty_prefer_session"
 
     reason, legacy_inference_retry_recommended = pick_legacy_inference_retry_meta(
         str(sess_gate_tag),
@@ -712,6 +733,17 @@ def select_validated_destination_startup_snapshot(
         legacy_inference_retry_recommended=bool(legacy_inference_retry_recommended),
         legacy_inference_block_reason=str(reason or "")[:80],
     )
+    log_info(
+        "destination_startup_snapshot_hydration_richness_decision",
+        session_sanitized_nodes=int(n_sess),
+        sidecar_sanitized_nodes=int(n_side),
+        session_raw_nodes_before_sanitize=int(n_sess_raw),
+        sidecar_raw_nodes_before_sanitize=int(n_side_raw),
+        selected_source=str(label)[:120],
+        chosen_node_count=int(snapshot_node_count_recursive(chosen)),
+        decision_reason=str(selection_reason)[:80],
+    )
+    meta["hydration_richness_decision_reason"] = str(selection_reason)
     return chosen, label, n_sess, n_side, meta
 
 
