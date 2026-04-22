@@ -393,6 +393,92 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             c.row = i
             c.parent = parent_node
 
+    def _graph_overlay_stable_reorder_siblings_in_place(
+        self,
+        parent_ix: QModelIndex,
+        *,
+        emit_model_layout: bool = True,
+        apply: bool = True,
+    ) -> bool:
+        """
+        Reorder *existing* child nodes under ``parent_ix`` in-place: live graph rows first,
+        then leaf ``name`` / ``base_display_label`` (casefold). Ties use original row order (stable).
+
+        No rows are created or removed — only sibling order. Returns whether order *would* change
+        (or did change, when ``apply`` is true).
+        When ``apply`` is false, only a dry run is done (no mutation, no layout signals).
+        When ``apply`` is true and ``emit_model_layout`` is true, emits a single round of layout
+        signals for this parent only.
+        """
+        parent_node = self._invisible if not parent_ix.isValid() else self._node(parent_ix)
+        if parent_node is None or not parent_node._children or len(parent_node._children) < 2:
+            return False
+        ch = list(parent_node._children)
+        indexed = list(enumerate(ch))  # (row, _Node) — tie-breaker preserves current order
+
+        def _skey(tup: Tuple[int, _Node]) -> Tuple[int, str, int]:
+            _r, n = tup
+            pl = n.payload if isinstance(n.payload, dict) else {}
+            pr = 0 if destination_payload_is_live_graph_row(pl) else 1
+            nm = str(pl.get("name") or pl.get("base_display_label") or "").casefold()
+            return (pr, nm, _r)
+
+        srt = sorted(indexed, key=_skey)
+        ch_new = [t[1] for t in srt]
+        if all(ch[i] is ch_new[i] for i in range(len(ch))):
+            return False
+        if not apply:
+            return True
+        if emit_model_layout:
+            self.layoutAboutToBeChanged.emit()
+        parent_node._children = ch_new
+        self._reindex(parent_node)
+        self._ur0_return_cache = None
+        if emit_model_layout:
+            self.layoutChanged.emit()
+        return True
+
+    def graph_overlay_apply_stable_sibling_order_all_parents(self) -> tuple[int, int, bool]:
+        """
+        Reorder all sibling groups with 2+ rows using :meth:`_graph_overlay_stable_reorder_siblings_in_place`.
+        A single pair of ``layoutAboutToBeChanged`` / ``layoutChanged`` is emitted if any order changed
+        (after a dry pass so no layout is emitted when nothing reorders).
+
+        Returns ``(reordered_parent_count, unchanged_parent_count, any_sibling_reorder)``.
+        """
+        to_check: List[QModelIndex] = []
+        inv = QModelIndex()
+        if int(self.rowCount(inv)) > 1:
+            to_check.append(inv)
+        for p_ix in list(self.iter_depth_first()):
+            try:
+                if int(self.rowCount(p_ix)) > 1:
+                    to_check.append(p_ix)
+            except Exception:
+                continue
+        n_reo = 0
+        n_unch = 0
+        if not to_check:
+            return 0, 0, False
+        to_apply: List[QModelIndex] = []
+        for p in to_check:
+            if self._graph_overlay_stable_reorder_siblings_in_place(
+                p, emit_model_layout=False, apply=False
+            ):
+                to_apply.append(p)
+        n_unch = len(to_check) - len(to_apply)
+        if not to_apply:
+            return 0, n_unch, False
+        self.layoutAboutToBeChanged.emit()
+        for p in to_apply:
+            self._graph_overlay_stable_reorder_siblings_in_place(
+                p, emit_model_layout=False, apply=True
+            )
+            n_reo += 1
+        self._ur0_return_cache = None
+        self.layoutChanged.emit()
+        return n_reo, n_unch, True
+
     def _path_key_for_payload(self, payload: Dict[str, Any]) -> str:
         fn = self._destination_index_key_fn
         if fn is None:

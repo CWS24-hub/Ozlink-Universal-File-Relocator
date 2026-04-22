@@ -33882,6 +33882,23 @@ class MainWindow(QMainWindow):
             drive_sel = ""
         if not drive_sel:
             return
+
+        def _graph_data_drive_and_library_id(gd: Dict[str, Any]) -> Tuple[str, str]:
+            pr = gd.get("parentReference")
+            if not isinstance(pr, dict):
+                pr = {}
+            dr = str(
+                gd.get("drive_id")
+                or pr.get("driveId")
+                or ""
+            ).strip()
+            lib = str(
+                gd.get("library_id")
+                or dr
+                or ""
+            ).strip()
+            return dr, lib
+
         promoted = 0
         preserved_subordinates = 0
         for ix in list(model.iter_depth_first()):
@@ -33906,10 +33923,44 @@ class MainWindow(QMainWindow):
             gitem = by_path.get(canon.casefold())
             if gitem is None or not isinstance(gitem, dict):
                 continue
-            g_row = self._destination_payload_from_graph_item(dict(gitem))
-            _did_g = str(g_row.get("drive_id") or g_row.get("library_id") or "").strip()
-            if _did_g and drive_sel and _did_g.strip().casefold() != drive_sel.strip().casefold():
+            g_drive, g_lib = _graph_data_drive_and_library_id(gitem)
+            if not g_drive:
+                log_info(
+                    "destination_graph_overlay_promotion_skipped_missing_graph_identity",
+                    path_excerpt=str(canon)[:400],
+                    reason="graph_item_missing_drive_id",
+                )
                 continue
+            if g_drive.strip().casefold() != drive_sel.strip().casefold():
+                log_info(
+                    "destination_graph_overlay_promotion_skipped_drive_mismatch",
+                    path_excerpt=str(canon)[:400],
+                    reason="graph_item_not_active_destination_drive",
+                    active_drive_id_suffix=drive_sel[-16:] if len(drive_sel) > 16 else drive_sel,
+                    graph_drive_id_suffix=g_drive[-16:] if len(g_drive) > 16 else g_drive,
+                )
+                continue
+            r_d = str(pl.get("drive_id") or pl.get("library_id") or "").strip()
+            if r_d and g_drive and r_d.strip().casefold() != g_drive.strip().casefold():
+                log_info(
+                    "destination_graph_overlay_promotion_skipped_drive_mismatch",
+                    path_excerpt=str(canon)[:400],
+                    reason="row_drive_conflicts_with_graph_item",
+                    row_drive_id_suffix=r_d[-16:] if len(r_d) > 16 else r_d,
+                    graph_drive_id_suffix=g_drive[-16:] if len(g_drive) > 16 else g_drive,
+                )
+                continue
+            r_lib = str(pl.get("library_id") or "").strip()
+            g_lib_cmp = str(gitem.get("library_id") or "").strip() or g_lib
+            if r_lib and g_lib_cmp and r_lib.strip().casefold() != g_lib_cmp.strip().casefold():
+                log_info(
+                    "destination_graph_overlay_promotion_skipped_library_mismatch",
+                    path_excerpt=str(canon)[:400],
+                    row_library_id_suffix=r_lib[-16:] if len(r_lib) > 16 else r_lib,
+                    graph_library_id_suffix=g_lib_cmp[-16:] if len(g_lib_cmp) > 16 else g_lib_cmp,
+                )
+                continue
+            g_row = self._destination_payload_from_graph_item(dict(gitem))
             try:
                 nsub = int(model.substantive_destination_folder_child_row_count(ix.siblingAtColumn(0) if ix.column() != 0 else ix))
             except Exception:
@@ -33944,17 +33995,43 @@ class MainWindow(QMainWindow):
             if str(pl.get("destination_overlay_kind") or "").strip():
                 _preserved["destination_overlay_kind"] = pl.get("destination_overlay_kind")
 
+            _gid = str(gitem.get("id", "") or "").strip()
+
             def _mut(
-                p,
-                _g=g_row,
-                _pre=_preserved,
+                p: Dict[str, Any],
+                _gr: Dict[str, Any] = g_row,
+                _pre: Dict[str, Any] = _preserved,
+                _path: str = canon,
+                _graph_id: str = _gid,
             ) -> None:
-                p.update(dict(_g))
+                p.update(dict(_gr))
                 p.update(_pre)
+                cleared: list[str] = []
+                for _k in ("non_graph_structural_authority", "non_graph"):
+                    if p.pop(_k, None) is not None:
+                        cleared.append(_k)
+                p["graph_vs_planned"] = "live_graph"
+                p["graph_item_id"] = str(
+                    p.get("graph_item_id")
+                    or p.get("id")
+                    or _graph_id
+                ).strip()
+                p["node_origin"] = "graph_full_tree_promotion"
+                p["projected"] = False
                 p["workspace_row_state"] = WORKSPACE_ROW_STATE_LIVE_CONFIRMED
                 p["verification_state"] = "live_confirmed"
                 p["row_kind"] = "live_folder" if bool(p.get("is_folder", True)) else "live_file"
-                p.pop("non_graph_structural_authority", None)
+                log_info(
+                    "destination_graph_overlay_structural_ownership_enforced",
+                    path_excerpt=str(_path)[:400],
+                    graph_item_id_suffix=(str(p.get("id", p.get("graph_item_id", ""))) or _graph_id)[-16:],
+                )
+                if cleared:
+                    log_info(
+                        "destination_graph_overlay_structural_flags_cleared",
+                        path_excerpt=str(_path)[:400],
+                        flags_cleared=",".join(cleared),
+                    )
 
             col0 = ix.siblingAtColumn(0) if ix.column() != 0 else ix
             model.update_payload_for_index(col0, _mut)
@@ -33982,10 +34059,22 @@ class MainWindow(QMainWindow):
                 "destination_graph_overlay_promotion_preserved_children_count",
                 under_promoted_folders_child_rows_total=int(preserved_subordinates),
             )
+            n_reo, n_unch, sib_moved = model.graph_overlay_apply_stable_sibling_order_all_parents()  # type: ignore[union-attr, unused-ignore]
             log_info(
                 "destination_graph_overlay_promotion_preserved_overlay_state",
                 promoted_count=int(promoted),
             )
+            if sib_moved:
+                log_info(
+                    "destination_graph_overlay_children_reordered_stably",
+                    parent_groups_reordered=int(n_reo),
+                    parent_groups_unchanged=int(n_unch),
+                )
+            else:
+                log_info(
+                    "destination_graph_overlay_children_order_unchanged",
+                    parent_groups_sibling_reorder_checked=int(n_reo) + int(n_unch),
+                )
 
     def _destination_apply_provisional_session_snapshot_if_eligible(self, *, phase: str) -> bool:
         """Option 3 Phase 1: paint the last saved destination snapshot immediately as cached provisional."""
