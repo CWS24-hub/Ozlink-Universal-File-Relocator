@@ -25,7 +25,7 @@ import shutil as _shutil
 import requests
 from datetime import datetime, timezone
 from pathlib import Path
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Tuple
 import xml.etree.ElementTree as ET
 
@@ -600,6 +600,7 @@ class _GraphDestinationChildBacklogEntry:
     reason: str
     path_excerpt: str
     enqueued_perf: float = 0.0
+    graph_child_union_fingerprint: Optional[dict] = field(default=None)
 
 
 def _graph_destination_child_load_request_is_high_priority(trigger: str, reason: str) -> bool:
@@ -3108,6 +3109,8 @@ class MainWindow(QMainWindow):
         self._destination_startup_overlay_snapshot_persist_ready: bool = False
         self._destination_last_overlay_audit_total_rows: int = 0
         self._destination_overlay_visibility_gate_reschedule_count: int = 0
+        # Read-only: ensure startup memory vs rich-candidate audit runs at most once per restore pass.
+        self._destination_memory_active_rich_candidate_audit_ran: bool = False
         self._destination_last_startup_status_reason: str = ""
         self._restore_abort_mode = False
         self._restore_abort_reason = ""
@@ -9209,6 +9212,7 @@ class MainWindow(QMainWindow):
             enqueue_reason=str(enq_r or ""),
             collect_reason=str(col_r or ""),
             skip_heavy_replay_defer=True,
+            user_initiated=True,
         )
 
     def _destination_after_descendant_apply_job_slot_cleared(self) -> None:
@@ -12158,9 +12162,20 @@ class MainWindow(QMainWindow):
             fresh = list(self._capture_tree_items_snapshot("destination") or [])
             snap_n = int(self._count_tree_snapshot_nodes(fresh))
             thin_capture_nodes = int(snap_n)
+            n_applied_inconsistent = int(
+                self._destination_snapshot_has_applied_planned_allocations_with_empty_subtrees(fresh)
+            )
+            thin_risk = bool(n_applied_inconsistent) or self._destination_thin_planned_memory_over_rich_reference(
+                thin_capture_nodes
+            )
             block_thin, block_reason = self._destination_should_block_thin_destination_snapshot_over_rich_sidecar(
                 thin_capture_nodes
             )
+            if not block_thin and thin_risk:
+                block_thin, block_reason = (
+                    True,
+                    "missing_applied_descendants_or_thin_planned" if n_applied_inconsistent else "thin_risk_overlay",
+                )
             if block_thin:
                 rs_try = getattr(self, "_runtime_session_tree_snapshots", None)
                 rt_dest: list = (
@@ -12318,6 +12333,15 @@ class MainWindow(QMainWindow):
                     snapshot_planned_workspace_rows=int(snap_planned),
                     live_model_planned_workspace_rows=int(mod_planned),
                 )
+            n_empty_applied = int(
+                self._destination_snapshot_has_applied_planned_allocations_with_empty_subtrees(roots, log_event=False)
+            )
+            if n_empty_applied <= 0:
+                log_info(
+                    "destination_snapshot_persist_allowed_planned_memory_safe",
+                    phase=str(phase)[:120],
+                    session_destination_snapshot_recursive_nodes=int(snap_n),
+                )
         except Exception as exc:
             self._log_restore_exception("destination_snapshot_persist_validation", exc)
 
@@ -12388,9 +12412,20 @@ class MainWindow(QMainWindow):
                 workspace_tree_snapshots = dict(workspace_tree_snapshots)
                 cap_dest = list(self._capture_tree_items_snapshot("destination") or [])
                 cap_n = int(self._count_tree_snapshot_nodes(cap_dest))
+                n_incons2 = int(
+                    self._destination_snapshot_has_applied_planned_allocations_with_empty_subtrees(
+                        cap_dest, log_event=False
+                    )
+                )
+                thin2 = n_incons2 > 0 or self._destination_thin_planned_memory_over_rich_reference(int(cap_n))
                 block_thin, block_reason = self._destination_should_block_thin_destination_snapshot_over_rich_sidecar(
                     cap_n
                 )
+                if not block_thin and thin2:
+                    block_thin, block_reason = (
+                        True,
+                        "missing_applied_descendants_or_thin_planned" if n_incons2 else "thin_risk_overlay",
+                    )
                 if block_thin:
                     ex_dest = list(getattr(existing_state, "DestinationTreeSnapshot", []) or [])
                     rt = getattr(self, "_runtime_session_tree_snapshots", None)
@@ -13601,6 +13636,9 @@ class MainWindow(QMainWindow):
         pending_key: str = "",
         source_folder_parent_persistent=None,
         destination_folder_parent_persistent=None,
+        destination_graph_union_merge_at_model_root: bool = False,
+        graph_union_mode: str = "",
+        graph_child_union_bootstrap: bool = False,
     ):
         worker_id = self._next_worker_id("folder")
         existing_entry = self.folder_load_workers.get(worker_key)
@@ -13615,7 +13653,7 @@ class MainWindow(QMainWindow):
                 running=existing_entry["worker"].isRunning(),
             )
 
-        entry = {
+        entry: dict = {
             "id": worker_id,
             "worker": worker,
             "item": item,
@@ -13625,6 +13663,12 @@ class MainWindow(QMainWindow):
             "source_folder_parent_persistent": source_folder_parent_persistent,
             "destination_folder_parent_persistent": destination_folder_parent_persistent,
         }
+        if destination_graph_union_merge_at_model_root:
+            entry["destination_graph_union_merge_at_model_root"] = True
+        if str(graph_union_mode or "").strip():
+            entry["graph_union_mode"] = str(graph_union_mode or "").strip()
+        if graph_child_union_bootstrap:
+            entry["graph_child_union_bootstrap"] = True
         if str(worker_key).startswith("source:") and getattr(self, "source_sharepoint_model", None) is not None:
             entry["source_model_structure_generation_at_request"] = int(
                 self.source_sharepoint_model.structure_generation()
@@ -26965,6 +27009,247 @@ class MainWindow(QMainWindow):
             return False, ""
         return True, "thin_capture_below_rich_baseline_during_startup_hydration"
 
+    def _destination_count_snapshot_substantive_child_nodes(self, node: dict) -> int:
+        """All non-placeholder snapshot rows under node (recursive)."""
+        n = 0
+        for ch in list((node or {}).get("children") or []):
+            if not isinstance(ch, dict):
+                continue
+            d0 = ch.get("data")
+            if isinstance(d0, dict) and d0.get("placeholder"):
+                continue
+            n += 1
+            n += self._destination_count_snapshot_substantive_child_nodes(ch)
+        return n
+
+    def _destination_count_snapshot_direct_substantive_children(self, node: dict) -> int:
+        n = 0
+        for ch in list((node or {}).get("children") or []):
+            if not isinstance(ch, dict):
+                continue
+            d0 = ch.get("data")
+            if isinstance(d0, dict) and d0.get("placeholder"):
+                continue
+            n += 1
+        return n
+
+    def _destination_snapshot_walk_applied_allocations_inconsistent(self, node: dict) -> int:
+        """Count nodes that claim ``allocation_descendants_applied`` but have no substantive children in JSON."""
+        n = 0
+        if not isinstance(node, dict):
+            return 0
+        d = node.get("data")
+        if isinstance(d, dict) and bool(d.get("allocation_descendants_applied")) and bool(d.get("is_folder", True)):
+            subs = int(self._destination_count_snapshot_direct_substantive_children(node))
+            if subs <= 0:
+                n += 1
+        for ch in list(node.get("children") or []):
+            if isinstance(ch, dict):
+                n += int(self._destination_snapshot_walk_applied_allocations_inconsistent(ch))
+        return n
+
+    def _destination_snapshot_has_applied_planned_allocations_with_empty_subtrees(
+        self, roots_list: list, *, log_event: bool = True
+    ) -> int:
+        """Count snapshot nodes that claim ``allocation_descendants_applied`` but have no substantive children."""
+        n_bad = 0
+        for r in roots_list or []:
+            if not isinstance(r, dict):
+                continue
+            n_bad += int(self._destination_snapshot_walk_applied_allocations_inconsistent(r))
+        if n_bad and log_event:
+            log_info(
+                "destination_snapshot_persist_blocked_missing_applied_descendants",
+                inconsistent_applied_folders_apx=int(n_bad),
+            )
+        return int(n_bad)
+
+    def _destination_thin_planned_memory_over_rich_reference(self, proposed_recursive_nodes: int) -> bool:
+        if not self._ozlink_destination_graph_overlay_mode():
+            return False
+        baseline = self._destination_rich_reference_snapshot_node_count_baseline()
+        if baseline < 120 or proposed_recursive_nodes < 0:
+            return False
+        if int(proposed_recursive_nodes) < max(60, int(baseline * 0.45)):
+            log_info(
+                "destination_snapshot_persist_blocked_thin_planned_memory",
+                proposed_nodes=int(proposed_recursive_nodes),
+                reference_baseline=int(baseline),
+            )
+            return True
+        return False
+
+    def _destination_should_block_cold_planned_descendant_replay(
+        self,
+        *,
+        enqueue_reason: str,
+        collect_reason: str,
+        user_initiated: bool,
+    ) -> bool:
+        """In Graph overlay mode, do not run allocation source replay on cold session paths; user explict expand unlocks."""
+        if user_initiated or getattr(self, "_overlay_followup_after_import", False):
+            return False
+        if not self._ozlink_destination_graph_overlay_mode():
+            return False
+        if not destination_authority_contract.graph_owns_visible_real_destination_structure(self):
+            return False
+        er = f"{enqueue_reason or ''}|{collect_reason or ''}".lower()
+        needles = (
+            "load_projected_descendants_startup_visibility_bypass",
+            "load_projected_descendants_children_loaded_graph_auth",
+            "overlay_projection_invariant_repair",
+            "eager_bind_allocation_descendants",
+            "deferred_projected_descendants_after_placeholder_strip",
+            "load_projected_descendants_graph_shell_pending",
+            "load_projected_descendants_graph_shell_pending_folder_alloc",
+        )
+        for nd in needles:
+            if nd in er:
+                return True
+        if "load_projected_descendants" in er and "bypass" in er:
+            return True
+        return False
+
+    def _destination_planned_replay_deferred_marker(
+        self,
+        parent_ix: QModelIndex,
+        move,
+        *,
+        log_reason: str,
+    ) -> None:
+        dm = getattr(self, "destination_planning_model", None)
+        if dm is None or not isinstance(parent_ix, QModelIndex) or not parent_ix.isValid():
+            return
+        c0 = parent_ix.siblingAtColumn(0) if parent_ix.column() != 0 else parent_ix
+
+        def _mut(p):
+            p["children_loaded"] = False
+            p["allocation_descendants_replay_deferred_cold_start"] = True
+            p["allocation_descendant_projection_pending"] = True
+            p["planned_allocation_subtree_stale"] = True
+
+        try:
+            dm.update_payload_for_index(c0, _mut)
+        except Exception:
+            return
+        p_ex = ""
+        try:
+            p_ex = str((move or {}).get("destination_path") or self._tree_item_path(c0.data(Qt.UserRole) or {}))[:400]
+        except Exception:
+            p_ex = str(log_reason or "")[:120]
+        log_info("destination_planned_allocation_pending_descendants_marker_added", path_excerpt=p_ex, reason_excerpt=str(log_reason)[:120])
+        log_info("destination_planned_allocation_replay_deferred_until_user_or_idle", path_excerpt=p_ex)
+        log_info(
+            "destination_planned_allocation_expand_affordance_added",
+            path_excerpt=p_ex,
+        )
+
+    def _destination_memory_active_vs_rich_candidate_audit_readonly(self) -> None:
+        """Log active vs richer candidates on disk; never copies or overwrites (diagnostics only)."""
+        if bool(getattr(self, "_destination_memory_active_rich_candidate_audit_ran", False)):
+            return
+        self._destination_memory_active_rich_candidate_audit_ran = True
+        mm = getattr(self, "memory_manager", None)
+        active_ws = 0
+        session_dst = 0
+        best = 0
+        best_lbl = ""
+        path_ws = path_sess = ""
+        if mm is not None:
+            mpaths = getattr(mm, "paths", None) or {}
+            path_ws = str(mpaths.get("workspace_snapshot") or "")
+            path_sess = str(mpaths.get("session") or "")
+            wso = None
+            try:
+                wso = mm.read_workspace_snapshot_optional()
+            except Exception:
+                wso = None
+            if isinstance(wso, dict):
+                dtn = wso.get("destination_tree_snapshot") or []
+                if isinstance(dtn, list):
+                    try:
+                        active_ws = int(self._count_tree_snapshot_nodes(dtn))
+                    except Exception:
+                        active_ws = 0
+            if path_sess and Path(path_sess).is_file():
+                try:
+                    sraw = json.loads(Path(path_sess).read_text(encoding="utf-8"))
+                except Exception:
+                    sraw = None
+                if isinstance(sraw, dict):
+                    dt = sraw.get("DestinationTreeSnapshot") or []
+                    if isinstance(dt, list):
+                        try:
+                            session_dst = int(self._count_tree_snapshot_nodes(dt))
+                        except Exception:
+                            session_dst = 0
+        try:
+            for cand, lbl in ((active_ws, "WorkspaceSnapshot"), (session_dst, "Draft_SessionState")):
+                if cand > best:
+                    best, best_lbl = int(cand), str(lbl)
+        except Exception:
+            pass
+        for extra_name, pth in (("quarantine", getattr(mm, "quarantine", None)), ("backups", getattr(mm, "backups", None))):
+            if pth is None or not Path(str(pth)).is_dir():
+                continue
+            try:
+                n_scanned = 0
+                for p in Path(str(pth)).glob("*.json"):
+                    if n_scanned >= 60:
+                        break
+                    n_scanned += 1
+                    if p.name in ("MemoryManifest.json",) or p.stat().st_size > 4_000_000:
+                        continue
+                    try:
+                        raw = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
+                    except Exception:
+                        continue
+                    dtn = None
+                    if isinstance(raw, dict):
+                        dtn = raw.get("DestinationTreeSnapshot") or raw.get("destination_tree_snapshot")
+                    if not isinstance(dtn, list) or not dtn:
+                        continue
+                    try:
+                        cn = int(self._count_tree_snapshot_nodes(dtn))
+                    except Exception:
+                        continue
+                    if cn > best:
+                        best, best_lbl = int(cn), f"{extra_name}/{p.name[:48]}"
+            except Exception:
+                pass
+        ref = 0
+        try:
+            ref = int(self._destination_rich_reference_snapshot_node_count_baseline())
+        except Exception:
+            ref = 0
+        log_info(
+            "destination_memory_active_vs_rich_candidate_audit",
+            active_workspace_nodes=int(active_ws),
+            session_destination_nodes=int(session_dst),
+            best_rich_node_count=int(best),
+            best_label=str(best_lbl)[:120],
+            reference_baseline=int(ref),
+        )
+        if best > 0 and best_lbl and best > max(session_dst, active_ws):
+            log_info(
+                "destination_memory_rich_candidate_found",
+                node_count=int(best),
+                where=str(best_lbl)[:200],
+            )
+        thin = max(session_dst, active_ws) < 80 and ref > 0 and int(ref) > 2 * max(int(session_dst), int(active_ws))
+        if thin and max(int(session_dst), int(active_ws)) < int(ref) - 20:
+            log_info(
+                "destination_memory_active_snapshot_is_thin",
+                active_max=int(max(session_dst, active_ws)),
+                reference_baseline=int(ref),
+            )
+        if session_dst and active_ws and (session_dst < 80) and (active_ws < session_dst - 1):
+            log_info(
+                "destination_memory_sidecar_runtime_session_versus_workspace_note",
+                session_json_nodes=int(session_dst),
+                workspace_json_nodes=int(active_ws),
+            )
+
     def _destination_loaded_snapshot_overlay_classification_audit(self) -> dict[str, Any]:
         """After snapshot bind: classify destination model rows for overlay vs live Graph (forensics)."""
         out: dict[str, Any] = {
@@ -27210,7 +27495,14 @@ class MainWindow(QMainWindow):
         ix = self._find_visible_destination_item_by_path(str(dest_lookup_cf or "").strip())
         if ix is None or not ix.isValid():
             return
-        self._load_destination_projected_descendants_index(ix)
+        log_info(
+            "destination_planned_allocation_replay_deferred_until_user_or_idle",
+            path_excerpt=str(dest_lookup_cf or "")[:400],
+        )
+        log_info(
+            "destination_descendant_replay_not_enqueued_startup_policy",
+        )
+        self._load_destination_projected_descendants_index(ix, user_initiated=False)
 
     def _destination_graph_bind_presnapshot_classify_row(
         self, pl: dict, *, parent_path_cf: str
@@ -27317,23 +27609,71 @@ class MainWindow(QMainWindow):
             ix = ix.parent()
         return max(0, d)
 
-    def _destination_try_root3_graph_child_union_bootstrap(self) -> None:
-        """Narrow: schedule a single Graph :meth:`/children` fetch for a visible *Root3* destination folder
-        (memory/overlay) so :meth:`merge_graph_branch_union_at_parent` can insert Graph-only children
-        (e.g. IT, Marketing) without ``reset_nested`` or a full drive list."""
-        if not destination_authority_contract.graph_owns_visible_real_destination_structure(self):
-            return
-        if not getattr(self, "graph", None) or not getattr(self.graph, "token", None):
-            return
+    def _destination_graph_child_union_skip_refresh_gate(
+        self, reason: str, node_data: dict, fingerprint: Optional[dict]
+    ) -> bool:
+        if str(reason or "") != "destination_graph_child_union" or not isinstance(fingerprint, dict):
+            return False
+        mode = str(fingerprint.get("mode") or "").strip()
+        if mode == "folder_root":
+            d0 = str(fingerprint.get("drive_id") or "").strip()
+            i0 = str(fingerprint.get("item_id") or "").strip()
+            d1 = str(self._resolve_tree_item_drive_id("destination", node_data) or "").strip()
+            i1 = str(node_data.get("id") or "").strip()
+            return bool(d0 and i0 and d0 == d1 and i0 == i1)
+        if mode == "library_root":
+            d0 = str(fingerprint.get("drive_id") or "").strip()
+            i0 = str(fingerprint.get("item_id") or "").strip()
+            d1 = str(self._resolve_tree_item_drive_id("destination", node_data) or "").strip()
+            i1 = str(node_data.get("id") or "").strip()
+            return bool(d0 and d0 == d1 and i0 and i0 == i1 and bool(fingerprint.get("item_id_is_drive_root")))
+        return False
+
+    def _destination_determine_graph_union_root_target(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "mode": "skipped",
+            "parent_index": QModelIndex(),
+            "parent_canonical_path": "",
+            "drive_id": "",
+            "item_id": "",
+            "item_id_is_drive_root": False,
+            "reason": "",
+        }
+        did = str(self._current_selected_destination_drive_id() or "").strip()
+        if not did:
+            out["reason"] = "no_selected_destination_drive"
+            log_info(
+                "destination_graph_union_root_target_skipped",
+                mode="skipped",
+                top_level_count=-1,
+                selected_drive_id_suffix="",
+                parent_path="",
+                parent_item_id_suffix="",
+                reason=str(out["reason"])[:200],
+            )
+            return out
         m = getattr(self, "destination_planning_model", None)
         if m is None or not hasattr(m, "rowCount"):
-            return
+            out["reason"] = "no_model"
+            log_info(
+                "destination_graph_union_root_target_skipped",
+                mode="skipped",
+                top_level_count=-1,
+                selected_drive_id_suffix=did[-16:],
+                parent_path="",
+                parent_item_id_suffix="",
+                reason="no_model",
+            )
+            return out
         inv = QModelIndex()
         try:
             nroot = int(m.rowCount(inv))
         except Exception:
-            return
-        for r in range(min(nroot, 256)):
+            nroot = 0
+        out["drive_id"] = did
+        nroot = min(int(nroot), 256)
+        row_payloads: list[dict] = []
+        for r in range(nroot):
             try:
                 ix = m.index(r, 0, inv)
             except Exception:
@@ -27343,28 +27683,225 @@ class MainWindow(QMainWindow):
             pl = self._destination_model_index_user_role_dict(ix)
             if not isinstance(pl, dict) or pl.get("placeholder"):
                 continue
-            if str(pl.get("name") or "").strip().casefold() != "root3":
-                continue
-            if not bool(pl.get("is_folder", True)):
-                return
-            if not str(pl.get("id") or "").strip() or not self._resolve_tree_item_drive_id("destination", pl):
-                return
+            row_payloads.append(
+                {
+                    "row": int(r),
+                    "ix": ix,
+                    "pl": pl,
+                    "name_excerpt": str(pl.get("name") or "")[:120],
+                }
+            )
+        def _is_hub(p: dict) -> bool:
+            if not p.get("is_folder", True):
+                return False
+            if not str(p.get("id") or "").strip():
+                return False
+            if str(self._resolve_tree_item_drive_id("destination", p) or "").strip() != did:
+                return False
+            if self._destination_row_is_live_graph_structure(p):
+                return True
+            wss = str(p.get("workspace_row_state") or "").strip()
+            if wss and wss == WORKSPACE_ROW_STATE_CACHED_PROVISIONAL:
+                return True
+            return self._destination_row_is_graph_derived_dest_child_fetch_eligible(p)
+
+        hubs = [e for e in row_payloads if _is_hub(e["pl"])]
+        if len(hubs) > 1:
+            out["mode"] = "ambiguous"
+            out["reason"] = "multiple_graph_hub_candidates_at_top_level"
             log_info(
-                "destination_root3_graph_child_union_requested",
-                path_excerpt=str(
-                    self._destination_semantic_path(pl)
-                    or pl.get("item_path")
-                    or pl.get("name")
-                    or ""
-                )[:500],
+                "destination_graph_union_root_target_skipped",
+                mode="ambiguous",
+                top_level_count=int(len(row_payloads)),
+                selected_drive_id_suffix=did[-16:],
+                parent_path="",
+                parent_item_id_suffix="",
+                reason=str(out["reason"])[:200],
             )
-            self._destination_start_graph_folder_load_worker_if_eligible(
-                ix.siblingAtColumn(0) if ix.column() != 0 else ix,
-                reason="root3_graph_child_union",
-                trigger="root3_bootstrap",
+            return out
+        if len(hubs) == 1:
+            h0 = hubs[0]
+            plh = h0["pl"]
+            out["mode"] = "folder_root"
+            out["parent_index"] = h0["ix"]
+            out["item_id"] = str(plh.get("id") or "").strip()
+            out["item_id_is_drive_root"] = False
+            pth = str(
+                self._destination_semantic_path(plh) or plh.get("item_path") or plh.get("name") or ""
+            ).strip()
+            out["parent_canonical_path"] = pth
+            out["reason"] = "single_top_level_graph_folder_hub"
+            log_info(
+                "destination_graph_union_root_target_detected",
+                mode="folder_root",
+                top_level_count=int(len(row_payloads)),
+                selected_drive_id_suffix=did[-16:],
+                parent_path=pth[:500],
+                parent_item_id_suffix=str(out["item_id"])[-16:],
+                reason=str(out["reason"])[:200],
             )
+            log_info("destination_graph_union_root_mode_folder_root", top_level_count=int(len(row_payloads)))
+            return out
+        g = getattr(self, "graph", None)
+        if g is None or not getattr(g, "token", None):
+            out["reason"] = "no_graph_or_token"
+            log_info(
+                "destination_graph_union_root_target_skipped",
+                mode="library_root",
+                top_level_count=int(len(row_payloads)),
+                selected_drive_id_suffix=did[-16:],
+                parent_path="",
+                parent_item_id_suffix="",
+                reason=str(out["reason"])[:200],
+            )
+            return out
+        try:
+            root_item = g.get_drive_root_item(did)  # type: ignore[union-attr, unused-ignore]
+        except Exception as exc:
+            out["reason"] = f"get_drive_root_item_failed:{exc!s}"[:200]
+            log_info(
+                "destination_graph_union_root_target_skipped",
+                mode="library_root",
+                top_level_count=int(len(row_payloads)),
+                selected_drive_id_suffix=did[-16:],
+                parent_path="",
+                parent_item_id_suffix="",
+                reason=str(out["reason"])[:200],
+            )
+            return out
+        if not isinstance(root_item, dict) or not str(root_item.get("id") or "").strip():
+            out["reason"] = "no_drive_root_item_id"
+            log_info(
+                "destination_graph_union_root_target_skipped",
+                mode="library_root",
+                top_level_count=int(len(row_payloads)),
+                selected_drive_id_suffix=did[-16:],
+                parent_path="",
+                parent_item_id_suffix="",
+                reason=str(out["reason"])[:200],
+            )
+            return out
+        out["mode"] = "library_root"
+        out["parent_index"] = QModelIndex()
+        out["item_id"] = str(root_item.get("id") or "").strip()
+        out["item_id_is_drive_root"] = True
+        out["parent_canonical_path"] = ""
+        out["reason"] = "no_single_graph_hub_use_drive_root_children"
+        log_info(
+            "destination_graph_union_root_target_detected",
+            mode="library_root",
+            top_level_count=int(len(row_payloads)),
+            selected_drive_id_suffix=did[-16:],
+            parent_path="",
+            parent_item_id_suffix=str(out["item_id"])[-16:],
+            reason=str(out["reason"])[:200],
+        )
+        log_info("destination_graph_union_root_mode_library_root", top_level_count=int(len(row_payloads)))
+        return out
+
+    def _destination_start_graph_library_root_child_union_worker(self, det: dict[str, Any]) -> bool:
+        if not destination_authority_contract.graph_owns_visible_real_destination_structure(self):
+            return False
+        g = getattr(self, "graph", None)
+        if g is None or not getattr(g, "token", None):
+            return False
+        did = str(det.get("drive_id") or "").strip()
+        iid = str(det.get("item_id") or "").strip()
+        if not did or not iid or not det.get("item_id_is_drive_root"):
+            return False
+        panel_key = "destination"
+        pending_key = f"{did}:{iid}"
+        worker_key = f"{panel_key}:{iid}"
+        if self._folder_load_worker_thread_running(worker_key):
+            self.pending_folder_loads[panel_key].add(pending_key)
+            return False
+        if pending_key in self.pending_folder_loads[panel_key]:
+            return False
+        if len(self.pending_folder_loads.get(panel_key, set())) >= _graph_destination_child_load_max_active():
+            return False
+        self.pending_folder_loads[panel_key].add(pending_key)
+        worker_context = {
+            "site_id": "",
+            "site_name": "",
+            "library_id": did,
+            "library_name": "",
+            "tree_role": panel_key,
+            "parent_item_path": "",
+            "cache_only": False,
+            "_graph_request_perf": time.perf_counter(),
+        }
+        worker = FolderLoadWorker(self.graph, panel_key, did, iid, worker_context)
+        worker_entry = self._register_folder_worker(
+            worker_key,
+            worker,
+            None,
+            pending_key=pending_key,
+            destination_folder_parent_persistent=None,
+            destination_graph_union_merge_at_model_root=True,
+            graph_union_mode="library_root",
+            graph_child_union_bootstrap=True,
+        )
+        worker.success.connect(
+            lambda payload, worker_id=worker_entry["id"]: self._safe_invoke(
+                "folder_worker.success", self.on_folder_load_success, payload, worker_id
+            )
+        )
+        worker.error.connect(
+            lambda payload, worker_id=worker_entry["id"]: self._safe_invoke(
+                "folder_worker.error", self.on_folder_load_error, payload, worker_id
+            )
+        )
+        worker.finished.connect(
+            lambda key=worker_key, worker_id=worker_entry["id"]: self._safe_invoke(
+                "folder_worker.finished", self.on_folder_worker_finished, key, worker_id
+            )
+        )
+        worker.start()
+        log_info(
+            "destination_graph_library_root_child_union_dispatched",
+            drive_id_suffix=did[-16:],
+            item_id_suffix=iid[-16:],
+        )
+        return True
+
+    def _destination_try_destination_graph_child_union_bootstrap(self) -> None:
+        """One-level Graph :meth:`/children` union: folder-root (under one hub) or library-root (drive root)."""
+        if not destination_authority_contract.graph_owns_visible_real_destination_structure(self):
             return
-        return
+        if not getattr(self, "graph", None) or not getattr(self.graph, "token", None):
+            return
+        m = getattr(self, "destination_planning_model", None)
+        if m is None or not hasattr(m, "rowCount"):
+            return
+        det = self._destination_determine_graph_union_root_target()
+        mode = str(det.get("mode") or "")
+        if mode not in ("folder_root", "library_root"):
+            return
+        if mode == "library_root":
+            self._destination_start_graph_library_root_child_union_worker(det)
+            return
+        p_ix = det.get("parent_index")
+        if p_ix is None or not isinstance(p_ix, QModelIndex) or not p_ix.isValid():
+            return
+        pl = self._destination_model_index_user_role_dict(p_ix)
+        if not str(pl.get("id") or "").strip():
+            return
+        path_ex = str(
+            self._destination_semantic_path(pl) or pl.get("item_path") or pl.get("name") or ""
+        )[:500]
+        log_info("destination_graph_child_union_requested", path_excerpt=path_ex, mode="folder_root")
+        fp = {
+            "mode": "folder_root",
+            "drive_id": str(det.get("drive_id") or "").strip(),
+            "item_id": str(det.get("item_id") or "").strip(),
+            "item_id_is_drive_root": False,
+        }
+        self._destination_start_graph_folder_load_worker_if_eligible(
+            p_ix.siblingAtColumn(0) if p_ix.column() != 0 else p_ix,
+            reason="destination_graph_child_union",
+            trigger="destination_root_union_bootstrap",
+            graph_child_union_fingerprint=fp,
+        )
 
     def _destination_expand_request_live_graph_folder_child_load(self, col0: QModelIndex) -> None:
         """Graph authority: request /children for the expanded folder (any nesting depth)."""
@@ -27943,6 +28480,10 @@ class MainWindow(QMainWindow):
                 list((getattr(self, "_runtime_session_tree_snapshots", {}) or {}).get("destination", []) or [])
             ),
         )
+        try:
+            self._destination_memory_active_vs_rich_candidate_audit_readonly()
+        except Exception as exc:
+            self._log_restore_exception("destination_memory_active_rich_candidate_audit", exc)
         if self._destination_branch_forensic_enabled() and mm is not None:
             log_info(
                 "destination_branch_forensic",
@@ -33528,7 +34069,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             try:
-                self._load_destination_projected_descendants_index(ix)
+                self._load_destination_projected_descendants_index(ix, user_initiated=False)
                 alloc_pass += 1
             except Exception as exc:
                 skipped.append(f"load_proj:{str(self._tree_item_path(pl) or '')[:80]}:{str(exc)[:60]}")
@@ -33970,11 +34511,11 @@ class MainWindow(QMainWindow):
                     self._attach_destination_overlays_for_visible_branch(pth)
             self._attach_destination_overlays_for_visible_branch("")
         try:
-            QTimer.singleShot(
+                QTimer.singleShot(
                 500,
                 lambda: self._safe_invoke(
-                    "root3_graph_child_union_bootstrap",
-                    self._destination_try_root3_graph_child_union_bootstrap,
+                    "destination_graph_child_union_bootstrap",
+                    self._destination_try_destination_graph_child_union_bootstrap,
                 ),
             )
         except Exception:
@@ -35809,9 +36350,14 @@ class MainWindow(QMainWindow):
         ):
             item_path = self._tree_item_path(node_data)
             if item_path:
-                QTimer.singleShot(0, lambda p=item_path: self._deferred_load_destination_projected_descendants(p))
+                QTimer.singleShot(
+                    0,
+                    lambda p=item_path: self._deferred_load_destination_projected_descendants(
+                        p, user_initiated=True
+                    ),
+                )
             else:
-                self._load_destination_projected_descendants_index(index)
+                self._load_destination_projected_descendants_index(index, user_initiated=True)
             return
         node_data = dict(col0.data(Qt.UserRole) or {})
         node_data = self._destination_expand_maybe_reset_stale_graph_children_loaded(col0, node_data)
@@ -37457,9 +38003,13 @@ class MainWindow(QMainWindow):
         """
         out: list[dict] = []
         model = getattr(self, "destination_planning_model", None)
-        if model is None or not parent_ix.isValid():
+        if model is None:
             return out
-        col0 = parent_ix.siblingAtColumn(0) if parent_ix.column() != 0 else parent_ix
+        col0 = parent_ix
+        if parent_ix.isValid() and parent_ix.column() != 0:
+            col0 = parent_ix.siblingAtColumn(0)
+        elif not parent_ix.isValid():
+            col0 = QModelIndex()
         for r in range(model.rowCount(col0)):
             ix = model.index(r, 0, col0)
             pl = self._destination_model_index_user_role_dict(ix)
@@ -37852,7 +38402,7 @@ class MainWindow(QMainWindow):
         """
         empty = {"matched_live": 0, "reattached": 0, "lost": 0, "no_op": 0}
         model = getattr(self, "destination_planning_model", None)
-        if model is None or not parent_ix.isValid() or not snapshots:
+        if model is None or not snapshots:
             return dict(empty)
         graph_auth_rec = destination_authority_contract.graph_owns_visible_real_destination_structure(self)
         norm_nodes: list[dict[str, Any]] = []
@@ -37870,11 +38420,16 @@ class MainWindow(QMainWindow):
         if not norm_nodes:
             return dict(empty)
         seen_identity: set[str] = set()
-        parent_col0 = parent_ix.siblingAtColumn(0) if parent_ix.column() != 0 else parent_ix
-        parent_folder_pl = self._destination_model_index_user_role_dict(parent_col0)
-        parent_folder_canon = self._canonical_planned_memory_path_for_graph_match(
-            str(self._tree_item_path(parent_folder_pl) or "").strip()
-        )
+        if not parent_ix.isValid():
+            parent_col0 = QModelIndex()
+            parent_folder_pl: dict = {}
+            parent_folder_canon = ""
+        else:
+            parent_col0 = parent_ix.siblingAtColumn(0) if parent_ix.column() != 0 else parent_ix
+            parent_folder_pl = self._destination_model_index_user_role_dict(parent_col0)
+            parent_folder_canon = self._canonical_planned_memory_path_for_graph_match(
+                str(self._tree_item_path(parent_folder_pl) or "").strip()
+            )
         log_info(
             "destination_reconcile_planned_rows_entered",
             parent_path=str(self._destination_semantic_path(parent_folder_pl) or "")[:400],
@@ -37887,19 +38442,13 @@ class MainWindow(QMainWindow):
             if not isinstance(snap, dict) or not destination_payload_is_planned_workspace_row(snap):
                 st["lost"] += self._destination_count_planned_snapshot_tree_nodes(nested)
                 return st
-            if not p_ix.isValid() or model is None:
+            if model is None:
                 st["lost"] += 1 + self._destination_count_planned_snapshot_tree_nodes(nested)
-                log_info(
-                    "destination_reconcile_planned_row_after_graph_replace",
-                    intended_path="",
-                    snapshot_model_path_excerpt=str(snap.get("item_path") or snap.get("destination_path") or "")[:400],
-                    matched_existing=False,
-                    reattached=False,
-                    match_method="none",
-                    reason="invalid_parent_index",
-                )
                 return st
-            col0 = p_ix.siblingAtColumn(0) if p_ix.column() != 0 else p_ix
+            if p_ix.isValid() and p_ix.column() != 0:
+                col0 = p_ix.siblingAtColumn(0)
+            else:
+                col0 = QModelIndex() if not p_ix.isValid() else p_ix
             ctx_parent_canon = self._destination_folder_index_canonical_path(col0)
             intended_canon, _resolve_meta = self._destination_reconcile_resolve_intended_canonical_meta(
                 snap, parent_folder_canonical=ctx_parent_canon
@@ -38430,9 +38979,10 @@ class MainWindow(QMainWindow):
                 st["lost"] += self._destination_count_planned_snapshot_tree_nodes(nested)
             return st
 
+        _p_recon = parent_ix if parent_ix.isValid() else QModelIndex()
         totals = dict(empty)
         for node in norm_nodes:
-            part = _reconcile_node(parent_ix, node)
+            part = _reconcile_node(_p_recon, node)
             totals["matched_live"] += part["matched_live"]
             totals["reattached"] += part["reattached"]
             totals["lost"] += part["lost"]
@@ -38454,8 +39004,11 @@ class MainWindow(QMainWindow):
         empty = {"matched_live": 0, "reattached": 0, "lost": 0, "no_op": 0}
         if not planned_workspace_presnapshot:
             return dict(empty)
-        p_col = parent_ix.siblingAtColumn(0) if parent_ix.column() != 0 else parent_ix
-        _pp = self._destination_semantic_path(dict(p_col.data(Qt.UserRole) or {}))
+        p_col = parent_ix.siblingAtColumn(0) if parent_ix.isValid() and parent_ix.column() != 0 else parent_ix
+        if p_col.isValid():
+            _pp = self._destination_semantic_path(dict(p_col.data(Qt.UserRole) or {}))
+        else:
+            _pp = ""
         _cnt = int(self._destination_count_planned_snapshot_tree_nodes(planned_workspace_presnapshot))
         log_info(
             "destination_reconcile_planned_rows_invoked",
@@ -40787,6 +41340,7 @@ class MainWindow(QMainWindow):
         reason: str = "",
         trigger: str = "",
         graph_request_perf_override: float = 0.0,
+        graph_child_union_fingerprint: Optional[dict] = None,
     ) -> bool:
         """Start a Graph :class:`FolderLoadWorker` for a destination folder row under the active cap.
 
@@ -40807,11 +41361,10 @@ class MainWindow(QMainWindow):
         if not _live_row and not _derived_ok:
             return False
         _needs_live = self._destination_row_needs_live_graph_child_refresh(node_data)
-        _root3_union = (
-            str(reason or "") == "root3_graph_child_union"
-            and str(node_data.get("name") or "").strip().casefold() == "root3"
+        _graph_union = self._destination_graph_child_union_skip_refresh_gate(
+            str(reason or ""), node_data, graph_child_union_fingerprint
         )
-        if (node_data.get("children_loaded") or node_data.get("load_failed")) and not _needs_live and not _root3_union:
+        if (node_data.get("children_loaded") or node_data.get("load_failed")) and not _needs_live and not _graph_union:
             return False
         drive_id = self._resolve_tree_item_drive_id(panel_key, node_data)
         item_id = str(node_data.get("id") or "").strip()
@@ -40840,7 +41393,7 @@ class MainWindow(QMainWindow):
         except Exception:
             _rc_vis = 0
         _keep_snapshot_visible = bool(_needs_live and _rc_vis > 0)
-        if not has_future_children and not _keep_snapshot_visible and not _root3_union:
+        if not has_future_children and not _keep_snapshot_visible and not _graph_union:
             model.set_loading_children(col0)
         elif _keep_snapshot_visible:
             log_info(
@@ -40857,7 +41410,7 @@ class MainWindow(QMainWindow):
         preserved_children = self._preserve_destination_future_state_children_model(col0)
         if preserved_children:
             self._destination_preserved_children_by_worker[worker_key] = preserved_children
-        if has_future_children and not _keep_snapshot_visible and not _root3_union:
+        if has_future_children and not _keep_snapshot_visible and not _graph_union:
             model.set_loading_children(col0)
         use_cache_only = False
         _t_req = time.perf_counter()
@@ -40884,6 +41437,11 @@ class MainWindow(QMainWindow):
             None,
             pending_key=pending_key,
             destination_folder_parent_persistent=pmi,
+            graph_child_union_bootstrap=bool(str(reason or "") == "destination_graph_child_union"),
+            graph_union_mode=str(
+                (graph_child_union_fingerprint or {}).get("mode")
+                or ("folder_root" if graph_child_union_fingerprint else "")
+            )[:32],
         )
         worker.success.connect(
             lambda payload, worker_id=worker_entry["id"]: self._safe_invoke(
@@ -41001,10 +41559,16 @@ class MainWindow(QMainWindow):
                 reason=entry.reason,
                 trigger=entry.trigger,
                 graph_request_perf_override=float(entry.enqueued_perf or 0.0),
+                graph_child_union_fingerprint=getattr(entry, "graph_child_union_fingerprint", None),
             )
 
     def _request_graph_destination_children_load(
-        self, index: QModelIndex, *, reason: str = "", trigger: str = ""
+        self,
+        index: QModelIndex,
+        *,
+        reason: str = "",
+        trigger: str = "",
+        graph_child_union_fingerprint: Optional[dict] = None,
     ) -> bool:
         """Queue a Graph :class:`FolderLoadWorker` for a destination folder (SharePoint authority mode).
 
@@ -41037,11 +41601,10 @@ class MainWindow(QMainWindow):
         if not _live_row and not _derived_ok:
             return False
         _needs_live_rq = self._destination_row_needs_live_graph_child_refresh(node_data)
-        _root3_queue_union = (
-            str(reason or "") == "root3_graph_child_union"
-            and str(node_data.get("name") or "").strip().casefold() == "root3"
+        _graph_queue_union = self._destination_graph_child_union_skip_refresh_gate(
+            str(reason or ""), node_data, graph_child_union_fingerprint
         )
-        if (node_data.get("children_loaded") or node_data.get("load_failed")) and not _needs_live_rq and not _root3_queue_union:
+        if (node_data.get("children_loaded") or node_data.get("load_failed")) and not _needs_live_rq and not _graph_queue_union:
             return False
         drive_id = self._resolve_tree_item_drive_id(panel_key, node_data)
         item_id = str(node_data.get("id") or "").strip()
@@ -41091,6 +41654,7 @@ class MainWindow(QMainWindow):
                 reason=str(reason)[:200],
                 path_excerpt=path_excerpt,
                 enqueued_perf=_enq_perf,
+                graph_child_union_fingerprint=graph_child_union_fingerprint,
             )
             _hi = _graph_destination_child_load_request_is_high_priority(trigger, reason)
             if not _hi:
@@ -41146,7 +41710,12 @@ class MainWindow(QMainWindow):
                 trace_note="after_enqueue",
             )
             return True
-        return self._destination_start_graph_folder_load_worker_if_eligible(col0, reason=reason, trigger=trigger)
+        return self._destination_start_graph_folder_load_worker_if_eligible(
+            col0,
+            reason=reason,
+            trigger=trigger,
+            graph_child_union_fingerprint=graph_child_union_fingerprint,
+        )
 
     def _destination_graph_subtree_hydration_root_key(self, path: str) -> str:
         p = self.normalize_memory_path(str(path or "").strip())
@@ -46171,6 +46740,7 @@ class MainWindow(QMainWindow):
         on_complete=None,
         enqueue_reason: str = "",
         collect_reason: str = "",
+        user_initiated: bool = False,
     ) -> int:
         """Project source subtree under a Graph-auth allocation folder (chunked; no single-wave bind).
 
@@ -46182,6 +46752,7 @@ class MainWindow(QMainWindow):
             on_complete,
             enqueue_reason=enqueue_reason,
             collect_reason=collect_reason,
+            user_initiated=bool(user_initiated),
         )
         return 0
 
@@ -47051,6 +47622,13 @@ class MainWindow(QMainWindow):
                     reason="source_tree_row_not_resolved_for_move",
                     source_path_excerpt=str(move.get("source_path", "") or "")[:400],
                 )
+        _ng_gen_snap = None
+        _ng_sg = getattr(model, "structure_generation", None)
+        if callable(_ng_sg):
+            try:
+                _ng_gen_snap = int(_ng_sg())
+            except Exception:
+                _ng_gen_snap = None
         return {
             "parent_ix": parent_ix,
             "move": move,
@@ -47073,6 +47651,7 @@ class MainWindow(QMainWindow):
             "visibility_targets": {},
             "added_count": 0,
             "walk_phase": "next_descendant",
+            "graph_model_structure_generation_snap": _ng_gen_snap,
         }
 
     def _destination_graph_descendant_apply_prepare_next_descendant(self, st) -> str:
@@ -48659,6 +49238,7 @@ class MainWindow(QMainWindow):
         enqueue_reason: str = "",
         collect_reason: str = "",
         skip_heavy_replay_defer: bool = False,
+        user_initiated: bool = False,
     ) -> bool:
         """Queue incremental allocation-descendant application for a QModelIndex. State is built when the job runs."""
         if _shutdown_mutation_skip_for_host(
@@ -48666,6 +49246,19 @@ class MainWindow(QMainWindow):
             "_enqueue_destination_descendant_apply_to_model",
             enqueue_reason=str(enqueue_reason or "")[:200],
         ):
+            return False
+        if self._destination_should_block_cold_planned_descendant_replay(
+            enqueue_reason=str(enqueue_reason or ""),
+            collect_reason=str(collect_reason or ""),
+            user_initiated=bool(user_initiated),
+        ):
+            self._destination_planned_replay_deferred_marker(
+                parent_ix,
+                move,
+                log_reason="cold_start_replay_deferred",
+            )
+            log_info("destination_startup_descendant_replay_blocked_memory_overlay_mode")
+            log_info("destination_descendant_replay_not_enqueued_startup_policy")
             return False
         model = getattr(self, "destination_planning_model", None)
         if model is None or not parent_ix.isValid():
@@ -48872,6 +49465,7 @@ class MainWindow(QMainWindow):
         *,
         enqueue_reason: str = "",
         collect_reason: str = "",
+        user_initiated: bool = False,
     ) -> int:
         """Apply projected allocation descendants under parent_ix. Work is incremental; return value is always 0."""
         self._enqueue_destination_descendant_apply_to_model(
@@ -48880,6 +49474,7 @@ class MainWindow(QMainWindow):
             completion_callback,
             enqueue_reason=enqueue_reason,
             collect_reason=collect_reason,
+            user_initiated=bool(user_initiated),
         )
         return 0
 
@@ -49219,6 +49814,7 @@ class MainWindow(QMainWindow):
                         _move,
                         collect_reason="eager_bind_allocation_descendants",
                         enqueue_reason="eager_bind_allocation_descendants",
+                        user_initiated=False,
                     )
 
             allocation_pass += self._destination_allocation_apply_canonical_path_one_index_per_resolve(
@@ -55964,7 +56560,7 @@ class MainWindow(QMainWindow):
                 continue
             if bool(nd.get("children_loaded")) and bool(nd.get("allocation_descendants_applied")):
                 continue
-            self._load_destination_projected_descendants_index(ix)
+            self._load_destination_projected_descendants_index(ix, user_initiated=False)
 
     def _hydrate_destination_allocations_for_expanded_paths(self, expanded_paths) -> None:
         self._hydrate_destination_allocations_for_expanded_paths_model(expanded_paths)
@@ -55992,7 +56588,7 @@ class MainWindow(QMainWindow):
                     continue
                 if bool(nd.get("children_loaded")) and bool(nd.get("allocation_descendants_applied")):
                     continue
-                self._load_destination_projected_descendants_index(ix)
+                self._load_destination_projected_descendants_index(ix, user_initiated=False)
             if si % 3 == 2:
                 QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
 
@@ -65664,7 +66260,9 @@ class MainWindow(QMainWindow):
             )
         worker.start()
 
-    def _deferred_load_destination_projected_descendants(self, item_path: str):
+    def _deferred_load_destination_projected_descendants(
+        self, item_path: str, *, user_initiated: bool = True
+    ):
         """Run projected-descendant materialization after the expand gesture finishes (next event).
 
         Keeps expand/collapse responsive like Explorer; path lookup avoids dangling QTreeWidgetItem refs.
@@ -65690,7 +66288,7 @@ class MainWindow(QMainWindow):
                 reason="index_not_live_after_defer",
             )
             return
-        self._load_destination_projected_descendants_index(item)
+        self._load_destination_projected_descendants_index(item, user_initiated=bool(user_initiated))
 
     def _destination_source_paths_touch_move_source_root(self, loaded_cf: set[str], move_root_cf: str) -> bool:
         """True when a loaded source folder path overlaps the move's source root (prefix either way)."""
@@ -65769,7 +66367,7 @@ class MainWindow(QMainWindow):
                 p.pop("allocation_projection_children_signature", None)
 
             dm.update_payload_for_index(col0, _mut_retry)
-            self._load_destination_projected_descendants_index(col0)
+            self._load_destination_projected_descendants_index(col0, user_initiated=True)
 
     def _apply_overlay_projection_invariant_repair_to_index(self, col0: QModelIndex, move) -> None:
         """Repair one overlay folder row using the same projection primitive as Graph-auth load (no Graph I/O).
@@ -65823,6 +66421,16 @@ class MainWindow(QMainWindow):
             )
         if move is None and isinstance(move_eff, dict):
             move = move_eff
+        if move is not None and self._destination_should_block_cold_planned_descendant_replay(
+            enqueue_reason="overlay_projection_invariant_repair",
+            collect_reason="overlay_projection_invariant_repair",
+            user_initiated=False,
+        ):
+            self._destination_planned_replay_deferred_marker(
+                col0, move, log_reason="overlay_projection_invariant_repair"
+            )
+            log_info("destination_descendant_replay_not_enqueued_startup_policy")
+            return
         self._strip_non_graph_direct_children_for_overlay_projection_reload(col0)
         source_item = self._find_source_item_for_planned_move(move)
         if source_item is not None:
@@ -65865,6 +66473,7 @@ class MainWindow(QMainWindow):
             on_complete=_after_invariant_repair,
             enqueue_reason="overlay_projection_invariant_repair",
             collect_reason="overlay_projection_invariant_repair",
+            user_initiated=False,
         )
 
     def _destination_index_has_overlay_backed_non_graph_children(self, dm, parent_ix: QModelIndex) -> bool:
@@ -66597,7 +67206,7 @@ class MainWindow(QMainWindow):
             p.pop("allocation_projection_children_signature", None)
 
         dm.update_payload_for_index(col0, _mut_retry)
-        self._load_destination_projected_descendants_index(col0)
+        self._load_destination_projected_descendants_index(col0, user_initiated=True)
 
     def _schedule_coalesced_overlay_invariant(self, reason: str, *, source_driven: bool = False) -> None:
         """Collapse many rapid notifications into one :meth:`_on_destination_state_mutation` on the next event-loop tick.
@@ -66979,7 +67588,9 @@ class MainWindow(QMainWindow):
         reason = str(getattr(self, "_destination_overlay_source_invariant_pending_reason", "") or "")
         self._run_overlay_projection_invariant_pass(reason or "debounced_overlay_projection_invariant")
 
-    def _load_destination_projected_descendants_index(self, ix: QModelIndex) -> None:
+    def _load_destination_projected_descendants_index(
+        self, ix: QModelIndex, *, user_initiated: bool = False
+    ) -> None:
         dmodel = getattr(self, "destination_planning_model", None)
         tree = getattr(self, "destination_tree_widget", None)
         if dmodel is None or not ix.isValid():
@@ -67043,25 +67654,56 @@ class MainWindow(QMainWindow):
 
                 dmodel.update_payload_for_index(ix, _mut_inv)
                 node_data = dict(ix.data(Qt.UserRole) or {})
+        graph_auth = destination_authority_contract.graph_owns_visible_real_destination_structure(self)
         if self.node_is_planned_allocation(node_data) and bool(node_data.get("allocation_descendants_applied")):
-            if not bool(node_data.get("children_loaded")):
+            _mv0 = move_for_row if move_for_row is not None else self._find_planned_move_for_destination_node(node_data)
+            _src0 = _mv0.get("source", {}) if isinstance(_mv0, dict) else {}
+            _is_folder_alloc = bool(_src0.get("is_folder", True)) if isinstance(_src0, dict) else True
+            try:
+                _direct_n = int(dmodel.rowCount(ix)) if dmodel is not None else 0
+            except Exception:
+                _direct_n = 0
+            if (
+                _is_folder_alloc
+                and _direct_n == 0
+                and graph_auth
+                and self._ozlink_destination_graph_overlay_mode()
+            ):
 
-                def _mut_loaded(p):
-                    p["children_loaded"] = True
-                    p["projection_unresolved_terminal"] = False
+                def _mut_thin(p):
+                    p["allocation_descendants_applied"] = False
+                    p["children_loaded"] = False
+                    p["allocation_descendant_projection_pending"] = True
+                    p["allocation_descendants_replay_deferred_cold_start"] = not bool(user_initiated)
 
-                dmodel.update_payload_for_index(ix, _mut_loaded)
-                node_after = dict(ix.data(Qt.UserRole) or {})
-                if move_for_row is not None:
-                    self._stamp_allocation_projection_cache_metadata_index(ix, node_after, move_for_row)
-                self._refresh_destination_item_visibility_index(ix)
-                self._apply_tree_item_visual_state(None, ix.data(Qt.UserRole) or {})
+                dmodel.update_payload_for_index(ix, _mut_thin)
+                node_data = dict(ix.data(Qt.UserRole) or {})
+                log_info(
+                    "destination_planned_allocation_thin_leaf_corrected",
+                    path_excerpt=row_path_ex[:400],
+                )
             else:
-                if move_for_row is not None and not (node_data.get("allocation_projection_destination_path_saved") or "").strip():
-                    self._stamp_allocation_projection_cache_metadata_index(ix, dict(node_data), move_for_row)
-            if tree is not None:
-                tree.viewport().update()
-            return
+                if not bool(node_data.get("children_loaded")):
+
+                    def _mut_loaded(p):
+                        p["children_loaded"] = True
+                        p["projection_unresolved_terminal"] = False
+
+                    dmodel.update_payload_for_index(ix, _mut_loaded)
+                    node_after = dict(ix.data(Qt.UserRole) or {})
+                    if move_for_row is not None:
+                        self._stamp_allocation_projection_cache_metadata_index(ix, node_after, move_for_row)
+                    self._refresh_destination_item_visibility_index(ix)
+                    self._apply_tree_item_visual_state(None, ix.data(Qt.UserRole) or {})
+                else:
+                    if move_for_row is not None and not (node_data.get("allocation_projection_destination_path_saved") or "").strip():
+                        self._stamp_allocation_projection_cache_metadata_index(
+                            ix, dict(node_data), move_for_row
+                        )
+                if tree is not None:
+                    tree.viewport().update()
+                if not (self.node_is_planned_allocation(node_data) and not bool(node_data.get("allocation_descendants_applied"))):
+                    return
         if bool(node_data.get("planned_allocation_descendant")) and not node_data.get("ozlink_deferred_files_summary"):
 
             def _mut_desc(p):
@@ -67089,7 +67731,6 @@ class MainWindow(QMainWindow):
                     )
                 return
         move = move_for_row if move_for_row is not None else self._find_planned_move_for_destination_node(node_data)
-        graph_auth = destination_authority_contract.graph_owns_visible_real_destination_structure(self)
         if move is None:
             if self.node_is_planned_allocation(node_data):
 
@@ -67204,6 +67845,7 @@ class MainWindow(QMainWindow):
                             on_complete=_after_graph_proj_shell_pending,
                             enqueue_reason="load_projected_descendants_graph_shell_pending_folder_alloc",
                             collect_reason="load_projected_descendants_graph_shell_pending_folder_alloc",
+                            user_initiated=bool(user_initiated),
                         )
                     else:
                         if fen_ld:
@@ -67314,6 +67956,7 @@ class MainWindow(QMainWindow):
                         on_complete=_after_graph_proj_bypass,
                         enqueue_reason="load_projected_descendants_startup_visibility_bypass",
                         collect_reason="load_projected_descendants_startup_visibility_bypass",
+                        user_initiated=bool(user_initiated),
                     )
                     return
                 if fen_ld:
@@ -67347,6 +67990,7 @@ class MainWindow(QMainWindow):
                 on_complete=_after_graph_proj_children_loaded,
                 enqueue_reason="load_projected_descendants_children_loaded_graph_auth",
                 collect_reason="load_projected_descendants_children_loaded_graph_auth",
+                user_initiated=bool(user_initiated),
             )
             return
         self._remove_placeholder_children(ix)
@@ -67431,6 +68075,7 @@ class MainWindow(QMainWindow):
             _on_projected_descendants_applied,
             enqueue_reason="deferred_projected_descendants_after_placeholder_strip",
             collect_reason="deferred_projected_descendants_after_placeholder_strip",
+            user_initiated=bool(user_initiated),
         ):
             move_src = move.get("source", {}) or {}
             if bool(move_src.get("is_folder", True)):
@@ -67459,7 +68104,7 @@ class MainWindow(QMainWindow):
         if item is None:
             return
         if isinstance(item, QModelIndex):
-            self._load_destination_projected_descendants_index(item)
+            self._load_destination_projected_descendants_index(item, user_initiated=True)
 
     def _on_source_tree_item_collapsed(self, item):
         if not self._full_trace_enabled():
@@ -67764,11 +68409,15 @@ class MainWindow(QMainWindow):
 
             if panel_key == "destination":
                 _t_folder_success_dest = time.perf_counter()
-                pmi = worker_state.get("destination_folder_parent_persistent")
-                parent_index = QModelIndex(pmi) if pmi is not None and pmi.isValid() else QModelIndex()
-                if not parent_index.isValid():
-                    parent_index = self.destination_planning_model.find_index_by_drive_item(drive_id, item_id)
-                if not parent_index.isValid():
+                _lib_root = bool(worker_state.get("destination_graph_union_merge_at_model_root"))
+                if _lib_root:
+                    parent_index = QModelIndex()
+                else:
+                    pmi = worker_state.get("destination_folder_parent_persistent")
+                    parent_index = QModelIndex(pmi) if pmi is not None and pmi.isValid() else QModelIndex()
+                    if not parent_index.isValid():
+                        parent_index = self.destination_planning_model.find_index_by_drive_item(drive_id, item_id)
+                if not parent_index.isValid() and not _lib_root:
                     self._snapshot_branch_refresh_baseline_by_worker.pop(worker_key, None)
                     self._destination_preserved_children_by_worker.pop(worker_key, None)
                     self._log_worker_lifecycle(
@@ -67820,14 +68469,18 @@ class MainWindow(QMainWindow):
                 _col0_pre = parent_index.siblingAtColumn(0) if parent_index.column() != 0 else parent_index
                 _n_graph_items = len(items or [])
                 if destination_authority_contract.graph_owns_visible_real_destination_structure(self):
-                    _pp_snap = self._destination_semantic_path(dict(parent_index.data(Qt.UserRole) or {}))
+                    if _lib_root:
+                        _pp_snap = ""
+                    else:
+                        _pp_snap = self._destination_semantic_path(dict(parent_index.data(Qt.UserRole) or {}))
                     _expects_planned_under = bool(
                         _pp_snap and self._destination_folder_expects_planned_workspace_underneath(_pp_snap)
                     )
                     _only_loading_placeholder = False
+                    _p_rc = _col0_pre if _col0_pre.isValid() else QModelIndex()
                     try:
-                        if model is not None and _col0_pre.isValid() and int(model.rowCount(_col0_pre)) == 1:
-                            _oix = model.index(0, 0, _col0_pre)
+                        if model is not None and int(model.rowCount(_p_rc)) == 1:
+                            _oix = model.index(0, 0, _p_rc)
                             _opl = dict(_oix.data(Qt.UserRole) or {})
                             _only_loading_placeholder = bool(
                                 _opl.get("placeholder")
@@ -67838,7 +68491,7 @@ class MainWindow(QMainWindow):
                     _skip_snapshot_collect = (
                         _n_graph_items == 0 and not _expects_planned_under and _only_loading_placeholder
                     )
-                    if not _skip_snapshot_collect and _pp_snap:
+                    if not _skip_snapshot_collect and _pp_snap and not _lib_root:
                         try:
                             self._destination_graph_bind_presnapshot_overlay_scan(
                                 parent_index, parent_semantic_path=str(_pp_snap or "")
@@ -67904,10 +68557,14 @@ class MainWindow(QMainWindow):
                         )[:400],
                         returned_child_names_sample=_child_name_sample,
                     )
-                    _muni0 = _col0_pre if _col0_pre.isValid() else parent_index
-                    _p_union = str(_pp_snap or "").strip() or str(
-                        self._destination_semantic_path(dict((parent_index.data(Qt.UserRole) or {})))
-                    ).strip()
+                    if _lib_root:
+                        _muni0 = QModelIndex()
+                        _p_union = ""
+                    else:
+                        _muni0 = _col0_pre if _col0_pre.isValid() else parent_index
+                        _p_union = str(_pp_snap or "").strip() or str(
+                            self._destination_semantic_path(dict((parent_index.data(Qt.UserRole) or {})))
+                        ).strip()
                     self._destination_graph_folder_replace_active = True
                     try:
                         if not hasattr(model, "merge_graph_branch_union_at_parent"):
@@ -67920,10 +68577,11 @@ class MainWindow(QMainWindow):
                             )
                     finally:
                         self._destination_graph_folder_replace_active = False
-                    if "root3" in str(_p_union or "").casefold():
+                    if worker_state.get("graph_child_union_bootstrap"):
                         log_info(
-                            "destination_root3_graph_child_union_completed",
+                            "destination_graph_child_union_completed",
                             parent_path_excerpt=str(_p_union or "")[:500],
+                            graph_union_mode=str(worker_state.get("graph_union_mode") or "")[:32],
                         )
                     if not child_payloads:
                         try:
@@ -67964,7 +68622,8 @@ class MainWindow(QMainWindow):
                         p["needs_live_child_refresh"] = False
                         p["destination_snapshot_cached"] = False
 
-                    model.update_payload_for_index(parent_index, _mut_ok)
+                    if parent_index.isValid():
+                        model.update_payload_for_index(parent_index, _mut_ok)
                     log_info(
                         "destination_graph_children_verified_after_live_bind",
                         parent_path_excerpt=str(
@@ -68001,7 +68660,9 @@ class MainWindow(QMainWindow):
                     col0_planned = (
                         parent_index.siblingAtColumn(0) if parent_index.column() != 0 else parent_index
                     )
-                    if col0_planned.isValid() and planned_workspace_presnapshot:
+                    if _lib_root:
+                        col0_planned = QModelIndex()
+                    if (_lib_root or col0_planned.isValid()) and planned_workspace_presnapshot:
                         _st_recon = self._destination_invoke_planned_workspace_reconcile_after_graph_folder_load(
                             col0_planned,
                             list(planned_workspace_presnapshot),
@@ -77556,8 +78217,13 @@ class MainWindow(QMainWindow):
 
     def _count_visible_subtree_nodes_index(self, index: QModelIndex) -> int:
         model = getattr(self, "destination_planning_model", None)
-        if model is None or not index.isValid():
+        if model is None:
             return 0
+        if not index.isValid():
+            n = 0
+            for r in range(model.rowCount(QModelIndex())):
+                n += self._count_visible_subtree_nodes_index(model.index(r, 0, QModelIndex()))
+            return n
         count = 0
         stack = [index]
         while stack:

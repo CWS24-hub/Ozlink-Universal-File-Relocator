@@ -119,7 +119,7 @@ def _stress_mw(monkeypatch, *, n: int = 120):
     MainWindow._apply_tree_item_visual_state(mw, None, children[0])
     dm.append_child_payloads(hub_ix, children)
 
-    monkeypatch.setattr(mw, "_load_destination_projected_descendants_index", lambda ix: None)
+    monkeypatch.setattr(mw, "_load_destination_projected_descendants_index", lambda ix, **_: None)
     monkeypatch.setattr(mw, "_destination_path_effective_expanded_for_hydrate", lambda tree, ix, p: True)
     monkeypatch.setattr(mw, "node_is_planned_allocation", lambda nd: bool(nd.get("planned_allocation")))
 

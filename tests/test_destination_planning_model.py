@@ -60,6 +60,40 @@ def test_destination_model_replace_children_and_clear():
     assert model.rowCount(QModelIndex()) == 0
 
 
+def test_node_resolves_from_row_path_without_reading_stale_internal_id():
+    """_Node lookup must not depend on C++ internalPointer (use-after-free under concurrent model mutation)."""
+    model = DestinationPlanningTreeModel()
+    model.reset_root_payloads(
+        [
+            {
+                "base_display_label": "Folder: A",
+                "name": "A",
+                "is_folder": True,
+                "item_path": "A",
+            },
+        ]
+    )
+    root = model.index(0, 0, QModelIndex())
+    model.replace_all_children(
+        root,
+        [
+            {
+                "base_display_label": "B",
+                "name": "B",
+                "is_folder": True,
+                "item_path": r"A\B",
+            }
+        ],
+    )
+    b_ix = model.index(0, 0, root)
+    path = model._row_path_from_index(b_ix)
+    assert path is not None
+    assert path == (0, 0)
+    assert model._node_at_path(path) is not None
+    assert model._node(b_ix) is not None
+    assert model.is_index_live(b_ix) is True
+
+
 def test_rowcount_safe_when_internal_pointer_not_node():
     """Regression: stale/corrupt indexes must not assume internalPointer is _Node (avoids list._children)."""
     model = DestinationPlanningTreeModel()

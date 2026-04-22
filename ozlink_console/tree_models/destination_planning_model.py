@@ -153,7 +153,21 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         except RuntimeError:
             return False
 
-    def _node(self, index: QModelIndex) -> Optional[_Node]:
+    def _row_slot_references_node(self, n: _Node, row: int) -> bool:
+        pr = n.parent
+        if pr is None:
+            return False
+        ch = pr._children
+        if not ch or row < 0 or row >= len(ch):
+            return False
+        return ch[row] is n
+
+    def _internal_node_if_mounted(self, index: QModelIndex) -> Optional[_Node]:
+        """
+        Read internal id only when it is a structurally valid :class:`_Node` (avoids treating garbage as a node).
+        :meth:`parent` must use this — not :meth:`_node` — so ``QModelIndex.parent()`` can walk the tree
+        without circular calls into :meth:`_node` (path fallback uses that walk).
+        """
         try:
             if not index.isValid():
                 return None
@@ -165,7 +179,52 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         if not isinstance(p, _Node):
             self._log_invalid_internal_pointer_once(context="index_internal_pointer", ptr=p)
             return None
+        if not self._row_slot_references_node(p, int(index.row())):
+            return None
         return p
+
+    def _row_path_from_index(self, index: QModelIndex) -> Optional[Tuple[int, ...]]:
+        """Build (root-to-leaf) row path via :meth:`QModelIndex.parent` (valid after :meth:`parent` stays non-circular)."""
+        try:
+            if not index.isValid():
+                return None
+            m = index.model()
+            if m is not None and m is not self:
+                return None
+            path: List[int] = []
+            cur: QModelIndex = index
+            depth = 0
+            while cur.isValid():
+                path.append(int(cur.row()))
+                cur = cur.parent()
+                depth += 1
+                if depth > 1_000_000:
+                    return None
+            path.reverse()
+            return tuple(path) if path else None
+        except RuntimeError:
+            return None
+
+    def _node_at_path(self, path: Tuple[int, ...]) -> Optional[_Node]:
+        n: _Node = self._invisible
+        for r in path:
+            ch = n._children
+            if ch is None or r < 0 or r >= len(ch):
+                return None
+            nxt = ch[int(r)]
+            if not isinstance(nxt, _Node):
+                return None
+            n = nxt
+        return n
+
+    def _node(self, index: QModelIndex) -> Optional[_Node]:
+        n0 = self._internal_node_if_mounted(index)
+        if n0 is not None:
+            return n0
+        path = self._row_path_from_index(index)
+        if not path:
+            return None
+        return self._node_at_path(path)
 
     def index(self, row: int, column: int, parent: QModelIndex) -> QModelIndex:
         if column < 0 or column >= EXPLORER_COLUMN_COUNT or row < 0:
@@ -188,7 +247,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
     def parent(self, index: QModelIndex) -> QModelIndex:
         if not index.isValid():
             return QModelIndex()
-        node = self._node(index)
+        node = self._internal_node_if_mounted(index)
         if node is None or node.parent is None:
             return QModelIndex()
         parent_node = node.parent
@@ -1192,15 +1251,16 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         * Matching rows (by drive item id or full canonical child path) are upgraded in place.
         * New Graph-only children are inserted.
         * Existing planned/overlay/cached children stay unless explicitly matched to a Graph row.
+        * ``QModelIndex()`` (invalid) denotes the model root: children of the document library
+          (siblings under the invisible root).
         """
-        parent_col0 = parent.siblingAtColumn(0) if parent.isValid() and parent.column() != 0 else parent
-        if not parent_col0.isValid():
-            return {
-                "inserted": 0,
-                "upgraded": 0,
-                "preserved": 0,
-            }
-        parent_pl = self._node(parent_col0)
+        if not parent.isValid():
+            parent_col0 = QModelIndex()
+        else:
+            parent_col0 = parent.siblingAtColumn(0) if parent.column() != 0 else parent
+        if parent_col0.isValid() and parent_col0.column() != 0:
+            parent_col0 = parent_col0.siblingAtColumn(0)
+        parent_pl = self._node(parent_col0) if parent_col0.isValid() else None
         ppl: Dict[str, Any] = (
             parent_pl.payload if parent_pl is not None and isinstance(parent_pl.payload, dict) else {}
         ) or {}
@@ -1226,8 +1286,10 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
 
         def _child_cpath(n: str) -> str:
             nm = str(n or "").strip()
-            if not nm or not pcan:
+            if not nm:
                 return ""
+            if not pcan:
+                return normalize_manifest_path(nm)
             return normalize_manifest_path(f"{pcan}\\{nm}")
 
         log_info(
@@ -1315,6 +1377,11 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
                             p["children_loaded"] = True
                             p["graph_children_verified"] = False
                             p["needs_live_child_refresh"] = True
+                            log_info(
+                                "destination_graph_branch_union_child_marked_needs_refresh",
+                                child_path_excerpt=str(ch_path)[:500],
+                                graph_item_id_suffix=gid[-16:] if len(gid) > 16 else gid,
+                            )
                         else:
                             p["children_loaded"] = False
                             p["graph_children_verified"] = True

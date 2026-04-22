@@ -142,6 +142,11 @@ def _mw_graph_source_dest(monkeypatch):
     mw._ui_trace = lambda *a, **k: None
     mw._destination_visible_library_anchor_canonical_path = lambda: "Root3"
     mw._log_sharepoint_overlay_destination_anchor_normalized = lambda **_k: None
+    mw._ozlink_destination_graph_overlay_mode = MainWindow._ozlink_destination_graph_overlay_mode.__get__(
+        mw, MainWindow
+    )
+    # Partial MainWindow: descendant apply may mark snapshot dirty; skip full coalesce invariants in tests.
+    mw._mark_destination_tree_snapshot_dirty_after_injection = lambda *a, **k: None
     return mw, sm, dm
 
 
