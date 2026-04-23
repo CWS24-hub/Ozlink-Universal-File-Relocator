@@ -3103,6 +3103,11 @@ class MainWindow(QMainWindow):
         self._source_snapshot_mount_drive_id: str = ""
         # Session JSON had SourceTreeSnapshot roots before first loading placeholder (login ordering).
         self._source_snapshot_shell_prearmed: bool = False
+        # Set when user runs an explicit source refresh / repair (allows full projection + count during startup).
+        self._source_user_explicit_full_projection: bool = False
+        # Richer per-path nodes for faster shutdown branch preservation (optional; built lazily).
+        self._destination_shutdown_preservation_branch_index: dict[str, dict] | None = None
+        self._destination_post_shell_rich_rehydrate_scan_ran: bool = False
         # Next live Graph root bind should replace (not merge) — e.g. force_refresh / explicit resync.
         self._source_sharepoint_root_force_replace: bool = False
         # Cached canonical path set (casefold) from session destination_tree_snapshot JSON.
@@ -11107,14 +11112,59 @@ class MainWindow(QMainWindow):
                 _live_np = int(self._count_destination_model_non_placeholder_nodes())
             except Exception:
                 _live_np = -1
+            log_info("destination_shutdown_snapshot_enrichment_started")
             fresh = self._capture_tree_items_snapshot("destination")
-            rs = getattr(self, "_runtime_session_tree_snapshots", None)
-            if isinstance(rs, dict):
-                rs["destination"] = list(fresh or [])
+            try:
+                _n_b = int(self._count_tree_snapshot_nodes(fresh))
+            except Exception:
+                _n_b = -1
+            st_d = getattr(self, "_draft_shell_state", None)
+            ex_s = list(st_d.DestinationTreeSnapshot or []) if isinstance(st_d, SessionState) else []
+            rs0 = getattr(self, "_runtime_session_tree_snapshots", None)
+            rt_d = list(rs0.get("destination") or []) if isinstance(rs0, dict) else []
+            pr_w: list = []
+            mm0 = getattr(self, "memory_manager", None)
+            if mm0 is not None:
+                try:
+                    wso0 = mm0.read_workspace_snapshot_optional()  # type: ignore[union-attr]  # noqa: E501
+                    if isinstance(wso0, dict):
+                        pr_w = list(wso0.get("destination_tree_snapshot") or [])
+                        if not isinstance(pr_w, list):
+                            pr_w = []
+                except Exception:
+                    pr_w = []
+            h0 = self._destination_bounded_history_snapshot_source_lists()
+            try:
+                fresh = self._destination_enrich_persisted_destination_tree_snapshot(
+                    list(fresh or []),
+                    existing_session_roots=ex_s,
+                    runtime_session_roots=rt_d,
+                    prior_workspace_roots=pr_w,
+                    history_sources=h0,
+                    phase="shutdown_prepare",
+                )
+            except Exception as exc:
+                self._log_restore_exception("destination_shutdown_snapshot_enrich", exc)
             try:
                 _n = int(self._count_tree_snapshot_nodes(fresh))
             except Exception:
                 _n = -1
+            _delta_nodes = int(_n) - int(_n_b) if _n >= 0 and _n_b >= 0 else 0
+            log_info(
+                "destination_shutdown_snapshot_enrichment_completed",
+                recursive_nodes_before=int(_n_b),
+                recursive_nodes_after=int(_n),
+                preserved_branch_count=int(max(0, _delta_nodes)),
+            )
+            log_info(
+                "destination_shutdown_preservation_index_used",
+                had_runtime_index=bool(
+                    isinstance(getattr(self, "_destination_shutdown_preservation_branch_index", None), dict)
+                ),
+            )
+            rs = getattr(self, "_runtime_session_tree_snapshots", None)
+            if isinstance(rs, dict):
+                rs["destination"] = list(fresh or [])
             log_info(
                 "destination_shutdown_final_snapshot_capture",
                 destination_snapshot_recursive_nodes=int(_n),
@@ -11573,6 +11623,12 @@ class MainWindow(QMainWindow):
             elapsed_ms=round((time.perf_counter() - t_stop0) * 1000.0, 2),
         )
         self._application_shutting_down = True
+        try:
+            self._source_projection_restore_chunk_gen = int(getattr(self, "_source_projection_restore_chunk_gen", 0) or 0) + 1000
+            self._source_projection_restore_chunk_active = False
+            log_info("source_startup_deferred_work_cancelled_on_close", segment="source_projection_chunked_refresh")
+        except Exception:
+            pass
         self._shutdown_descendant_tick_skip_logs_suppressed = 0
         self._shutdown_descendant_tick_skip_event_logged = False
         # Descendant-apply queue clear is deferred until AFTER save (see close_post_save_descendant_apply_abort).
@@ -21153,6 +21209,20 @@ class MainWindow(QMainWindow):
             )
             self._update_source_count_labels(loaded_items)
             return
+        _cnt_ok, _cnt_why = self._source_should_run_startup_count_worker(str(drive_id))
+        if not _cnt_ok:
+            self._full_count_pending_drive_id_after_restore = str(drive_id)
+            log_info(
+                "source_startup_count_worker_blocked_policy",
+                root_path_count=0,
+                row_count=0,
+                reason=str(_cnt_why)[:120],
+            )
+            loaded_items = (
+                self.count_tree_items(self.source_tree_widget) if hasattr(self, "source_tree_widget") else 0
+            )
+            self._update_source_count_labels(loaded_items)
+            return
 
         if (
             self.full_count_worker is not None
@@ -27679,6 +27749,172 @@ class MainWindow(QMainWindow):
             replay_blocked_count=int(getattr(self, "_destination_startup_replay_blocked_count", 0) or 0),
             reason=str(reason or "")[:200],
         )
+        QTimer.singleShot(
+            0,
+            lambda: self._safe_invoke(
+                "destination_post_shell_rich_memory_rehydrate_scan",
+                self._destination_post_shell_rich_memory_rehydrate_scan,
+            ),
+        )
+        log_info("destination_startup_shell_work_completed", reason=str(reason or "")[:120])
+
+    def _destination_memory_rehydrate_eligibility_checked(
+        self, *, canonical_path: str, stored_descendants: int
+    ) -> dict[str, Any]:
+        c = str(self._destination_snapshot_norm_path(canonical_path) or canonical_path or "").casefold()
+        pcf = c
+        in_vis = self._destination_path_in_expanded_or_selected_startup_shell(pcf)
+        sel = self._collect_selected_tree_path("destination")
+        s_norm = (self._materialize_cached_destination_lookup_norm(str(sel or "")) or "").casefold() if sel else ""
+        in_sel = bool(
+            s_norm
+            and (
+                pcf == s_norm
+                or pcf.startswith(s_norm + "\\")
+                or s_norm.startswith(pcf + "\\")
+            )
+        )
+        is_pl = True
+        eligible = bool(
+            in_vis or in_sel or pcf in (getattr(self, "_destination_planned_user_opened_paths_cf", set()) or set())
+        ) and int(stored_descendants) > 0
+        dr = "ok" if eligible else ("not_in_visible_or_selected_chain" if not (in_vis or in_sel) else "no_stored_substance")
+        out = {
+            "canonical_path": str(canonical_path)[:500],
+            "in_visible_shell": bool(in_vis),
+            "in_selected_chain": bool(in_sel),
+            "is_planned_branch": bool(is_pl),
+            "stored_descendant_count": int(stored_descendants),
+            "eligible": bool(eligible),
+            "deny_reason": str(dr)[:64],
+        }
+        log_info("destination_memory_rehydrate_eligibility_checked", **out)
+        return out
+
+    def _destination_post_shell_rich_memory_rehydrate_scan(self) -> None:
+        """One bounded pass: rich planned branches in the memory snapshot that sit in the visible/expanded shell get a memory rehydrate.
+
+        Fires after startup replay relaxes so deep deferred expand is not the only way to repopulate shell rows.
+        """
+        if bool(getattr(self, "_application_shutting_down", False)):
+            return
+        if bool(getattr(self, "_destination_post_shell_rich_rehydrate_scan_ran", False)):
+            return
+        self._destination_post_shell_rich_rehydrate_scan_ran = True
+        dm = getattr(self, "destination_planning_model", None)
+        if dm is None or not hasattr(dm, "find_indices_for_canonical_destination_path"):
+            return
+        roots, t_src = self._destination_eager_destination_tree_snapshot_roots()
+        if not roots:
+            return
+        n_done = 0
+        n_cap = 36
+
+        def _consider(node: dict) -> bool:
+            nonlocal n_done
+            if n_done >= n_cap:
+                return True
+            if not isinstance(node, dict):
+                return False
+            d0 = node.get("data") if isinstance(node.get("data"), dict) else None
+            if not isinstance(d0, dict) or d0.get("placeholder"):
+                for ch in node.get("children") or []:
+                    if isinstance(ch, dict) and _consider(ch):
+                        return True
+                return False
+            if not self._destination_snapshot_data_planned_allocationish(d0):
+                for ch in node.get("children") or []:
+                    if isinstance(ch, dict) and _consider(ch):
+                        return True
+                return False
+            pth = self._destination_extract_branch_snapshot_path(d0)
+            stn = self._destination_branch_stats_for_snapshot_node(node)
+            sd = int(stn.get("descendants", 0) or 0)
+            if sd < 4:
+                for ch in node.get("children") or []:
+                    if isinstance(ch, dict) and _consider(ch):
+                        return True
+                return False
+            el = self._destination_memory_rehydrate_eligibility_checked(
+                canonical_path=pth, stored_descendants=sd
+            )
+            if not el.get("eligible"):
+                for ch in node.get("children") or []:
+                    if isinstance(ch, dict) and _consider(ch):
+                        return True
+                return False
+            n_done += 1
+            ixs = dm.find_indices_for_canonical_destination_path(str(pth).strip()) or []  # type: ignore[union-attr]  # noqa: E501
+            ix0 = ixs[0] if ixs and ixs[0].isValid() else None
+            if ix0 is None or not isinstance(ix0, QModelIndex) or not ix0.isValid():
+                log_info(
+                    "destination_visible_shell_branch_memory_rehydrate_skipped",
+                    canonical_path=pth[:500],
+                    skip_reason="no_model_index",
+                )
+                for ch in node.get("children") or []:
+                    if isinstance(ch, dict) and _consider(ch):
+                        return True
+                return False
+            if hasattr(dm, "is_index_live") and not dm.is_index_live(ix0.siblingAtColumn(0) if ix0.column() else ix0):
+                log_info(
+                    "destination_visible_shell_branch_memory_rehydrate_skipped",
+                    canonical_path=pth[:500],
+                    skip_reason="index_not_live",
+                )
+                for ch in node.get("children") or []:
+                    if isinstance(ch, dict) and _consider(ch):
+                        return True
+                return False
+            mv = self._find_planned_move_for_destination_node((ix0.data(Qt.UserRole) or {}) if ix0 else {})
+            if not isinstance(mv, dict):
+                log_info(
+                    "destination_visible_shell_branch_memory_rehydrate_skipped",
+                    canonical_path=pth[:500],
+                    skip_reason="no_planned_move",
+                )
+                for ch in node.get("children") or []:
+                    if isinstance(ch, dict) and _consider(ch):
+                        return True
+                return False
+            log_info(
+                "destination_visible_shell_branch_marked_for_memory_rehydrate",
+                canonical_path=pth[:500],
+                reason="rich_snapshot_in_visible_or_selected",
+            )
+            c0 = ix0.siblingAtColumn(0) if ix0.column() != 0 else ix0
+            log_info(
+                "destination_visible_shell_branch_memory_rehydrate_started",
+                canonical_path=pth[:500],
+                source=f"post_shell_scan+{t_src}"[:64],
+                stored_descendant_count=int(sd),
+            )
+            rh = self._destination_rehydrate_visible_branch_from_memory_snapshot(
+                c0, mv, audit_ctx="post_shell_rich_branch_scan"
+            )
+            v2 = -1
+            try:
+                v2 = int(self._destination_visible_descendant_counts_for_index(dm, c0)[1] or 0)
+            except Exception:
+                v2 = -1
+            log_info(
+                "destination_visible_shell_branch_memory_rehydrate_completed",
+                canonical_path=pth[:500],
+                source=str(rh.get("rehydrate_source") or "")[:32],
+                inserted_rows=int(rh.get("inserted_rows") or 0),
+                resulting_visible_descendants=int(v2),
+            )
+            for ch in node.get("children") or []:
+                if isinstance(ch, dict) and _consider(ch):
+                    return True
+            return n_done >= n_cap
+
+        try:
+            for r0 in roots:
+                if isinstance(r0, dict) and _consider(r0):
+                    break
+        except Exception as exc:
+            self._log_restore_exception("destination_post_shell_rich_memory_rehydrate_scan", exc)
 
     def _destination_memory_snapshot_quality_metrics(self, roots_list: list) -> dict[str, int]:
         """Snapshot JSON counts for ``destination_memory_snapshot_quality_metrics`` diagnostics (lightweight)."""
@@ -28296,12 +28532,22 @@ class MainWindow(QMainWindow):
             bool((pl or {}).get("allocation_descendants_applied"))
             and int(assess.get("visible_descendant_count") or 0) < int(assess.get("stored_descendant_count") or 0)
         )
-        if should_try_rehydrate and not self._destination_should_run_branch_local_startup_work(
-            canonical_path=canon,
-            work_kind="visible_memory_rehydrate",
-            explicit_repair=bool(explicit_repair_authorized),
-        ):
-            should_try_rehydrate = False
+        if should_try_rehydrate and not bool(explicit_repair_authorized):
+            _br = self._destination_should_run_branch_local_startup_work(
+                canonical_path=canon,
+                work_kind="visible_memory_rehydrate",
+                explicit_repair=False,
+            )
+            if not _br and int(assess.get("stored_descendant_count") or 0) >= 4 and bool(
+                assess.get("visible_underrepresents_memory")
+            ):
+                _el = self._destination_memory_rehydrate_eligibility_checked(
+                    canonical_path=canon,
+                    stored_descendants=int(assess.get("stored_descendant_count") or 0),
+                )
+                _br = bool(_el.get("eligible"))
+            if not _br:
+                should_try_rehydrate = False
         if should_try_rehydrate:
             if bool((pl or {}).get("allocation_descendants_applied")) and int(assess.get("visible_descendant_count") or 0) < int(
                 assess.get("stored_descendant_count") or 0
@@ -33367,6 +33613,49 @@ class MainWindow(QMainWindow):
             return False
         return snap_fp == mod_fp
 
+    def _source_should_run_startup_projection_refresh(
+        self,
+        *,
+        phase_name: str,
+        path_count: int,
+        root_path_count: int,
+        subtree_scope: str,
+    ) -> tuple[bool, str]:
+        """Broad source relationship / subtree projection refresh during memory-restore or destination startup.
+
+        Returns (allowed, reason). When False, caller should defer to explicit user refresh, post-startup idle,
+        or a cheap ``roots_only`` shell pass (handled by the caller).
+        """
+        ph = str(phase_name or "")
+        if bool(getattr(self, "_source_user_explicit_full_projection", False)):
+            return True, "explicit_user_full_projection"
+        if not bool(getattr(self, "_destination_startup_phase_active", False)) and not bool(
+            getattr(self, "_memory_restore_in_progress", False)
+        ) and not bool(getattr(self, "_memory_restore_background_trees", False)):
+            return True, "not_startup_or_restore"
+        # Cheap path: only root rows, narrow — always allow.
+        if str(subtree_scope or "") == "roots_only" and int(path_count) <= 16 and int(root_path_count) <= 12:
+            return True, "roots_only_bounded"
+        mem = bool(getattr(self, "_memory_restore_in_progress", False) or getattr(self, "_memory_restore_background_trees", False))
+        if mem and (int(root_path_count) > 3 or int(path_count) > 6):
+            return False, "memory_restore_broad_paths"
+        st = bool(getattr(self, "_destination_startup_phase_active", False))
+        if st and ("deferred" in ph.lower() or "graph_ids" in ph.lower() or "source_projection_deferred" in ph):
+            if int(path_count) > 4 or int(root_path_count) > 2:
+                return False, "startup_broad_deferred_graph_projection"
+        if st and str(subtree_scope or "") == "full" and (int(path_count) > 8 or int(root_path_count) > 3):
+            return False, "startup_full_subtree_scope_too_broad"
+        return True, "default_allow"
+
+    def _source_should_run_startup_count_worker(self, _drive_id: str) -> tuple[bool, str]:
+        if bool(getattr(self, "_source_user_explicit_full_projection", False)):
+            return True, "explicit_user_authorized"
+        if self._memory_restore_blocks_source_full_count():
+            return False, "memory_restore_or_background_trees"
+        if bool(getattr(self, "_destination_startup_phase_active", False)):
+            return False, "destination_startup_phase_active"
+        return True, "post_startup"
+
     def _refresh_source_projection_for_paths(
         self,
         paths,
@@ -33433,6 +33722,51 @@ class MainWindow(QMainWindow):
                 refreshed_item_count=0,
                 reason="no_visible_target_paths",
             )
+            return
+        _est_roots = int(len(self._minimal_descendant_cover_paths(set(normalized_paths)) or set()))
+        _sc = str(subtree_scope or "full")
+        _allow, _why = self._source_should_run_startup_projection_refresh(
+            phase_name=str(phase_name or ""),
+            path_count=int(len(normalized_paths)),
+            root_path_count=_est_roots,
+            subtree_scope=_sc,
+        )
+        log_info(
+            "source_projection_auth_classified",
+            auth_class=("source_startup_shell_restore" if _sc == "roots_only" else "source_deep_projection_validation")
+            if _allow
+            else "deferred_or_blocked",
+            row_count=int(len(normalized_paths)),
+            root_path_count=int(_est_roots),
+            phase_name_excerpt=str(phase_name or "")[:120],
+        )
+        if not _allow:
+            log_info(
+                "source_startup_projection_refresh_blocked_policy",
+                root_path_count=int(_est_roots),
+                row_count=int(len(normalized_paths)),
+                reason=str(_why)[:120],
+            )
+            log_info(
+                "source_projection_refresh_deferred_until_explicit_or_idle",
+                row_count=int(len(normalized_paths)),
+                root_path_count=int(_est_roots),
+            )
+            if _sc == "full" and _est_roots > 0:
+                log_info(
+                    "source_projection_auth_classified",
+                    auth_class="source_startup_shell_restore",
+                    row_count=min(12, int(len(normalized_paths))),
+                    root_path_count=min(8, int(_est_roots)),
+                    phase_name_excerpt="downgrade_roots_only_after_block",
+                )
+                self._refresh_source_projection_for_paths(
+                    set(list(normalized_paths)[:8]),
+                    str(phase_name or "") + "_startup_shell_only",
+                    trigger_path=trigger_path,
+                    source_perf_move_origin=source_perf_move_origin,
+                    subtree_scope="roots_only",
+                )
             return
 
         self._rebuild_submission_visual_cache()
