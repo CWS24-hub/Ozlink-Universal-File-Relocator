@@ -3144,11 +3144,18 @@ class MainWindow(QMainWindow):
         self._destination_startup_replay_summary_logged: bool = False
         # Graph SharePoint: startup phase is cleared once post-shell rehydrate + shell bind complete (not idle-timer only).
         self._destination_graph_startup_phase_completion_key: str = ""
+        # When True, startup phase may complete even if the deferred user-expand queue is non-empty (intentional suppress).
+        self._destination_graph_startup_deferred_queue_suppressed_for_phase_completion: bool = False
         # Per-session: branches that completed post-shell memory rehydrate; later expands take light paths only.
         self._destination_post_shell_rehydrate_branches_cf: set[str] = set()
         # User-authored planning dirty (not generic UI/tree churn) for save prompts + recovery journal.
         self._session_user_edited_unsaved: bool = False
         self._session_user_edited_unsaved_count: int = 0
+        # One-time planning recovery dialog per app session; single arming of startup timer from try_restore.
+        self._recovery_prompt_handled_this_session: bool = False
+        self._planning_recovery_checkpoint_timer_armed: bool = False
+        # Set during :meth:`_load_destination_projected_descendants_index` (explicit repair vs normal expand).
+        self._destination_current_projected_load_explicit_repair: bool = False
         # Explicit full save from UI (enables force-live destination snapshot while saving).
         self._explicit_session_save_user_triggered: bool = False
         # Close: skip last draft write when user chooses "Don't save".
@@ -9066,9 +9073,13 @@ class MainWindow(QMainWindow):
 
     def _destination_force_live_snapshot_allowed(self) -> bool:
         """Force-live destination snapshot walk is UI-heavy; allow only during save or shutdown capture."""
-        return bool(getattr(self, "_destination_save_in_progress", False)) or bool(
-            getattr(self, "_application_shutting_down", False)
-        )
+        if bool(getattr(self, "_destination_save_in_progress", False)):
+            return True
+        if bool(getattr(self, "_application_shutting_down", False)):
+            return True
+        if bool(getattr(self, "_explicit_session_save_user_triggered", False)):
+            return True
+        return False
 
     def _refresh_runtime_tree_snapshot(self, panel_key):
         if panel_key not in {"source", "destination"}:
@@ -11644,8 +11655,8 @@ class MainWindow(QMainWindow):
                 dirty_count=int(getattr(self, "_session_user_edited_unsaved_count", 0) or 0),
             )
             box = QMessageBox(self)
-            box.setWindowTitle("Unsaved planning")
-            box.setText("Save your planning changes before closing?")
+            box.setWindowTitle("Unsaved changes")
+            box.setText("You have unsaved changes. Do you want to save before exiting?")
             box.setIcon(QMessageBox.Question)
             _bs = (
                 QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel
@@ -11654,17 +11665,17 @@ class MainWindow(QMainWindow):
             box.setDefaultButton(QMessageBox.Save)
             res = int(box.exec())
             if res == int(QMessageBox.Cancel):
-                log_info("close_prompt_save_choice", choice="cancel")
+                log_info("close_prompt_choice", choice="cancel")
                 try:
                     event.ignore()
                 except Exception:
                     pass
                 return
             if res == int(QMessageBox.Discard):
-                log_info("close_prompt_save_choice", choice="dont_save")
+                log_info("close_prompt_choice", choice="dont_save")
                 self._close_event_skip_draft_persist = True
             else:
-                log_info("close_prompt_save_choice", choice="save")
+                log_info("close_prompt_choice", choice="save")
                 self._explicit_session_save_user_triggered = True
                 try:
                     self._save_draft_shell(force=True, include_workspace_ui=True)
@@ -28275,17 +28286,30 @@ class MainWindow(QMainWindow):
             rsn = "post_shell_rehydrate_incomplete"
         else:
             rsn = "ready"
+        _q_bypass = bool(
+            getattr(self, "_destination_graph_startup_deferred_queue_suppressed_for_phase_completion", False)
+        )
+        if sh and rehydr and qn > 0 and not _q_bypass and qn >= 0:
+            rsn = f"{rsn}+deferred_expand_pending" if rsn != "wait" else "deferred_expand_pending"
         log_info(
             "destination_graph_startup_phase_completion_check",
             startup_phase=in_start,
             shell_bound=bool(sh),
             post_shell_rehydrate_done=bool(rehydr),
             deferred_expand_pending_count=int(qn) if qn >= 0 else -1,
+            deferred_queue_suppressed_for_phase=bool(_q_bypass),
             reason=rsn[:80],
         )
         if not sh or not rehydr:
             return
-        self._destination_mark_graph_startup_phase_complete(
+        if qn > 0 and not _q_bypass and qn >= 0:
+            log_info(
+                "destination_graph_startup_phase_waiting_deferred_expand_queue",
+                pending_deferred_count=int(qn),
+                reason=str(reason or "")[:200],
+            )
+            return
+        self._destination_mark_startup_phase_complete(
             reason=str(reason or "")[:200], drive_id=str(self._current_selected_destination_drive_id() or "")[:120]
         )
 
@@ -28337,6 +28361,16 @@ class MainWindow(QMainWindow):
                 save_count=0,
             )
             self._destination_startup_shell_persistence_pending_dirty = False
+
+    def _destination_mark_startup_phase_complete(
+        self, *, reason: str, drive_id: str, pending_deferred_count: int = -1
+    ) -> None:
+        """API alias: deterministic Graph destination startup phase completion (sets ``_destination_startup_phase_active = False``)."""
+        self._destination_mark_graph_startup_phase_complete(
+            reason=str(reason or "")[:200],
+            drive_id=str(drive_id or "")[:120],
+            pending_deferred_count=int(pending_deferred_count),
+        )
 
     def _destination_memory_rehydrate_eligibility_checked(
         self,
@@ -28659,10 +28693,11 @@ class MainWindow(QMainWindow):
             return True, "pre_full_init_or_test_harness"
         if bool(getattr(self, "_destination_startup_phase_active", False)):
             return True, "startup_phase_full_projection"
-        return (
-            False,
-            "post_startup_requires_explicit_repair_for_full_source_subtree",
-        )
+        if not destination_authority_contract.graph_owns_visible_real_destination_structure(
+            self
+        ) or not self._destination_memory_overlay_mode_enabled():
+            return True, "non_graph_or_non_overlay_uses_default_collect_policy"
+        return (False, "post_startup_graph_overlay_requires_explicit_user_repair")
 
     def _destination_shell_persist_heavy_deferred(self) -> bool:
         """True while Graph destination startup shell is still in its heavy phase (no full tree autosave)."""
@@ -28713,7 +28748,23 @@ class MainWindow(QMainWindow):
         except Exception:
             return None
 
-    def _touch_planning_user_checkpoint(self) -> None:
+    def _planning_user_checkpoint_meta_path(self) -> Path | None:
+        p = self._planning_user_checkpoint_path()
+        if p is None:
+            return None
+        return p.parent / "PlanningUserCheckpoint.meta.json"
+
+    def _read_planning_user_checkpoint_meta(self) -> dict[str, Any] | None:
+        mp = self._planning_user_checkpoint_meta_path()
+        if mp is None or not mp.is_file():
+            return None
+        try:
+            raw = json.loads(mp.read_text(encoding="utf-8"))
+            return raw if isinstance(raw, dict) else None
+        except Exception:
+            return None
+
+    def _touch_planning_user_checkpoint(self, *, change_count: int | None = None) -> None:
         p = self._planning_user_checkpoint_path()
         if p is None:
             return
@@ -28722,18 +28773,164 @@ class MainWindow(QMainWindow):
             p.write_text("pending\n", encoding="utf-8")
         except OSError:
             return
+        mp = self._planning_user_checkpoint_meta_path()
+        if mp is not None:
+            try:
+                try:
+                    local = datetime.now().astimezone()
+                    saved_at = local.strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    saved_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+                d = {
+                    "saved_at": saved_at,
+                    "change_count": int(change_count) if change_count is not None else 0,
+                }
+                mp.write_text(json.dumps(d, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            except OSError:
+                pass
 
     def _clear_planning_user_checkpoint(self) -> None:
         p = self._planning_user_checkpoint_path()
         if p is None:
             return
+        mp = self._planning_user_checkpoint_meta_path()
         try:
             if p.is_file():
                 p.unlink()
         except OSError:
-            return
+            pass
+        if mp is not None:
+            try:
+                if mp.is_file():
+                    mp.unlink()
+            except OSError:
+                pass
 
-    def _flush_recovery_journal_lightweight(self) -> int:
+    def _archive_planning_user_checkpoint(self) -> str | None:
+        """Move ``PlanningUserCheckpoint.pending`` to a timestamped name in the same directory."""
+        p = self._planning_user_checkpoint_path()
+        mp = self._planning_user_checkpoint_meta_path()
+        if p is None or not p.is_file():
+            if mp is not None:
+                try:
+                    if mp.is_file():
+                        mp.unlink()
+                except OSError:
+                    pass
+            return None
+        try:
+            dest = p.parent / f"PlanningUserCheckpoint.reviewed.{int(time.time())}.archived"
+            _shutil.move(str(p), str(dest))
+            if mp is not None:
+                try:
+                    if mp.is_file():
+                        mp.unlink()
+                except OSError:
+                    pass
+            return str(dest)
+        except OSError:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+            if mp is not None:
+                try:
+                    if mp.is_file():
+                        mp.unlink()
+                except OSError:
+                    pass
+            return None
+
+    def _apply_planning_recovery_from_recovery_disk_mirrors(self) -> tuple[int, int]:
+        """Copy recovery JSON mirrors into primaries and rebuild runtime planning rows (allocations + proposed)."""
+        mm = getattr(self, "memory_manager", None)
+        if mm is None:
+            return 0, 0
+        try:
+            a_rec = Path(mm.paths["allocations_recovery"])
+            p_rec = Path(mm.paths["proposed_recovery"])
+            a_pri = Path(mm.paths["allocations"])
+            p_pri = Path(mm.paths["proposed"])
+        except Exception:
+            return 0, 0
+        n_alloc = 0
+        n_prop = 0
+        try:
+            if a_rec.is_file() and a_pri.parent.is_dir():
+                _shutil.copy2(a_rec, a_pri)
+            if p_rec.is_file() and p_pri.parent.is_dir():
+                _shutil.copy2(p_rec, p_pri)
+        except OSError:
+            return 0, 0
+        try:
+            alloc_rows = list(mm.load_allocations())
+            n_alloc = int(len(alloc_rows))
+        except Exception:
+            alloc_rows = []
+        try:
+            proposed_rows = list(mm.load_proposed())
+            n_prop = int(len(proposed_rows))
+        except Exception:
+            proposed_rows = []
+        self.planned_moves = [self._build_restored_planned_move_record(row) for row in alloc_rows]
+        self.proposed_folders = list(proposed_rows)
+        try:
+            self._ensure_proposed_folders_stable_keys_assigned()
+        except Exception:
+            pass
+        try:
+            self._reset_unresolved_proposed_queue()
+            self._reset_unresolved_allocation_queue()
+        except Exception:
+            pass
+        try:
+            self._clear_source_projection_descendants_cache(
+                reason="planning_recovery_from_recovery_mirrors",
+                caller="_apply_planning_recovery_from_recovery_disk_mirrors",
+            )
+        except Exception:
+            pass
+        try:
+            self._sync_restore_destination_overlay_pending_from_unresolved_queues()
+        except Exception:
+            pass
+        try:
+            self.refresh_planned_moves_table()
+        except Exception:
+            pass
+        try:
+            _st = self._draft_shell_state
+            self._destination_filter_restored_planning_against_session_identity(
+                _st if isinstance(_st, SessionState) else SessionState(),
+                context="planning_recovery_from_recovery_mirrors",
+            )
+        except Exception:
+            pass
+        self._mark_session_dirty_from_user_edit(reason="planning_recovery_restore")
+        return n_alloc, n_prop
+
+    def _planning_recovery_user_dialog_informative_lines(self) -> str:
+        meta = self._read_planning_user_checkpoint_meta()
+        if meta and meta.get("saved_at") is not None:
+            try:
+                sc = int(meta.get("change_count") or 0)
+            except (TypeError, ValueError):
+                sc = 0
+            return (
+                f"Saved at: {str(meta.get('saved_at') or '')}\n"
+                f"Changes: {sc} edits (allocation + proposed rows in recovery files)"
+            )
+        p = self._planning_user_checkpoint_path()
+        if p is not None and p.is_file():
+            try:
+                t = p.stat().st_mtime
+                ts = datetime.fromtimestamp(t, tz=timezone.utc).astimezone()
+                return f"Saved at: {ts:%Y-%m-%d %H:%M} (no detail file)"
+            except Exception:
+                return ""
+        return ""
+
+    def _flush_recovery_journal_lightweight(self, *, touch_pending_checkpoint: bool = True) -> int:
         """Allocations + proposed to disk; no full session JSON / destination tree walk."""
         mm = getattr(self, "memory_manager", None)
         if mm is None:
@@ -28744,10 +28941,11 @@ class MainWindow(QMainWindow):
         pr = self._build_memory_proposed_folders()
         n = int(len(ar)) + int(len(pr))
         _pctx = self._planning_persist_context(save_reason=_save_ctx)
-        try:
-            self._touch_planning_user_checkpoint()
-        except Exception:
-            pass
+        if touch_pending_checkpoint:
+            try:
+                self._touch_planning_user_checkpoint(change_count=int(n))
+            except Exception:
+                pass
         try:
             mm.save_allocations(
                 ar,
@@ -37824,6 +38022,7 @@ class MainWindow(QMainWindow):
                         or ""
                     ).strip()
                     self._destination_sharepoint_root_graph_bound_drive_id = did_empty
+                    self._destination_maybe_finish_graph_startup_phase(reason="sharepoint_root_graph_bound_empty_library")
                     self._destination_full_library_reconcile_pending = True
                     self._destination_authority_pending_shell = True
                     self._destination_non_authoritative_shell_active = True
@@ -37942,6 +38141,7 @@ class MainWindow(QMainWindow):
                     )
                 did_shell = did_shell_early
                 self._destination_sharepoint_root_graph_bound_drive_id = did_shell
+                self._destination_maybe_finish_graph_startup_phase(reason="sharepoint_root_graph_bound")
                 merge_stats: dict | None = None
                 if snap_preserving:
                     self._destination_full_library_reconcile_pending = False
@@ -49703,6 +49903,8 @@ class MainWindow(QMainWindow):
         collect_reason: str = "",
         user_initiated: bool = False,
         idle_bounded: bool = False,
+        explicit_repair_authorized: bool = False,
+        expand_auth_class: str | None = None,
     ):
         """Graph-authority allocation descendant projection: chunked (see :meth:`_decorate_destination_graph_subtree_for_allocation_move`)."""
         self._alloc_apply_sibling_reconcile_coalesce_key = None
@@ -49769,7 +49971,13 @@ class MainWindow(QMainWindow):
             caller="_build_destination_graph_allocation_descendant_apply_state",
         )
         descendants = self._sort_descendants_for_allocation_apply(
-            self._collect_source_descendants_for_projection(source_root_data, move, collect_reason=cr)
+            self._collect_source_descendants_for_projection(
+                source_root_data,
+                move,
+                collect_reason=cr,
+                expand_auth_class=expand_auth_class,
+                explicit_repair_authorized=bool(explicit_repair_authorized),
+            )
         )
         if not descendants:
             log_info(
@@ -49892,6 +50100,8 @@ class MainWindow(QMainWindow):
         collect_reason: str = "",
         user_initiated: bool = False,
         idle_bounded: bool = False,
+        explicit_repair_authorized: bool = False,
+        expand_auth_class: str | None = None,
     ):
         self._alloc_apply_sibling_reconcile_coalesce_key = None
         model = getattr(self, "destination_planning_model", None)
@@ -49915,6 +50125,8 @@ class MainWindow(QMainWindow):
                 collect_reason=collect_reason,
                 user_initiated=bool(user_initiated),
                 idle_bounded=bool(idle_bounded),
+                explicit_repair_authorized=bool(explicit_repair_authorized),
+                expand_auth_class=expand_auth_class,
             )
         parent_data = parent_ix.data(Qt.UserRole) or {}
         allocation_destination_path = self._canonical_destination_projection_path(
@@ -49935,7 +50147,13 @@ class MainWindow(QMainWindow):
             return None
         source_root_path = self._canonical_source_projection_path(self._tree_item_path(source_root_data))
         cr = str(collect_reason or "").strip() or str(enqueue_reason or "").strip() or "destination_descendant_apply_non_graph"
-        descendants = self._collect_source_descendants_for_projection(source_root_data, move, collect_reason=cr)
+        descendants = self._collect_source_descendants_for_projection(
+            source_root_data,
+            move,
+            collect_reason=cr,
+            expand_auth_class=expand_auth_class,
+            explicit_repair_authorized=bool(explicit_repair_authorized),
+        )
         descendants = self._sort_descendants_for_allocation_apply(descendants)
         if not descendants:
             log_info(
@@ -51252,10 +51470,17 @@ class MainWindow(QMainWindow):
                         parent_ix, move, on_complete = ent[0], ent[1], ent[2]
                         enq_r, col_r = "", ""
                     u_i, idle_b = False, False
+                    exp_repair_g = False
+                    eac_g: str | None = None
                     if len(ent) >= 6:
                         u_i = bool(ent[5])
                     if len(ent) >= 7:
                         idle_b = bool(ent[6])
+                    if len(ent) >= 8:
+                        exp_repair_g = bool(ent[7])
+                    if len(ent) >= 9:
+                        _eac_s = str(ent[8] or "")[:64] or ""
+                        eac_g = _eac_s if _eac_s else None
                     st = self._build_destination_descendant_apply_state(
                         parent_ix,
                         move,
@@ -51264,6 +51489,8 @@ class MainWindow(QMainWindow):
                         collect_reason=str(col_r or ""),
                         user_initiated=u_i,
                         idle_bounded=idle_b,
+                        explicit_repair_authorized=bool(exp_repair_g),
+                        expand_auth_class=eac_g,
                     )
                     if st is None:
                         if on_complete is not None:
@@ -51892,17 +52119,12 @@ class MainWindow(QMainWindow):
             ),
         )
         _auth_gate = str(expand_auth_class or "").strip() or str(_auth_class_enq)
-        e_low = str(enqueue_reason or "").lower()
-        _looks_like_deferred_bypass = (
-            "deferred_user_expand" in e_low
-            or "startup_visibility_bypass" in e_low
-            or ("load_projected" in e_low and "bypass" in e_low)
-        )
         if (
-            _looks_like_deferred_bypass
-            and bool(user_initiated)
+            not bool(getattr(self, "_destination_startup_phase_active", False))
+            and _graph_auth_enqueue
+            and self._destination_memory_overlay_mode_enabled()
             and not bool(explicit_repair_authorized)
-            and _auth_gate not in ("explicit_user_repair",)
+            and str(_auth_gate or _auth_class_enq or "") != "explicit_user_repair"
         ):
             pl_gate = dict(parent_ix.data(Qt.UserRole) or {})
             _pth_g = str(
@@ -51911,7 +52133,7 @@ class MainWindow(QMainWindow):
             log_info(
                 "destination_replay_hard_blocked_non_explicit_auth",
                 canonical_path=_pth_g,
-                auth_class=str(_auth_gate)[:40],
+                auth_class=str(_auth_gate or _auth_class_enq or "")[:40],
                 enqueue_reason=str(enqueue_reason or "")[:200],
                 explicit_repair_authorized=bool(explicit_repair_authorized),
             )
@@ -57872,7 +58094,15 @@ class MainWindow(QMainWindow):
             note="write_copy_deepclone",
         )
 
-    def _collect_source_descendants_for_projection(self, source_root_data, move=None, *, collect_reason: str = ""):
+    def _collect_source_descendants_for_projection(
+        self,
+        source_root_data,
+        move=None,
+        *,
+        collect_reason: str = "",
+        expand_auth_class: str | None = None,
+        explicit_repair_authorized: bool | None = None,
+    ):
         """Enumerate allocation source descendants for destination projection.
 
         When ``drive_id`` and ``id`` are available on the source root (after enrichment), Microsoft Graph
@@ -57890,6 +58120,40 @@ class MainWindow(QMainWindow):
         )
         source_item = self._find_source_item_for_planned_move(move)
         base_diag = self._destination_projection_diag_payload(source_root_data, move, source_item)
+        _in_su = bool(getattr(self, "_destination_startup_phase_active", False))
+        _cr0 = str(collect_reason or "")
+        _eac0 = (str(expand_auth_class).strip() if expand_auth_class is not None else "").strip() or str(
+            getattr(self, "_destination_load_expand_auth_class", "") or ""
+        ).strip() or self._destination_infer_expand_auth_class()
+        if explicit_repair_authorized is not None:
+            _ex0 = bool(explicit_repair_authorized)
+        else:
+            _ex0 = bool(getattr(self, "_destination_current_projected_load_explicit_repair", False))
+        _graph_ov = (
+            destination_authority_contract.graph_owns_visible_real_destination_structure(self)
+            and self._destination_memory_overlay_mode_enabled()
+        )
+        _internal0 = any(
+            x in _cr0
+            for x in (
+                "destination_descendant_snapshot_reuse",
+                "pilot_transfer_picker",
+                "future_model_project",
+            )
+        ) or ("reuse" in _cr0.lower() and "assess" in _cr0.lower()) or "startup_visibility" in _cr0
+        if _graph_ov and not _in_su and not _internal0:
+            if str(_eac0) != "explicit_user_repair" and not _ex0:
+                try:
+                    sp0 = str(self._canonical_source_projection_path(self._tree_item_path(source_root_data)) or "")[:400]
+                except Exception:
+                    sp0 = ""
+                log_info(
+                    "projection_source_descendants_collect_hard_blocked_non_explicit_repair",
+                    collect_reason=_cr0[:200],
+                    expand_auth_class=str(_eac0)[:40],
+                    source_root_path_excerpt=sp0,
+                )
+                return []
 
         drive_id = str(source_root_data.get("drive_id", "") or "").strip()
         item_id = str(source_root_data.get("id", "") or "").strip()
@@ -59330,6 +59594,7 @@ class MainWindow(QMainWindow):
         if not bool(getattr(self, "_destination_expand_queue_paused", False)):
             return
         self._destination_expand_queue_paused = False
+        self._destination_graph_startup_deferred_queue_suppressed_for_phase_completion = False
         log_info("destination_expand_queue_resumed", reason=str(reason or "")[:120])
         if self._destination_expand_user_deferred_queue:
             self._schedule_destination_expand_user_deferred_drain(
@@ -59766,6 +60031,10 @@ class MainWindow(QMainWindow):
                 "destination_expand_queue_paused",
                 reason="spin_detected",
                 queue_len=int(_ql_final),
+            )
+            self._destination_graph_startup_deferred_queue_suppressed_for_phase_completion = True
+            self._destination_maybe_finish_graph_startup_phase(
+                reason="deferred_expand_queue_intentional_suppress_spin",
             )
             self._destination_expand_queue_paused = True
             self._destination_expand_deferred_stagnation_ticks = 0
@@ -70350,6 +70619,7 @@ class MainWindow(QMainWindow):
             return
         node_data = dict(ix.data(Qt.UserRole) or {})
         _lauth = str(expand_auth_class or getattr(self, "_destination_load_expand_auth_class", "") or "").strip() or self._destination_infer_expand_auth_class()
+        self._destination_current_projected_load_explicit_repair = bool(explicit_repair_authorized)
         if self._full_trace_enabled():
             self._ui_trace(
                 "projection",
@@ -70801,11 +71071,15 @@ class MainWindow(QMainWindow):
 
                     # No Graph row id: cold-replay block must not conflate with startup visibility-bypass
                     # (bypass + structural row still uses startup bypass tag for correct metrics/guards).
-                    _pl_alloc_tag = (
-                        "load_projected_descendants_planned_allocation_no_structural_item_id"
-                        if not self._destination_row_allows_structural_folder_child_load(nd_graph)
-                        else "load_projected_descendants_startup_visibility_bypass"
+                    _in_startup_proj = bool(getattr(self, "_destination_startup_phase_active", False)) and bool(
+                        getattr(self, "_destination_startup_projection_visibility_pass_active", False)
                     )
+                    if not self._destination_row_allows_structural_folder_child_load(nd_graph):
+                        _pl_alloc_tag = "load_projected_descendants_planned_allocation_no_structural_item_id"
+                    elif _in_startup_proj:
+                        _pl_alloc_tag = "load_projected_descendants_startup_visibility_bypass"
+                    else:
+                        _pl_alloc_tag = "load_projected_descendants_post_startup_real_user_expand"
                     _planned_eq = _eq_reason(_pl_alloc_tag)
                     self._decorate_destination_graph_subtree_for_allocation_move(
                         ix,
@@ -82799,28 +83073,65 @@ class MainWindow(QMainWindow):
 
         self._schedule_safe_timer(200, "login_force_window_front_200ms", self._force_window_to_front_win32)
         self._schedule_safe_timer(0, "login_post_restore_window_log", self._log_post_login_window_state)
-        self._schedule_safe_timer(500, "planning_recovery_checkpoint_prompt", self._maybe_prompt_planning_recovery_journal)
+        if not bool(getattr(self, "_planning_recovery_checkpoint_timer_armed", False)):
+            self._planning_recovery_checkpoint_timer_armed = True
+            self._schedule_safe_timer(
+                500, "planning_recovery_checkpoint_prompt", self._maybe_prompt_planning_recovery_journal
+            )
 
     def _maybe_prompt_planning_recovery_journal(self) -> None:
+        """Single startup entry: planning recovery checkpoint file; not called from overlay/rehydrate/expand paths."""
+        if bool(getattr(self, "_recovery_prompt_handled_this_session", False)):
+            log_info("recovery_prompt_skipped_already_handled")
+            return
         p = self._planning_user_checkpoint_path()
         if p is None or not p.is_file():
+            self._recovery_prompt_handled_this_session = True
             return
-        log_info("recovery_journal_detected_on_startup", delta_count=-1)
-        box = QMessageBox(self)
-        box.setWindowTitle("Planning recovery")
-        box.setText(
-            "A lightweight planning checkpoint from a previous run was found (the app may not have shut down cleanly). "
-            "Your current session is already loaded; you can discard the checkpoint file or keep it for diagnostics."
+        log_info(
+            "recovery_journal_detected_on_startup",
+            path=str(p)[:500],
+            clean_session_close=False,
         )
+        log_info("recovery_prompt_shown", path=str(p)[:400])
+        extra = str(self._planning_recovery_user_dialog_informative_lines() or "").strip()
+        body = (
+            "We found unsaved changes from a previous session that did not close properly.\n\n"
+            "Your current session has already been loaded.\n\n"
+            "You can:\n"
+            "• Restore the unsaved changes (this may overwrite your current changes)\n"
+            "• Ignore them and continue with your current session\n\n"
+            "What would you like to do?"
+        )
+        if extra:
+            body = body + "\n\n" + extra
+        box = QMessageBox(self)
+        box.setWindowTitle("Recover unsaved work")
+        box.setText(body)
         box.setIcon(QMessageBox.Question)
-        box.setStandardButtons(QMessageBox.Ok | QMessageBox.Discard)
-        box.setDefaultButton(QMessageBox.Ok)
-        r = int(box.exec())
-        if r == int(QMessageBox.Discard):
-            log_info("recovery_prompt_choice", choice="discard")
+        btn_restore = box.addButton("Restore unsaved changes", QMessageBox.AcceptRole)
+        box.addButton("Ignore", QMessageBox.DestructiveRole)
+        btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(btn_restore)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked == btn_cancel:
+            log_info("recovery_prompt_choice", choice="cancel")
+            return
+        self._recovery_prompt_handled_this_session = True
+        if clicked == btn_restore:
+            log_info("recovery_prompt_choice", choice="restore")
+            n_alloc, n_pr = self._apply_planning_recovery_from_recovery_disk_mirrors()
             self._clear_planning_user_checkpoint()
-        else:
-            log_info("recovery_prompt_choice", choice="keep")
+            log_info(
+                "recovery_journal_restored",
+                allocation_rows_applied=int(n_alloc),
+                proposed_rows_applied=int(n_pr),
+            )
+            return
+        log_info("recovery_prompt_choice", choice="ignore")
+        self._archive_planning_user_checkpoint()
+        log_info("recovery_journal_cleared", path=str(p)[:400], mode="archived")
 
     def _force_window_to_front_win32(self):
         print(
