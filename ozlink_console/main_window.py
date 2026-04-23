@@ -14740,6 +14740,15 @@ class MainWindow(QMainWindow):
         if self.memory_manager is None:
             log_info("draft_save_skipped", reason="no_memory_manager", force=bool(force))
             return False
+        if bool(getattr(self, "_destination_startup_phase_active", False)) and not bool(
+            getattr(self, "_application_shutting_down", False)
+        ) and not bool(getattr(self, "_explicit_session_save_user_triggered", False)):
+            log_info(
+                "destination_draft_full_save_suppressed_during_startup_phase",
+                include_workspace_ui=bool(include_workspace_ui),
+                force=bool(force),
+            )
+            return False
 
         if not self._destination_should_allow_draft_save_now(force=bool(force)):
             self._destination_startup_shell_persistence_pending_dirty = True
@@ -27565,6 +27574,19 @@ class MainWindow(QMainWindow):
             pass
         return out
 
+    def _destination_allow_branch_snapshot_richness_merge(self, *, phase: str) -> bool:
+        """Richness merge is shutdown / explicit full-save only; never for runtime draft/startup snapshot paths."""
+        if bool(getattr(self, "_application_shutting_down", False)):
+            return True
+        p = str(phase or "").casefold()
+        if "shutdown" in p:
+            return True
+        if bool(getattr(self, "_destination_save_in_progress", False)) and bool(
+            getattr(self, "_explicit_session_save_user_triggered", False)
+        ):
+            return True
+        return False
+
     def _destination_enrich_persisted_destination_tree_snapshot(
         self,
         current_roots: list,
@@ -27576,6 +27598,13 @@ class MainWindow(QMainWindow):
         phase: str = "",
     ) -> list:
         cur = copy.deepcopy(list(current_roots or []))
+        if not self._destination_allow_branch_snapshot_richness_merge(phase=str(phase)[:200]):
+            log_info(
+                "destination_branch_richness_comparison_blocked_runtime",
+                reason=str(phase)[:200],
+                caller="enrich_persisted_destination_tree_snapshot",
+            )
+            return cur
         lib_key = self._destination_selected_destination_library_id_key()
         cands: list[tuple[str, list]] = [
             ("existing_session", list(existing_session_roots or [])),
@@ -27878,10 +27907,23 @@ class MainWindow(QMainWindow):
         if not destination_authority_contract.graph_owns_visible_real_destination_structure(self):
             return
         dm = getattr(self, "destination_planning_model", None)
-        if dm is None or not bool(getattr(self, "_destination_snapshot_overlay_classification_startup_complete", False)):
+        if dm is None or not hasattr(dm, "rowCount"):
             return
-        if not hasattr(dm, "rowCount"):
-            return
+        _ov = bool(getattr(self, "_destination_snapshot_overlay_classification_startup_complete", False))
+        if not _ov:
+            try:
+                _rc0 = int(dm.rowCount(QModelIndex())) if dm is not None else 0
+            except Exception:
+                _rc0 = 0
+            _root_bound = bool(str(getattr(self, "_destination_sharepoint_root_graph_bound_drive_id", "") or "").strip())
+            if _root_bound and _rc0 > 0:
+                log_info(
+                    "destination_post_shell_rehydrate_schedule_before_overlay_ok",
+                    reason=str(reason or "")[:200],
+                    model_top_level_rows=int(_rc0),
+                )
+            else:
+                return
         try:
             if int(dm.rowCount(QModelIndex()) or 0) <= 0:
                 return
@@ -28290,7 +28332,7 @@ class MainWindow(QMainWindow):
             getattr(self, "_destination_graph_startup_deferred_queue_suppressed_for_phase_completion", False)
         )
         if sh and rehydr and qn > 0 and not _q_bypass and qn >= 0:
-            rsn = f"{rsn}+deferred_expand_pending" if rsn != "wait" else "deferred_expand_pending"
+            rsn = f"{rsn}+deferred_expand_not_blocking_completion"
         log_info(
             "destination_graph_startup_phase_completion_check",
             startup_phase=in_start,
@@ -28304,11 +28346,10 @@ class MainWindow(QMainWindow):
             return
         if qn > 0 and not _q_bypass and qn >= 0:
             log_info(
-                "destination_graph_startup_phase_waiting_deferred_expand_queue",
+                "destination_graph_startup_phase_deferred_expand_pending_nonblocking",
                 pending_deferred_count=int(qn),
                 reason=str(reason or "")[:200],
             )
-            return
         self._destination_mark_startup_phase_complete(
             reason=str(reason or "")[:200], drive_id=str(self._current_selected_destination_drive_id() or "")[:120]
         )
@@ -38142,6 +38183,15 @@ class MainWindow(QMainWindow):
                 did_shell = did_shell_early
                 self._destination_sharepoint_root_graph_bound_drive_id = did_shell
                 self._destination_maybe_finish_graph_startup_phase(reason="sharepoint_root_graph_bound")
+                QTimer.singleShot(
+                    0,
+                    lambda: self._safe_invoke(
+                        "post_sharepoint_root_bound_rehydrate",
+                        lambda: self._destination_schedule_post_shell_memory_rehydrate_if_ready(
+                            reason="post_sharepoint_root_bound"
+                        ),
+                    ),
+                )
                 merge_stats: dict | None = None
                 if snap_preserving:
                     self._destination_full_library_reconcile_pending = False
