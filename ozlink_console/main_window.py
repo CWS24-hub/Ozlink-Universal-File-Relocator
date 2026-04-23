@@ -34881,6 +34881,51 @@ class MainWindow(QMainWindow):
             return False, "destination_startup_phase_active"
         return True, "post_startup"
 
+    def _source_path_is_strict_descendant_of_folder(self, folder_canon: str, source_path: str) -> bool:
+        """True if *source_path* (after canonicalization) is the folder or a strict child under *folder_canon*."""
+        fc0 = str(folder_canon or "").strip()
+        if not fc0:
+            return False
+        sp = self._canonical_source_projection_path(str(source_path or "").strip()) or ""
+        if not sp:
+            return False
+        fc = fc0.casefold()
+        sc = sp.strip().casefold()
+        return sc == fc or sc.startswith(fc + "\\")
+
+    def _source_folder_load_planning_paths_intersecting(self, folder_canon: str) -> set[str]:
+        """Canonical source paths for planned/proposed rows whose source side lies under the loaded folder."""
+        out: set[str] = set()
+        fc0 = self._canonical_source_projection_path(str(folder_canon or "").strip()) or ""
+        if not fc0:
+            return out
+        for m in self.planned_moves or []:
+            if not isinstance(m, dict):
+                continue
+            sp = str(m.get("source_path", "") or "").strip()
+            if sp and self._source_path_is_strict_descendant_of_folder(fc0, sp):
+                c = self._canonical_source_projection_path(sp) or sp
+                if c:
+                    out.add(c)
+        for pf in self.proposed_folders or []:
+            pp = str(getattr(pf, "ParentPath", "") or "").strip()
+            if pp and self._source_path_is_strict_descendant_of_folder(fc0, pp):
+                c = self._canonical_source_projection_path(pp) or pp
+                if c:
+                    out.add(c)
+        return out
+
+    @staticmethod
+    def _merge_source_projection_subtree_scopes(
+        prev: str, new: str
+    ) -> Literal["full", "roots_only", "explicit_paths"]:
+        p, n = str(prev or "full"), str(new or "full")
+        if p == "full" or n == "full":
+            return "full"
+        if p == "explicit_paths" or n == "explicit_paths":
+            return "explicit_paths"
+        return "roots_only"
+
     def _refresh_source_projection_for_paths(
         self,
         paths,
@@ -34888,7 +34933,7 @@ class MainWindow(QMainWindow):
         trigger_path="",
         *,
         source_perf_move_origin="",
-        subtree_scope: Literal["full", "roots_only"] = "full",
+        subtree_scope: Literal["full", "roots_only", "explicit_paths"] = "full",
     ):
         _expand_pending = getattr(self, "_expand_all_pending", None) or {}
         if str(phase_name or "") == "source_projection_restore_complete":
@@ -34924,12 +34969,12 @@ class MainWindow(QMainWindow):
             )
             return
 
-        if not self.planned_moves:
+        if not self.planned_moves and not (self.proposed_folders or []):
             self._log_restore_phase(
                 phase_name,
                 trigger_path=self.normalize_memory_path(trigger_path),
                 refreshed_item_count=0,
-                reason="no_planned_moves",
+                reason="no_planned_moves_or_proposed",
             )
             return
 
@@ -34956,13 +35001,19 @@ class MainWindow(QMainWindow):
             root_path_count=_est_roots,
             subtree_scope=_sc,
         )
+        _auth_row = int(len(normalized_paths))
+        _auth_roots = int(_est_roots)
+        if str(_sc or "") == "explicit_paths":
+            _auth_class = "source_explicit_projection_scope"
+        elif _sc == "roots_only":
+            _auth_class = "source_startup_shell_restore"
+        else:
+            _auth_class = "source_deep_projection_validation"
         log_info(
             "source_projection_auth_classified",
-            auth_class=("source_startup_shell_restore" if _sc == "roots_only" else "source_deep_projection_validation")
-            if _allow
-            else "deferred_or_blocked",
-            row_count=int(len(normalized_paths)),
-            root_path_count=int(_est_roots),
+            auth_class=(_auth_class if _allow else "deferred_or_blocked"),
+            row_count=_auth_row,
+            root_path_count=_auth_roots,
             phase_name_excerpt=str(phase_name or "")[:120],
         )
         if not _allow:
@@ -35048,33 +35099,51 @@ class MainWindow(QMainWindow):
 
         try:
             item_map, lookup_stats = self._map_visible_source_items_by_canonical_paths(normalized_paths)
-            subtree_roots = self._minimal_descendant_cover_paths(normalized_paths)
             seen_paths: set[str] = set()
-            for source_path in subtree_roots:
-                item = item_map.get(source_path)
-                if item is None:
-                    continue
-                if subtree_scope == "roots_only":
+            if str(subtree_scope or "") == "explicit_paths":
+                for p in sorted(normalized_paths):
+                    item = item_map.get(p)
+                    if item is None:
+                        continue
+                    if isinstance(item, QModelIndex) and (not item.isValid()):
+                        continue
                     subtree_data = dict(self._source_tree_row_payload(item))
                     if subtree_data.get("placeholder"):
                         continue
-                    subtree_path = self._canonical_source_projection_path(self._tree_item_path(subtree_data))
-                    if subtree_path and subtree_path in seen_paths:
+                    sp2 = self._canonical_source_projection_path(self._tree_item_path(subtree_data))
+                    if not sp2:
                         continue
-                    if subtree_path:
-                        seen_paths.add(subtree_path)
-                    work_items.append((item, subtree_data, subtree_path or ""))
-                    continue
-                for subtree_row in self._iter_source_tree_subtree_rows(item):
-                    subtree_data = dict(self._source_tree_row_payload(subtree_row))
-                    if subtree_data.get("placeholder"):
+                    if sp2 in seen_paths:
                         continue
-                    subtree_path = self._canonical_source_projection_path(self._tree_item_path(subtree_data))
-                    if subtree_path and subtree_path in seen_paths:
+                    seen_paths.add(sp2)
+                    work_items.append((item, subtree_data, sp2))
+            else:
+                subtree_roots = self._minimal_descendant_cover_paths(normalized_paths)
+                for source_path in subtree_roots:
+                    item = item_map.get(source_path)
+                    if item is None:
                         continue
-                    if subtree_path:
-                        seen_paths.add(subtree_path)
-                    work_items.append((subtree_row, subtree_data, subtree_path or ""))
+                    if subtree_scope == "roots_only":
+                        subtree_data = dict(self._source_tree_row_payload(item))
+                        if subtree_data.get("placeholder"):
+                            continue
+                        subtree_path = self._canonical_source_projection_path(self._tree_item_path(subtree_data))
+                        if subtree_path and subtree_path in seen_paths:
+                            continue
+                        if subtree_path:
+                            seen_paths.add(subtree_path)
+                        work_items.append((item, subtree_data, subtree_path or ""))
+                        continue
+                    for subtree_row in self._iter_source_tree_subtree_rows(item):
+                        subtree_data = dict(self._source_tree_row_payload(subtree_row))
+                        if subtree_data.get("placeholder"):
+                            continue
+                        subtree_path = self._canonical_source_projection_path(self._tree_item_path(subtree_data))
+                        if subtree_path and subtree_path in seen_paths:
+                            continue
+                        if subtree_path:
+                            seen_paths.add(subtree_path)
+                        work_items.append((subtree_row, subtree_data, subtree_path or ""))
 
             eval_index = self._build_source_relationship_eval_index()
             plan_sig = self._source_projection_planning_signature_refresh()
@@ -35237,7 +35306,13 @@ class MainWindow(QMainWindow):
             )
 
     def _schedule_source_projection_refresh_for_paths(
-        self, paths, phase_name, trigger_path="", delay_ms=250, *, subtree_scope: Literal["full", "roots_only"] = "full"
+        self,
+        paths,
+        phase_name,
+        trigger_path="",
+        delay_ms=250,
+        *,
+        subtree_scope: Literal["full", "roots_only", "explicit_paths"] = "full",
     ):
         _ev = 0
         for path in paths or []:
@@ -35249,10 +35324,8 @@ class MainWindow(QMainWindow):
             getattr(self, "_source_projection_refresh_coalesce_events", 0) or 0
         ) + max(1, _ev)
         self._source_projection_refresh_context = (phase_name, self.normalize_memory_path(trigger_path))
-        prev_scope = getattr(self, "_source_projection_refresh_subtree_scope", "full")
-        merged_scope: Literal["full", "roots_only"] = (
-            "full" if (prev_scope == "full" or subtree_scope == "full") else "roots_only"
-        )
+        prev_scope = str(getattr(self, "_source_projection_refresh_subtree_scope", "full") or "full")
+        merged_scope = self._merge_source_projection_subtree_scopes(prev_scope, str(subtree_scope or "full"))
         self._source_projection_refresh_subtree_scope = merged_scope
         if self._source_projection_refresh_scheduled:
             log_info(
@@ -35271,7 +35344,7 @@ class MainWindow(QMainWindow):
             phase, queued_trigger_path = self._source_projection_refresh_context
             queued_paths = set(self._source_projection_refresh_paths)
             self._source_projection_refresh_paths.clear()
-            run_scope: Literal["full", "roots_only"] = getattr(
+            run_scope: Literal["full", "roots_only", "explicit_paths"] = getattr(
                 self, "_source_projection_refresh_subtree_scope", "full"
             )
             self._source_projection_refresh_subtree_scope = "full"
@@ -45670,28 +45743,57 @@ class MainWindow(QMainWindow):
                 )
 
         projection_refresh_invoked = False
+        folder_canon = self._canonical_source_projection_path(str(trigger_path or "")) or ""
+        impacted_move_paths = self._source_folder_load_planning_paths_intersecting(folder_canon)
+        has_planning_intersection = bool(impacted_move_paths)
+        if folder_canon and has_planning_intersection:
+            impacted_move_paths.add(folder_canon)
         will_apply_overlay_after_source_load = (
             not self._expand_all_pending.get("source")
             and getattr(self, "destination_tree_widget", None) is not None
             and bool(self.planned_moves)
             and not getattr(self, "_sharepoint_lazy_mode", False)
             and not self._destination_steady_state_full_materialize_redundant()
+            and has_planning_intersection
         )
         if self._expand_all_pending.get("source"):
             self._expand_all_deferred_refresh["source"] = True
         elif self._memory_restore_in_progress or bool(self._source_restore_materialization_queue):
             self._source_projection_refresh_pending = True
         else:
-            self._schedule_source_projection_refresh_for_paths(
-                [trigger_path],
-                "source_projection_folder_load_applied",
-                trigger_path=trigger_path,
-            )
+            if has_planning_intersection and impacted_move_paths:
+                log_info(
+                    "source_projection_folder_load_scoped",
+                    trigger_path=str(trigger_path or "")[:500],
+                    subtree_size=int(bound_rows),
+                    impacted_count=int(len(impacted_move_paths)),
+                    skipped_full_projection=True,
+                )
+                self._schedule_source_projection_refresh_for_paths(
+                    list(impacted_move_paths),
+                    "source_projection_folder_load_applied",
+                    trigger_path=trigger_path,
+                    subtree_scope="explicit_paths",
+                )
+            else:
+                log_info(
+                    "source_projection_folder_load_scoped",
+                    trigger_path=str(trigger_path or "")[:500],
+                    subtree_size=int(bound_rows),
+                    impacted_count=0,
+                    skipped_full_projection=True,
+                )
+                self._schedule_source_projection_refresh_for_paths(
+                    [trigger_path],
+                    "source_projection_folder_load_applied",
+                    trigger_path=trigger_path,
+                    subtree_scope="roots_only",
+                )
             projection_refresh_invoked = True
             if destination_authority_contract.graph_owns_visible_real_destination_structure(self):
                 # When overlay materialize runs for this load, its batch ``finally`` already calls
                 # ``_on_destination_state_mutation`` — avoid a duplicate full-tree invariant here.
-                if not will_apply_overlay_after_source_load:
+                if (not will_apply_overlay_after_source_load) and has_planning_intersection:
                     self._schedule_coalesced_overlay_invariant(
                         "source_folder_load_applied:" + str(trigger_path or "")[:200],
                         source_driven=True,
