@@ -3111,6 +3111,14 @@ class MainWindow(QMainWindow):
         # Post-shell memory rehydrate: Graph sessions must not depend on local-only startup hooks.
         self._destination_post_shell_memory_rehydrate_done_key: str = ""
         self._destination_post_shell_memory_rehydrate_scheduled: bool = False
+        self._destination_post_shell_memory_rehydrate_running: bool = False
+        self._destination_post_shell_memory_rehydrate_chunk_state: dict | None = None
+        self._destination_post_shell_rehydrate_max_branches_per_tick: int = 1
+        self._destination_post_shell_rehydrate_max_ms_per_tick: int = 12
+        self._destination_post_shell_rehydrate_max_rows_per_tick: int = 400
+        self._destination_post_shell_rehydrate_total_ticks: int = 0
+        self._recovery_checkpoint_startup_work_gate_resolved: bool = True
+        self._destination_deferred_post_shell_rehydrate_reason: str = ""
         # Casefolded canonical paths in the current visible destination model (rebuilt for post-shell work).
         self._destination_visible_startup_shell_paths_cf: set[str] = set()
         # path_cf -> (payload_node, source, descendant_count) for shutdown subtree preserve (one-time build).
@@ -3415,6 +3423,11 @@ class MainWindow(QMainWindow):
         self._destination_planning_overlay_gui_chunk_timer.setSingleShot(True)
         self._destination_planning_overlay_gui_chunk_timer.timeout.connect(
             self._destination_planning_overlay_body_gui_chunk_tick
+        )
+        self._destination_post_shell_rehydrate_chunk_timer = QTimer(self)
+        self._destination_post_shell_rehydrate_chunk_timer.setSingleShot(True)
+        self._destination_post_shell_rehydrate_chunk_timer.timeout.connect(
+            self._destination_run_post_shell_memory_rehydrate_tick
         )
         self._destination_planning_overlay_gui_chunk_state: dict | None = None
         self._destination_planning_overlay_gui_chunk_gen: int = 0
@@ -12362,6 +12375,15 @@ class MainWindow(QMainWindow):
         _save_or_shutdown = bool(getattr(self, "_destination_save_in_progress", False)) or bool(
             getattr(self, "_application_shutting_down", False)
         )
+        if self._destination_chunked_startup_shell_work_active() and not _save_or_shutdown:
+            log_info(
+                "destination_live_snapshot_save_deferred_startup_shell_active",
+                reason=str(reason)[:120],
+            )
+            rs = getattr(self, "_runtime_session_tree_snapshots", None)
+            if isinstance(rs, dict) and isinstance(rs.get("destination"), list):
+                return list(rs["destination"])
+            return []
         if getattr(self, "_destination_startup_memory_workspace_building", False) and not _save_or_shutdown:
             log_info(
                 "snapshot_capture_skipped",
@@ -27901,6 +27923,35 @@ class MainWindow(QMainWindow):
                 return True
         return False
 
+    def _destination_post_shell_rehydrate_recovery_checkpoint_would_block(self) -> bool:
+        p = self._planning_user_checkpoint_path()
+        return bool(
+            p is not None
+            and p.is_file()
+            and not bool(getattr(self, "_recovery_checkpoint_startup_work_gate_resolved", True))
+        )
+
+    def _destination_chunked_startup_shell_work_active(self) -> bool:
+        if bool(getattr(self, "_destination_post_shell_memory_rehydrate_running", False)):
+            return True
+        stg = getattr(self, "_destination_planning_overlay_gui_chunk_state", None)
+        if not isinstance(stg, dict):
+            return False
+        if bool(stg.get("cold_start_materialize")):
+            return bool(getattr(self, "_destination_startup_phase_active", False))
+        return False
+
+    def _destination_flush_deferred_post_shell_rehydrate_if_ready(self) -> None:
+        r = str(getattr(self, "_destination_deferred_post_shell_rehydrate_reason", "") or "")
+        if not r:
+            return
+        self._destination_deferred_post_shell_rehydrate_reason = ""
+        log_info(
+            "destination_startup_work_resumed_after_recovery_prompt",
+            work_kind="post_shell_memory_rehydrate",
+        )
+        self._destination_schedule_post_shell_memory_rehydrate_if_ready(reason=str(r)[:200])
+
     def _destination_schedule_post_shell_memory_rehydrate_if_ready(self, *, reason: str) -> None:
         if bool(getattr(self, "_application_shutting_down", False)):
             return
@@ -27936,6 +27987,13 @@ class MainWindow(QMainWindow):
             getattr(self, "_destination_post_shell_rich_rehydrate_scan_ran", False)
         ):
             return
+        if self._destination_post_shell_rehydrate_recovery_checkpoint_would_block():
+            self._destination_deferred_post_shell_rehydrate_reason = str(reason or "")[:200]
+            log_info(
+                "destination_startup_work_deferred_for_recovery_prompt",
+                work_kind="post_shell_memory_rehydrate",
+            )
+            return
         if bool(getattr(self, "_destination_post_shell_memory_rehydrate_scheduled", False)):
             return
         self._destination_post_shell_memory_rehydrate_scheduled = True
@@ -27948,71 +28006,134 @@ class MainWindow(QMainWindow):
         i2 = str(ident)[:200]
 
         def _go() -> None:
-            self._destination_run_post_shell_memory_rehydrate_once(reason=r2, library_identity=i2)
+            self._destination_begin_post_shell_memory_rehydrate_chunked(
+                reason=str(r2)[:200], library_identity=str(i2)[:200]
+            )
 
         QTimer.singleShot(0, lambda: self._safe_invoke("destination_post_shell_memory_rehydrate", _go))
 
     def _destination_run_post_shell_memory_rehydrate_once(self, *, reason: str, library_identity: str) -> None:
-        if bool(getattr(self, "_application_shutting_down", False)):
-            return
-        if str(getattr(self, "_destination_post_shell_memory_rehydrate_done_key", "") or "") == str(
-            library_identity
-        ) and bool(getattr(self, "_destination_post_shell_rich_rehydrate_scan_ran", False)):
-            return
-        self._destination_post_shell_memory_rehydrate_scheduled = False
-        log_info(
-            "destination_post_shell_memory_rehydrate_started",
-            reason=str(reason or "")[:200],
-            library_identity=str(library_identity)[:200],
-        )
-        n_rh, n_sk = 0, 0
-        try:
-            shell = self._destination_collect_visible_startup_shell_paths()
-            self._destination_visible_startup_shell_paths_cf = set(shell)
-            ex = [p for p in list(shell)[:12]]
-            log_info(
-                "destination_visible_startup_shell_paths_collected",
-                count=int(len(shell)),
-                top_examples=ex,
-            )
-            n_rh, n_sk = self._destination_post_shell_memory_rehydrate_scan_body(shell)
-        except Exception as exc:
-            self._log_restore_exception("destination_post_shell_memory_rehydrate", exc)
-            self._destination_post_shell_memory_rehydrate_done_key = str(library_identity)[:200]
-            self._destination_post_shell_rich_rehydrate_scan_ran = True
-        else:
-            self._destination_post_shell_memory_rehydrate_done_key = str(library_identity)[:200]
-            self._destination_post_shell_rich_rehydrate_scan_ran = True
-        log_info(
-            "destination_post_shell_memory_rehydrate_completed",
-            reason=str(reason or "")[:200],
-            library_identity=str(library_identity)[:200],
-            scanned_branch_count=int(n_rh + n_sk),
-            rehydrated_branch_count=int(n_rh),
-            skipped_branch_count=int(n_sk),
-        )
-        self._destination_maybe_finish_graph_startup_phase(
-            reason="post_shell_memory_rehydrate_completed",
+        """Entry used by one-shot and scan helpers; post-shell rehydrate is co-operative chunked on the GUI thread."""
+        self._destination_begin_post_shell_memory_rehydrate_chunked(
+            reason=str(reason)[:200], library_identity=str(library_identity)[:200]
         )
 
-    def _destination_post_shell_memory_rehydrate_scan_body(self, shell: set[str]) -> tuple[int, int]:
-        """Rich planned rows in the memory snapshot that are in startup shell context get one branch rehydrate."""
-        n_rh = 0
-        n_sk = 0
-        if bool(getattr(self, "_application_shutting_down", False)):
-            return 0, 0
+    def _destination_post_shell_rehydrate_process_single_path(
+        self,
+        pth: str,
+        *,
+        shell_cf: set[str],
+        t_src: str,
+        child_index_start: int = 0,
+        max_row_nodes: int | None = None,
+    ) -> tuple[dict, bool]:
+        """Rehydrate one memory-backed branch. Returns (rh, stop_walk)."""
         dm = getattr(self, "destination_planning_model", None)
         if dm is None or not hasattr(dm, "find_indices_for_canonical_destination_path"):
-            return 0, 0
+            return {}, False
+        ixs = dm.find_indices_for_canonical_destination_path(str(pth).strip()) or []  # type: ignore[union-attr]  # noqa: E501
+        ix0 = ixs[0] if ixs and ixs[0].isValid() else None
+        c0 = ix0.siblingAtColumn(0) if ix0 is not None and ix0.column() else ix0
+        stn: dict
+        try:
+            roots, _t = self._destination_eager_destination_tree_snapshot_roots()
+            mem = (
+                self._destination_snapshot_find_node_by_canonical_path(list(roots or []), str(pth).strip())  # type: ignore[arg-type]  # noqa: E501
+                if roots
+                else None
+            )
+        except Exception:
+            mem = None
+        stn = self._destination_branch_stats_for_snapshot_node(mem) if mem else {"descendants": 0}  # type: ignore[arg-type]  # noqa: E501
+        sd = int(stn.get("descendants", 0) or 0)
+        v2 = 0
+        if ix0 is not None and isinstance(ix0, QModelIndex) and ix0.isValid() and c0 is not None and isinstance(
+            c0, QModelIndex
+        ):
+            try:
+                c0a = c0.siblingAtColumn(0) if c0.column() else c0
+                v2 = int(self._destination_visible_descendant_counts_for_index(dm, c0a)[1] or 0)
+            except Exception:
+                v2 = 0
+        under = bool(sd > 0 and v2 < sd)
+        el = self._destination_memory_rehydrate_eligibility_checked(
+            canonical_path=pth,
+            stored_descendants=sd,
+            visible_descendant_count=int(v2),
+            shell_paths_cf=set(shell_cf or set()),
+            model_underrepresents_memory=under,
+        )
+        if not el.get("eligible") or (ix0 is None or not isinstance(c0, QModelIndex) or not c0.isValid()):
+            return {}, False
+        c_live = c0.siblingAtColumn(0) if c0.column() else c0
+        if hasattr(dm, "is_index_live") and not dm.is_index_live(c_live):
+            return {}, False
+        mv = self._find_planned_move_for_destination_node((c0.data(Qt.UserRole) or {}))
+        if not isinstance(mv, dict):
+            return {}, False
+        mark_r = "startup_visible_shell_context" if el.get("in_startup_visible_shell_context") else "visible_or_chain"
+        log_info(
+            "destination_visible_shell_branch_marked_for_memory_rehydrate",
+            canonical_path=pth[:500],
+            stored_descendant_count=int(sd),
+            visible_descendant_count=int(v2),
+            reason=mark_r[:64],
+        )
+        log_info(
+            "destination_visible_shell_branch_memory_rehydrate_started",
+            canonical_path=pth[:500],
+            source=f"post_shell_scan+{t_src}"[:64],
+            stored_descendant_count=int(sd),
+        )
+        rh = self._destination_rehydrate_visible_branch_from_memory_snapshot(
+            c0,
+            mv,
+            audit_ctx="post_shell_rich_branch_scan",
+            child_index_start=int(child_index_start or 0),
+            max_row_nodes=max_row_nodes,
+        )
+        v3 = -1
+        try:
+            c0a = c0.siblingAtColumn(0) if c0.column() else c0
+            v3 = int(self._destination_visible_descendant_counts_for_index(dm, c0a)[1] or 0)
+        except Exception:
+            v3 = -1
+        if not bool(rh.get("partial_pending")):
+            log_info(
+                "destination_visible_shell_branch_memory_rehydrate_completed",
+                canonical_path=pth[:500],
+                source=str(rh.get("rehydrate_source") or "")[:32],
+                stored_descendant_count=int(sd),
+                inserted_rows=int(rh.get("inserted_rows") or 0),
+                upgraded_rows=int(rh.get("upgraded_rows") or 0),
+                preserved_live_rows=int(rh.get("preserved_live_rows") or 0),
+                resulting_visible_descendants=int(v3),
+            )
+        if bool(rh.get("partial_pending")):
+            return rh, True
+        return rh, False
+
+    def _destination_post_shell_enumerate_rehydration_path_queue(
+        self, shell: set[str]
+    ) -> tuple[list[str], int, int, str, set[str]]:
+        """Return (rehydration_paths, n_rh, n_sk, t_src, shell_cf) in deterministic tree order."""
+        n_rh = 0
+        n_sk = 0
+        n_cap = 36
+        out_paths: list[str] = []
+        if bool(getattr(self, "_application_shutting_down", False)):
+            return [], 0, 0, "", set()
+        dm = getattr(self, "destination_planning_model", None)
+        if dm is None or not hasattr(dm, "find_indices_for_canonical_destination_path"):
+            return [], 0, 0, "", set()
         roots, t_src = self._destination_eager_destination_tree_snapshot_roots()
         if not roots:
-            return 0, 0
-        n_cap = 36
+            return [], 0, 0, str(t_src)[:32] if t_src is not None else "", set()
+        t_src0 = str(t_src)[:32]
         shell_cf = set(shell or set())
-        t_src = str(t_src)[:32]
 
         def _consider(node: dict) -> bool:
-            nonlocal n_rh, n_sk
+            nonlocal n_rh, n_sk, out_paths
             if n_rh >= n_cap:
                 return True
             if not isinstance(node, dict):
@@ -28095,38 +28216,7 @@ class MainWindow(QMainWindow):
                     if isinstance(ch, dict) and _consider(ch):
                         return True
                 return False
-            mark_r = "startup_visible_shell_context" if el.get("in_startup_visible_shell_context") else "visible_or_chain"
-            log_info(
-                "destination_visible_shell_branch_marked_for_memory_rehydrate",
-                canonical_path=pth[:500],
-                stored_descendant_count=int(sd),
-                visible_descendant_count=int(v2),
-                reason=mark_r[:64],
-            )
-            log_info(
-                "destination_visible_shell_branch_memory_rehydrate_started",
-                canonical_path=pth[:500],
-                source=f"post_shell_scan+{t_src}"[:64],
-                stored_descendant_count=int(sd),
-            )
-            rh = self._destination_rehydrate_visible_branch_from_memory_snapshot(
-                c0, mv, audit_ctx="post_shell_rich_branch_scan"
-            )
-            v3 = -1
-            try:
-                v3 = int(self._destination_visible_descendant_counts_for_index(dm, c0)[1] or 0)
-            except Exception:
-                v3 = -1
-            log_info(
-                "destination_visible_shell_branch_memory_rehydrate_completed",
-                canonical_path=pth[:500],
-                source=str(rh.get("rehydrate_source") or "")[:32],
-                stored_descendant_count=int(sd),
-                inserted_rows=int(rh.get("inserted_rows") or 0),
-                upgraded_rows=int(rh.get("upgraded_rows") or 0),
-                preserved_live_rows=int(rh.get("preserved_live_rows") or 0),
-                resulting_visible_descendants=int(v3),
-            )
+            out_paths.append(str(pth).strip())
             n_rh += 1
             for ch in node.get("children") or []:
                 if isinstance(ch, dict) and _consider(ch):
@@ -28138,8 +28228,225 @@ class MainWindow(QMainWindow):
                 if isinstance(r0, dict) and _consider(r0):
                     break
         except Exception as exc:
-            self._log_restore_exception("destination_post_shell_memory_rehydrate_scan_body", exc)
-        return n_rh, n_sk
+            self._log_restore_exception("destination_post_shell_enumerate_rehydration_path_queue", exc)
+        return out_paths, int(n_rh), int(n_sk), t_src0, set(shell_cf)
+
+    def _destination_post_shell_memory_rehydrate_scan_body(self, shell: set[str]) -> tuple[int, int]:
+        """Rich planned rows in the memory snapshot that are in startup shell context get one branch rehydrate (sync, tests)."""
+        paths, _n_r, n_sk, t_src, shell_cf = self._destination_post_shell_enumerate_rehydration_path_queue(shell)
+        n_re = 0
+        for pth in paths:
+            _rh, _s = self._destination_post_shell_rehydrate_process_single_path(
+                pth, shell_cf=set(shell_cf), t_src=t_src, child_index_start=0, max_row_nodes=None
+            )
+            n_re += 1
+        return int(n_re), int(n_sk)
+
+    def _destination_begin_post_shell_memory_rehydrate_chunked(
+        self, *, reason: str, library_identity: str
+    ) -> None:
+        if bool(getattr(self, "_application_shutting_down", False)):
+            return
+        if str(getattr(self, "_destination_post_shell_memory_rehydrate_done_key", "") or "") == str(
+            library_identity
+        ) and bool(getattr(self, "_destination_post_shell_rich_rehydrate_scan_ran", False)):
+            return
+        if bool(getattr(self, "_destination_post_shell_memory_rehydrate_running", False)):
+            return
+        self._destination_post_shell_memory_rehydrate_scheduled = False
+        t_wall0 = time.perf_counter()
+        self._destination_post_shell_rehydrate_total_ticks = 0
+        self._destination_post_shell_memory_rehydrate_running = True
+        self._destination_post_shell_memory_rehydrate_done_key = ""
+        log_info(
+            "destination_post_shell_memory_rehydrate_started",
+            reason=str(reason or "")[:200],
+            library_identity=str(library_identity)[:200],
+            mode="chunked",
+        )
+        try:
+            shell = self._destination_collect_visible_startup_shell_paths()
+            self._destination_visible_startup_shell_paths_cf = set(shell)
+            ex = [p for p in list(shell)[:12]]
+            log_info(
+                "destination_visible_startup_shell_paths_collected",
+                count=int(len(shell)),
+                top_examples=ex,
+            )
+            paths, _nr, n_sk, t_src, shell_cf = self._destination_post_shell_enumerate_rehydration_path_queue(
+                set(shell)
+            )
+        except Exception as exc:
+            self._log_restore_exception("destination_post_shell_memory_rehydrate_begin", exc)
+            self._destination_finish_post_shell_memory_rehydrate(
+                str(reason)[:200],
+                str(library_identity)[:200],
+                0,
+                0,
+                0,
+                t_wall0,
+                0.0,
+                bool(True),
+            )
+            return
+        st: dict = {
+            "library_identity": str(library_identity)[:200],
+            "reason": str(reason)[:200],
+            "paths": list(paths),
+            "path_index": 0,
+            "n_sk": int(n_sk),
+            "n_rh": 0,
+            "n_rows_tick": 0,
+            "t_src": t_src,
+            "shell_cf": set(shell_cf),
+            "t_wall0": t_wall0,
+            "total_ticks": 0,
+            "total_elapsed_ms": 0.0,
+            "partial": None,
+        }
+        self._destination_post_shell_memory_rehydrate_chunk_state = st
+        if not paths:
+            n_sk0 = int(n_sk)
+            self._destination_finish_post_shell_memory_rehydrate(
+                st["reason"],
+                st["library_identity"],
+                0,
+                int(0 + n_sk0),
+                n_sk0,
+                t_wall0,
+                0.0,
+                False,
+            )
+            return
+        self._destination_post_shell_rehydrate_chunk_timer.start(0)
+
+    def _destination_run_post_shell_memory_rehydrate_tick(self) -> None:
+        st = self._destination_post_shell_memory_rehydrate_chunk_state
+        if not isinstance(st, dict) or not bool(
+            getattr(self, "_destination_post_shell_memory_rehydrate_running", False)
+        ):
+            return
+        if self._destination_post_shell_rehydrate_recovery_checkpoint_would_block():
+            tmr = getattr(self, "_destination_post_shell_rehydrate_chunk_timer", None)
+            if tmr is not None:
+                tmr.start(100)
+            return
+        t0 = time.perf_counter()
+        br_done = 0
+        rows = 0
+        max_b = max(1, int(getattr(self, "_destination_post_shell_rehydrate_max_branches_per_tick", 1) or 1))
+        max_ms = max(0.0, int(getattr(self, "_destination_post_shell_rehydrate_max_ms_per_tick", 12) or 12) / 1000.0)
+        max_r = max(1, int(getattr(self, "_destination_post_shell_rehydrate_max_rows_per_tick", 400) or 400))
+        paths: list = list(st.get("paths") or [])
+
+        while br_done < max_b and (time.perf_counter() - t0) < max_ms:
+            part = st.get("partial")
+            pidx = int(st.get("path_index", 0) or 0)
+            if isinstance(part, dict) and str(part.get("pth") or "").strip():
+                pth0 = str(part["pth"])
+                ci0 = int(part.get("child", 0) or 0)
+                rhb = max(1, int(part.get("row_left", max_r) or max_r))
+            else:
+                if pidx >= len(paths):
+                    break
+                pth0 = str(paths[pidx])
+                ci0 = 0
+                rhb = int(max_r)
+            rh, _s = self._destination_post_shell_rehydrate_process_single_path(
+                pth0,
+                shell_cf=set(st.get("shell_cf") or set()),
+                t_src=str(st.get("t_src") or "")[:32],
+                child_index_start=int(ci0 or 0),
+                max_row_nodes=int(rhb),
+            )
+            rows += int(rh.get("inserted_rows") or 0) + int(rh.get("upgraded_rows") or 0)
+            if bool(rh.get("partial_pending")):
+                nci = int(rh.get("next_child_index", 0) or 0)
+                st["partial"] = {"pth": pth0, "child": nci, "row_left": max(1, int(rhb))}
+                break
+            st["partial"] = None
+            st["n_rh"] = int(st.get("n_rh", 0) or 0) + 1
+            st["path_index"] = pidx + 1
+            br_done += 1
+        pidx2 = int(st.get("path_index", 0) or 0)
+        remain = 0
+        if isinstance(st.get("partial"), dict) and st["partial"].get("pth"):
+            remain = max(0, len(paths) - pidx2) + 1
+        else:
+            remain = max(0, len(paths) - pidx2)
+        st["total_ticks"] = int(st.get("total_ticks", 0) or 0) + 1
+        self._destination_post_shell_rehydrate_total_ticks = int(st.get("total_ticks", 0) or 0)
+        self._destination_post_shell_memory_rehydrate_chunk_state = st
+        log_info(
+            "destination_post_shell_memory_rehydrate_tick",
+            processed_branches=int(br_done),
+            processed_rows=int(rows),
+            elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 2),
+            remaining_branches=int(remain),
+        )
+        pidx3 = int(st.get("path_index", 0) or 0)
+        part2 = st.get("partial")
+        done = bool(pidx3 >= int(len(paths))) and not (isinstance(part2, dict) and str((part2 or {}).get("pth") or ""))
+        if (not done) and (not bool(getattr(self, "_application_shutting_down", False))):
+            self._destination_post_shell_rehydrate_chunk_timer.start(0)
+            return
+        self._destination_finish_post_shell_memory_rehydrate(
+            str(st.get("reason", "") or "")[:200],
+            str(st.get("library_identity", "") or "")[:200],
+            int(st.get("n_rh", 0) or 0),
+            int(int(st.get("n_rh", 0) or 0) + int(st.get("n_sk", 0) or 0)),
+            int(st.get("n_sk", 0) or 0),
+            float(st.get("t_wall0", time.perf_counter()) or 0.0),
+            float((time.perf_counter() - float(st.get("t_wall0", time.perf_counter()) or 0.0)) * 1000.0),
+            bool(False),
+        )
+
+    def _destination_finish_post_shell_memory_rehydrate(
+        self,
+        reason: str,
+        library_identity: str,
+        n_rehydrated: int,
+        n_scanned: int,
+        n_sk: int,
+        t_wall0: float,
+        last_tick_ms: float,
+        from_exception: bool,
+    ) -> None:
+        if (not from_exception) and (not bool(getattr(self, "_destination_post_shell_memory_rehydrate_running", False))):
+            return
+        self._destination_post_shell_memory_rehydrate_chunk_state = None
+        self._destination_post_shell_memory_rehydrate_running = False
+        self._destination_post_shell_memory_rehydrate_done_key = str(library_identity)[:200]
+        self._destination_post_shell_rich_rehydrate_scan_ran = True
+        _ticks = int(getattr(self, "_destination_post_shell_rehydrate_total_ticks", 0) or 0)
+        _el = round((time.perf_counter() - float(t_wall0 or time.perf_counter())) * 1000.0, 2)
+        if (not from_exception) and _ticks <= 0:
+            _ticks = 1
+        log_info(
+            "destination_post_shell_memory_rehydrate_completed",
+            reason=str(reason or "")[:200],
+            library_identity=str(library_identity)[:200],
+            scanned_branch_count=int(n_scanned if n_scanned else (n_rehydrated + n_sk)),
+            rehydrated_branch_count=int(n_rehydrated),
+            skipped_branch_count=int(n_sk),
+            total_ticks=int(_ticks),
+            total_elapsed_ms=float(_el if _el else last_tick_ms),
+        )
+        self._destination_maybe_finish_graph_startup_phase(
+            reason="post_shell_memory_rehydrate_completed",
+        )
+
+    def _destination_overlay_reason_uses_cold_start_materialize_chunking(self, r: str) -> bool:
+        s = str(r or "")
+        if "phase4_destination_overlay" in s or "phase4_destination" in s:
+            return True
+        if s.startswith("phase4_") and "overlay" in s:
+            return True
+        if "post_login_restore" in s and "overlay" in s:
+            return True
+        if "lazy_memory_truth" in s or "startup_descendant_materialization" in s:
+            return True
+        return False
 
     def _destination_map_rehydrate_log_source(self, best_source_label: str) -> str:
         """Map internal snapshot label to destination_visible_branch_rehydrate_source_selected log values."""
@@ -28321,6 +28628,9 @@ class MainWindow(QMainWindow):
         except Exception:
             qn = -1
         in_start = bool(getattr(self, "_destination_startup_phase_active", False))
+        rehydr_run = bool(getattr(self, "_destination_post_shell_memory_rehydrate_running", False))
+        _gui = getattr(self, "_destination_planning_overlay_gui_chunk_state", None)
+        _mat_run = bool(isinstance(_gui, dict) and bool(_gui.get("cold_start_materialize")))
         rsn = "wait"
         if not sh:
             rsn = "shell_not_bound"
@@ -28328,21 +28638,28 @@ class MainWindow(QMainWindow):
             rsn = "post_shell_rehydrate_incomplete"
         else:
             rsn = "ready"
+        if in_start and _mat_run:
+            rsn = "cold_materialize_chunk_running"
         _q_bypass = bool(
             getattr(self, "_destination_graph_startup_deferred_queue_suppressed_for_phase_completion", False)
         )
-        if sh and rehydr and qn > 0 and not _q_bypass and qn >= 0:
+        if sh and rehydr and qn > 0 and not _q_bypass and qn >= 0 and rsn == "ready":
             rsn = f"{rsn}+deferred_expand_not_blocking_completion"
         log_info(
             "destination_graph_startup_phase_completion_check",
             startup_phase=in_start,
             shell_bound=bool(sh),
             post_shell_rehydrate_done=bool(rehydr),
+            post_shell_rehydrate_running=bool(rehydr_run),
+            materialize_running=bool(_mat_run),
+            materialize_done=bool(not _mat_run),
             deferred_expand_pending_count=int(qn) if qn >= 0 else -1,
             deferred_queue_suppressed_for_phase=bool(_q_bypass),
             reason=rsn[:80],
         )
         if not sh or not rehydr:
+            return
+        if in_start and _mat_run:
             return
         if qn > 0 and not _q_bypass and qn >= 0:
             log_info(
@@ -28742,6 +29059,8 @@ class MainWindow(QMainWindow):
 
     def _destination_shell_persist_heavy_deferred(self) -> bool:
         """True while Graph destination startup shell is still in its heavy phase (no full tree autosave)."""
+        if self._destination_chunked_startup_shell_work_active():
+            return True
         if not destination_authority_contract.graph_owns_visible_real_destination_structure(self):
             return bool(getattr(self, "_destination_startup_phase_active", False))
         if bool(getattr(self, "_destination_startup_phase_active", False)):
@@ -29012,7 +29331,10 @@ class MainWindow(QMainWindow):
             delta_count=int(n),
         )
         if self._destination_shell_persist_heavy_deferred():
-            log_info("destination_recovery_journal_only_mode_active", reason="graph_startup_or_shell_work")
+            _rjn = "graph_startup_or_shell_work"
+            if self._destination_chunked_startup_shell_work_active():
+                _rjn = "chunked_startup_rehydrate_or_cold_materialize"
+            log_info("destination_recovery_journal_only_mode_active", reason=_rjn)
         return n
 
     def _destination_visible_descendant_counts_for_index(self, dm, parent_ix: QModelIndex) -> tuple[int, int]:
@@ -29135,6 +29457,8 @@ class MainWindow(QMainWindow):
         move,
         *,
         audit_ctx: str,
+        child_index_start: int = 0,
+        max_row_nodes: int | None = None,
     ) -> dict[str, Any]:
         out: dict[str, Any] = {
             "outcome": "skipped",
@@ -29143,6 +29467,8 @@ class MainWindow(QMainWindow):
             "preserved_live_rows": 0,
             "resulting_visible_descendants": -1,
             "rehydrate_source": "",
+            "partial_pending": False,
+            "next_child_index": -1,
         }
         dm = getattr(self, "destination_planning_model", None)
         if dm is None or not parent_ix.isValid() or not isinstance(move, dict):
@@ -29221,8 +29547,18 @@ class MainWindow(QMainWindow):
         inserted = 0
         preserved = 0
         chs = [c for c in (mem_node.get("children") or []) if isinstance(c, dict)]
+        n_ch = int(len(chs))
+        c_start = max(0, int(child_index_start or 0))
+        row_budget: int | None = None
+        if max_row_nodes is not None:
+            try:
+                row_budget = int(max(0, int(max_row_nodes)))
+            except Exception:
+                row_budget = None
+        rows_consumed = 0
         try:
-            for ch in chs:
+            for idx in range(c_start, n_ch):
+                ch = chs[idx]
                 d = ch.get("data") if isinstance(ch.get("data"), dict) else None
                 if not isinstance(d, dict) or d.get("placeholder"):
                     continue
@@ -29249,9 +29585,21 @@ class MainWindow(QMainWindow):
                     continue
                 if not hasattr(dm, "append_nested_child"):
                     break
+                spec_n = 0
+                try:
+                    spec_n = int(self._count_planned_snapshot_nested_spec_nodes(spec))
+                except Exception:
+                    spec_n = 0
+                if row_budget is not None and spec_n > 0 and rows_consumed + spec_n > int(row_budget):
+                    if rows_consumed > 0 or int(row_budget) <= 0:
+                        out["partial_pending"] = True
+                        out["next_child_index"] = int(idx)
+                        out["outcome"] = "partial"
+                        return out
                 try:
                     dm.append_nested_child(c0, spec)
-                    inserted += int(self._count_planned_snapshot_nested_spec_nodes(spec))
+                    inserted += int(spec_n)
+                    rows_consumed += int(spec_n)
                 except Exception:
                     continue
         except Exception as ex:
@@ -60475,6 +60823,7 @@ class MainWindow(QMainWindow):
         allow_defer: bool,
         prefer_chunked_projection: bool,
         narrow_restore_real_snapshot: bool,
+        cold_start_materialize: bool = False,
     ) -> int:
         """Split heavy overlay work across event-loop ticks for graph-id deferred materialize."""
         self._destination_planning_overlay_gui_chunk_gen = (
@@ -60487,6 +60836,9 @@ class MainWindow(QMainWindow):
                 tm.stop()
             except Exception:
                 pass
+        _cold0 = bool(cold_start_materialize) or self._destination_overlay_reason_uses_cold_start_materialize_chunking(
+            str(reason or "")
+        )
         self._destination_planning_overlay_gui_chunk_state = {
             "gen": gen,
             "phase": 0,
@@ -60494,6 +60846,7 @@ class MainWindow(QMainWindow):
             "allow_defer": bool(allow_defer),
             "prefer_chunked_projection": bool(prefer_chunked_projection),
             "narrow_restore_real_snapshot": bool(narrow_restore_real_snapshot),
+            "cold_start_materialize": bool(_cold0),
             "chunk_seq": 0,
             "t_pass0": time.perf_counter(),
         }
@@ -60503,6 +60856,11 @@ class MainWindow(QMainWindow):
             gen=int(gen),
             apply_mode="gui_chunked_cooperative_yield",
         )
+        if bool(_cold0):
+            log_info(
+                "destination_materialize_chunked_started",
+                reason=str(reason or "")[:220],
+            )
         if tm is not None:
             tm.start(0)
         return 0
@@ -60519,11 +60877,19 @@ class MainWindow(QMainWindow):
             return
         if int(st.get("gen", 0) or 0) != int(getattr(self, "_destination_planning_overlay_gui_chunk_gen", 0) or 0):
             return
+        tm = getattr(self, "_destination_planning_overlay_gui_chunk_timer", None)
+        if self._destination_post_shell_rehydrate_recovery_checkpoint_would_block():
+            if tm is not None:
+                tm.start(100)
+            log_info(
+                "destination_startup_work_deferred_for_recovery_prompt",
+                work_kind="destination_planning_overlay_gui_chunk",
+            )
+            return
         st["chunk_seq"] = int(st.get("chunk_seq", 0) or 0) + 1
         phase = int(st.get("phase", 0) or 0)
         t_phase0 = time.perf_counter()
         reason = str(st.get("reason") or "")
-        tm = getattr(self, "_destination_planning_overlay_gui_chunk_timer", None)
 
         def _sched_next() -> None:
             if tm is not None:
@@ -60537,6 +60903,20 @@ class MainWindow(QMainWindow):
                 chunk_seq=int(st.get("chunk_seq", 0) or 0),
                 wall_ms=round((time.perf_counter() - t_phase0) * 1000.0, 3),
             )
+            if bool(st.get("cold_start_materialize")):
+                _pidx = int(phase_idx)
+                _rem = 9 - _pidx
+                if _rem < 0:
+                    _rem = 0
+                log_info(
+                    "destination_materialize_chunked_tick",
+                    reason=str(st.get("reason", "") or "")[:200],
+                    processed_items=1,
+                    phase=int(phase_idx),
+                    phase_name=str(phase_name)[:100],
+                    elapsed_ms=round((time.perf_counter() - t_phase0) * 1000.0, 2),
+                    remaining_items=int(_rem),
+                )
 
         try:
             if phase == 0:
@@ -60663,7 +61043,20 @@ class MainWindow(QMainWindow):
                     ),
                     applied_total=int(int(st.get("n_prop", 0) or 0) + int(st.get("n_alloc", 0) or 0)),
                 )
+                _cold_m = bool(st.get("cold_start_materialize"))
+                if _cold_m:
+                    _tp0 = float(st.get("t_pass0", 0) or 0)
+                    log_info(
+                        "destination_materialize_chunked_completed",
+                        reason=str(reason or "")[:220],
+                        total_ticks=int(st.get("chunk_seq", 0) or 0),
+                        total_elapsed_ms=round((time.perf_counter() - _tp0) * 1000.0, 2),
+                    )
                 self._destination_planning_overlay_gui_chunk_state = None
+                if _cold_m:
+                    self._destination_maybe_finish_graph_startup_phase(
+                        reason="destination_materialize_chunked_complete",
+                    )
                 return
             else:
                 self._destination_planning_overlay_gui_chunk_state = None
@@ -62955,16 +63348,23 @@ class MainWindow(QMainWindow):
             reason_excerpt=str(reason or "")[:160],
         )
         rr = str(reason or "")
-        if (
-            bool(prefer_chunked_projection)
-            and ("deferred_graph_ids_resolved" in rr or rr.startswith("deferred_graph_ids_resolved"))
-            and not force_authoritative_bind
+        _cold_mat = self._destination_overlay_reason_uses_cold_start_materialize_chunking(rr)
+        if (not bool(force_authoritative_bind)) and (
+            (
+                bool(prefer_chunked_projection)
+                and (
+                    "deferred_graph_ids_resolved" in rr
+                    or rr.startswith("deferred_graph_ids_resolved")
+                )
+            )
+            or bool(_cold_mat)
         ):
             return self._destination_planning_overlay_begin_gui_chunked_pass(
                 reason,
                 allow_defer=allow_defer,
                 prefer_chunked_projection=prefer_chunked_projection,
                 narrow_restore_real_snapshot=narrow_restore_real_snapshot,
+                cold_start_materialize=bool(_cold_mat),
             )
         self._destination_materialize_profile_start_cycle()
         exp_paths = self._destination_expanded_paths_for_planning_bind()
@@ -83111,6 +83511,11 @@ class MainWindow(QMainWindow):
             f"before_state={self._window_state_repr()} "
             f"before_geometry={self.geometry().getRect()}"
         )
+        _cp0 = self._planning_user_checkpoint_path()
+        if _cp0 is not None and _cp0.is_file():
+            self._recovery_checkpoint_startup_work_gate_resolved = False
+        else:
+            self._recovery_checkpoint_startup_work_gate_resolved = True
 
         if preserve_maximized:
             self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowMaximized)
@@ -83143,45 +83548,55 @@ class MainWindow(QMainWindow):
             path=str(p)[:500],
             clean_session_close=False,
         )
-        log_info("recovery_prompt_shown", path=str(p)[:400])
-        extra = str(self._planning_recovery_user_dialog_informative_lines() or "").strip()
-        body = (
-            "We found unsaved changes from a previous session that did not close properly.\n\n"
-            "Your current session has already been loaded.\n\n"
-            "You can:\n"
-            "• Restore the unsaved changes (this may overwrite your current changes)\n"
-            "• Ignore them and continue with your current session\n\n"
-            "What would you like to do?"
-        )
-        if extra:
-            body = body + "\n\n" + extra
-        box = QMessageBox(self)
-        box.setWindowTitle("Recover unsaved work")
-        box.setText(body)
-        box.setIcon(QMessageBox.Question)
-        btn_restore = box.addButton("Restore unsaved changes", QMessageBox.AcceptRole)
-        box.addButton("Ignore", QMessageBox.DestructiveRole)
-        btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
-        box.setDefaultButton(btn_restore)
-        box.exec()
-        clicked = box.clickedButton()
-        if clicked == btn_cancel:
-            log_info("recovery_prompt_choice", choice="cancel")
-            return
-        self._recovery_prompt_handled_this_session = True
-        if clicked == btn_restore:
-            log_info("recovery_prompt_choice", choice="restore")
-            n_alloc, n_pr = self._apply_planning_recovery_from_recovery_disk_mirrors()
-            self._clear_planning_user_checkpoint()
-            log_info(
-                "recovery_journal_restored",
-                allocation_rows_applied=int(n_alloc),
-                proposed_rows_applied=int(n_pr),
+        _recovery_prompt_dialog_entered = False
+        try:
+            _recovery_prompt_dialog_entered = True
+            log_info("recovery_prompt_shown", path=str(p)[:400])
+            extra = str(self._planning_recovery_user_dialog_informative_lines() or "").strip()
+            body = (
+                "We found unsaved changes from a previous session that did not close properly.\n\n"
+                "Your current session has already been loaded.\n\n"
+                "You can:\n"
+                "• Restore the unsaved changes (this may overwrite your current changes)\n"
+                "• Ignore them and continue with your current session\n\n"
+                "What would you like to do?"
             )
-            return
-        log_info("recovery_prompt_choice", choice="ignore")
-        self._archive_planning_user_checkpoint()
-        log_info("recovery_journal_cleared", path=str(p)[:400], mode="archived")
+            if extra:
+                body = body + "\n\n" + extra
+            box = QMessageBox(self)
+            box.setWindowTitle("Recover unsaved work")
+            box.setText(body)
+            box.setIcon(QMessageBox.Question)
+            btn_restore = box.addButton("Restore unsaved changes", QMessageBox.AcceptRole)
+            box.addButton("Ignore", QMessageBox.DestructiveRole)
+            btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+            box.setDefaultButton(btn_restore)
+            QApplication.processEvents()
+            log_info("recovery_prompt_ui_yield_before_heavy_startup", path=str(p)[:400])
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked == btn_cancel:
+                log_info("recovery_prompt_choice", choice="cancel")
+                return
+            self._recovery_prompt_handled_this_session = True
+            if clicked == btn_restore:
+                log_info("recovery_prompt_choice", choice="restore")
+                n_alloc, n_pr = self._apply_planning_recovery_from_recovery_disk_mirrors()
+                self._clear_planning_user_checkpoint()
+                log_info(
+                    "recovery_journal_restored",
+                    allocation_rows_applied=int(n_alloc),
+                    proposed_rows_applied=int(n_pr),
+                )
+                return
+            log_info("recovery_prompt_choice", choice="ignore")
+            self._archive_planning_user_checkpoint()
+            log_info("recovery_journal_cleared", path=str(p)[:400], mode="archived")
+        finally:
+            self._recovery_checkpoint_startup_work_gate_resolved = True
+            self._destination_flush_deferred_post_shell_rehydrate_if_ready()
+            if _recovery_prompt_dialog_entered:
+                self._recovery_prompt_handled_this_session = True
 
     def _force_window_to_front_win32(self):
         print(

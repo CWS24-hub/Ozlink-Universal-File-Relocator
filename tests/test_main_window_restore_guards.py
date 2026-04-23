@@ -175,6 +175,9 @@ class _MaterializeSkipHost:
     def _try_skip_redundant_destination_future_model_materialize(self, reason):
         return MainWindow._try_skip_redundant_destination_future_model_materialize(self, reason)
 
+    def _destination_overlay_reason_uses_cold_start_materialize_chunking(self, r: str) -> bool:
+        return MainWindow._destination_overlay_reason_uses_cold_start_materialize_chunking(self, r)
+
     def _log_restore_phase(self, phase, **data):
         self.logged.append((phase, dict(data)))
 
