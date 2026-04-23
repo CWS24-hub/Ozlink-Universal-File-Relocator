@@ -68859,7 +68859,7 @@ class MainWindow(QMainWindow):
             ):
                 if isinstance(_mv0, dict):
                     _rh_thin = self._destination_rehydrate_visible_branch_from_memory_snapshot(
-                        ix, _mv0, audit_context="allocation_descendants_applied_zero_direct"
+                        ix, _mv0, audit_ctx="allocation_descendants_applied_zero_direct"
                     )
                     if int(_rh_thin.get("inserted_rows") or 0) > 0:
                         log_info(
