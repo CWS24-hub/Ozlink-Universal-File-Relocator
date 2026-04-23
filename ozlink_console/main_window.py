@@ -3134,6 +3134,22 @@ class MainWindow(QMainWindow):
         self._destination_invariant_repair_path_cooldown_mono: dict[str, float] = {}
         self._destination_invariant_repair_path_last_fingerprint: dict[str, str] = {}
         self._destination_invariant_repair_cooldown_s: float = 4.0
+        # Workspace destination snapshot cache (short TTL) for memory-backed branch classification.
+        self._destination_wso_roots_cache: list | None = None
+        self._destination_wso_roots_cache_tag: str = ""
+        self._destination_wso_roots_cache_expiry_mono: float = 0.0
+        # "" | "deferred_gesture_queue" | "explicit_repair" (set by deferred expand / explicit repair entry).
+        self._destination_expand_invocation: str = ""
+        self._destination_rehydrate_session_fingerprint: dict[str, str] = {}
+        # path_cf -> invariant fingerprint when memory-backed repair was suppressed (cleared on fresh evidence)
+        self._destination_invariant_repair_memory_backed_suppress_paths: dict[str, str] = {}
+        self._destination_startup_deferred_expand_enqueued_count: int = 0
+        # True while :meth:`_drain_destination_expand_user_deferred_queue` is synchronously expanding.
+        self._destination_expand_deferred_drain_active: bool = False
+        # Set during destination tree expand handling for :meth:`_load_destination_projected_descendants_index`.
+        self._destination_load_expand_auth_class: str = ""
+        # True after startup replay guard end / shell interactable: relax strict deferred expand caps.
+        self._destination_expand_shell_ready: bool = False
         # Read-only: ensure startup memory vs rich-candidate audit runs at most once per restore pass.
         self._destination_memory_active_rich_candidate_audit_ran: bool = False
         self._destination_last_startup_status_reason: str = ""
@@ -27172,6 +27188,7 @@ class MainWindow(QMainWindow):
         if not bool(getattr(self, "_destination_startup_phase_active", True)):
             return
         self._destination_startup_phase_active = False
+        self._destination_expand_shell_ready = True
         log_info(
             "destination_startup_replay_summary",
             replay_enqueued_count=int(getattr(self, "_destination_startup_replay_enqueued_count", 0) or 0),
@@ -27250,6 +27267,92 @@ class MainWindow(QMainWindow):
             if isinstance(d, list) and d:
                 return d, "runtime_session"
         return [], "none"
+
+    def _destination_invalidate_workspace_snapshot_roots_cache(self) -> None:
+        self._destination_wso_roots_cache = None
+        self._destination_wso_roots_cache_tag = ""
+        self._destination_wso_roots_cache_expiry_mono = 0.0
+
+    def _destination_eager_destination_tree_snapshot_roots(self) -> tuple[list, str]:
+        """Same sources as :meth:`_destination_memory_snapshot_roots_for_hydration` with a short TTL cache.
+
+        If the first read is empty, perform one additional read of the workspace snapshot and log so
+        memory-backed classification is not dropped on early timing windows.
+        """
+        t0 = time.monotonic()
+        exp = float(getattr(self, "_destination_wso_roots_cache_expiry_mono", 0) or 0)
+        c = getattr(self, "_destination_wso_roots_cache", None)
+        if isinstance(c, list) and t0 < exp and c:
+            return c, str(getattr(self, "_destination_wso_roots_cache_tag", "") or "")
+        roots, tag = self._destination_memory_snapshot_roots_for_hydration()
+        if not roots and getattr(self, "memory_manager", None) is not None:
+            try:
+                wso = self.memory_manager.read_workspace_snapshot_optional()  # type: ignore[union-attr]  # noqa: E501
+            except Exception:
+                wso = None
+            if isinstance(wso, dict):
+                dtn = wso.get("destination_tree_snapshot") or []
+                if isinstance(dtn, list) and dtn:
+                    roots, tag = dtn, "workspace_snapshot_ondemand_reread"
+                    log_info(
+                        "destination_memory_backed_lookup_on_demand_fallback_used",
+                        lookup_source="workspace_snapshot_reread",
+                        node_count_hint=int(len(roots)) if isinstance(roots, list) else 0,
+                    )
+        self._destination_wso_roots_cache = roots
+        self._destination_wso_roots_cache_tag = tag
+        self._destination_wso_roots_cache_expiry_mono = t0 + 2.0
+        return roots, tag
+
+    def _destination_infer_expand_auth_class(self) -> str:
+        ex = str(getattr(self, "_destination_expand_invocation", "") or "").strip()
+        if ex in ("explicit_repair", "explicit_repair_authorized_path"):
+            return "explicit_user_repair"
+        if ex == "deferred_gesture_queue":
+            return "deferred_visibility_expand"
+        if not bool(getattr(self, "_destination_startup_phase_active", False)):
+            return "real_user_expand" if bool(getattr(self, "_destination_expand_shell_ready", False)) else "deferred_visibility_expand"
+        if bool(getattr(self, "_destination_startup_first_interactable_logged", False)):
+            return "real_user_expand"
+        return "startup_shell_expand"
+
+    def _destination_should_allow_deferred_startup_expand(self, *, canonical_path: str) -> tuple[bool, str, str]:
+        """Narrow allowlist: block deep / unselected planned rows during early startup; log policy."""
+        p = self._materialize_cached_destination_lookup_norm(str(canonical_path or "").strip())
+        if not p:
+            return False, "empty_path", ""
+        if bool(getattr(self, "_destination_expand_shell_ready", False)) and not bool(
+            getattr(self, "_destination_startup_phase_active", False)
+        ):
+            return True, "post_startup_relaxed", "relaxed"
+        ex_n = int(getattr(self, "_destination_startup_deferred_expand_enqueued_count", 0) or 0)
+        if ex_n > 200:
+            return False, "session_deferred_cap_exceeded", "hard_cap"
+        segs = [x for x in str(p).replace("/", "\\").split("\\") if x] if not hasattr(self, "_path_segments") else self._path_segments(p)  # noqa: E501
+        depth = int(len(segs))
+        sel = self._collect_selected_tree_path("destination")
+        s_norm = (self._materialize_cached_destination_lookup_norm(str(sel or "")) or "").casefold() if sel else ""
+        p_cf = p.casefold()
+        in_sel_chain = bool(s_norm and (p_cf == s_norm or p_cf.startswith(s_norm + "\\") or s_norm.startswith(p_cf + "\\")))
+        dm = getattr(self, "destination_planning_model", None)
+        is_planned_alloc = False
+        if dm is not None and hasattr(dm, "find_indices_for_canonical_destination_path"):
+            for ix2 in (dm.find_indices_for_canonical_destination_path(p) or []):
+                if not ix2.isValid():
+                    continue
+                ch = ix2.data(Qt.UserRole) or {}
+                if self.node_is_planned_allocation(ch if isinstance(ch, dict) else {}):
+                    is_planned_alloc = True
+                    break
+        if in_sel_chain:
+            return True, "selected_or_ancestor", "nav_context"
+        if depth <= 2 and not (is_planned_alloc and depth >= 3):
+            return True, "shallow_2", "shell"
+        if is_planned_alloc and depth > 2 and not in_sel_chain:
+            return False, "deep_planned_allocation_unselected", "block_deep"
+        if depth > 3 and not in_sel_chain:
+            return False, "deep_unselected", "block_deep"
+        return True, "default_admit", "admit"
 
     def _destination_snapshot_norm_path(self, raw: str) -> str:
         s = str(raw or "").strip()
@@ -27400,14 +27503,29 @@ class MainWindow(QMainWindow):
             "visible_descendant_count": 0,
             "allocation_descendants_applied": bool((node_data or {}).get("allocation_descendants_applied")),
         }
-        roots, src = self._destination_memory_snapshot_roots_for_hydration()
+        cnorm = self._destination_snapshot_norm_path(canonical_path)
+        log_info(
+            "destination_memory_backed_lookup_started",
+            normalized_path=str(cnorm)[:500],
+        )
+        roots, src = self._destination_eager_destination_tree_snapshot_roots()
         out["snapshot_source"] = str(src)
         if not roots or not isinstance(move, dict):
+            log_info(
+                "destination_memory_backed_lookup_miss",
+                lookup_source="no_roots",
+                normalized_path=str(cnorm)[:500],
+            )
             return out
         if not self.node_is_planned_allocation(node_data or {}):
             return out
         mem_node = self._destination_snapshot_find_node_by_canonical_path(roots, canonical_path)
         if mem_node is None:
+            log_info(
+                "destination_memory_backed_lookup_miss",
+                lookup_source="path_not_in_snapshot",
+                normalized_path=str(cnorm)[:500],
+            )
             return out
         out["candid_memory_backing"] = True
         try:
@@ -27418,6 +27536,12 @@ class MainWindow(QMainWindow):
         except Exception:
             out["stored_children_count"] = 0
         out["stored_descendant_count"] = int(self._destination_snapshot_subtree_substantive_node_count(mem_node))
+        log_info(
+            "destination_memory_backed_lookup_hit",
+            lookup_source=str(src)[:40],
+            normalized_path=str(cnorm)[:500],
+            hit_descendant_count=int(out.get("stored_descendant_count") or 0),
+        )
         vdir, vtot = self._destination_visible_descendant_counts_for_index(dm, parent_ix)
         out["visible_child_count"] = int(vdir)
         out["visible_descendant_count"] = int(vtot)
@@ -27452,7 +27576,7 @@ class MainWindow(QMainWindow):
         canon = str(
             self._canonical_planned_memory_path_for_graph_match(row_path) or self.normalize_memory_path(row_path) or ""
         ).strip()
-        roots, src = self._destination_memory_snapshot_roots_for_hydration()
+        roots, src = self._destination_eager_destination_tree_snapshot_roots()
         if not roots or not canon:
             log_info(
                 "destination_visible_branch_rehydrate_from_memory_skipped",
@@ -27469,6 +27593,31 @@ class MainWindow(QMainWindow):
                 audit_context=str(audit_ctx or "")[:120],
                 canonical_path_excerpt=canon[:400],
             )
+            return out
+        c_cf = str(canon).casefold()
+        vdir0, vtot0 = self._destination_visible_descendant_counts_for_index(dm, c0)
+        sub_n = int(self._destination_snapshot_subtree_substantive_node_count(mem_node))
+        fp = f"{c_cf}|v={vtot0}|m={sub_n}"
+        dfp = getattr(self, "_destination_rehydrate_session_fingerprint", None)
+        if not isinstance(dfp, dict):
+            dfp = {}
+        self._destination_rehydrate_session_fingerprint = dfp
+        prev = str(dfp.get(c_cf) or "")
+        if prev == fp and int(vtot0) > 0:
+            log_info(
+                "destination_visible_branch_rehydrate_from_memory_skipped_already_applied",
+                canonical_path_excerpt=canon[:400],
+                fingerprint_excerpt=fp[:200],
+            )
+            out["outcome"] = "skipped"
+            return out
+        if prev == fp and int(vtot0) == 0 and int(sub_n) > 0:
+            log_info(
+                "destination_visible_branch_rehydrate_from_memory_state_unchanged",
+                canonical_path_excerpt=canon[:400],
+                fingerprint_excerpt=fp[:200],
+            )
+            out["outcome"] = "skipped"
             return out
         log_info(
             "destination_visible_branch_rehydrate_from_memory_started",
@@ -27527,6 +27676,8 @@ class MainWindow(QMainWindow):
         out["resulting_visible_descendants"] = int(vtot)
         if inserted > 0:
             out["outcome"] = "completed"
+            _fp2 = f"{c_cf}|v={vtot}|m={sub_n}"
+            dfp[c_cf] = _fp2
             self._mark_destination_tree_snapshot_dirty_after_injection(
                 reason="rehydrate_visible_from_memory", affected_path=canon[:400]
             )
@@ -27600,8 +27751,13 @@ class MainWindow(QMainWindow):
         user_initiated: bool,
         idle_bounded: bool,
         explicit_repair_authorized: bool,
+        expand_auth_class: str = "",
     ) -> str:
-        """Return ``proceed`` | ``blocked`` | ``rehydrated_no_replay`` for graph allocation-descendant decoration."""
+        """Return ``proceed`` | ``blocked`` | ``rehydrated_no_replay`` for graph allocation-descendant decoration.
+
+        For planned allocation branches with substantive memory snapshot, full descendant replay is denied unless
+        :meth:`_destination_infer_expand_auth_class` is ``explicit_user_repair`` (or ``explicit_repair_authorized``).
+        """
         dm = getattr(self, "destination_planning_model", None)
         if (
             dm is None
@@ -27618,6 +27774,7 @@ class MainWindow(QMainWindow):
         canon = str(
             self._canonical_planned_memory_path_for_graph_match(row_path) or self.normalize_memory_path(row_path) or ""
         ).strip()
+        _eac = str(expand_auth_class or "").strip() or self._destination_infer_expand_auth_class()
         assess = self._destination_assess_memory_backed_branch(
             canonical_path=canon, move=move, node_data=pl, dm=dm, parent_ix=c0
         )
@@ -27651,11 +27808,9 @@ class MainWindow(QMainWindow):
             )
             if int(rehydr_out.get("inserted_rows") or 0) > 0:
                 log_info("destination_applied_empty_branch_rehydrate_succeeded", path_excerpt=row_path[:400])
-        if bool(explicit_repair_authorized):
+        if bool(explicit_repair_authorized) or _eac == "explicit_user_repair":
             return "proceed"
         if not bool(assess.get("memory_backed_branch")):
-            return "proceed"
-        if not self._destination_enqueue_reason_hits_memory_backed_replay_deny(str(enqueue_reason or "")):
             return "proceed"
         inserted = int((rehydr_out or {}).get("inserted_rows") or 0)
         assess2 = self._destination_assess_memory_backed_branch(
@@ -27669,6 +27824,7 @@ class MainWindow(QMainWindow):
                 enqueue_reason=str(enqueue_reason or "")[:200],
                 user_initiated=bool(user_initiated),
                 idle_bounded=bool(idle_bounded),
+                auth_class=str(_eac)[:40],
                 branch_memory_backed=True,
                 rehydrate_attempted=True,
                 pending_marker_added=False,
@@ -27681,8 +27837,9 @@ class MainWindow(QMainWindow):
             enqueue_reason=str(enqueue_reason or "")[:200],
             user_initiated=bool(user_initiated),
             idle_bounded=bool(idle_bounded),
+            auth_class=str(_eac)[:40],
             branch_memory_backed=True,
-            rehydrate_attempted=bool(should_try_rehydrate and rehydr_out),
+            rehydrate_attempted=bool(should_try_rehydrate and bool(rehydr_out)),
             pending_marker_added=bool(still_thin or inserted == 0),
             explicit_repair_authorized=bool(explicit_repair_authorized),
         )
@@ -36918,6 +37075,22 @@ class MainWindow(QMainWindow):
         if self._full_trace_enabled():
             self._ui_trace("tree", "expand_signal", panel_key=panel_key, item=None)
         node_data = col0.data(Qt.UserRole) or {}
+        ex0 = str(getattr(self, "_destination_expand_invocation", "") or "").strip()
+        if not getattr(self, "_destination_expand_deferred_drain_active", False):
+            if ex0 not in ("explicit_repair", "explicit_repair_authorized_path"):
+                self._destination_expand_invocation = ""
+        _ac = self._destination_infer_expand_auth_class()
+        self._destination_load_expand_auth_class = _ac
+        _spc = str(self._destination_semantic_path(node_data) or self._tree_item_path(node_data) or "")[:500]
+        _sctx = str(self._collect_selected_tree_path("destination") or "")[:500]
+        log_info(
+            "destination_expand_authorization_classified",
+            canonical_path=_spc,
+            original_reason="tree_expanded",
+            auth_class=_ac,
+            startup_phase=bool(getattr(self, "_destination_startup_phase_active", False)),
+            selected_context=_sctx,
+        )
         base_label = str(node_data.get("base_display_label", "") or "").strip().lower()
         tree_label = str(node_data.get("tree_label", "") or "").strip().lower()
         text_label = str(node_data.get("base_display_label", "") or "").strip().lower()
@@ -36933,7 +37106,9 @@ class MainWindow(QMainWindow):
         if self._destination_pipeline_blocks_user_expand_gesture():
             sp = self._destination_semantic_path(node_data) or self._tree_item_path(node_data)
             if sp:
-                self._enqueue_destination_expand_deferred(str(sp).strip())
+                self._enqueue_destination_expand_deferred(
+                    str(sp).strip(), producer="pipeline_block_user_expand_deferred"
+                )
             return
         if (
             self.node_is_planned_allocation(node_data)
@@ -47371,6 +47546,7 @@ class MainWindow(QMainWindow):
         user_initiated: bool = False,
         idle_bounded: bool = False,
         explicit_repair_authorized: bool = False,
+        expand_auth_class: str | None = None,
     ) -> int:
         """Project source subtree under a Graph-auth allocation folder (chunked; no single-wave bind).
 
@@ -47385,6 +47561,7 @@ class MainWindow(QMainWindow):
             user_initiated=bool(user_initiated),
             idle_bounded=bool(idle_bounded),
             explicit_repair_authorized=bool(explicit_repair_authorized),
+            expand_auth_class=expand_auth_class,
         )
         return 0
 
@@ -49910,6 +50087,7 @@ class MainWindow(QMainWindow):
         user_initiated: bool = False,
         idle_bounded: bool = False,
         explicit_repair_authorized: bool = False,
+        expand_auth_class: str | None = None,
     ) -> bool:
         """Queue incremental allocation-descendant application for a QModelIndex. State is built when the job runs."""
         if _shutdown_mutation_skip_for_host(
@@ -49993,6 +50171,7 @@ class MainWindow(QMainWindow):
                     )
                     return True
         _graph_auth_enqueue = destination_authority_contract.graph_owns_visible_real_destination_structure(self)
+        _auth_class_enq = str(expand_auth_class or "").strip() or self._destination_infer_expand_auth_class()
         _assess_enq: dict | None = None
         _assessor_called_enq = False
         _assess_out_enq = "not_called"
@@ -50087,13 +50266,41 @@ class MainWindow(QMainWindow):
                         path_excerpt=str(_dp3)[:400],
                     )
         _exp_defer = int((_assess_enq or {}).get("expected_descendant_count") or 0) if _assess_enq else 0
-        _mem_roots_for_policy, _ = self._destination_memory_snapshot_roots_for_hydration()
-        if (
-            _graph_auth_enqueue
-            and isinstance(move, dict)
-            and self._destination_memory_overlay_mode_enabled()
-            and _mem_roots_for_policy
-        ):
+        if _graph_auth_enqueue and isinstance(move, dict) and self._destination_memory_overlay_mode_enabled():
+            pl_pr = dict(parent_ix.data(Qt.UserRole) or {})
+            row_pr = str(self._tree_item_path(pl_pr) or "").strip()
+            canon_pr = str(
+                self._canonical_planned_memory_path_for_graph_match(row_pr) or self.normalize_memory_path(row_pr) or ""
+            ).strip()
+            _assess_pre = self._destination_assess_memory_backed_branch(
+                canonical_path=canon_pr, move=move, node_data=pl_pr, dm=model, parent_ix=parent_ix
+            )
+            vdir_p = int(_assess_pre.get("visible_child_count") or 0)
+            vtot_p = int(_assess_pre.get("visible_descendant_count") or 0)
+            _mem_b = bool(_assess_pre.get("memory_backed_branch"))
+            _deny = bool(
+                _mem_b
+                and (str(_auth_class_enq) not in ("explicit_user_repair",) and not bool(explicit_repair_authorized))
+            )
+            _deny_r = (
+                "memory_backed_replay_requires_explicit_repair"
+                if _deny
+                else ("not_memory_backed" if not _mem_b else "explicit_repair_authorized")
+            )
+            log_info(
+                "destination_pre_replay_branch_classification",
+                canonical_path=canon_pr[:500],
+                row_kind=str(pl_pr.get("row_kind") or "")[:40],
+                auth_class=str(_auth_class_enq)[:40],
+                memory_backed=_mem_b,
+                stored_children_count=int(_assess_pre.get("stored_children_count") or 0),
+                stored_descendant_count=int(_assess_pre.get("stored_descendant_count") or 0),
+                visible_children_count=vdir_p,
+                visible_descendant_count=vtot_p,
+                explicit_repair_authorized=bool(explicit_repair_authorized),
+                replay_denied=bool(_deny),
+                deny_reason=str(_deny_r)[:120],
+            )
             _mp = self._destination_pre_descendant_replay_memory_branch_policy(
                 parent_ix,
                 move,
@@ -50101,6 +50308,7 @@ class MainWindow(QMainWindow):
                 user_initiated=bool(user_initiated),
                 idle_bounded=bool(idle_bounded),
                 explicit_repair_authorized=bool(explicit_repair_authorized),
+                expand_auth_class=str(_auth_class_enq),
             )
             if _mp == "rehydrated_no_replay":
                 tree_rc2 = getattr(self, "destination_tree_widget", None)
@@ -50191,6 +50399,7 @@ class MainWindow(QMainWindow):
                 bool(user_initiated),
                 bool(idle_bounded),
                 bool(explicit_repair_authorized),
+                str(_auth_class_enq)[:64],
             )
         )
         if not bool(user_initiated):
@@ -50238,6 +50447,7 @@ class MainWindow(QMainWindow):
         user_initiated: bool = False,
         idle_bounded: bool = False,
         explicit_repair_authorized: bool = False,
+        expand_auth_class: str | None = None,
     ) -> int:
         """Apply projected allocation descendants under parent_ix. Work is incremental; return value is always 0."""
         self._enqueue_destination_descendant_apply_to_model(
@@ -50249,6 +50459,7 @@ class MainWindow(QMainWindow):
             user_initiated=bool(user_initiated),
             idle_bounded=bool(idle_bounded),
             explicit_repair_authorized=bool(explicit_repair_authorized),
+            expand_auth_class=expand_auth_class,
         )
         return 0
 
@@ -57594,10 +57805,50 @@ class MainWindow(QMainWindow):
                 delay_ms=int(self._DEFERRED_EXPAND_TAIL_DELAY_MS)
             )
 
-    def _enqueue_destination_expand_deferred(self, semantic_path: str) -> None:
+    def _enqueue_destination_expand_deferred(self, semantic_path: str, *, producer: str = "unspecified") -> None:
         p = (semantic_path or "").strip()
         if not p:
             return
+        allow, rsn, akind = self._destination_should_allow_deferred_startup_expand(canonical_path=p)
+        if not allow:
+            log_info(
+                "destination_startup_deferred_expand_blocked_policy",
+                canonical_path=p[:500],
+                reason=str(rsn)[:120],
+                row_kind=str(akind)[:40],
+                startup_phase=bool(getattr(self, "_destination_startup_phase_active", False)),
+                selected_context=str(self._collect_selected_tree_path("destination") or "")[:500],
+            )
+            log_info(
+                "destination_deferred_expand_enqueue_blocked_policy",
+                canonical_path=p[:500],
+                producer=str(producer)[:80],
+                block_reason=str(rsn)[:120],
+            )
+            return
+        log_info(
+            "destination_startup_deferred_expand_allowed_policy",
+            canonical_path=p[:500],
+            reason=str(rsn)[:120],
+            allowed_kind=str(akind)[:40],
+            startup_phase=bool(getattr(self, "_destination_startup_phase_active", False)),
+            selected_context=str(self._collect_selected_tree_path("destination") or "")[:500],
+        )
+        _dac = self._destination_infer_expand_auth_class()
+        log_info(
+            "destination_deferred_expand_enqueued",
+            canonical_path=p[:500],
+            producer=str(producer)[:80],
+            auth_class=str(_dac)[:40],
+            startup_phase=bool(getattr(self, "_destination_startup_phase_active", False)),
+            selected_context=str(self._collect_selected_tree_path("destination") or "")[:500],
+        )
+        try:
+            self._destination_startup_deferred_expand_enqueued_count = int(
+                getattr(self, "_destination_startup_deferred_expand_enqueued_count", 0) or 0
+            ) + 1
+        except Exception:
+            pass
         if p in self._destination_expand_user_deferred_seen:
             return
         self._destination_expand_user_deferred_seen.add(p)
@@ -57615,9 +57866,10 @@ class MainWindow(QMainWindow):
 
     def _schedule_destination_expand_user_deferred_drain(self, *, delay_ms: int) -> None:
         """Coalesce: only one singleShot outstanding; never stack duplicate zero-delay timers."""
-        d = int(max(50, int(delay_ms)))
+        _raw = int(delay_ms)
+        d = int(max(50, _raw))
         if self._destination_expand_user_deferred_scheduled:
-            if d <= 0:
+            if _raw <= 0:
                 n = int(getattr(self, "_destination_expand_deferred_duplicate_zero_suppressed", 0) or 0) + 1
                 self._destination_expand_deferred_duplicate_zero_suppressed = n
                 if n <= 4 or n % 200 == 0:
@@ -57643,6 +57895,12 @@ class MainWindow(QMainWindow):
             return
         if getattr(self, "_destination_expand_deferred_drain_running", False):
             log_info("destination_expand_queue_reentry_blocked", queue_len=len(q))
+            if not bool(getattr(self, "_destination_expand_deferred_drain_reentry_pended", False)):
+                self._destination_expand_deferred_drain_reentry_pended = True
+                QTimer.singleShot(
+                    int(self._DEFERRED_EXPAND_REENTRY_COALESCE_MS),
+                    self._drain_destination_expand_user_deferred_queue,
+                )
             return
         _queue_len_before = len(q)
         _processed = 0
@@ -57833,24 +58091,30 @@ class MainWindow(QMainWindow):
                         )
                     else:
                         _expanded = False
+                        self._destination_expand_deferred_drain_active = True
+                        self._destination_expand_invocation = "deferred_gesture_queue"
                         try:
-                            if not tree.isExpanded(ix):
-                                tree.expand(ix)
-                                _expanded = True
-                                log_info(
-                                    "destination_expand_deferred_expand_applied",
-                                    drain_id=_sum_id,
-                                    semantic_path=path[:400],
-                                )
-                        except Exception:
-                            pass
-                        log_info(
-                            "destination_expand_deferred_graph_load_requested",
-                            drain_id=_sum_id,
-                            semantic_path=path[:400],
-                            note="invoke_expand_handler_after_expand",
-                        )
-                        self._on_destination_planning_model_expanded(ix)
+                            try:
+                                if not tree.isExpanded(ix):
+                                    tree.expand(ix)
+                                    _expanded = True
+                                    log_info(
+                                        "destination_expand_deferred_expand_applied",
+                                        drain_id=_sum_id,
+                                        semantic_path=path[:400],
+                                    )
+                            except Exception:
+                                pass
+                            log_info(
+                                "destination_expand_deferred_graph_load_requested",
+                                drain_id=_sum_id,
+                                semantic_path=path[:400],
+                                note="invoke_expand_handler_after_expand",
+                            )
+                            self._on_destination_planning_model_expanded(ix)
+                        finally:
+                            self._destination_expand_deferred_drain_active = False
+                            self._destination_expand_invocation = ""
                         self._destination_expand_deferred_parked_paths.discard(path)
                         self._destination_expand_deferred_path_retries.pop(path, None)
                         log_info(
@@ -67172,7 +67436,11 @@ class MainWindow(QMainWindow):
 
             dm.update_payload_for_index(col0, _mut_retry)
             self._load_destination_projected_descendants_index(
-                col0, user_initiated=True, idle_bounded=True, explicit_repair_authorized=True
+                col0,
+                user_initiated=True,
+                idle_bounded=True,
+                explicit_repair_authorized=True,
+                expand_auth_class="explicit_user_repair",
             )
 
     def _apply_overlay_projection_invariant_repair_to_index(self, col0: QModelIndex, move) -> None:
@@ -67207,6 +67475,38 @@ class MainWindow(QMainWindow):
             pl_probe = pl0
             move_eff = self._find_exact_planned_move_for_destination_projection_path(pl_probe)
         if isinstance(move_eff, dict):
+            _canon_ox = str(
+                self._canonical_planned_memory_path_for_graph_match(row_p0) or self.normalize_memory_path(row_p0) or ""
+            ).strip()
+            _ass_ox = self._destination_assess_memory_backed_branch(
+                canonical_path=_canon_ox,
+                move=move_eff,
+                node_data=pl0,
+                dm=dm,
+                parent_ix=col0,
+            )
+            if bool(_ass_ox.get("memory_backed_branch")) and not bool(_ass_ox.get("visible_underrepresents_memory")):
+                log_info(
+                    "destination_invariant_repair_suppressed_memory_backed_branch",
+                    canonical_path=(canon_inv[:500] if canon_inv else str(_canon_ox)[:500]),
+                    reason="visible_matches_memory_substantive",
+                )
+                return
+            _smap = self._destination_invariant_repair_memory_backed_suppress_paths
+            if not isinstance(_smap, dict):
+                _smap = {}
+            _fp_ox = self._destination_invariant_repair_fingerprint(dm, col0) if canon_inv else ""
+            if (
+                canon_inv
+                and bool(_ass_ox.get("memory_backed_branch"))
+                and str(_smap.get(canon_inv) or "") == str(_fp_ox)
+            ):
+                log_info(
+                    "destination_invariant_repair_suppressed_memory_backed_branch",
+                    canonical_path=canon_inv[:500],
+                    reason="fingerprint_unchanged_since_last_suppress",
+                )
+                return
             log_info(
                 "destination_overlay_repair_reuse_assess_entered",
                 move_key_excerpt=str(self._allocation_move_key(move_eff) or "")[:120],
@@ -67237,12 +67537,17 @@ class MainWindow(QMainWindow):
                 user_initiated=False,
                 idle_bounded=False,
                 explicit_repair_authorized=False,
+                expand_auth_class="deferred_visibility_expand",
             )
             if _mpol in ("rehydrated_no_replay", "blocked"):
                 if canon_inv:
-                    self._destination_invariant_repair_mark_cooldown(
-                        canon_inv, self._destination_invariant_repair_fingerprint(dm, col0)
-                    )
+                    _fp_mem = self._destination_invariant_repair_fingerprint(dm, col0)
+                    self._destination_invariant_repair_mark_cooldown(canon_inv, _fp_mem)
+                    sm = self._destination_invariant_repair_memory_backed_suppress_paths
+                    if not isinstance(sm, dict):
+                        sm = {}
+                    sm[canon_inv] = str(_fp_mem)[:200]
+                    self._destination_invariant_repair_memory_backed_suppress_paths = sm
                 log_info(
                     "destination_invariant_repair_branch_state_unchanged",
                     policy_result=str(_mpol)[:32],
@@ -67318,6 +67623,7 @@ class MainWindow(QMainWindow):
             collect_reason="overlay_projection_invariant_repair",
             user_initiated=False,
             explicit_repair_authorized=False,
+            expand_auth_class="deferred_visibility_expand",
         )
 
     def _destination_index_has_overlay_backed_non_graph_children(self, dm, parent_ix: QModelIndex) -> bool:
@@ -68050,9 +68356,30 @@ class MainWindow(QMainWindow):
             p.pop("allocation_projection_children_signature", None)
 
         dm.update_payload_for_index(col0, _mut_retry)
-        self._load_destination_projected_descendants_index(
-            col0, user_initiated=True, idle_bounded=True, explicit_repair_authorized=True
-        )
+        plp = dict(col0.data(Qt.UserRole) or {})
+        _rp0 = str(self._tree_item_path(plp) or "").strip()
+        _cc0 = str(
+            self._canonical_planned_memory_path_for_graph_match(_rp0) or self.normalize_memory_path(_rp0) or ""
+        ).strip().casefold()
+        if _cc0 and _cc0 in (self._destination_invariant_repair_memory_backed_suppress_paths or {}):
+            self._destination_invariant_repair_memory_backed_suppress_paths.pop(_cc0, None)
+            log_info(
+                "destination_invariant_repair_suppression_cleared",
+                canonical_path=_cc0[:500],
+                reason="explicit_user_repair_prepare_and_reload",
+            )
+        _prev_inv = str(getattr(self, "_destination_expand_invocation", "") or "")
+        self._destination_expand_invocation = "explicit_repair"
+        try:
+            self._load_destination_projected_descendants_index(
+                col0,
+                user_initiated=True,
+                idle_bounded=True,
+                explicit_repair_authorized=True,
+                expand_auth_class="explicit_user_repair",
+            )
+        finally:
+            self._destination_expand_invocation = _prev_inv
 
     def _schedule_coalesced_overlay_invariant(self, reason: str, *, source_driven: bool = False) -> None:
         """Collapse many rapid notifications into one :meth:`_on_destination_state_mutation` on the next event-loop tick.
@@ -68441,6 +68768,7 @@ class MainWindow(QMainWindow):
         user_initiated: bool = False,
         idle_bounded: bool = False,
         explicit_repair_authorized: bool = False,
+        expand_auth_class: str | None = None,
     ) -> None:
         dmodel = getattr(self, "destination_planning_model", None)
         tree = getattr(self, "destination_tree_widget", None)
@@ -68458,6 +68786,7 @@ class MainWindow(QMainWindow):
             )
             return
         node_data = dict(ix.data(Qt.UserRole) or {})
+        _lauth = str(expand_auth_class or getattr(self, "_destination_load_expand_auth_class", "") or "").strip() or self._destination_infer_expand_auth_class()
         if self._full_trace_enabled():
             self._ui_trace(
                 "projection",
@@ -68725,6 +69054,7 @@ class MainWindow(QMainWindow):
                             collect_reason=_eq_reason("load_projected_descendants_graph_shell_pending_folder_alloc"),
                             user_initiated=bool(user_initiated),
                             explicit_repair_authorized=bool(explicit_repair_authorized),
+                            expand_auth_class=_lauth,
                         )
                     else:
                         if fen_ld:
@@ -68837,6 +69167,7 @@ class MainWindow(QMainWindow):
                         collect_reason=_eq_reason("load_projected_descendants_startup_visibility_bypass"),
                         user_initiated=bool(user_initiated),
                         explicit_repair_authorized=bool(explicit_repair_authorized),
+                        expand_auth_class=_lauth,
                     )
                     return
                 if fen_ld:
@@ -68873,6 +69204,7 @@ class MainWindow(QMainWindow):
                 user_initiated=bool(user_initiated),
                 idle_bounded=bool(idle_bounded),
                 explicit_repair_authorized=bool(explicit_repair_authorized),
+                expand_auth_class=_lauth,
             )
             return
         self._remove_placeholder_children(ix)
@@ -68960,6 +69292,7 @@ class MainWindow(QMainWindow):
             user_initiated=bool(user_initiated),
             idle_bounded=bool(idle_bounded),
             explicit_repair_authorized=bool(explicit_repair_authorized),
+            expand_auth_class=_lauth,
         ):
             move_src = move.get("source", {}) or {}
             if bool(move_src.get("is_folder", True)):
