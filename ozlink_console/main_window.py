@@ -3150,6 +3150,10 @@ class MainWindow(QMainWindow):
         self._destination_load_expand_auth_class: str = ""
         # True after startup replay guard end / shell interactable: relax strict deferred expand caps.
         self._destination_expand_shell_ready: bool = False
+        # User explicitly expanded this planned path (casefold) after the shell is interactable.
+        self._destination_planned_user_opened_paths_cf: set[str] = set()
+        # Branches (casefold) known thin in the active memory snapshot; suppress repeated invariant churn.
+        self._destination_invariant_repair_known_thin_branch_paths: set[str] = set()
         # Read-only: ensure startup memory vs rich-candidate audit runs at most once per restore pass.
         self._destination_memory_active_rich_candidate_audit_ran: bool = False
         self._destination_last_startup_status_reason: str = ""
@@ -12228,6 +12232,30 @@ class MainWindow(QMainWindow):
         self._destination_runtime_snapshot_force_refresh_during_tick = True
         try:
             fresh = list(self._capture_tree_items_snapshot("destination") or [])
+            try:
+                st_d = getattr(self, "_draft_shell_state", None)
+                ex_f = list(st_d.DestinationTreeSnapshot or []) if isinstance(st_d, SessionState) else []
+                rs_f = getattr(self, "_runtime_session_tree_snapshots", None)
+                rt_f = list(rs_f.get("destination") or []) if isinstance(rs_f, dict) else []
+                pr_f: list = []
+                mm_f = getattr(self, "memory_manager", None)
+                if mm_f is not None:
+                    wso_f = mm_f.read_workspace_snapshot_optional()  # type: ignore[union-attr]  # noqa: E501
+                    if isinstance(wso_f, dict):
+                        pr_f = list(wso_f.get("destination_tree_snapshot") or [])
+                        if not isinstance(pr_f, list):
+                            pr_f = []
+                h_f = self._destination_bounded_history_snapshot_source_lists()
+                fresh = self._destination_enrich_persisted_destination_tree_snapshot(
+                    fresh,
+                    existing_session_roots=ex_f,
+                    runtime_session_roots=rt_f,
+                    prior_workspace_roots=pr_f,
+                    history_sources=h_f,
+                    phase=str(reason)[:80] or "force_live",
+                )
+            except Exception:
+                pass
             snap_n = int(self._count_tree_snapshot_nodes(fresh))
             thin_capture_nodes = int(snap_n)
             try:
@@ -12484,6 +12512,29 @@ class MainWindow(QMainWindow):
             else:
                 workspace_tree_snapshots = dict(workspace_tree_snapshots)
                 cap_dest = list(self._capture_tree_items_snapshot("destination") or [])
+                try:
+                    ex_s0 = list(getattr(existing_state, "DestinationTreeSnapshot", []) or [])
+                    rt0 = getattr(self, "_runtime_session_tree_snapshots", None)
+                    rt_d0 = list(rt0.get("destination") or []) if isinstance(rt0, dict) else []
+                    pr_w0: list = []
+                    mm_d = getattr(self, "memory_manager", None)
+                    if mm_d is not None:
+                        wso_d = mm_d.read_workspace_snapshot_optional()  # type: ignore[union-attr]  # noqa: E501
+                        if isinstance(wso_d, dict):
+                            pr_w0 = list(wso_d.get("destination_tree_snapshot") or [])
+                            if not isinstance(pr_w0, list):
+                                pr_w0 = []
+                    hsrc0 = self._destination_bounded_history_snapshot_source_lists()
+                    cap_dest = self._destination_enrich_persisted_destination_tree_snapshot(
+                        cap_dest,
+                        existing_session_roots=ex_s0,
+                        runtime_session_roots=rt_d0,
+                        prior_workspace_roots=pr_w0,
+                        history_sources=hsrc0,
+                        phase="draft_shell_partial_refresh",
+                    )
+                except Exception:
+                    pass
                 cap_n = int(self._count_tree_snapshot_nodes(cap_dest))
                 n_incons2 = int(
                     self._destination_snapshot_has_applied_planned_allocations_with_empty_subtrees(
@@ -27152,6 +27203,439 @@ class MainWindow(QMainWindow):
             return True
         return False
 
+    def _destination_selected_destination_library_id_key(self) -> str:
+        s = str(getattr(self, "_draft_shell_state", None) and getattr(self._draft_shell_state, "SelectedDestinationLibraryId", "") or "")
+        if s.strip():
+            return s.strip().casefold()
+        for sel, role in (("Destination Library", "destination"),):
+            cmb = self.planning_inputs.get(sel) if hasattr(self, "planning_inputs") else None
+            d = cmb.currentData() if cmb is not None else None
+            if isinstance(d, dict) and str(d.get("id") or "").strip():
+                return str(d.get("id") or "").strip().casefold()
+        return ""
+
+    def _destination_snapshot_data_lib_key(self, d: dict) -> str:
+        if not isinstance(d, dict) or not d:
+            return ""
+        for k in (
+            "library_id",
+            "DestinationLibraryId",
+            "destination_library_id",
+        ):
+            v = str(d.get(k) or "").strip()
+            if v:
+                return v.casefold()
+        return ""
+
+    def _destination_snapshot_data_planned_allocationish(self, d: dict) -> bool:
+        if not isinstance(d, dict) or not d or d.get("placeholder"):
+            return False
+        o = str(d.get("node_origin", "") or "").lower()
+        ov = str(d.get("overlay_state", "") or "").lower()
+        return bool(
+            d.get("planned_allocation")
+            or o == "plannedallocation"
+            or ov == "plannedallocation"
+            or d.get("planned_allocation_descendant")
+        )
+
+    def _destination_extract_branch_snapshot_path(self, d: dict) -> str:
+        if not isinstance(d, dict):
+            return ""
+        row_path = str(self._tree_item_path(d) or d.get("item_path") or d.get("destination_path") or d.get("display_path") or "")
+        return str(
+            self._canonical_planned_memory_path_for_graph_match(row_path) or self.normalize_memory_path(row_path) or ""
+        ).strip()
+
+    def _destination_branch_stats_for_snapshot_node(self, node: dict) -> dict[str, int | bool]:
+        out: dict[str, int | bool] = {
+            "descendants": 0,
+            "direct": 0,
+            "hollow_applied": False,
+        }
+        if not isinstance(node, dict):
+            return out
+        d0 = node.get("data")
+        if isinstance(d0, dict) and d0.get("is_folder", True) and bool(d0.get("allocation_descendants_applied")):
+            dsub = int(self._destination_count_snapshot_direct_substantive_children(node))
+            if dsub <= 0:
+                out["hollow_applied"] = True
+        out["descendants"] = int(self._destination_count_snapshot_substantive_child_nodes(node))
+        out["direct"] = int(self._destination_count_snapshot_direct_substantive_children(node))
+        return out
+
+    def _destination_compare_branch_snapshot_richness(
+        self, a: dict[str, int | bool] | None, b: dict[str, int | bool] | None
+    ) -> int:
+        if not a or not b:
+            return 0
+        da, ddir, ha = int(a.get("descendants", 0)), int(a.get("direct", 0)), bool(a.get("hollow_applied"))
+        db, dird, hb = int(b.get("descendants", 0)), int(b.get("direct", 0)), bool(b.get("hollow_applied"))
+        if (da, ddir, 0 if ha else 1) > (db, dird, 0 if hb else 1):
+            return 1
+        if (db, dird, 0 if hb else 1) > (da, ddir, 0 if ha else 1):
+            return -1
+        return 0
+
+    def _destination_should_preserve_richer_branch_payload(
+        self,
+        cur: dict,
+        other: dict | None,
+    ) -> bool:
+        if not isinstance(cur, dict) or not other or not isinstance(other, dict):
+            return False
+        sa = self._destination_branch_stats_for_snapshot_node(cur)
+        sb = self._destination_branch_stats_for_snapshot_node(other)
+        return int(self._destination_compare_branch_snapshot_richness(sb, sa)) > 0
+
+    def _destination_branch_library_key_compatible(self, lib_key: str, d: dict) -> bool:
+        if not str(lib_key or "").strip():
+            return True
+        g = self._destination_snapshot_data_lib_key(d)
+        if not str(g or "").strip():
+            return True
+        return g == str(lib_key).casefold()
+
+    def _destination_bounded_history_snapshot_source_lists(
+        self,
+    ) -> list[tuple[str, list]]:
+        out: list[tuple[str, list]] = []
+        mm = getattr(self, "memory_manager", None)
+        if mm is None:
+            return out
+        try:
+            pth = (mm.paths or {}).get("session")
+            if pth and Path(str(pth)).is_file():
+                raw = json.loads(Path(str(pth)).read_text(encoding="utf-8", errors="ignore"))
+                if isinstance(raw, dict):
+                    dtn = raw.get("DestinationTreeSnapshot") or []
+                    if isinstance(dtn, list) and dtn:
+                        out.append(("session_json", dtn))
+        except Exception:
+            pass
+        try:
+            for folder, tag in ((getattr(mm, "quarantine", None), "quarantine"), (getattr(mm, "backups", None), "backups")):
+                if folder is None or not Path(str(folder)).is_dir():
+                    continue
+                n_sc = 0
+                for p in Path(str(folder)).glob("*.json"):
+                    n_sc += 1
+                    if n_sc > 8:
+                        break
+                    if p.name in ("MemoryManifest.json",) or p.stat().st_size > 1_500_000:
+                        continue
+                    try:
+                        raw2 = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
+                    except Exception:
+                        continue
+                    dtn2 = None
+                    if isinstance(raw2, dict):
+                        dtn2 = raw2.get("DestinationTreeSnapshot") or raw2.get("destination_tree_snapshot")
+                    if isinstance(dtn2, list) and dtn2 and len(dtn2) > 0:
+                        out.append((f"{tag}/{p.name[:32]}", dtn2))
+        except Exception:
+            pass
+        return out
+
+    def _destination_enrich_persisted_destination_tree_snapshot(
+        self,
+        current_roots: list,
+        *,
+        existing_session_roots: list | None,
+        runtime_session_roots: list | None,
+        prior_workspace_roots: list | None,
+        history_sources: list[tuple[str, list]] | None = None,
+        phase: str = "",
+    ) -> list:
+        cur = copy.deepcopy(list(current_roots or []))
+        lib_key = self._destination_selected_destination_library_id_key()
+        cands: list[tuple[str, list]] = [
+            ("existing_session", list(existing_session_roots or [])),
+            ("runtime_session", list(runtime_session_roots or [])),
+            ("prior_workspace", list(prior_workspace_roots or [])),
+        ]
+        if history_sources:
+            cands.extend(list(history_sources or []))
+        self._destination_merge_preserved_richer_planned_subtrees_in_place(
+            cur, cands, lib_key=str(lib_key), phase=str(phase)[:80]
+        )
+        return cur
+
+    def _destination_merge_preserved_richer_planned_subtrees_in_place(
+        self,
+        nodes: list,
+        candidates: list[tuple[str, list]],
+        *,
+        lib_key: str,
+        phase: str = "",
+    ) -> None:
+        for i, node in enumerate(list(nodes or [])):
+            if not isinstance(node, dict):
+                continue
+            d0 = node.get("data")
+            if isinstance(d0, dict) and not d0.get("placeholder") and self._destination_snapshot_data_planned_allocationish(d0):
+                path = self._destination_extract_branch_snapshot_path(d0)
+                pcf = path.casefold() if path else ""
+                if not pcf or not self._destination_branch_library_key_compatible(lib_key, d0):
+                    if path:
+                        log_info(
+                            "destination_branch_history_lookup_rejected_incompatible",
+                            canonical_path=path[:500],
+                            source="capture",
+                            compatibility_reason="library_mismatch" if str(lib_key) and self._destination_snapshot_data_lib_key(d0) and self._destination_snapshot_data_lib_key(d0) != str(lib_key).casefold() else "unclear",
+                        )
+                else:
+                    st_cur = self._destination_branch_stats_for_snapshot_node(node)
+                    best_node: dict = copy.deepcopy(node)
+                    best_lbl = "current_capture"
+                    st_pers_d = 0
+                    st_pers_dc = 0
+                    for _l3, _r3 in candidates or []:
+                        if str(_l3) == "existing_session" and _r3 and path:
+                            pex = self._destination_snapshot_find_node_by_canonical_path(list(_r3 or []), path)
+                            if isinstance(pex, dict):
+                                sxx = self._destination_branch_stats_for_snapshot_node(pex)
+                                st_pers_d = int(sxx.get("descendants", 0))
+                                st_pers_dc = int(sxx.get("direct", 0))
+                            break
+                    for lbl, rlist in candidates or []:
+                        rlist2 = list(rlist or [])
+                        cnode = self._destination_snapshot_find_node_by_canonical_path(rlist2, path) if (path and rlist2) else None
+                        if cnode is None or not isinstance(cnode, dict) or cnode is node:
+                            continue
+                        cdata = cnode.get("data")
+                        if not isinstance(cdata, dict) or cdata.get("placeholder"):
+                            continue
+                        if not self._destination_branch_library_key_compatible(lib_key, cdata):
+                            log_info(
+                                "destination_branch_history_lookup_rejected_incompatible",
+                                canonical_path=path[:500],
+                                source=str(lbl)[:64],
+                                compatibility_reason="library_mismatch",
+                            )
+                            continue
+                        st_c = self._destination_branch_stats_for_snapshot_node(cnode)
+                        is_pers = str(lbl) == "existing_session"
+                        clab = str(lbl)[:64]
+                        log_info(
+                            "destination_branch_snapshot_richness_compared",
+                            canonical_path=path[:500],
+                            current_descendants=int(st_cur.get("descendants", 0)),
+                            persisted_descendants=int(st_pers_d) if is_pers else 0,
+                            candidate_descendants=int(st_c.get("descendants", 0)),
+                            current_direct_children=int(st_cur.get("direct", 0)),
+                            persisted_direct_children=int(st_pers_dc) if is_pers else 0,
+                            applied_flag=bool((d0 or {}).get("allocation_descendants_applied")),
+                            richer_source=clab,
+                            decision="compare",
+                        )
+                        if not self._destination_should_preserve_richer_branch_payload(node, cnode):
+                            continue
+                        st_best = self._destination_branch_stats_for_snapshot_node(best_node)
+                        if int(self._destination_compare_branch_snapshot_richness(st_c, st_best)) > 0:
+                            best_node = copy.deepcopy(cnode)
+                            best_lbl = clab
+                    st_f = self._destination_branch_stats_for_snapshot_node(node)
+                    st_b = self._destination_branch_stats_for_snapshot_node(best_node)
+                    if str(best_lbl) != "current_capture" and int(self._destination_compare_branch_snapshot_richness(st_b, st_f)) > 0:
+                        log_info(
+                            "destination_branch_snapshot_preserve_richer_payload",
+                            canonical_path=path[:500],
+                            preserved_from=str(best_lbl)[:80],
+                            current_reason_thin="fewer_substantive_nodes" if st_f.get("descendants", 0) < st_b.get("descendants", 0) else "hollow_applied",
+                        )
+                        log_info(
+                            "destination_snapshot_persist_branch_thin_blocked",
+                            canonical_path=path[:500],
+                            current_descendants=int(st_f.get("descendants", 0)),
+                            preserved_descendants=int(st_b.get("descendants", 0)),
+                            block_reason="thinner_capture_than_preserved",
+                        )
+                        nodes[i] = best_node
+                    else:
+                        log_info(
+                            "destination_snapshot_persist_branch_safe",
+                            canonical_path=path[:500] if path else "",
+                            reason="capture_unchanged_or_richest",
+                        )
+                        log_info(
+                            "destination_branch_snapshot_overwrite_allowed",
+                            canonical_path=path[:500] if path else "",
+                            reason="no_replacement_richer_or_capture_ok",
+                        )
+            nref = nodes[i] if i < len(nodes) else None
+            if isinstance(nref, dict):
+                subc = nref.get("children")
+                if isinstance(subc, list) and subc:
+                    self._destination_merge_preserved_richer_planned_subtrees_in_place(
+                        subc, candidates, lib_key=lib_key, phase=phase
+                    )
+        return
+
+    def _destination_select_richer_snapshot_node_for_rehydrate(
+        self, canon: str, *, min_desc: int = 0
+    ) -> tuple[dict | None, str, int, str, str]:
+        cnorm = self._destination_snapshot_norm_path(canon)
+        if not cnorm:
+            return None, "", -1, "", "empty"
+        log_info("destination_branch_history_lookup_started", canonical_path=str(cnorm)[:500])
+        best: dict | None = None
+        best_desc = -1
+        best_src = ""
+        why = "none"
+
+        def _set_best(node: dict | None, label: str, dcount: int) -> None:
+            nonlocal best, best_desc, best_src, why
+            if node is not None and isinstance(node, dict) and dcount > best_desc:
+                best, best_desc, best_src, why = node, int(dcount), label, "selected"
+
+        roots0, t0 = self._destination_eager_destination_tree_snapshot_roots()
+        a0 = self._destination_snapshot_find_node_by_canonical_path(roots0, canon) if roots0 else None
+        d0c = int(self._destination_count_snapshot_substantive_child_nodes(a0)) if a0 else 0
+        if a0 is not None and d0c > best_desc and d0c >= min_desc:
+            _set_best(a0, f"active_{t0}", d0c)
+        mm = getattr(self, "memory_manager", None)
+        if mm is not None:
+            try:
+                wso = mm.read_workspace_snapshot_optional()
+            except Exception:
+                wso = None
+            if isinstance(wso, dict):
+                pr = wso.get("destination_tree_snapshot") or []
+                if isinstance(pr, list) and pr:
+                    pn = self._destination_snapshot_find_node_by_canonical_path(pr, canon)
+                    dpc = int(self._destination_count_snapshot_substantive_child_nodes(pn)) if pn else 0
+                    if pn is not None and dpc > best_desc and dpc >= min_desc:
+                        _set_best(pn, "prior_workspace_json", dpc)
+        for lbl, rlist in self._destination_bounded_history_snapshot_source_lists():
+            pn2 = self._destination_snapshot_find_node_by_canonical_path(rlist, canon) if rlist else None
+            d2 = int(self._destination_count_snapshot_substantive_child_nodes(pn2)) if pn2 else 0
+            if pn2 is not None and d2 > best_desc and d2 >= min_desc:
+                _set_best(pn2, lbl, d2)
+        if best is not None and best_desc >= 0:
+            log_info(
+                "destination_branch_history_lookup_hit",
+                canonical_path=str(cnorm)[:500],
+                source=str(best_src)[:64],
+                descendant_count=int(best_desc),
+                direct_child_count=int(
+                    self._destination_count_snapshot_direct_substantive_children(best)
+                    if isinstance(best, dict)
+                    else 0
+                ),
+                compatibility_reason=why,
+            )
+        else:
+            log_info(
+                "destination_branch_history_lookup_miss",
+                canonical_path=str(cnorm)[:500],
+            )
+        return best, str(best_src)[:80], int(best_desc if best is not None else -1), str(why)[:64], t0
+
+    def _destination_path_in_expanded_or_selected_startup_shell(self, pcf: str) -> bool:
+        """True when path is on the selected chain or in an expanded destination folder (visible shell)."""
+        if not pcf:
+            return False
+        try:
+            ex = {str(x).casefold() for x in (self._destination_expanded_paths_for_planning_bind() or set()) if str(x).strip()}
+        except Exception:
+            ex = set()
+        for e in ex:
+            if e and (pcf == e or pcf.startswith(e + "\\") or e.startswith(pcf + "\\")):
+                return True
+        return False
+
+    def _destination_map_rehydrate_log_source(self, best_source_label: str) -> str:
+        """Map internal snapshot label to destination_visible_branch_rehydrate_source_selected log values."""
+        bl = str(best_source_label or "")
+        if bl.startswith("active_") or not bl:
+            return "active_snapshot"
+        if "prior_workspace" in bl or "session" in bl.lower() or "quarantine" in bl or "backup" in bl or "/" in bl:
+            return "history_candidate"
+        return "active_snapshot"
+
+    def _destination_should_run_branch_local_startup_work(
+        self,
+        *,
+        canonical_path: str,
+        work_kind: str,
+        explicit_repair: bool = False,
+    ) -> bool:
+        wk = str(work_kind or "")[:64]
+        cpath = str(canonical_path or "").strip()
+        pcf = cpath.casefold()
+        if bool(explicit_repair):
+            log_info(
+                "destination_startup_branch_local_work_allowed",
+                canonical_path=cpath[:500],
+                work_kind=wk,
+                reason="explicit_repair_authorized",
+            )
+            return True
+        in_startup = bool(getattr(self, "_destination_startup_phase_active", False))
+        if not in_startup:
+            log_info(
+                "destination_startup_branch_local_work_allowed",
+                canonical_path=cpath[:500],
+                work_kind=wk,
+                reason="not_in_startup_phase",
+            )
+            return True
+        if not pcf:
+            log_info(
+                "destination_startup_branch_local_work_blocked",
+                canonical_path=cpath[:500],
+                work_kind=wk,
+                reason="empty_path_startup",
+            )
+            return False
+        if self._destination_path_in_expanded_or_selected_startup_shell(pcf):
+            log_info(
+                "destination_startup_branch_local_work_allowed",
+                canonical_path=cpath[:500],
+                work_kind=wk,
+                reason="visible_expanded_or_ancestor",
+            )
+            return True
+        uo = getattr(self, "_destination_planned_user_opened_paths_cf", set()) or set()
+        if pcf in uo:
+            log_info(
+                "destination_startup_branch_local_work_allowed",
+                canonical_path=cpath[:500],
+                work_kind=wk,
+                reason="user_opened_after_shell_interactable",
+            )
+            return True
+        sel = self._collect_selected_tree_path("destination")
+        s_norm = (self._materialize_cached_destination_lookup_norm(str(sel or "")) or "").casefold() if sel else ""
+        in_sel = bool(
+            s_norm
+            and (
+                pcf == s_norm
+                or pcf.startswith(s_norm + "\\")
+                or s_norm.startswith(pcf + "\\")
+            )
+        )
+        if in_sel:
+            log_info(
+                "destination_startup_branch_local_work_allowed",
+                canonical_path=cpath[:500],
+                work_kind=wk,
+                reason="selected_or_ancestor",
+            )
+            return True
+        try:
+            self._destination_invariant_repair_known_thin_branch_paths.add(pcf)  # type: ignore[union-attr]
+        except Exception:
+            pass
+        log_info(
+            "destination_startup_branch_local_work_blocked",
+            canonical_path=cpath[:500],
+            work_kind=wk,
+            reason="startup_not_visible_selected_or_user_opened",
+        )
+        return False
+
     def _destination_should_block_cold_planned_descendant_replay(
         self,
         *,
@@ -27564,6 +28048,7 @@ class MainWindow(QMainWindow):
             "upgraded_rows": 0,
             "preserved_live_rows": 0,
             "resulting_visible_descendants": -1,
+            "rehydrate_source": "",
         }
         dm = getattr(self, "destination_planning_model", None)
         if dm is None or not parent_ix.isValid() or not isinstance(move, dict):
@@ -27585,7 +28070,11 @@ class MainWindow(QMainWindow):
                 snapshot_source=str(src),
             )
             return out
-        mem_node = self._destination_snapshot_find_node_by_canonical_path(roots, canon)
+        mem_node, best_lbl, _bd, _why, _t0 = self._destination_select_richer_snapshot_node_for_rehydrate(canon, min_desc=0)
+        rehydr_source = self._destination_map_rehydrate_log_source(best_lbl)
+        out["rehydrate_source"] = str(rehydr_source)[:32]
+        if mem_node is None:
+            mem_node = self._destination_snapshot_find_node_by_canonical_path(roots, canon)
         if mem_node is None:
             log_info(
                 "destination_visible_branch_rehydrate_from_memory_skipped",
@@ -27594,6 +28083,16 @@ class MainWindow(QMainWindow):
                 canonical_path_excerpt=canon[:400],
             )
             return out
+        sel_d = int(self._destination_count_snapshot_substantive_child_nodes(mem_node))
+        if sel_d < 0:
+            sel_d = 0
+        log_info(
+            "destination_visible_branch_rehydrate_source_selected",
+            canonical_path=canon[:500],
+            source=str(rehydr_source)[:32],
+            selected_descendant_count=int(sel_d),
+            raw_source=str(best_lbl)[:80] if best_lbl else str(src)[:64],
+        )
         c_cf = str(canon).casefold()
         vdir0, vtot0 = self._destination_visible_descendant_counts_for_index(dm, c0)
         sub_n = int(self._destination_snapshot_subtree_substantive_node_count(mem_node))
@@ -27684,7 +28183,9 @@ class MainWindow(QMainWindow):
             log_info(
                 "destination_visible_branch_rehydrate_from_memory_completed",
                 audit_context=str(audit_ctx or "")[:120],
+                source=str(rehydr_source)[:32],
                 inserted_rows=int(inserted),
+                upgraded_rows=0,
                 preserved_live_rows=int(preserved),
                 resulting_visible_descendants=int(vtot),
             )
@@ -27795,6 +28296,12 @@ class MainWindow(QMainWindow):
             bool((pl or {}).get("allocation_descendants_applied"))
             and int(assess.get("visible_descendant_count") or 0) < int(assess.get("stored_descendant_count") or 0)
         )
+        if should_try_rehydrate and not self._destination_should_run_branch_local_startup_work(
+            canonical_path=canon,
+            work_kind="visible_memory_rehydrate",
+            explicit_repair=bool(explicit_repair_authorized),
+        ):
+            should_try_rehydrate = False
         if should_try_rehydrate:
             if bool((pl or {}).get("allocation_descendants_applied")) and int(assess.get("visible_descendant_count") or 0) < int(
                 assess.get("stored_descendant_count") or 0
@@ -37091,6 +37598,12 @@ class MainWindow(QMainWindow):
             startup_phase=bool(getattr(self, "_destination_startup_phase_active", False)),
             selected_context=_sctx,
         )
+        if bool(getattr(self, "_destination_expand_shell_ready", False)) and _spc:
+            _uo = str(
+                self._canonical_planned_memory_path_for_graph_match(_spc) or self.normalize_memory_path(_spc) or ""
+            ).strip().casefold()
+            if _uo:
+                self._destination_planned_user_opened_paths_cf.add(_uo)
         base_label = str(node_data.get("base_display_label", "") or "").strip().lower()
         tree_label = str(node_data.get("tree_label", "") or "").strip().lower()
         text_label = str(node_data.get("base_display_label", "") or "").strip().lower()
@@ -67470,6 +67983,30 @@ class MainWindow(QMainWindow):
                     fingerprint_excerpt=_fp0[:200],
                 )
                 return
+        p_inv_gate = canon_inv or str(
+            self._canonical_planned_memory_path_for_graph_match(row_p0) or self.normalize_memory_path(row_p0) or ""
+        ).strip().casefold()
+        _in_known_thin = bool(
+            canon_inv
+            and str(canon_inv) in (getattr(self, "_destination_invariant_repair_known_thin_branch_paths", set()) or set())
+        )
+        if p_inv_gate and not self._destination_should_run_branch_local_startup_work(
+            canonical_path=p_inv_gate,
+            work_kind="invariant_repair",
+            explicit_repair=False,
+        ):
+            log_info(
+                "destination_invariant_repair_suppressed_known_thin_branch",
+                canonical_path=canon_inv[:500] if canon_inv else str(row_p0)[:500],
+                reason="startup_gated" if p_inv_gate else "unknown",
+            )
+            return
+        if _in_known_thin:
+            log_info(
+                "destination_invariant_repair_known_thin_branch_visible_rehydrate_allowed",
+                canonical_path=canon_inv[:500] if canon_inv else str(row_p0)[:500],
+                reason="in_selected_expanded_or_user_opened",
+            )
         move_eff = move
         if move_eff is None or not isinstance(move_eff, dict):
             pl_probe = pl0
@@ -68858,9 +69395,19 @@ class MainWindow(QMainWindow):
                 and self._destination_memory_overlay_mode_enabled()
             ):
                 if isinstance(_mv0, dict):
-                    _rh_thin = self._destination_rehydrate_visible_branch_from_memory_snapshot(
-                        ix, _mv0, audit_ctx="allocation_descendants_applied_zero_direct"
+                    _pzero = str(
+                        self._canonical_planned_memory_path_for_graph_match(row_path_ex) or self.normalize_memory_path(row_path_ex) or ""
+                    ).strip()
+                    _do_rh = _pzero and self._destination_should_run_branch_local_startup_work(
+                        canonical_path=_pzero.casefold(),
+                        work_kind="zero_direct_allocation_rehydrate",
+                        explicit_repair=bool(explicit_repair_authorized),
                     )
+                    _rh_thin: dict = {}
+                    if _do_rh:
+                        _rh_thin = self._destination_rehydrate_visible_branch_from_memory_snapshot(
+                            ix, _mv0, audit_ctx="allocation_descendants_applied_zero_direct"
+                        )
                     if int(_rh_thin.get("inserted_rows") or 0) > 0:
                         log_info(
                             "destination_applied_empty_branch_rehydrate_succeeded",
@@ -68876,19 +69423,44 @@ class MainWindow(QMainWindow):
                 and graph_auth
                 and self._destination_memory_overlay_mode_enabled()
             ):
+                _pc_hist = str(
+                    self._canonical_planned_memory_path_for_graph_match(row_path_ex) or self.normalize_memory_path(row_path_ex) or ""
+                ).strip()
+                _hn, _hlab, _hd, _, _ = self._destination_select_richer_snapshot_node_for_rehydrate(_pc_hist, min_desc=0)
+                _hist_d = int(self._destination_count_snapshot_substantive_child_nodes(_hn)) if isinstance(_hn, dict) else 0
+                if _hist_d > 0:
+                    log_info(
+                        "destination_planned_branch_thin_leaf_prevented",
+                        canonical_path=_pc_hist[:500],
+                        reason="history_shows_substantive_snapshot_children",
+                        history_descendants=_hist_d,
+                        preserved_descendants=0,
+                    )
+                    log_info(
+                        "destination_planned_branch_pending_from_history",
+                        canonical_path=_pc_hist[:500],
+                        history_descendants=_hist_d,
+                    )
 
-                def _mut_thin(p):
-                    p["allocation_descendants_applied"] = False
-                    p["children_loaded"] = False
-                    p["allocation_descendant_projection_pending"] = True
-                    p["allocation_descendants_replay_deferred_cold_start"] = not bool(user_initiated)
+                    def _mut_pend_hist(p):
+                        p["allocation_descendant_projection_pending"] = True
 
-                dmodel.update_payload_for_index(ix, _mut_thin)
-                node_data = dict(ix.data(Qt.UserRole) or {})
-                log_info(
-                    "destination_planned_allocation_thin_leaf_corrected",
-                    path_excerpt=row_path_ex[:400],
-                )
+                    dmodel.update_payload_for_index(ix, _mut_pend_hist)
+                    node_data = dict(ix.data(Qt.UserRole) or {})
+                else:
+
+                    def _mut_thin(p):
+                        p["allocation_descendants_applied"] = False
+                        p["children_loaded"] = False
+                        p["allocation_descendant_projection_pending"] = True
+                        p["allocation_descendants_replay_deferred_cold_start"] = not bool(user_initiated)
+
+                    dmodel.update_payload_for_index(ix, _mut_thin)
+                    node_data = dict(ix.data(Qt.UserRole) or {})
+                    log_info(
+                        "destination_planned_allocation_thin_leaf_corrected",
+                        path_excerpt=row_path_ex[:400],
+                    )
             else:
                 if not bool(node_data.get("children_loaded")):
 
