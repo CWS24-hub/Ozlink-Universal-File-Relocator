@@ -49,6 +49,10 @@ def _mw_graph_source_dest(monkeypatch):
     mw.unresolved_proposed_by_parent_path = {}
     mw.unresolved_allocations_by_parent_path = {}
     mw._root_tree_bind_in_progress = False
+    # __init__ sets these; partial MainWindow needs them for overlay invariant / repair paths.
+    mw._destination_invariant_repair_memory_backed_suppress_paths = {}
+    mw._destination_invariant_repair_known_thin_branch_paths = set()
+    mw._destination_planned_user_opened_paths_cf = set()
 
     st = QTreeView()
     sm = SharePointSourceTreeModel(parent=st, column_labels=["N", "S", "T", "D"], source_index_key_fn=_source_key)

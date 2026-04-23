@@ -311,6 +311,8 @@ def test_deferred_expand_queue_block_reason_library_unresolved():
     mw._destination_incremental_merge_session = None
     mw._destination_future_projection_async_state = None
     mw._destination_library_context_unresolved_for_graph_display = lambda: True
+    # Library gate applies only when selector plumbing exists (real / stub session host).
+    mw.planning_inputs = {"Destination Library": MagicMock()}
     assert MainWindow._destination_deferred_expand_queue_block_reason(mw) == "library_unresolved"
 
 
