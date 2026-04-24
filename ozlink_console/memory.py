@@ -1012,6 +1012,27 @@ class MemoryManager:
         except Exception:
             return
 
+    def planning_allocations_proposed_primary_match_recovery_copies(self) -> bool:
+        """
+        True when live planning JSON files match their recovery mirror byte-for-byte.
+
+        After a successful lightweight journal flush, primaries and ``*.recovery.json`` hold the
+        same payload; a pending user checkpoint is redundant. When they differ, the user may need
+        the recovery dialog (e.g. crash after a partial write).
+        """
+        try:
+            ap = self.paths["allocations"]
+            ar = self.paths["allocations_recovery"]
+            pp = self.paths["proposed"]
+            pr = self.paths["proposed_recovery"]
+            if not ap.is_file() or not ar.is_file() or not pp.is_file() or not pr.is_file():
+                return False
+            return ap.read_text(encoding="utf-8") == ar.read_text(
+                encoding="utf-8"
+            ) and pp.read_text(encoding="utf-8") == pr.read_text(encoding="utf-8")
+        except OSError:
+            return False
+
     def save_allocations(
         self,
         rows: list[AllocationRow],

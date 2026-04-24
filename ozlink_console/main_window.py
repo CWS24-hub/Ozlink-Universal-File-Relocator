@@ -29127,31 +29127,6 @@ class MainWindow(QMainWindow):
         except Exception:
             return None
 
-    def _touch_planning_user_checkpoint(self, *, change_count: int | None = None) -> None:
-        p = self._planning_user_checkpoint_path()
-        if p is None:
-            return
-        try:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text("pending\n", encoding="utf-8")
-        except OSError:
-            return
-        mp = self._planning_user_checkpoint_meta_path()
-        if mp is not None:
-            try:
-                try:
-                    local = datetime.now().astimezone()
-                    saved_at = local.strftime("%Y-%m-%d %H:%M")
-                except Exception:
-                    saved_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-                d = {
-                    "saved_at": saved_at,
-                    "change_count": int(change_count) if change_count is not None else 0,
-                }
-                mp.write_text(json.dumps(d, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-            except OSError:
-                pass
-
     def _clear_planning_user_checkpoint(self) -> None:
         p = self._planning_user_checkpoint_path()
         if p is None:
@@ -29293,8 +29268,13 @@ class MainWindow(QMainWindow):
                 return ""
         return ""
 
-    def _flush_recovery_journal_lightweight(self, *, touch_pending_checkpoint: bool = True) -> int:
-        """Allocations + proposed to disk; no full session JSON / destination tree walk."""
+    def _flush_recovery_journal_lightweight(self) -> int:
+        """Allocations + proposed to disk; no full session JSON / destination tree walk.
+
+        On success, primaries and ``*.recovery.json`` are written atomically with the same payload,
+        so ``PlanningUserCheckpoint.pending`` is cleared (it only indicated \"flush not yet
+        reconciled on next startup\"—superseded once mirrors match).
+        """
         mm = getattr(self, "memory_manager", None)
         if mm is None:
             return 0
@@ -29304,11 +29284,6 @@ class MainWindow(QMainWindow):
         pr = self._build_memory_proposed_folders()
         n = int(len(ar)) + int(len(pr))
         _pctx = self._planning_persist_context(save_reason=_save_ctx)
-        if touch_pending_checkpoint:
-            try:
-                self._touch_planning_user_checkpoint(change_count=int(n))
-            except Exception:
-                pass
         try:
             mm.save_allocations(
                 ar,
@@ -29329,6 +29304,10 @@ class MainWindow(QMainWindow):
             )
         except Exception:
             return 0
+        try:
+            self._clear_planning_user_checkpoint()
+        except Exception:
+            pass
         log_info(
             "recovery_journal_flush_completed",
             delta_count=int(n),
@@ -83753,10 +83732,25 @@ class MainWindow(QMainWindow):
         if p is None or not p.is_file():
             self._recovery_prompt_handled_this_session = True
             return
+        mm = getattr(self, "memory_manager", None)
+        if mm is not None and mm.planning_allocations_proposed_primary_match_recovery_copies():
+            log_info(
+                "recovery_journal_checkpoint_suppressed_mirrors_in_sync",
+                path=str(p)[:500],
+                note="primary_and_recovery_json_match_no_actionable_recovery",
+            )
+            try:
+                self._clear_planning_user_checkpoint()
+            except Exception:
+                pass
+            self._recovery_prompt_handled_this_session = True
+            self._recovery_checkpoint_startup_work_gate_resolved = True
+            return
         log_info(
             "recovery_journal_detected_on_startup",
             path=str(p)[:500],
             clean_session_close=False,
+            primary_and_recovery_mirrors_in_sync=False,
         )
         _recovery_prompt_dialog_entered = False
         try:
