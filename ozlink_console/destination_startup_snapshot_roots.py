@@ -17,6 +17,7 @@ from ozlink_console.destination_legacy_snapshot_identity import (
     InferenceConfidence,
     infer_destination_snapshot_identity_from_legacy_snapshot,
 )
+from ozlink_console.hybrid_destination_preview import sanitize_destination_tree_snapshot_roots
 from ozlink_console.logger import log_info
 from ozlink_console.paths import normalize_manifest_path
 from ozlink_console.sharepoint_destination_overlay_attach import (
@@ -634,6 +635,27 @@ def select_validated_destination_startup_snapshot(
         side_gated, ctx, selection_tag="sidecar_candidate", log_validation_summary=False
     )
 
+    sess_ded, ddm_sess = sanitize_destination_tree_snapshot_roots(list(sess_san or []))
+    side_ded, ddm_side = sanitize_destination_tree_snapshot_roots(list(side_san or []))
+    if int(ddm_sess.get("removed_count", 0) or 0) or int(ddm_sess.get("duplicate_path_count", 0) or 0):
+        log_info(
+            "destination_memory_preview_dedupe_applied",
+            before_count=int(ddm_sess.get("before_count", 0) or 0),
+            after_count=int(ddm_sess.get("after_count", 0) or 0),
+            duplicate_path_count=int(ddm_sess.get("duplicate_path_count", 0) or 0),
+            removed_count=int(ddm_sess.get("removed_count", 0) or 0),
+            context="destination_startup_selection_session",
+        )
+    if int(ddm_side.get("removed_count", 0) or 0) or int(ddm_side.get("duplicate_path_count", 0) or 0):
+        log_info(
+            "destination_memory_preview_dedupe_applied",
+            before_count=int(ddm_side.get("before_count", 0) or 0),
+            after_count=int(ddm_side.get("after_count", 0) or 0),
+            duplicate_path_count=int(ddm_side.get("duplicate_path_count", 0) or 0),
+            removed_count=int(ddm_side.get("removed_count", 0) or 0),
+            context="destination_startup_selection_sidecar",
+        )
+
     log_info(
         "destination_startup_snapshot_validation_summary_strict",
         session_identity_gate=str(sess_gate_tag)[:80],
@@ -645,8 +667,10 @@ def select_validated_destination_startup_snapshot(
         sidecar_pruned_top=int(st_side.pruned_top_level),
     )
 
-    n_sess = snapshot_node_count_recursive(sess_san)
-    n_side = snapshot_node_count_recursive(side_san)
+    n_sess = snapshot_node_count_recursive(sess_ded)
+    n_side = snapshot_node_count_recursive(side_ded)
+    n_sess_pre_path_dedup = snapshot_node_count_recursive(sess_san)
+    n_side_pre_path_dedup = snapshot_node_count_recursive(side_san)
     n_sess_raw = snapshot_node_count_recursive(session_list)
     n_side_raw = snapshot_node_count_recursive(side_list)
 
@@ -658,49 +682,63 @@ def select_validated_destination_startup_snapshot(
         sidecar_nodes_before=int(n_side_raw),
         session_pruned_top_level=int(st_sess.pruned_top_level),
         sidecar_pruned_top_level=int(st_side.pruned_top_level),
+        session_nodes_pre_path_dedup=int(n_sess_pre_path_dedup),
+        sidecar_nodes_pre_path_dedup=int(n_side_pre_path_dedup),
     )
 
     usable_sess = n_sess > 0
     usable_side = n_side > 0
 
     label = "SessionState.DestinationTreeSnapshot"
-    chosen: list = sess_san
+    chosen: list = sess_ded
     selection_reason = "init"
     if usable_sess and not usable_side:
         label = "SessionState.DestinationTreeSnapshot"
-        chosen = sess_san
+        chosen = sess_ded
         selection_reason = "only_session_sanitized_usable"
     elif usable_side and not usable_sess:
         label = "WorkspaceSnapshot.destination_tree_snapshot"
-        chosen = side_san
+        chosen = side_ded
         selection_reason = "only_sidecar_sanitized_usable"
     elif usable_sess and usable_side:
         if n_side > n_sess:
             label = "WorkspaceSnapshot.destination_tree_snapshot"
-            chosen = side_san
+            chosen = side_ded
             selection_reason = "sidecar_sanitized_richer"
         elif n_sess > n_side:
             label = "SessionState.DestinationTreeSnapshot"
-            chosen = sess_san
+            chosen = sess_ded
             selection_reason = "session_sanitized_richer"
         else:
-            # Sanitized node counts tie: prefer the candidate with more **raw** nodes; if still tied,
-            # prefer the workspace sidecar (durable on-disk) over the session JSON.
-            if n_side_raw > n_sess_raw:
+            # After path de-dupe, break ties by preferring the candidate with **less** duplicate
+            # inflation (pre-dedup / post-dedup), not the larger **raw** JSON tree.
+            s_ratio = float(n_sess_pre_path_dedup) / max(float(n_sess), 1.0)
+            t_ratio = float(n_side_pre_path_dedup) / max(float(n_side), 1.0)
+            if s_ratio > t_ratio + 0.01:
                 label = "WorkspaceSnapshot.destination_tree_snapshot"
-                chosen = side_san
-                selection_reason = "sanitized_tie_raw_nodes_prefer_sidecar"
-            elif n_sess_raw > n_side_raw:
+                chosen = side_ded
+                selection_reason = "sanitized_tie_prefer_cleaner_path_dedup_sidecar"
+            elif t_ratio > s_ratio + 0.01:
                 label = "SessionState.DestinationTreeSnapshot"
-                chosen = sess_san
-                selection_reason = "sanitized_tie_raw_nodes_prefer_session"
+                chosen = sess_ded
+                selection_reason = "sanitized_tie_prefer_cleaner_path_dedup_session"
             else:
-                label = "WorkspaceSnapshot.destination_tree_snapshot"
-                chosen = side_san
-                selection_reason = "sanitized_and_raw_tie_prefer_sidecar_persistence"
+                # No meaningful per-path duplicate inflation difference — legacy raw as weak tie.
+                if n_side_raw > n_sess_raw:
+                    label = "WorkspaceSnapshot.destination_tree_snapshot"
+                    chosen = side_ded
+                    selection_reason = "sanitized_tie_raw_nodes_prefer_sidecar"
+                elif n_sess_raw > n_side_raw:
+                    label = "SessionState.DestinationTreeSnapshot"
+                    chosen = sess_ded
+                    selection_reason = "sanitized_tie_raw_nodes_prefer_session"
+                else:
+                    label = "WorkspaceSnapshot.destination_tree_snapshot"
+                    chosen = side_ded
+                    selection_reason = "sanitized_and_raw_tie_prefer_sidecar_persistence"
     else:
         # Both empty after sanitization — prefer session (usually fewer stale sidecars).
-        chosen = sess_san
+        chosen = sess_ded
         label = "SessionState.DestinationTreeSnapshot_fallback_empty"
         selection_reason = "both_sanitized_empty_prefer_session"
 
@@ -714,8 +752,16 @@ def select_validated_destination_startup_snapshot(
     meta = {
         "session_sanitized_nodes": n_sess,
         "sidecar_sanitized_nodes": n_side,
+        "session_sanitized_nodes_pre_path_dedup": int(n_sess_pre_path_dedup),
+        "sidecar_sanitized_nodes_pre_path_dedup": int(n_side_pre_path_dedup),
+        "session_path_dedupe_stats": dict(ddm_sess),
+        "sidecar_path_dedupe_stats": dict(ddm_side),
         "session_raw_nodes": int(n_sess_raw),
         "sidecar_raw_nodes": int(n_side_raw),
+        "path_dedupe_recommended_persist": bool(
+            int(ddm_sess.get("removed_count", 0) or 0) > 0
+            or int(ddm_sess.get("duplicate_path_count", 0) or 0) > 0
+        ),
         "chosen_label": label,
         "session_identity_gate": str(sess_gate_tag),
         "sidecar_identity_gate": str(side_gate_tag),

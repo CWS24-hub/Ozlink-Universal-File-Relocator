@@ -18,6 +18,7 @@ from ozlink_console.sharepoint_destination_overlay_attach import (
     WORKSPACE_ROW_STATE_LIVE_CONFIRMED,
     WORKSPACE_ROW_STATE_PLANNED_ONLY,
     destination_payload_is_live_graph_row,
+    destination_payload_is_memory_overlay_row_for_reuse,
     destination_payload_is_planned_workspace_row,
     destination_payload_workspace_row_state,
 )
@@ -863,6 +864,51 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             n += 1
         return n
 
+    @staticmethod
+    def _payload_is_planning_protected_descendant_row(pl: Dict[str, Any]) -> bool:
+        if not isinstance(pl, dict) or pl.get("placeholder"):
+            return False
+        if destination_payload_is_planned_workspace_row(pl) or destination_payload_is_memory_overlay_row_for_reuse(pl):
+            return True
+        if bool(pl.get("proposed")):
+            return True
+        gvp = str(pl.get("graph_vs_planned") or "").strip().casefold()
+        if gvp in ("live_planned", "planned", "proposed"):
+            return True
+        if str(pl.get("workspace_row_state") or "").strip().casefold() in ("planned_only", "cached_provisional", ""):
+            if pl.get("planned_allocation") or pl.get("workspace_planned_row") or pl.get("planned_allocation_descendant"):
+                return True
+        return False
+
+    def count_planning_protected_descendant_rows(
+        self, parent_folder_ix: QModelIndex, *, max_nodes: int = 16_000
+    ) -> int:
+        """Recursive count of planned/proposed/overlay rows under a folder (descendants only)."""
+        if not parent_folder_ix.isValid():
+            return 0
+        stack: list[QModelIndex] = []
+        for r in range(self.rowCount(parent_folder_ix)):
+            stack.append(self.index(r, 0, parent_folder_ix))
+        n = 0
+        seen = 0
+        while stack and seen < max_nodes:
+            ix = stack.pop()
+            if not ix.isValid():
+                continue
+            seen += 1
+            pl = ix.data(Qt.UserRole) or {}
+            pld = pl if isinstance(pl, dict) else {}
+            if self._payload_is_planning_protected_descendant_row(pld):
+                n += 1
+            for r2 in range(self.rowCount(ix)):
+                stack.append(self.index(r2, 0, ix))
+        return n
+
+    def folder_subtree_has_planning_protected_descendant(
+        self, parent_folder_ix: QModelIndex, *, max_nodes: int = 16_000
+    ) -> bool:
+        return int(self.count_planning_protected_descendant_rows(parent_folder_ix, max_nodes=max_nodes) or 0) > 0
+
     def reconcile_top_level_live_graph_children_loaded_when_subtree_empty(self, *, reason: str = "unspecified") -> int:
         """Clear ``children_loaded`` on live top-level folders when the model has zero child rows.
 
@@ -1325,6 +1371,7 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
 
         n_up = 0
         n_preserved = 0
+        n_matched_subtree_protected = 0
         matched_rows: Set[int] = set()
         to_insert: List[Dict[str, Any]] = []
 
@@ -1341,6 +1388,9 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             if cix_hit is None and ch_path:
                 cix_hit = by_path.get(str(ch_path).casefold())
             n_desc = 0
+            subtree_planning = False
+            plan_desc_count = 0
+            row_state_before = ""
             if cix_hit is not None and cix_hit.isValid():
                 opl0 = cix_hit.data(Qt.UserRole) or {}
                 if (
@@ -1352,7 +1402,19 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
                         n_desc = int(self.substantive_destination_folder_child_row_count(cix_hit)) or 0
                     except Exception:
                         n_desc = 0
+                    try:
+                        subtree_planning = bool(
+                            opl0.get("is_folder", True) and self.folder_subtree_has_planning_protected_descendant(cix_hit)
+                        )
+                        if bool(opl0.get("is_folder", True)):
+                            plan_desc_count = int(
+                                self.count_planning_protected_descendant_rows(cix_hit) or 0
+                            )
+                    except Exception:
+                        subtree_planning = False
+                        plan_desc_count = 0
                 opl: Dict[str, Any] = dict(opl0) if isinstance(opl0, dict) else {}
+                row_state_before = str((opl0 if isinstance(opl0, dict) else {}).get("workspace_row_state") or "")[:64]
 
                 def _mut(
                     p: Dict[str, Any],
@@ -1408,9 +1470,25 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
                         matched_rows.add(int(cix_hit.row()))
                     except Exception:
                         pass
-                is_common = destination_payload_is_planned_workspace_row(opl) or (
-                    not destination_payload_is_live_graph_row(opl) and n_desc > 0
+                opl_after = cix_hit.data(Qt.UserRole) or {}
+                row_state_after = str(
+                    (opl_after if isinstance(opl_after, dict) else {}).get("workspace_row_state") or ""
+                )[:64]
+                is_common = (
+                    destination_payload_is_planned_workspace_row(opl)
+                    or (not destination_payload_is_live_graph_row(opl) and n_desc > 0)
+                    or bool(subtree_planning)
                 )
+                if (subtree_planning or int(plan_desc_count) > 0) and ch_path:
+                    n_matched_subtree_protected += 1
+                    log_info(
+                        "destination_graph_branch_union_preserved_planned_descendants",
+                        parent_path=str(pcan)[:500],
+                        graph_child_path=str(ch_path)[:500],
+                        preserved_descendant_count=int(plan_desc_count),
+                        row_state_before=str(row_state_before)[:64],
+                        row_state_after=str(row_state_after)[:64],
+                    )
                 log_info(
                     "destination_graph_branch_union_existing_child_upgraded",
                     child_path_excerpt=str(ch_path)[:500],
@@ -1422,11 +1500,13 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
                         "destination_graph_branch_union_common_path_merged",
                         child_path_excerpt=str(ch_path)[:500],
                     )
-                if n_desc:
+                if n_desc or subtree_planning or int(plan_desc_count) > 0:
                     log_info(
                         "destination_graph_branch_union_planned_descendants_preserved",
                         child_path_excerpt=str(ch_path)[:500],
                         n_descendant_rows=n_desc,
+                        n_planning_protected_subtree_descendants=int(plan_desc_count),
+                        subtree_planning_had_protected=bool(subtree_planning),
                     )
                 continue
 
@@ -1471,17 +1551,21 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
                 )
 
         self._rebuild_path_index()
+        _overlay_preserved = int(n_preserved) + int(n_matched_subtree_protected)
         log_info(
             "destination_graph_branch_union_completed",
             parent_path_excerpt=pcan[:500],
             inserted=int(n_ins),
             upgraded=int(n_up),
-            overlay_preserved=int(n_preserved),
+            overlay_preserved=int(_overlay_preserved),
+            overlay_preserved_unmatched_graph_children=int(n_preserved),
+            overlay_preserved_matched_protected_subtrees=int(n_matched_subtree_protected),
         )
         return {
             "inserted": n_ins,
             "upgraded": n_up,
             "preserved": n_preserved,
+            "matched_subtree_protected": int(n_matched_subtree_protected),
         }
 
     def replace_all_children(

@@ -3117,6 +3117,9 @@ class MainWindow(QMainWindow):
         self._source_snapshot_shell_prearmed: bool = False
         # Set when user runs an explicit source refresh / repair (allows full projection + count during startup).
         self._source_user_explicit_full_projection: bool = False
+        # Hybrid browse: allow expensive recursive full-count only after explicit refresh or unlock.
+        self._source_hybrid_full_count_unlocked: bool = False
+        self._source_hybrid_browse_defer_count_logged: bool = False
         # Richer per-path nodes for faster shutdown branch preservation (optional; built lazily).
         self._destination_shutdown_preservation_branch_index: dict[str, dict] | None = None
         self._destination_post_shell_rich_rehydrate_scan_ran: bool = False
@@ -3563,6 +3566,7 @@ class MainWindow(QMainWindow):
         self._destination_graph_subtree_hydration_roots: set[str] = set()
         self._destination_graph_subtree_hydration_meta: dict[str, dict[str, Any]] = {}
         self._destination_expand_user_deferred_queue: deque = deque()
+        self._destination_expand_deferred_auth_by_path: dict[str, str] = {}
         self._destination_expand_user_deferred_seen: set = set()
         self._destination_expand_user_deferred_scheduled = False
         self._destination_expand_deferred_block_count = 0
@@ -12660,6 +12664,27 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._log_restore_exception("destination_snapshot_persist_validation", exc)
 
+    def _sanitize_destination_tree_snapshot_for_draft_persist(self, roots: list) -> list:
+        """Path de-dupe before JSON serialization; logs once on shutdown when work is done."""
+        if not isinstance(roots, list) or not roots:
+            return list(roots or [])
+        t0 = time.perf_counter()
+        before = int(self._count_tree_snapshot_nodes(roots))
+        r2, st = sanitize_destination_tree_snapshot_roots(list(roots))
+        after = int(self._count_tree_snapshot_nodes(r2))
+        if bool(getattr(self, "_application_shutting_down", False)) and (
+            int(st.get("removed_count", 0) or 0)
+            or int(st.get("duplicate_path_count", 0) or 0)
+            or before != after
+        ):
+            log_info(
+                "destination_shutdown_saved_sanitized_preview",
+                before_nodes=int(before),
+                after_nodes=int(after),
+                elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 2),
+            )
+        return r2
+
     def _build_current_draft_shell_state(self, *, include_workspace_ui: bool = False, save_reason: str = ""):
         state = SessionState()
         existing_state = self._draft_shell_state if isinstance(self._draft_shell_state, SessionState) else SessionState()
@@ -12897,7 +12922,10 @@ class MainWindow(QMainWindow):
             state.SourceSelectedPath = str(workspace_ui_state.get("source_selected_path", "") or "")
             state.DestinationSelectedPath = str(workspace_ui_state.get("destination_selected_path", "") or "")
             state.SourceTreeSnapshot = list(workspace_tree_snapshots.get("source", []) or [])
-            state.DestinationTreeSnapshot = list(workspace_tree_snapshots.get("destination", []) or [])
+            _dtr = list(workspace_tree_snapshots.get("destination", []) or [])
+            if hybrid_destination_preview_browse_first_enabled():
+                _dtr = self._sanitize_destination_tree_snapshot_for_draft_persist(_dtr)
+            state.DestinationTreeSnapshot = _dtr
             self._apply_destination_tree_snapshot_identity_fields(state, merged_dst_lib, destination_site)
         else:
             state.SourceExpandedAll = bool(getattr(existing_state, "SourceExpandedAll", False))
@@ -12909,7 +12937,10 @@ class MainWindow(QMainWindow):
             state.SourceSelectedPath = str(getattr(existing_state, "SourceSelectedPath", "") or "")
             state.DestinationSelectedPath = str(getattr(existing_state, "DestinationSelectedPath", "") or "")
             state.SourceTreeSnapshot = list(workspace_tree_snapshots.get("source", []) or [])
-            state.DestinationTreeSnapshot = list(workspace_tree_snapshots.get("destination", []) or [])
+            _dtr0 = list(workspace_tree_snapshots.get("destination", []) or [])
+            if hybrid_destination_preview_browse_first_enabled():
+                _dtr0 = self._sanitize_destination_tree_snapshot_for_draft_persist(_dtr0)
+            state.DestinationTreeSnapshot = _dtr0
             self._apply_destination_tree_snapshot_identity_fields(state, merged_dst_lib, destination_site)
         if not state.DraftName:
             operator_display = self.current_session_context.get("operator_display_name", "") or "Planning Session"
@@ -27123,6 +27154,11 @@ class MainWindow(QMainWindow):
         )
         self._apply_destination_snapshot_legacy_identity_stamp(meta)
         self._last_destination_snapshot_selection_meta = meta
+        try:
+            if bool(meta.get("path_dedupe_recommended_persist")) and list(chosen or []):
+                self._destination_tree_snapshot_dirty_for_persist = True
+        except Exception:
+            pass
         n_sess = int(meta.get("session_raw_nodes", 0) or 0)
         n_side = int(meta.get("sidecar_raw_nodes", 0) or 0)
         return chosen, str(label), n_sess, n_side, meta
@@ -30438,7 +30474,7 @@ class MainWindow(QMainWindow):
         self._load_destination_projected_descendants_index(ix, user_initiated=False)
 
     def _destination_graph_bind_presnapshot_classify_row(
-        self, pl: dict, *, parent_path_cf: str
+        self, pl: dict, *, parent_path_cf: str, model: Any = None, child_ix: Any = None
     ) -> tuple[bool, str]:
         """Return (include_in_overlay_snapshot, ignore_reason) for a direct model child before Graph replace."""
         if not isinstance(pl, dict):
@@ -30475,6 +30511,19 @@ class MainWindow(QMainWindow):
                     if "[planned]" not in lbl and "[allocated]" not in lbl:
                         return False, "missing_planning_identity"
             return True, ""
+        if (
+            model is not None
+            and child_ix is not None
+            and hasattr(child_ix, "isValid")
+            and child_ix.isValid()
+            and hasattr(model, "folder_subtree_has_planning_protected_descendant")
+        ):
+            try:
+                if bool(pl.get("is_folder", True)) and not destination_payload_is_live_graph_row(pl):
+                    if model.folder_subtree_has_planning_protected_descendant(child_ix):
+                        return True, "subtree_planning_protected"
+            except Exception:
+                pass
         return False, "not_planned_workspace_row"
 
     def _destination_graph_bind_presnapshot_overlay_scan(
@@ -30499,7 +30548,9 @@ class MainWindow(QMainWindow):
             if not ix.isValid():
                 continue
             pl = dict(ix.data(Qt.UserRole) or {})
-            ok, reason = self._destination_graph_bind_presnapshot_classify_row(pl, parent_path_cf=parent_cf)
+            ok, reason = self._destination_graph_bind_presnapshot_classify_row(
+                pl, parent_path_cf=parent_cf, model=model, child_ix=ix
+            )
             tp = str(self._tree_item_path(pl) or pl.get("item_path") or "")[:400]
             if ok:
                 log_info(
@@ -33828,6 +33879,8 @@ class MainWindow(QMainWindow):
                     self._invalidate_destination_full_tree_for_live_reconcile(drive_id)
             if panel_key == "source":
                 self._source_sharepoint_root_force_replace = bool(force_refresh)
+                if bool(force_refresh):
+                    self._source_hybrid_full_count_unlocked = True
 
             active_entry = self.root_load_workers.get(panel_key)
             active_signature = active_entry.get("request_signature") if active_entry else None
@@ -35109,6 +35162,13 @@ class MainWindow(QMainWindow):
             return False, "memory_restore_or_background_trees"
         if bool(getattr(self, "_destination_startup_phase_active", False)):
             return False, "destination_startup_phase_active"
+        if hybrid_destination_preview_browse_first_enabled() and not bool(
+            getattr(self, "_source_hybrid_full_count_unlocked", False)
+        ):
+            if not bool(getattr(self, "_source_hybrid_browse_defer_count_logged", False)):
+                self._source_hybrid_browse_defer_count_logged = True
+                log_info("source_full_count_deferred_hybrid_browse_startup", reason="hybrid_browse_defer_full_recursive")
+            return False, "hybrid_browse_defer_full_recursive_count"
         return True, "post_startup"
 
     def _source_path_is_strict_descendant_of_folder(self, folder_canon: str, source_path: str) -> bool:
@@ -60467,6 +60527,13 @@ class MainWindow(QMainWindow):
             selected_context=str(self._collect_selected_tree_path("destination") or "")[:500],
         )
         _dac = self._destination_infer_expand_auth_class()
+        if str(producer) == "pipeline_block_user_expand_deferred" and hybrid_destination_preview_browse_first_enabled():
+            _dac = "session_restore_expand"
+            ad = getattr(self, "_destination_expand_deferred_auth_by_path", None)
+            if not isinstance(ad, dict):
+                ad = {}
+                self._destination_expand_deferred_auth_by_path = ad
+            ad[str(p).strip()] = "session_restore_expand"
         log_info(
             "destination_deferred_expand_enqueued",
             canonical_path=p[:500],
@@ -60663,6 +60730,10 @@ class MainWindow(QMainWindow):
             path = str(q.popleft())
             _popped = 1
             _processed = 1
+            _admap = getattr(self, "_destination_expand_deferred_auth_by_path", None)
+            _deferred_path_auth = ""
+            if isinstance(_admap, dict):
+                _deferred_path_auth = str(_admap.pop(path, "") or "")
             log_info("destination_expand_deferred_queue_item", drain_id=_sum_id, semantic_path=path[:400])
             _retries_map = getattr(self, "_destination_expand_deferred_path_retries", None)
             if not isinstance(_retries_map, dict):
@@ -60730,6 +60801,7 @@ class MainWindow(QMainWindow):
                         )
                     else:
                         _expanded = False
+                        _greq = 0
                         self._destination_expand_deferred_drain_active = True
                         self._destination_expand_invocation = "deferred_gesture_queue"
                         try:
@@ -60744,24 +60816,40 @@ class MainWindow(QMainWindow):
                                     )
                             except Exception:
                                 pass
-                            log_info(
-                                "destination_expand_deferred_graph_load_requested",
-                                drain_id=_sum_id,
-                                semantic_path=path[:400],
-                                note="invoke_expand_handler_after_expand",
-                            )
-                            self._on_destination_planning_model_expanded(ix)
+                            if (
+                                _deferred_path_auth == "session_restore_expand"
+                                and hybrid_destination_preview_browse_first_enabled()
+                            ):
+                                _greq = 0
+                                log_info(
+                                    "destination_deferred_expand_replay_blocked_hybrid_visual_only",
+                                    canonical_path=path[:500],
+                                    note="deferred_gesture_no_graph_on_restore_auth",
+                                )
+                            else:
+                                _greq = 1
+                                log_info(
+                                    "destination_expand_deferred_graph_load_requested",
+                                    drain_id=_sum_id,
+                                    semantic_path=path[:400],
+                                    note="invoke_expand_handler_after_expand",
+                                )
+                                self._on_destination_planning_model_expanded(ix)
                         finally:
                             self._destination_expand_deferred_drain_active = False
                             self._destination_expand_invocation = ""
                         self._destination_expand_deferred_parked_paths.discard(path)
                         self._destination_expand_deferred_path_retries.pop(path, None)
+                        if _greq == 0 and _deferred_path_auth == "session_restore_expand":
+                            _r_item = "hybrid_visual_only"
+                        else:
+                            _r_item = "expanded" if _expanded else "ok_live"
                         log_info(
                             "destination_expand_deferred_queue_item_result",
                             drain_id=_sum_id,
-                            result="expanded" if _expanded else "ok_live",
+                            result=_r_item,
                             path_excerpt=path[:400],
-                            graph_expand_requested=1,
+                            graph_expand_requested=_greq,
                             retry_count=_retry_before,
                         )
                 else:
