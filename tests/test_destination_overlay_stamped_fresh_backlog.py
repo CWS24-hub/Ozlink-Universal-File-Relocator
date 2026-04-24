@@ -27,6 +27,15 @@ def _bind(mw, names: tuple[str, ...]) -> None:
 
 @pytest.fixture
 def mw_graph(monkeypatch):
+    monkeypatch.setenv("OZLINK_HYBRID_DESTINATION_PREVIEW", "0")
+    monkeypatch.setattr(
+        "ozlink_console.main_window.hybrid_destination_preview_browse_first_enabled",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        "ozlink_console.hybrid_destination_preview.hybrid_destination_preview_browse_first_enabled",
+        lambda: False,
+    )
     monkeypatch.setattr(
         "ozlink_console.destination_authority_contract.graph_owns_visible_real_destination_structure",
         lambda _h: True,

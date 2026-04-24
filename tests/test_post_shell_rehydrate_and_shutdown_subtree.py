@@ -40,10 +40,14 @@ class PostShellRehydrateTests(unittest.TestCase):
             patch.object(
                 destination_authority_contract, "graph_owns_visible_real_destination_structure", return_value=True
             ),
+            patch(
+                "ozlink_console.main_window.hybrid_destination_preview_browse_first_enabled",
+                new=lambda: False,
+            ),
             patch("ozlink_console.main_window.QTimer") as pqt,
             patch.object(m, "_safe_invoke", new=_instant_invoke),  # type: ignore[assignment, misc]  # noqa: E501
             patch.object(
-                MainWindow, "_destination_run_post_shell_memory_rehydrate_once", autospec=True
+                MainWindow, "_destination_begin_post_shell_memory_rehydrate_chunked", autospec=True
             ) as p_run,
         ):
             pqt.singleShot = lambda _ms, fn: fn()

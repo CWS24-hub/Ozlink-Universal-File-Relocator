@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QApplication
 from ozlink_console.hybrid_destination_preview import (
     destination_hybrid_preview_badge_text,
     destination_memory_rehydrate_is_repair_truth_audit,
+    destination_preview_rehydrate_audit_is_idempotent_merge_log,
     hybrid_destination_preview_browse_first_enabled,
 )
 from ozlink_console.main_window import MainWindow
@@ -28,6 +29,41 @@ def test_repair_truth_audit_tag_detection() -> None:
     assert destination_memory_rehydrate_is_repair_truth_audit("overlay_projection_invariant_repair")
     assert not destination_memory_rehydrate_is_repair_truth_audit("post_shell_rich_branch_scan")
     assert not destination_memory_rehydrate_is_repair_truth_audit("allocation_descendants_applied_zero_direct")
+
+
+def test_idempotent_merge_audit_tag_detection() -> None:
+    assert destination_preview_rehydrate_audit_is_idempotent_merge_log("post_shell_rich_branch_scan")
+    assert not destination_preview_rehydrate_audit_is_idempotent_merge_log("overlay_projection_invariant_repair")
+
+
+def test_hybrid_overlay_invariant_pass_blocked_without_repair_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OZLINK_HYBRID_DESTINATION_PREVIEW", "1")
+    mw = MainWindow.__new__(MainWindow)
+    mw._destination_repair_truth_hydration_depth = 0
+    monkeypatch.setattr(
+        "ozlink_console.destination_authority_contract.graph_owns_visible_real_destination_structure",
+        lambda _h: True,
+    )
+    log_captured: list[str] = []
+
+    def _cap(msg, **k):
+        if msg == "destination_overlay_repair_blocked_in_browse_lane":
+            log_captured.append(msg)
+
+    monkeypatch.setattr("ozlink_console.main_window.log_info", _cap)
+    n = MainWindow._run_overlay_projection_invariant_pass(mw, "enforce_test")
+    assert n == 0
+    assert log_captured == ["destination_overlay_repair_blocked_in_browse_lane"]
+
+
+def test_hybrid_startup_expand_auth_is_session_restore_not_real_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OZLINK_HYBRID_DESTINATION_PREVIEW", "1")
+    mw = MainWindow.__new__(MainWindow)
+    mw._destination_expand_invocation = ""
+    mw._destination_startup_phase_active = True
+    mw._destination_startup_first_interactable_logged = True
+    ac = MainWindow._destination_infer_expand_auth_class(mw)
+    assert ac == "session_restore_expand"
 
 
 def test_hybrid_badge_live_planned_from_graph_vs_planned() -> None:

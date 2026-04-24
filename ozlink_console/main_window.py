@@ -222,6 +222,7 @@ from ozlink_console.destination_overlay_identity import (
 from ozlink_console.destination_overlay_layer import overlay_row_marker
 from ozlink_console.hybrid_destination_preview import (
     destination_memory_rehydrate_is_repair_truth_audit,
+    destination_preview_rehydrate_audit_is_idempotent_merge_log,
     hybrid_destination_preview_browse_first_enabled,
 )
 from ozlink_console.sharepoint_destination_overlay_attach import (
@@ -27966,6 +27967,13 @@ class MainWindow(QMainWindow):
             return
         if not destination_authority_contract.graph_owns_visible_real_destination_structure(self):
             return
+        if hybrid_destination_preview_browse_first_enabled() and not self._destination_repair_truth_hydration_permitted():
+            log_info(
+                "destination_post_shell_memory_rehydrate_skipped",
+                reason="hybrid_browse_lane_broad_rehydrate_disabled",
+                request_reason=str(reason or "")[:200],
+            )
+            return
         dm = getattr(self, "destination_planning_model", None)
         if dm is None or not hasattr(dm, "rowCount"):
             return
@@ -28926,6 +28934,10 @@ class MainWindow(QMainWindow):
             if bool(getattr(self, "_destination_expand_shell_ready", False)):
                 return "real_user_expand"
             return "deferred_visibility_expand"
+        if hybrid_destination_preview_browse_first_enabled():
+            if bool(getattr(self, "_destination_startup_first_interactable_logged", False)):
+                return "session_restore_expand"
+            return "startup_shell_expand"
         if bool(getattr(self, "_destination_startup_first_interactable_logged", False)):
             return "real_user_expand"
         return "startup_shell_expand"
@@ -29453,6 +29465,8 @@ class MainWindow(QMainWindow):
             "inserted_rows": 0,
             "upgraded_rows": 0,
             "preserved_live_rows": 0,
+            "existing_visible_child_paths": 0,
+            "skipped_duplicate_count": 0,
             "resulting_visible_descendants": -1,
             "rehydrate_source": "",
             "partial_pending": False,
@@ -29545,6 +29559,9 @@ class MainWindow(QMainWindow):
         )
         inserted = 0
         preserved = 0
+        upgraded = 0
+        skipped_dup = 0
+        existing_paths = 0
         chs = [c for c in (mem_node.get("children") or []) if isinstance(c, dict)]
         n_ch = int(len(chs))
         c_start = max(0, int(child_index_start or 0))
@@ -29575,10 +29592,30 @@ class MainWindow(QMainWindow):
                     else []
                 )
                 if existing and existing[0].isValid():
+                    existing_paths += 1
                     epl = existing[0].data(Qt.UserRole) or {}
                     if destination_payload_is_live_graph_row(epl if isinstance(epl, dict) else {}):
                         preserved += 1
                         continue
+                    skipped_dup += 1
+                    spec_merge = self._destination_tree_snapshot_dict_to_nested_spec(ch)
+                    d_merge = spec_merge.get("data") if isinstance(spec_merge, dict) else None
+                    if (
+                        hasattr(dm, "update_payload_for_index")
+                        and isinstance(epl, dict)
+                        and isinstance(d_merge, dict)
+                        and d_merge
+                    ):
+                        try:
+
+                            def _up(p: dict, src=d_merge) -> None:
+                                p.update({k: v for k, v in src.items() if v is not None and k != "placeholder"})
+
+                            dm.update_payload_for_index(existing[0], _up)  # type: ignore[union-attr]  # noqa: E501
+                            upgraded += 1
+                        except Exception:
+                            pass
+                    continue
                 spec = self._destination_tree_snapshot_dict_to_nested_spec(ch)
                 if spec is None:
                     continue
@@ -29612,9 +29649,23 @@ class MainWindow(QMainWindow):
             return out
         vdir, vtot = self._destination_visible_descendant_counts_for_index(dm, c0)
         out["inserted_rows"] = int(inserted)
+        out["upgraded_rows"] = int(upgraded)
         out["preserved_live_rows"] = int(preserved)
+        out["existing_visible_child_paths"] = int(existing_paths)
+        out["skipped_duplicate_count"] = int(skipped_dup)
         out["resulting_visible_descendants"] = int(vtot)
-        if inserted > 0:
+        if destination_preview_rehydrate_audit_is_idempotent_merge_log(audit_ctx):
+            log_info(
+                "destination_preview_rehydrate_idempotent_merge",
+                audit_context=str(audit_ctx or "")[:120],
+                canonical_path_excerpt=canon[:400],
+                existing_count=int(existing_paths),
+                inserted_count=int(inserted),
+                upgraded_count=int(upgraded),
+                skipped_duplicate_count=int(skipped_dup),
+                preserved_live_rows=int(preserved),
+            )
+        if inserted > 0 or upgraded > 0:
             out["outcome"] = "completed"
             _fp2 = f"{c_cf}|v={vtot}|m={sub_n}"
             dfp[c_cf] = _fp2
@@ -29629,17 +29680,27 @@ class MainWindow(QMainWindow):
                     "destination_branch_post_shell_rehydrate_marked_complete",
                     canonical_path=canon[:500],
                 )
-            self._mark_destination_tree_snapshot_dirty_after_injection(
-                reason="rehydrate_visible_from_memory", affected_path=canon[:400]
-            )
+            if inserted > 0:
+                self._mark_destination_tree_snapshot_dirty_after_injection(
+                    reason="rehydrate_visible_from_memory", affected_path=canon[:400]
+                )
             log_info(
                 "destination_visible_branch_rehydrate_from_memory_completed",
                 audit_context=str(audit_ctx or "")[:120],
                 source=str(rehydr_source)[:32],
                 inserted_rows=int(inserted),
-                upgraded_rows=0,
+                upgraded_rows=int(upgraded),
                 preserved_live_rows=int(preserved),
                 resulting_visible_descendants=int(vtot),
+            )
+        elif skipped_dup > 0 or preserved > 0:
+            out["outcome"] = "no_op_idempotent"
+            _fp2 = f"{c_cf}|v={vtot}|m={sub_n}"
+            dfp[c_cf] = _fp2
+            log_info(
+                "destination_visible_branch_rehydrate_from_memory_skipped",
+                reason="all_paths_already_represented",
+                audit_context=str(audit_ctx or "")[:120],
             )
         else:
             out["outcome"] = "no_op"
@@ -33532,7 +33593,24 @@ class MainWindow(QMainWindow):
         if isinstance(ps, dict):
             ps["destination"] = set()
         self._mark_destination_real_tree_snapshot_stale()
-        self._invalidate_destination_full_tree_for_live_reconcile(did)
+        _hybrid_skip_ft_invalidate = False
+        if hybrid_destination_preview_browse_first_enabled():
+            try:
+                _nnp_pe = int(_prep_enter.get("model_nodes_non_placeholder") or 0)
+            except Exception:
+                _nnp_pe = 0
+            if _nnp_pe >= 1 and (
+                bool(getattr(self, "_destination_startup_snapshot_mount_seen", False))
+                or bool(getattr(self, "_destination_provisional_startup_applied", False))
+            ):
+                _hybrid_skip_ft_invalidate = True
+                log_info(
+                    "destination_hybrid_skipped_full_tree_invalidate_for_bound_preview",
+                    drive_id_suffix=did[-16:] if len(did) > 16 else did,
+                    model_nodes_non_placeholder=int(_nnp_pe),
+                )
+        if not _hybrid_skip_ft_invalidate:
+            self._invalidate_destination_full_tree_for_live_reconcile(did)
         self._sync_restore_destination_overlay_pending_from_unresolved_queues()
         self._destination_sharepoint_root_graph_bound_drive_id = ""
         self._destination_full_library_reconcile_pending = False
@@ -33545,6 +33623,7 @@ class MainWindow(QMainWindow):
             prep_enter_model_nodes_non_placeholder=int(_prep_enter.get("model_nodes_non_placeholder") or 0),
             prep_enter_model_nodes_iter_depth_first=int(_prep_enter.get("model_nodes_iter_depth_first") or 0),
             prep_delta_non_placeholder=int(_prep_exit.get("model_nodes_non_placeholder", 0) - _prep_enter.get("model_nodes_non_placeholder", 0)),
+            note="graph_cache_and_queue_prep_not_destination_planning_model_reset",
         )
 
     def load_library_root(self, panel_key, site, library, force_refresh=False):
@@ -38609,6 +38688,27 @@ class MainWindow(QMainWindow):
                     )
                     and hasattr(model, "merge_sharepoint_library_root_graph_children")
                 )
+                _fc_hybrid_bind = self._destination_forensic_destination_model_counts()
+                _nnp_hybrid = int(_fc_hybrid_bind.get("model_nodes_non_placeholder") or 0)
+                if (
+                    hybrid_destination_preview_browse_first_enabled()
+                    and hasattr(model, "merge_sharepoint_library_root_graph_children")
+                    and _nnp_hybrid >= 1
+                    and (
+                        bool(getattr(self, "_destination_startup_snapshot_mount_seen", False))
+                        or bool(getattr(self, "_destination_provisional_startup_applied", False))
+                        or bool(pre_graph_snapshot_mount)
+                        or self._pending_session_destination_snapshot_drive_match(did_shell_early)
+                    )
+                ):
+                    snap_eligible = True
+                    if identity_snap_block:
+                        log_info(
+                            "destination_hybrid_forced_snapshot_merge_preserve",
+                            model_nodes_non_placeholder=int(_nnp_hybrid),
+                            drive_id_suffix=did_shell_early[-16:] if len(did_shell_early) > 16 else did_shell_early,
+                        )
+                    identity_snap_block = False
                 if identity_snap_block and snap_eligible:
                     log_info(
                         "destination_snap_preserving_disabled_due_to_identity_change",
@@ -51898,7 +51998,8 @@ class MainWindow(QMainWindow):
         self._destination_projection_repair_defer_suppress_count = 0
         log_info("destination_projection_repair_resumed_after_descendant_apply")
         try:
-            self._run_overlay_projection_invariant_pass("projection_repair_after_descendant_apply_flush")
+            with self._destination_repair_truth_hydration_scope():
+                self._run_overlay_projection_invariant_pass("projection_repair_after_descendant_apply_flush")
         except Exception as exc:
             self._log_restore_exception("destination_projection_repair_resumed_after_descendant_apply", exc)
 
@@ -52670,6 +52771,24 @@ class MainWindow(QMainWindow):
                 else "graph_authority_false_enqueue_without_assessor"
             ),
         )
+        if (
+            hybrid_destination_preview_browse_first_enabled()
+            and bool(getattr(self, "_destination_startup_phase_active", False))
+            and _graph_auth_enqueue
+            and not bool(explicit_repair_authorized)
+            and str(_auth_class_enq or "") != "explicit_user_repair"
+        ):
+            pl_h = dict(parent_ix.data(Qt.UserRole) or {})
+            _pth_hb = str(
+                self._tree_item_path(pl_h) or self._destination_semantic_path(pl_h) or ""
+            )[:500]
+            log_info(
+                "destination_descendant_replay_blocked_hybrid_startup",
+                canonical_path=_pth_hb,
+                auth_class=str(_auth_class_enq or "")[:40],
+                enqueue_reason=str(enqueue_reason or "")[:200],
+            )
+            return False
         _auth_gate = str(expand_auth_class or "").strip() or str(_auth_class_enq)
         if (
             not bool(getattr(self, "_destination_startup_phase_active", False))
@@ -70960,6 +71079,12 @@ class MainWindow(QMainWindow):
         if getattr(self, "_destination_quiet_startup_overlay_structural_suppress", False):
             return 0
         if getattr(self, "_application_shutting_down", False):
+            return 0
+        if hybrid_destination_preview_browse_first_enabled() and not self._destination_repair_truth_hydration_permitted():
+            log_info(
+                "destination_overlay_repair_blocked_in_browse_lane",
+                reason_excerpt=str(reason or "")[:200],
+            )
             return 0
         if not destination_authority_contract.graph_owns_visible_real_destination_structure(self):
             return 0

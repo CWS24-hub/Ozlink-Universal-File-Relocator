@@ -34,6 +34,18 @@ def destination_memory_rehydrate_is_repair_truth_audit(audit_ctx: str) -> bool:
     return False
 
 
+def destination_preview_rehydrate_audit_is_idempotent_merge_log(audit_ctx: str) -> bool:
+    """True for browse/preview rehydrate audits that should log idempotent merge stats."""
+    a = str(audit_ctx or "").strip().casefold()
+    if not a:
+        return False
+    if "post_shell" in a:
+        return True
+    if "rich_branch_scan" in a or "post_shell_rich" in a:
+        return True
+    return False
+
+
 def hybrid_destination_preview_browse_first_enabled() -> bool:
     """
     When True, provisional startup skips phase-2 expand/hydrate/branch-refresh (broad rehydrate)
