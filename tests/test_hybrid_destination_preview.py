@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QApplication
 
 from ozlink_console.hybrid_destination_preview import (
     destination_hybrid_preview_badge_text,
+    destination_memory_rehydrate_is_repair_truth_audit,
     hybrid_destination_preview_browse_first_enabled,
 )
 from ozlink_console.main_window import MainWindow
@@ -21,6 +22,12 @@ from ozlink_console.sharepoint_destination_overlay_attach import (
 from ozlink_console.tree_models.destination_planning_model import DestinationPlanningTreeModel
 
 from test_sharepoint_destination_provisional_startup import _provisional_startup_test_mw_with_snapshot
+
+
+def test_repair_truth_audit_tag_detection() -> None:
+    assert destination_memory_rehydrate_is_repair_truth_audit("overlay_projection_invariant_repair")
+    assert not destination_memory_rehydrate_is_repair_truth_audit("post_shell_rich_branch_scan")
+    assert not destination_memory_rehydrate_is_repair_truth_audit("allocation_descendants_applied_zero_direct")
 
 
 def test_hybrid_badge_live_planned_from_graph_vs_planned() -> None:

@@ -15,6 +15,25 @@ from typing import Any
 from ozlink_console.sharepoint_destination_overlay_attach import destination_payload_is_planned_workspace_row
 
 
+def destination_memory_rehydrate_is_repair_truth_audit(audit_ctx: str) -> bool:
+    """
+    True when a memory branch rehydrate is tagged as repair/truth work (Execute/Validate lane).
+
+    Brows/startup / display_preview hydration must not use these tags — they may trigger
+    invariant/overlay repair paths. See :meth:`MainWindow._destination_repair_truth_hydration_scope`.
+    """
+    a = str(audit_ctx or "").strip().casefold()
+    if not a:
+        return False
+    if a == "overlay_projection_invariant_repair":
+        return True
+    if "overlay_projection_invariant_repair" in a:
+        return True
+    if "projection_repair_after" in a and "descendant" in a:
+        return True
+    return False
+
+
 def hybrid_destination_preview_browse_first_enabled() -> bool:
     """
     When True, provisional startup skips phase-2 expand/hydrate/branch-refresh (broad rehydrate)
@@ -52,6 +71,8 @@ def destination_hybrid_preview_badge_text(payload: Any) -> str:
     if destination_payload_is_planned_workspace_row(payload):
         if bool(payload.get("proposed")) or str(payload.get("node_origin") or "").strip().lower() == "proposed":
             return "[Proposed]"
+        if bool(payload.get("is_folder", True)) and not str(payload.get("id") or "").strip():
+            return "[Pending creation]"
         return "[Planned]"
     if ws == "live_confirmed":
         return "[Live]"

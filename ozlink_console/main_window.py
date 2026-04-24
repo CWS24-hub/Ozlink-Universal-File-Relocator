@@ -220,7 +220,10 @@ from ozlink_console.destination_overlay_identity import (
     new_overlay_node_id,
 )
 from ozlink_console.destination_overlay_layer import overlay_row_marker
-from ozlink_console.hybrid_destination_preview import hybrid_destination_preview_browse_first_enabled
+from ozlink_console.hybrid_destination_preview import (
+    destination_memory_rehydrate_is_repair_truth_audit,
+    hybrid_destination_preview_browse_first_enabled,
+)
 from ozlink_console.sharepoint_destination_overlay_attach import (
     WORKSPACE_ROW_STATE_CACHED_PROVISIONAL,
     WORKSPACE_ROW_STATE_LIVE_CONFIRMED,
@@ -3047,6 +3050,8 @@ class MainWindow(QMainWindow):
         self._destination_provisional_startup_status_message = ""
         # Two-phase startup: paint cached snapshot first (cached_only), then expand/hydrate/refresh off the hot path.
         self._destination_startup_ui_phase: str = "inactive"
+        # >0 only while explicitly running repair/truth work (Validate/Prepare/Execute, simulation export, etc.).
+        self._destination_repair_truth_hydration_depth: int = 0
         # While cached_only / hydrating: defer overlay materialize + indicator passes (flushed by orchestrator or graph bind).
         self._destination_startup_deferred_overlay_reasons: list[str] = []
         self._destination_startup_indicator_refresh_pending_after_cached: bool = False
@@ -29456,6 +29461,17 @@ class MainWindow(QMainWindow):
         dm = getattr(self, "destination_planning_model", None)
         if dm is None or not parent_ix.isValid() or not isinstance(move, dict):
             return out
+        if (
+            destination_memory_rehydrate_is_repair_truth_audit(audit_ctx)
+            and not self._destination_repair_truth_hydration_permitted()
+        ):
+            log_info(
+                "destination_visible_branch_rehydrate_from_memory_skipped",
+                reason="repair_hydration_blocked_browse_lane",
+                audit_context=str(audit_ctx or "")[:120],
+            )
+            out["outcome"] = "skipped"
+            return out
         c0 = parent_ix.siblingAtColumn(0) if parent_ix.column() != 0 else parent_ix
         if hasattr(dm, "is_index_live") and not dm.is_index_live(c0):
             return out
@@ -38122,6 +38138,21 @@ class MainWindow(QMainWindow):
             self._destination_maybe_begin_provisional_startup_hydration(reason="idle_fallback_after_cached_paint")
 
         QTimer.singleShot(delay_ms, lambda: self._safe_invoke("provisional_startup_hydration_idle_fallback_timer", _kick))
+
+    def _destination_repair_truth_hydration_permitted(self) -> bool:
+        """When False, :meth:`_destination_rehydrate_visible_branch_from_memory_snapshot` must not run repair-tagged rehydrate."""
+        if not hybrid_destination_preview_browse_first_enabled():
+            return True
+        return int(getattr(self, "_destination_repair_truth_hydration_depth", 0) or 0) > 0
+
+    @contextmanager
+    def _destination_repair_truth_hydration_scope(self):
+        d = int(getattr(self, "_destination_repair_truth_hydration_depth", 0) or 0)
+        self._destination_repair_truth_hydration_depth = d + 1
+        try:
+            yield
+        finally:
+            self._destination_repair_truth_hydration_depth = max(0, d)
 
     def _destination_hybrid_skip_provisional_phase2_broad_rehydrate(self, *, reason: str) -> None:
         """Browse-first: do not run expand/hydrate/branch-refresh at startup; transition to interactive idle."""
@@ -77612,38 +77643,39 @@ class MainWindow(QMainWindow):
 
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            t0 = time.perf_counter()
-            self.ensure_planned_moves_resolved_via_graph(persist=True, quiet=True)
-            ms_graph = int((time.perf_counter() - t0) * 1000)
-
-            t0 = time.perf_counter()
-            dup_err = self._planned_moves_duplicate_validation_error(self.planned_moves)
-            ms_dup = int((time.perf_counter() - t0) * 1000)
-
-            if not dup_err:
-                ctx = getattr(self, "current_session_context", None) or {}
-                tenant_hint = str(ctx.get("tenant_domain") or "")
+            with self._destination_repair_truth_hydration_scope():
+                t0 = time.perf_counter()
+                self.ensure_planned_moves_resolved_via_graph(persist=True, quiet=True)
+                ms_graph = int((time.perf_counter() - t0) * 1000)
 
                 t0 = time.perf_counter()
-                manifest = build_simulation_manifest(
-                    planned_moves=list(self.planned_moves or []),
-                    proposed_folders=list(self.proposed_folders or []),
-                    draft_id=str(self.active_draft_session_id or draft_key or ""),
-                    tenant_hint=tenant_hint,
-                    notes="Simulation export from Ozlink Console. Local absolute paths can be run from the Execution page or Planned Moves (Run manifest).",
-                    manifest_version=2,
-                    plan_leaf_exclusions=sorted(getattr(self, "_plan_leaf_exclusions", set()) or []),
-                    graph_unsafe_folder_step_indices=self._compute_graph_unsafe_folder_step_indices(),
-                    graph_expanded_transfer_steps=self._compute_graph_expanded_transfer_steps_json(),
-                )
-                ms_build = int((time.perf_counter() - t0) * 1000)
+                dup_err = self._planned_moves_duplicate_validation_error(self.planned_moves)
+                ms_dup = int((time.perf_counter() - t0) * 1000)
 
-                t0 = time.perf_counter()
-                try:
-                    write_manifest_json(path, manifest)
-                except OSError as exc:
-                    write_exc = exc
-                ms_write = int((time.perf_counter() - t0) * 1000)
+                if not dup_err:
+                    ctx = getattr(self, "current_session_context", None) or {}
+                    tenant_hint = str(ctx.get("tenant_domain") or "")
+
+                    t0 = time.perf_counter()
+                    manifest = build_simulation_manifest(
+                        planned_moves=list(self.planned_moves or []),
+                        proposed_folders=list(self.proposed_folders or []),
+                        draft_id=str(self.active_draft_session_id or draft_key or ""),
+                        tenant_hint=tenant_hint,
+                        notes="Simulation export from Ozlink Console. Local absolute paths can be run from the Execution page or Planned Moves (Run manifest).",
+                        manifest_version=2,
+                        plan_leaf_exclusions=sorted(getattr(self, "_plan_leaf_exclusions", set()) or []),
+                        graph_unsafe_folder_step_indices=self._compute_graph_unsafe_folder_step_indices(),
+                        graph_expanded_transfer_steps=self._compute_graph_expanded_transfer_steps_json(),
+                    )
+                    ms_build = int((time.perf_counter() - t0) * 1000)
+
+                    t0 = time.perf_counter()
+                    try:
+                        write_manifest_json(path, manifest)
+                    except OSError as exc:
+                        write_exc = exc
+                    ms_write = int((time.perf_counter() - t0) * 1000)
         finally:
             QApplication.restoreOverrideCursor()
 
@@ -81019,9 +81051,12 @@ class MainWindow(QMainWindow):
         )
 
         graph_client = self.graph if getattr(self.graph, "token", None) else None
-        preflight_transfer_updated, preflight_proposed_updated = self._preflight_enrich_manifest_graph_ids(run_manifest)
-        readiness_after = self._manifest_graph_readiness_counts(run_manifest)
-        dup_err = self._transfer_manifest_duplicate_validation_error(run_manifest)
+        with self._destination_repair_truth_hydration_scope():
+            preflight_transfer_updated, preflight_proposed_updated = self._preflight_enrich_manifest_graph_ids(
+                run_manifest
+            )
+            readiness_after = self._manifest_graph_readiness_counts(run_manifest)
+            dup_err = self._transfer_manifest_duplicate_validation_error(run_manifest)
         if dup_err:
             ref_ctx = self._inspector_capture_duplicate_inspector_refresh_context(
                 run_manifest, browsed_recursive_context
