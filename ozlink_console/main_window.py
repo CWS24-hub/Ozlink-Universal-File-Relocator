@@ -259,6 +259,8 @@ from ozlink_console.destination_projection_cache import (
 )
 from ozlink_console.planned_move_graph_resolve import (
     _parent_and_leaf,
+    classify_planned_move_destination_parent_for_linkage,
+    collect_proposed_folder_destination_paths_casefold,
     enrich_proposed_folder_record,
     enrich_single_planned_move,
     graph_dest_parent_negative_cache_key,
@@ -16169,11 +16171,10 @@ class MainWindow(QMainWindow):
                 # Enrich missing Graph ids using the same logic as ensure_planned_moves_resolved_via_graph,
                 # but sliced across event-loop ticks so the UI stays responsive (see _schedule_post_import_graph_enrichment).
                 try:
-                    _missing_graph = (
-                        int(_audit_import.get("rows_missing_graph_ids") or 0)
-                        + int(_audit_import.get("proposed_rows_missing_graph_ids") or 0)
+                    _missing_graph = int(_audit_import.get("rows_missing_graph_ids") or 0) + int(
+                        _audit_import.get("proposed_rows_missing_graph_ids") or 0
                     )
-                    if _missing_graph > 0:
+                    if _missing_graph > 0 or self._any_planned_move_missing_source_id():
                         self._graph_linkage_progress_session_begin()
                         self._schedule_post_import_graph_enrichment(source_description=source_description)
                         _import_graph_enrich_async = True
@@ -25992,18 +25993,20 @@ class MainWindow(QMainWindow):
             self._apply_graph_linkage_banner_from_audit(audit, phase="post_memory_restore_empty")
             return
 
-        _will_enrich = (
-            bool(self.current_session_context.get("connected"))
-            and bool(self._graph_resolve_planning_context())
-            and (
-                int(audit.get("rows_missing_graph_ids") or 0) + int(audit.get("proposed_rows_missing_graph_ids") or 0)
-                > 0
-            )
+        _will_enrich = bool(self.current_session_context.get("connected")) and bool(
+            self._graph_resolve_planning_context()
+        ) and (
+            int(audit.get("rows_missing_graph_ids") or 0) + int(audit.get("proposed_rows_missing_graph_ids") or 0) > 0
+            or self._any_planned_move_missing_source_id()
         )
 
         self._apply_graph_linkage_banner_from_audit(audit, phase="post_memory_restore_pre_resolve")
 
-        if audit.get("rows_missing_graph_ids", 0) == 0 and audit.get("proposed_rows_missing_graph_ids", 0) == 0:
+        if (
+            audit.get("rows_missing_graph_ids", 0) == 0
+            and audit.get("proposed_rows_missing_graph_ids", 0) == 0
+            and not self._any_planned_move_missing_source_id()
+        ):
             log_info(
                 "post_memory_restore_graph_id_enrichment",
                 event="skipped_already_linked",
@@ -26037,7 +26040,7 @@ class MainWindow(QMainWindow):
             if _will_enrich:
                 self._graph_linkage_progress_session_begin()
             move_rows_updated, proposed_updated = self.ensure_planned_moves_resolved_via_graph(
-                persist=True, quiet=True, refresh_sources=True
+                persist=True, quiet=True, refresh_sources=True, enrichment_mode="skip"
             )
             audit_after = self._audit_planned_moves_graph_destination_identity()
             log_info(
@@ -76276,7 +76279,7 @@ class MainWindow(QMainWindow):
             self._planned_move_source_sharepoint_refresh_last_mono = time.monotonic()
 
     def _graph_enrichment_run_generator(
-        self, *, persist: bool, quiet: bool, refresh_sources: bool = True
+        self, *, persist: bool, quiet: bool, refresh_sources: bool = True, enrichment_mode: str = "full"
     ):
         """Single implementation for Graph id enrichment; yields to the event loop between steps.
 
@@ -76321,8 +76324,13 @@ class MainWindow(QMainWindow):
             else:
                 su, src_touch = 0, set()
 
+            proposed_cf = collect_proposed_folder_destination_paths_casefold(self.proposed_folders)
+            pass_prop = proposed_cf if (enrichment_mode or "full") == "skip" else None
             missing_m_set, missing_p_set = self._graph_linkage_missing_row_index_sets()
-            total_graph_enrich = len(missing_m_set) + len(missing_p_set)
+            m_progress_set = self._graph_linkage_planned_move_indices_for_dest_progress(
+                enrichment_mode, proposed_cf
+            )
+            total_graph_enrich = len(m_progress_set) + len(missing_p_set)
             armed = bool(getattr(self, "_graph_linkage_progress_session_arm", False))
             _graph_progress_track = armed and total_graph_enrich > 0
             if _graph_progress_track:
@@ -76370,11 +76378,13 @@ class MainWindow(QMainWindow):
                     destination_parent_resolve_diag_sink=_sink_move_dest,
                     visible_library_anchor_destination=dest_skeleton_anchor,
                     sharepoint_graph_authority_destination=graph_auth_dest,
+                    enrichment_mode=enrichment_mode,
+                    proposed_folder_paths_casefold=pass_prop,
                 )
                 if ok:
                     mu += 1
                     graph_touch.update(self._narrow_source_projection_paths_for_move(move))
-                if i in missing_m_set:
+                if i in m_progress_set:
                     processed_missing += 1
                     if self._planned_move_destination_graph_ids_present(move):
                         resolved_missing += 1
@@ -76450,6 +76460,8 @@ class MainWindow(QMainWindow):
                         skip_dest_parent_negative_cache_read=True,
                         visible_library_anchor_destination=dest_skeleton_anchor,
                         sharepoint_graph_authority_destination=graph_auth_dest,
+                        enrichment_mode=enrichment_mode,
+                        proposed_folder_paths_casefold=pass_prop,
                     )
                     if ok_r:
                         mu += 1
@@ -76527,11 +76539,11 @@ class MainWindow(QMainWindow):
             self._destination_idle_materialize_reentrancy_block -= 1
 
     def ensure_planned_moves_resolved_via_graph(
-        self, *, persist: bool, quiet: bool, refresh_sources: bool = True
+        self, *, persist: bool, quiet: bool, refresh_sources: bool = True, enrichment_mode: str = "full"
     ) -> tuple[int, int]:
         """Refresh source metadata by id, then fill missing Graph ids from paths. Returns (moves_updated, proposed_updated)."""
         gen = self._graph_enrichment_run_generator(
-            persist=persist, quiet=quiet, refresh_sources=refresh_sources
+            persist=persist, quiet=quiet, refresh_sources=refresh_sources, enrichment_mode=enrichment_mode
         )
         n = 0
         try:
@@ -76885,7 +76897,16 @@ class MainWindow(QMainWindow):
         _max_affected = 50
         moves = list(self.planned_moves or [])
         total_rows = len(moves)
+        graph_auth = bool(
+            destination_authority_contract.graph_owns_visible_real_destination_structure(self)
+        )
+        dest_anchor = str(self._destination_visible_library_anchor_canonical_path() or "").strip()
+        ctx0 = self._graph_resolve_planning_context()
+        dest_lib = str((ctx0 or {}).get("dest_library_name") or "")
+        dest_site = str((ctx0 or {}).get("dest_site_name") or "")
+        proposed_cf = collect_proposed_folder_destination_paths_casefold(self.proposed_folders)
         rows_missing_graph_ids = 0
+        rows_planned_proposed_parent_pending = 0
         rows_with_legacy_path_only_identity = 0
         rows_recoverable = 0
         rows_unrecoverable = 0
@@ -76901,6 +76922,28 @@ class MainWindow(QMainWindow):
             ).strip()
             has_graph_dest = bool(did and ddrv)
             if has_graph_dest:
+                continue
+            parent_cls = classify_planned_move_destination_parent_for_linkage(
+                m,
+                dest_library_name=dest_lib,
+                dest_site_name=dest_site,
+                visible_library_anchor_destination=dest_anchor,
+                sharepoint_graph_authority_destination=graph_auth,
+                proposed_folder_paths_casefold=proposed_cf,
+            )
+            if parent_cls == "planned_or_proposed_parent":
+                rows_planned_proposed_parent_pending += 1
+                if len(affected_items) < _max_affected:
+                    src_path = str(m.get("source_path") or "").strip() or "(none)"
+                    affected_items.append(
+                        {
+                            "kind": "planned_move",
+                            "source_path": src_path,
+                            "destination_path": dest_path or "(none)",
+                            "missing_graph_identity": "destination Graph ids (pending under proposed folder)",
+                            "status": "pending_proposed_parent",
+                        }
+                    )
                 continue
             rows_missing_graph_ids += 1
             if dest_path:
@@ -76952,16 +76995,23 @@ class MainWindow(QMainWindow):
                         }
                     )
 
-        total_affected = int(rows_missing_graph_ids) + int(proposed_rows_missing_graph_ids)
+        total_affected = (
+            int(rows_missing_graph_ids)
+            + int(proposed_rows_missing_graph_ids)
+            + int(rows_planned_proposed_parent_pending)
+        )
         affected_omitted = max(0, total_affected - len(affected_items))
 
         severity = "ok"
-        if rows_missing_graph_ids or proposed_rows_missing_graph_ids:
-            severity = "error" if rows_unrecoverable else "warn"
+        if rows_unrecoverable:
+            severity = "error"
+        elif rows_missing_graph_ids or proposed_rows_missing_graph_ids:
+            severity = "warn"
 
         return {
             "total_rows": total_rows,
             "rows_missing_graph_ids": rows_missing_graph_ids,
+            "rows_planned_proposed_parent_pending": int(rows_planned_proposed_parent_pending),
             "rows_with_legacy_path_only_identity": rows_with_legacy_path_only_identity,
             "rows_recoverable": rows_recoverable,
             "rows_unrecoverable": rows_unrecoverable,
@@ -76992,6 +77042,58 @@ class MainWindow(QMainWindow):
             ):
                 missing_proposed.add(pi)
         return (missing_moves, missing_proposed)
+
+    def _any_planned_move_missing_source_id(self) -> bool:
+        """True when a planned move has a source path but no stored Graph source item id."""
+        for m in self.planned_moves or []:
+            if not isinstance(m, dict):
+                continue
+            src = m.get("source") if isinstance(m.get("source"), dict) else {}
+            if not str(m.get("source_path") or src.get("display_path") or src.get("item_path") or "").strip():
+                continue
+            if not str(src.get("id") or m.get("source_id") or "").strip():
+                return True
+        return False
+
+    def _planned_move_is_planned_or_proposed_parent_destination(
+        self, m: dict[str, Any], proposed_cf: set[str]
+    ) -> bool:
+        if not proposed_cf:
+            return False
+        ctx = self._graph_resolve_planning_context()
+        if not ctx:
+            return False
+        dest_anchor = str(self._destination_visible_library_anchor_canonical_path() or "").strip()
+        gauth = bool(destination_authority_contract.graph_owns_visible_real_destination_structure(self))
+        return (
+            classify_planned_move_destination_parent_for_linkage(
+                m,
+                dest_library_name=ctx["dest_library_name"],
+                dest_site_name=ctx["dest_site_name"],
+                visible_library_anchor_destination=dest_anchor,
+                sharepoint_graph_authority_destination=gauth,
+                proposed_folder_paths_casefold=proposed_cf,
+            )
+            == "planned_or_proposed_parent"
+        )
+
+    def _graph_linkage_planned_move_indices_for_dest_progress(
+        self, enrichment_mode: str, proposed_cf: set[str]
+    ) -> set[int]:
+        """Indices of planned rows that count toward destination resolution progress (skips proposed-only parents in skip mode)."""
+        m_all, _ = self._graph_linkage_missing_row_index_sets()
+        if (enrichment_mode or "full") != "skip" or not proposed_cf:
+            return m_all
+        out: set[int] = set()
+        pm = list(self.planned_moves or [])
+        for i in m_all:
+            m = pm[i] if 0 <= i < len(pm) else None
+            if not isinstance(m, dict):
+                out.add(i)
+                continue
+            if not self._planned_move_is_planned_or_proposed_parent_destination(m, proposed_cf):
+                out.add(i)
+        return out
 
     def _planned_move_destination_graph_ids_present(self, move: dict) -> bool:
         if not isinstance(move, dict):
@@ -77145,6 +77247,7 @@ class MainWindow(QMainWindow):
         sig = (
             int(audit.get("total_rows") or 0),
             int(audit.get("rows_missing_graph_ids") or 0),
+            int(audit.get("rows_planned_proposed_parent_pending") or 0),
             int(audit.get("rows_with_legacy_path_only_identity") or 0),
             int(audit.get("rows_unrecoverable") or 0),
             int(audit.get("rows_recoverable") or 0),
@@ -77179,6 +77282,7 @@ class MainWindow(QMainWindow):
             "",
             f"total_rows (planned moves): {int(snap.get('total_rows') or 0)}",
             f"rows_missing_graph_ids: {int(snap.get('rows_missing_graph_ids') or 0)}",
+            f"rows_planned_proposed_parent_pending: {int(snap.get('rows_planned_proposed_parent_pending') or 0)}",
             f"rows_with_legacy_path_only_identity: {int(snap.get('rows_with_legacy_path_only_identity') or 0)}",
             f"rows_recoverable: {int(snap.get('rows_recoverable') or 0)}",
             f"rows_unrecoverable: {int(snap.get('rows_unrecoverable') or 0)}",
@@ -77195,6 +77299,7 @@ class MainWindow(QMainWindow):
             if (
                 int(snap.get("rows_missing_graph_ids") or 0) == 0
                 and int(snap.get("proposed_rows_missing_graph_ids") or 0) == 0
+                and int(snap.get("rows_planned_proposed_parent_pending") or 0) == 0
             ):
                 return ["(No issues — destination Graph identity complete for audited planned/proposed rows.)"]
             return ["(Affected rows exist but are not included in this compact sample.)"]
@@ -77258,6 +77363,7 @@ class MainWindow(QMainWindow):
             str(int(audit.get(k) or 0))
             for k in (
                 "rows_missing_graph_ids",
+                "rows_planned_proposed_parent_pending",
                 "proposed_rows_missing_graph_ids",
                 "rows_unrecoverable",
                 "rows_recoverable",
@@ -77447,9 +77553,11 @@ class MainWindow(QMainWindow):
         _audit_d = self._audit_planned_moves_graph_destination_identity()
         if int(_audit_d.get("rows_missing_graph_ids") or 0) + int(
             _audit_d.get("proposed_rows_missing_graph_ids") or 0
-        ) > 0:
+        ) > 0 or self._any_planned_move_missing_source_id():
             self._graph_linkage_progress_session_begin()
-        self.ensure_planned_moves_resolved_via_graph(persist=True, quiet=False, refresh_sources=False)
+        self.ensure_planned_moves_resolved_via_graph(
+            persist=True, quiet=False, refresh_sources=False, enrichment_mode="skip"
+        )
 
     def _on_simulate_run_save_manifest(self):
         if not self.planned_moves and not self.proposed_folders:

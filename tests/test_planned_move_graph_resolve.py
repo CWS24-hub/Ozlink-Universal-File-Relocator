@@ -2,9 +2,12 @@
 
 from ozlink_console.planned_move_graph_resolve import (
     allocation_path_to_drive_relative,
+    classify_planned_move_destination_parent_for_linkage,
+    collect_proposed_folder_destination_paths_casefold,
     drive_relative_path_candidates,
     enrich_single_planned_move,
     is_internal_proposed_destination_item_id,
+    is_destination_parent_planned_or_proposed_only,
     refresh_planned_move_source_from_graph,
     resolve_item_by_path_candidates,
 )
@@ -105,6 +108,103 @@ def test_enrich_single_planned_move_resolves_destination_when_only_prop_placehol
     assert move["source_id"] == "SRC-FILE-1"
     assert move["destination_id"] == "REAL-PARENT-1"
     assert move["destination"]["id"] == "REAL-PARENT-1"
+
+
+def test_enrich_single_planned_move_skip_mode_does_not_call_graph_for_proposed_parent_dest():
+    calls: list[str] = []
+
+    def get_item_by_path(drive: str, rel: str) -> None:
+        calls.append(rel)
+        return None
+
+    def get_root_item(drive: str):
+        return {"id": "ROOT-1"}
+
+    move = {
+        "source_path": "S/a.jpg",
+        "destination_path": "FTBMRoot/ProposedArea/new.docx",
+        "source": {"id": "src-1", "drive_id": "d-s"},
+        "destination": {"id": "", "drive_id": "d-d"},
+    }
+    proposed = collect_proposed_folder_destination_paths_casefold(
+        [{"DestinationPath": r"FTBMRoot/ProposedArea", "ParentPath": "", "FolderName": ""}]
+    )
+    enrich_single_planned_move(
+        move,
+        get_item_by_path=get_item_by_path,
+        get_root_item=get_root_item,
+        source_drive_id="d-s",
+        source_library_name="LibS",
+        dest_drive_id="d-d",
+        dest_library_name="LibD",
+        enrichment_mode="skip",
+        proposed_folder_paths_casefold=proposed,
+    )
+    assert not calls, "skip mode must not look up live destination parent for proposed path"
+
+
+def test_enrich_single_planned_move_full_mode_still_looks_up_live_parent():
+    calls: list[str] = []
+
+    def get_item_by_path(drive: str, rel: str) -> None:
+        if drive == "d-d":
+            calls.append(rel)
+        return None
+
+    def get_root_item(drive: str):
+        return {"id": "ROOT-1"}
+
+    move = {
+        "source_path": "S/a.jpg",
+        "destination_path": "FTBMRoot/OnlyLive/file.docx",
+        "source": {"id": "src-1", "drive_id": "d-s"},
+        "destination": {"id": "", "drive_id": "d-d"},
+    }
+    prop = collect_proposed_folder_destination_paths_casefold(
+        [{"DestinationPath": "FTBMRoot/ProposedArea", "ParentPath": "", "FolderName": ""}]
+    )
+    enrich_single_planned_move(
+        move,
+        get_item_by_path=get_item_by_path,
+        get_root_item=get_root_item,
+        source_drive_id="d-s",
+        source_library_name="LibS",
+        dest_drive_id="d-d",
+        dest_library_name="LibD",
+        enrichment_mode="full",
+        proposed_folder_paths_casefold=prop,
+    )
+    assert calls, "full mode should attempt at least one live destination parent lookup when missing id"
+
+
+def test_classify_planned_move_destination_proposed_vs_live():
+    m_proposed = {
+        "destination_path": "FTBMRoot/ProposedX/y.txt",
+        "destination": {},
+    }
+    m_live = {
+        "destination_path": "FTBMRoot/ExistingZ/y.txt",
+        "destination": {},
+    }
+    pcf = collect_proposed_folder_destination_paths_casefold(
+        [{"DestinationPath": "FTBMRoot/ProposedX", "ParentPath": "FTBMRoot", "FolderName": "ProposedX"}]
+    )
+    c1 = classify_planned_move_destination_parent_for_linkage(
+        m_proposed, dest_library_name="LibD", dest_site_name="S", proposed_folder_paths_casefold=pcf
+    )
+    c2 = classify_planned_move_destination_parent_for_linkage(
+        m_live, dest_library_name="LibD", dest_site_name="S", proposed_folder_paths_casefold=pcf
+    )
+    assert c1 == "planned_or_proposed_parent"
+    assert c2 == "live_existing_parent"
+
+
+def test_is_destination_parent_planned_or_proposed_only_prefix_match():
+    s = collect_proposed_folder_destination_paths_casefold(
+        [{"DestinationPath": "FTBMRoot/Area", "ParentPath": "FTBMRoot", "FolderName": "Area"}]
+    )
+    assert is_destination_parent_planned_or_proposed_only("FTBMRoot/Area/child/f.txt", s) is True
+    assert is_destination_parent_planned_or_proposed_only("FTBMRoot/Other/child/f.txt", s) is False
 
 
 def test_resolve_item_by_path_candidates_second_path_wins():

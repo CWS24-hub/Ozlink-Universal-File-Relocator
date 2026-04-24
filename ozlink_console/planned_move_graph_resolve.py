@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Callable, MutableSet, Optional
+from typing import Any, Callable, MutableSet, Optional, Sequence, Union
 
 from ozlink_console.destination_path_bridge import remap_under_visible_library_anchor, strip_legacy_internal_root_prefix
 from ozlink_console.graph import GraphClient
@@ -25,6 +25,69 @@ def graph_dest_parent_negative_cache_key(
         f"{str(dest_drive_id or '').strip()}\x00{str(dest_library_name or '').strip()}\x00"
         f"{str(dest_site_name or '').strip()}\x00{marker}"
     )
+
+
+def _norm_path_casefold_backslash(path: str) -> str:
+    s = normalize_manifest_path(str(path or "").replace("/", "\\"))
+    return s.strip().casefold()
+
+
+def collect_proposed_folder_destination_paths_casefold(
+    proposed_folders: Optional[Sequence[Union[dict[str, Any], Any]]],
+) -> set[str]:
+    """
+    Normalized (casefold) full destination paths for proposed folder rows.
+    Used to detect planned moves whose destination lives under a folder that is only
+    proposed (not created in SharePoint until execution).
+    """
+    out: set[str] = set()
+    for pf in proposed_folders or []:
+        dp = ""
+        pp = ""
+        fn = ""
+        if isinstance(pf, dict):
+            dp = str(pf.get("DestinationPath") or "").strip()
+            pp = str(pf.get("ParentPath") or "").strip()
+            fn = str(pf.get("FolderName") or "").strip()
+        else:
+            dp = str(getattr(pf, "DestinationPath", "") or "").strip()
+            pp = str(getattr(pf, "ParentPath", "") or "").strip()
+            fn = str(getattr(pf, "FolderName", "") or "").strip()
+        if dp:
+            out.add(_norm_path_casefold_backslash(dp))
+        if pp and fn:
+            out.add(_norm_path_casefold_backslash(f"{pp}\\{fn}"))
+    return out
+
+
+def is_destination_parent_planned_or_proposed_only(
+    drive_relative_primary: str,
+    proposed_paths_casefold: set[str],
+) -> bool:
+    """
+    True when the first drive-relative path's parent (or the path itself for a single-segment
+    place-holder) is covered by a *proposed folder* path — the folder does not have to exist in
+    SharePoint until execution, so live Graph parent resolution is not a startup failure.
+    """
+    if not drive_relative_primary or not proposed_paths_casefold:
+        return False
+    rel = str(drive_relative_primary or "").replace("\\", "/").strip("/")
+    if not rel:
+        return False
+    d_cf = _norm_path_casefold_backslash(rel)
+    if d_cf in proposed_paths_casefold:
+        return True
+    parent_slash, _leaf = _parent_and_leaf(rel)
+    p_cf = _norm_path_casefold_backslash(parent_slash.replace("/", "\\") if parent_slash else "")
+    for marker in (d_cf, p_cf):
+        if not marker:
+            continue
+        for prop in proposed_paths_casefold:
+            if not prop:
+                continue
+            if marker == prop or marker.startswith(prop + "\\") or d_cf.startswith(prop + "\\"):
+                return True
+    return False
 
 
 def is_internal_proposed_destination_item_id(value: str) -> bool:
@@ -225,6 +288,51 @@ def drive_relative_path_candidates(
     return candidates[:max_candidates]
 
 
+def classify_planned_move_destination_parent_for_linkage(
+    move: dict[str, Any],
+    *,
+    dest_library_name: str,
+    dest_site_name: str,
+    visible_library_anchor_destination: str = "",
+    sharepoint_graph_authority_destination: bool = False,
+    proposed_folder_paths_casefold: Optional[set[str]] = None,
+) -> str:
+    """
+    Classify how a planned move's *destination* parent should be treated in Graph linkage:
+
+    - ``planned_or_proposed_parent`` — the destination (or a prefix) is one of the proposed folder
+      paths, so the parent is not required to exist in live SharePoint until execution.
+    - ``live_existing_parent`` — not covered by a proposed path; a normal live Graph parent lookup
+      is appropriate when IDs are missing.
+    - ``no_destination_path`` — there is no usable destination path to classify.
+    """
+    dst = move.get("destination") if isinstance(move.get("destination"), dict) else {}
+    dst_path = str(
+        move.get("destination_path") or dst.get("display_path") or dst.get("item_path") or ""
+    ).strip()
+    if not dst_path:
+        return "no_destination_path"
+    prop = proposed_folder_paths_casefold or set()
+    if not prop:
+        return "live_existing_parent"
+    sp_auth = bool(sharepoint_graph_authority_destination)
+    anchor_d = str(visible_library_anchor_destination or "").strip()
+    if sp_auth and not anchor_d:
+        return "live_existing_parent"
+    candidates = drive_relative_path_candidates(
+        dst_path,
+        library_name=dest_library_name,
+        site_name=dest_site_name,
+        visible_library_anchor=anchor_d if sp_auth else str(visible_library_anchor_destination or "").strip(),
+        restrict_to_live_graph_skeleton=sp_auth,
+    )
+    if not candidates:
+        return "live_existing_parent"
+    if is_destination_parent_planned_or_proposed_only(candidates[0], prop):
+        return "planned_or_proposed_parent"
+    return "live_existing_parent"
+
+
 def resolve_item_by_path_candidates(
     get_item_by_path: Callable[[str, str], Optional[dict[str, Any]]],
     drive_id: str,
@@ -420,6 +528,8 @@ def enrich_single_planned_move(
     skip_dest_parent_negative_cache_read: bool = False,
     visible_library_anchor_destination: str = "",
     sharepoint_graph_authority_destination: bool = False,
+    enrichment_mode: str = "full",
+    proposed_folder_paths_casefold: Optional[set[str]] = None,
 ) -> bool:
     """
     Fill ``source`` / ``destination`` nested dicts with Graph ids when missing (read-only GETs).
@@ -430,6 +540,11 @@ def enrich_single_planned_move(
     When ``sharepoint_graph_authority_destination`` is True, destination drive-relative candidates
     are restricted to the live skeleton coordinate system: a visible library anchor path is
     required, and de-anchored alternates are not emitted.
+
+    When ``enrichment_mode == "skip"`` and the destination is under a *proposed folder* path
+    (``proposed_folder_paths_casefold`` from the current draft), do **not** run live destination
+    parent resolution — the folder is expected to be created on execution, not a startup Graph
+    failure.
 
     Returns True if at least one id was set.
     """
@@ -551,180 +666,198 @@ def enrich_single_planned_move(
                     **base_log,
                 )
             else:
-                dest_resolved = False
-                tried: list[str] = []
-                candidate_attempts: list[dict[str, Any]] = []
-                cache_skipped = 0
-                graph_miss = 0
-                exc_count = 0
-                aborted_root = False
-                nc = dest_parent_negative_cache
-                for idx, cand in enumerate(candidates):
-                    parent_rel, leaf = _parent_and_leaf(cand)
-                    label = parent_rel if parent_rel else "(library_root)"
-                    tried.append(f"[{idx}] parent={label[:100]} leaf={leaf[:80] if leaf else ''}")
-                    cache_key = graph_dest_parent_negative_cache_key(
-                        d_drive, parent_rel or "", dest_library_name, dest_site_name
+                skip_mode = (enrichment_mode or "full").lower() == "skip"
+                prop_cf = proposed_folder_paths_casefold or set()
+                defer_dest = bool(
+                    skip_mode
+                    and prop_cf
+                    and is_destination_parent_planned_or_proposed_only(
+                        str(candidates[0] or "").replace("\\", "/").strip("/"), prop_cf
                     )
-                    attempt: dict[str, Any] = {
-                        "candidate_index": idx,
-                        "full_drive_relative_candidate": cand[:500],
-                        "parent_path_for_graph_api": parent_rel[:500] if parent_rel else "",
-                        "leaf_segment": leaf[:200] if leaf else "",
-                    }
-                    if (
-                        not skip_dest_parent_negative_cache_read
-                        and nc is not None
-                        and cache_key in nc
-                    ):
-                        cache_skipped += 1
-                        attempt["outcome"] = "skipped_negative_cache"
-                        candidate_attempts.append(attempt)
-                        log_trace(
-                            "graph_resolve",
-                            "dest_parent_negative_cache_hit",
-                            candidate_index=idx,
-                            cache_key_excerpt=cache_key[:200],
-                            **base_log,
-                        )
-                        continue
-                    parent_item: Optional[dict[str, Any]] = None
-                    if parent_rel:
-                        try:
-                            parent_item = get_item_by_path(d_drive, parent_rel)
-                        except Exception as exc:
-                            exc_count += 1
-                            attempt["outcome"] = "parent_lookup_exception"
-                            attempt["error_excerpt"] = str(exc)[:400]
-                            candidate_attempts.append(attempt)
-                            log_warn(
-                                "graph_resolve_dest_parent_exception",
-                                candidate_index=idx,
-                                parent_rel_excerpt=parent_rel[:200],
-                                error=str(exc)[:500],
-                                **base_log,
-                            )
-                            if nc is not None:
-                                nc.add(cache_key)
-                            continue
-                    else:
-                        try:
-                            parent_item = get_root_item(d_drive)
-                        except Exception as exc:
-                            exc_count += 1
-                            aborted_root = True
-                            attempt["outcome"] = "root_lookup_exception"
-                            attempt["error_excerpt"] = str(exc)[:400]
-                            candidate_attempts.append(attempt)
-                            log_warn(
-                                "graph_resolve_dest_root_exception",
-                                error=str(exc)[:500],
-                                **base_log,
-                            )
-                            if nc is not None:
-                                nc.add(cache_key)
-                            break
-
-                    if parent_item and parent_item.get("id"):
-                        attempt["outcome"] = "parent_resolved_ok"
-                        candidate_attempts.append(attempt)
-                        pid = str(parent_item.get("id", "")).strip()
-                        dst["id"] = pid
-                        dst["drive_id"] = d_drive
-                        move["destination_id"] = pid
-                        if leaf:
-                            move["destination_name"] = leaf
-                            dst["name"] = leaf
-                        changed = True
-                        dest_resolved = True
-                        if idx > 0:
-                            log_info(
-                                "graph_resolve_path_fallback_success",
-                                phase="planned_move_destination_parent",
-                                candidate_index=idx,
-                                rel_used=cand[:240],
-                                parent_rel_excerpt=parent_rel[:200] if parent_rel else "",
-                                leaf_name_excerpt=leaf[:120] if leaf else "",
-                                dest_library=dest_library_name[:80],
-                                dest_site=dest_site_name[:80],
-                                **base_log,
-                            )
-                        break
-                    graph_miss += 1
-                    attempt["outcome"] = "parent_graph_response_missing_or_no_id"
-                    candidate_attempts.append(attempt)
+                )
+                if defer_dest:
                     log_trace(
                         "graph_resolve",
-                        "dest_parent_candidate_miss",
-                        candidate_index=idx,
-                        parent_rel_excerpt=parent_rel[:200] if parent_rel else "(root)",
-                        leaf_excerpt=leaf[:120] if leaf else "",
+                        "dest_parent_resolution_deferred",
+                        reason="pending_proposed_parent",
+                        first_candidate_excerpt=(candidates[0] or "")[:300],
                         **base_log,
                     )
-                    if nc is not None:
-                        nc.add(cache_key)
+                if not defer_dest:
+                    dest_resolved = False
+                    tried: list[str] = []
+                    candidate_attempts: list[dict[str, Any]] = []
+                    cache_skipped = 0
+                    graph_miss = 0
+                    exc_count = 0
+                    aborted_root = False
+                    nc = dest_parent_negative_cache
+                    for idx, cand in enumerate(candidates):
+                        parent_rel, leaf = _parent_and_leaf(cand)
+                        label = parent_rel if parent_rel else "(library_root)"
+                        tried.append(f"[{idx}] parent={label[:100]} leaf={leaf[:80] if leaf else ''}")
+                        cache_key = graph_dest_parent_negative_cache_key(
+                            d_drive, parent_rel or "", dest_library_name, dest_site_name
+                        )
+                        attempt: dict[str, Any] = {
+                            "candidate_index": idx,
+                            "full_drive_relative_candidate": cand[:500],
+                            "parent_path_for_graph_api": parent_rel[:500] if parent_rel else "",
+                            "leaf_segment": leaf[:200] if leaf else "",
+                        }
+                        if (
+                            not skip_dest_parent_negative_cache_read
+                            and nc is not None
+                            and cache_key in nc
+                        ):
+                            cache_skipped += 1
+                            attempt["outcome"] = "skipped_negative_cache"
+                            candidate_attempts.append(attempt)
+                            log_trace(
+                                "graph_resolve",
+                                "dest_parent_negative_cache_hit",
+                                candidate_index=idx,
+                                cache_key_excerpt=cache_key[:200],
+                                **base_log,
+                            )
+                            continue
+                        parent_item: Optional[dict[str, Any]] = None
+                        if parent_rel:
+                            try:
+                                parent_item = get_item_by_path(d_drive, parent_rel)
+                            except Exception as exc:
+                                exc_count += 1
+                                attempt["outcome"] = "parent_lookup_exception"
+                                attempt["error_excerpt"] = str(exc)[:400]
+                                candidate_attempts.append(attempt)
+                                log_warn(
+                                    "graph_resolve_dest_parent_exception",
+                                    candidate_index=idx,
+                                    parent_rel_excerpt=parent_rel[:200],
+                                    error=str(exc)[:500],
+                                    **base_log,
+                                )
+                                if nc is not None:
+                                    nc.add(cache_key)
+                                continue
+                        else:
+                            try:
+                                parent_item = get_root_item(d_drive)
+                            except Exception as exc:
+                                exc_count += 1
+                                aborted_root = True
+                                attempt["outcome"] = "root_lookup_exception"
+                                attempt["error_excerpt"] = str(exc)[:400]
+                                candidate_attempts.append(attempt)
+                                log_warn(
+                                    "graph_resolve_dest_root_exception",
+                                    error=str(exc)[:500],
+                                    **base_log,
+                                )
+                                if nc is not None:
+                                    nc.add(cache_key)
+                                break
 
-                if not dest_resolved:
-                    if aborted_root:
-                        final_reason = "root_lookup_exception"
-                    elif cache_skipped == len(candidates) and candidates:
-                        final_reason = "negative_cache_all_candidates_skipped"
-                    else:
-                        final_reason = "parent_folder_not_found_in_destination_library"
-                    if cache_skipped == len(candidates) and candidates:
+                        if parent_item and parent_item.get("id"):
+                            attempt["outcome"] = "parent_resolved_ok"
+                            candidate_attempts.append(attempt)
+                            pid = str(parent_item.get("id", "")).strip()
+                            dst["id"] = pid
+                            dst["drive_id"] = d_drive
+                            move["destination_id"] = pid
+                            if leaf:
+                                move["destination_name"] = leaf
+                                dst["name"] = leaf
+                            changed = True
+                            dest_resolved = True
+                            if idx > 0:
+                                log_info(
+                                    "graph_resolve_path_fallback_success",
+                                    phase="planned_move_destination_parent",
+                                    candidate_index=idx,
+                                    rel_used=cand[:240],
+                                    parent_rel_excerpt=parent_rel[:200] if parent_rel else "",
+                                    leaf_name_excerpt=leaf[:120] if leaf else "",
+                                    dest_library=dest_library_name[:80],
+                                    dest_site=dest_site_name[:80],
+                                    **base_log,
+                                )
+                            break
+                        graph_miss += 1
+                        attempt["outcome"] = "parent_graph_response_missing_or_no_id"
+                        candidate_attempts.append(attempt)
                         log_trace(
                             "graph_resolve",
-                            "graph_resolve_dest_parent_all_candidates_failed_suppressed_negative_cache",
-                            reason="all_parent_candidates_known_missing_this_session",
-                            raw_destination_path_excerpt=dst_path[:240],
-                            dest_library=dest_library_name[:80],
-                            dest_site=dest_site_name[:80],
-                            candidate_count=len(candidates),
+                            "dest_parent_candidate_miss",
+                            candidate_index=idx,
+                            parent_rel_excerpt=parent_rel[:200] if parent_rel else "(root)",
+                            leaf_excerpt=leaf[:120] if leaf else "",
                             **base_log,
                         )
-                    else:
-                        log_warn(
-                            "graph_resolve_dest_parent_all_candidates_failed",
-                            reason="parent_folder_not_found_in_destination_library",
-                            hint="create_parent_folders_in_sharepoint_or_fix_destination_path",
-                            raw_destination_path_excerpt=dst_path[:240],
-                            dest_library=dest_library_name[:80],
-                            dest_site=dest_site_name[:80],
-                            attempts_summary=tried[:24],
-                            candidate_count=len(candidates),
+                        if nc is not None:
+                            nc.add(cache_key)
+
+                    if not dest_resolved:
+                        if aborted_root:
+                            final_reason = "root_lookup_exception"
+                        elif cache_skipped == len(candidates) and candidates:
+                            final_reason = "negative_cache_all_candidates_skipped"
+                        else:
+                            final_reason = "parent_folder_not_found_in_destination_library"
+                        if cache_skipped == len(candidates) and candidates:
+                            log_trace(
+                                "graph_resolve",
+                                "graph_resolve_dest_parent_all_candidates_failed_suppressed_negative_cache",
+                                reason="all_parent_candidates_known_missing_this_session",
+                                raw_destination_path_excerpt=dst_path[:240],
+                                dest_library=dest_library_name[:80],
+                                dest_site=dest_site_name[:80],
+                                candidate_count=len(candidates),
+                                **base_log,
+                            )
+                        else:
+                            log_warn(
+                                "graph_resolve_dest_parent_all_candidates_failed",
+                                reason="parent_folder_not_found_in_destination_library",
+                                hint="create_parent_folders_in_sharepoint_or_fix_destination_path",
+                                raw_destination_path_excerpt=dst_path[:240],
+                                dest_library=dest_library_name[:80],
+                                dest_site=dest_site_name[:80],
+                                attempts_summary=tried[:24],
+                                candidate_count=len(candidates),
+                                **base_log,
+                            )
+                        forensic: dict[str, Any] = {
                             **base_log,
+                            "phase": "planned_move_destination_parent",
+                            "resolver_uses_real_sharepoint_parent_only": True,
+                            "raw_source_path_excerpt": src_path[:500],
+                            "raw_destination_path_excerpt": dst_path[:500],
+                            "dest_site_excerpt": dest_site_name[:80],
+                            "dest_library_excerpt": dest_library_name[:80],
+                            "drive_relative_path_candidates": [c[:400] for c in candidates],
+                            "candidate_parent_variants_attempted": tried[:40],
+                            "candidate_attempts": candidate_attempts,
+                            "final_failure_reason": final_reason,
+                            "cache_skip_count": cache_skipped,
+                            "graph_parent_miss_count": graph_miss,
+                            "parent_lookup_exception_count": exc_count,
+                        }
+                        if destination_parent_resolve_diag_sink is not None:
+                            try:
+                                destination_parent_resolve_diag_sink(forensic)
+                            except Exception:
+                                pass
+                        log_info(
+                            "graph_resolve_dest_row_forensic",
+                            candidate_attempt_detail_json=json.dumps(
+                                forensic.get("candidate_attempts") or [], ensure_ascii=False
+                            )[:12000],
+                            projection_parent_hints_json=json.dumps(
+                                forensic.get("projection_parent_hints") or [], ensure_ascii=False
+                            )[:8000],
+                            **{k: v for k, v in forensic.items() if k not in ("candidate_attempts", "projection_parent_hints")},
                         )
-                    forensic: dict[str, Any] = {
-                        **base_log,
-                        "phase": "planned_move_destination_parent",
-                        "resolver_uses_real_sharepoint_parent_only": True,
-                        "raw_source_path_excerpt": src_path[:500],
-                        "raw_destination_path_excerpt": dst_path[:500],
-                        "dest_site_excerpt": dest_site_name[:80],
-                        "dest_library_excerpt": dest_library_name[:80],
-                        "drive_relative_path_candidates": [c[:400] for c in candidates],
-                        "candidate_parent_variants_attempted": tried[:40],
-                        "candidate_attempts": candidate_attempts,
-                        "final_failure_reason": final_reason,
-                        "cache_skip_count": cache_skipped,
-                        "graph_parent_miss_count": graph_miss,
-                        "parent_lookup_exception_count": exc_count,
-                    }
-                    if destination_parent_resolve_diag_sink is not None:
-                        try:
-                            destination_parent_resolve_diag_sink(forensic)
-                        except Exception:
-                            pass
-                    log_info(
-                        "graph_resolve_dest_row_forensic",
-                        candidate_attempt_detail_json=json.dumps(
-                            forensic.get("candidate_attempts") or [], ensure_ascii=False
-                        )[:12000],
-                        projection_parent_hints_json=json.dumps(
-                            forensic.get("projection_parent_hints") or [], ensure_ascii=False
-                        )[:8000],
-                        **{k: v for k, v in forensic.items() if k not in ("candidate_attempts", "projection_parent_hints")},
-                    )
 
     return changed
 
