@@ -130,6 +130,7 @@ def test_provisional_startup_mount_does_not_immediately_trigger_heavy_hydration(
 def test_startup_hydration_begins_after_cached_only_phase(monkeypatch):
     """Invariant: hydration is deferred from phase-1 paint, then runs when explicitly advanced — not stuck in cached_only."""
     os.environ.pop("OZLINK_PROVISIONAL_DESTINATION_STARTUP", None)
+    monkeypatch.setenv("OZLINK_HYBRID_DESTINATION_PREVIEW", "0")
     monkeypatch.setenv("OZLINK_STARTUP_BACKGROUND_HYDRATION_DELAY_MS", "0")
     app = QApplication.instance() or QApplication([])
     mw, _dm = _provisional_startup_test_mw_with_snapshot()
@@ -307,6 +308,7 @@ def test_startup_hydration_can_begin_later_without_losing_state(monkeypatch):
     synchronous overlay on the real hot path.
     """
     os.environ.pop("OZLINK_PROVISIONAL_DESTINATION_STARTUP", None)
+    monkeypatch.setenv("OZLINK_HYBRID_DESTINATION_PREVIEW", "0")
     monkeypatch.setenv("OZLINK_STARTUP_BACKGROUND_HYDRATION_DELAY_MS", "0")
     monkeypatch.setenv("OZLINK_STARTUP_POST_VISIBLE_HEAVY_WORK_GRACE_SEC", "0")
     app = QApplication.instance() or QApplication([])

@@ -10,6 +10,7 @@ from typing import AbstractSet, Any, Callable, Dict, List, Optional, Tuple, Set
 from PySide6.QtCore import QAbstractItemModel, QModelIndex, Qt, Signal
 from PySide6.QtGui import QBrush, QColor
 
+from ozlink_console.hybrid_destination_preview import destination_hybrid_name_column_text
 from ozlink_console.logger import log_info
 from ozlink_console.paths import normalize_manifest_path
 from ozlink_console.sharepoint_destination_overlay_attach import (
@@ -349,7 +350,8 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
                 return None
             if role == Qt.DisplayRole:
                 if col == 0:
-                    return p.get("base_display_label") or ""
+                    base0 = p.get("base_display_label") or ""
+                    return destination_hybrid_name_column_text(str(base0 or ""), p)
                 if col == 1:
                     return explorer_size_label(p)
                 if col == 2:
@@ -1389,6 +1391,15 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
                     else:
                         p["graph_children_verified"] = True
                         p["needs_live_child_refresh"] = False
+                    if destination_payload_is_planned_workspace_row(_old) or bool(
+                        _old.get("workspace_planned_row")
+                        or _old.get("planned_allocation")
+                    ):
+                        p["graph_vs_planned"] = "live_planned"
+                    else:
+                        p["graph_vs_planned"] = str(
+                            p.get("graph_vs_planned") or _old.get("graph_vs_planned") or "live_graph"
+                        ).strip() or "live_graph"
 
                 self.update_payload_for_index(cix_hit, _mut)  # type: ignore[union-attr, unused-ignore]
                 n_up += 1

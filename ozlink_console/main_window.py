@@ -220,6 +220,7 @@ from ozlink_console.destination_overlay_identity import (
     new_overlay_node_id,
 )
 from ozlink_console.destination_overlay_layer import overlay_row_marker
+from ozlink_console.hybrid_destination_preview import hybrid_destination_preview_browse_first_enabled
 from ozlink_console.sharepoint_destination_overlay_attach import (
     WORKSPACE_ROW_STATE_CACHED_PROVISIONAL,
     WORKSPACE_ROW_STATE_LIVE_CONFIRMED,
@@ -37816,7 +37817,10 @@ class MainWindow(QMainWindow):
         self._destination_startup_promotion_scope_drive_id = str(self._destination_snapshot_mount_drive_id or "").strip()
         self._destination_run_post_snapshot_bind_overlay_pipeline(reason="provisional_startup_reset_nested")
         self._destination_provisional_startup_applied = True
-        msg = "Loaded saved workspace snapshot. Verifying live SharePoint content…"
+        if hybrid_destination_preview_browse_first_enabled():
+            msg = "Saved plan preview — expand a folder to load live SharePoint children."
+        else:
+            msg = "Loaded saved workspace snapshot. Verifying live SharePoint content…"
         self._destination_provisional_startup_status_message = msg
         self._destination_last_startup_status_reason = "provisional_snapshot_first_paint"
         self._set_tree_status_message("destination", msg, loading=False)
@@ -38119,9 +38123,44 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(delay_ms, lambda: self._safe_invoke("provisional_startup_hydration_idle_fallback_timer", _kick))
 
+    def _destination_hybrid_skip_provisional_phase2_broad_rehydrate(self, *, reason: str) -> None:
+        """Browse-first: do not run expand/hydrate/branch-refresh at startup; transition to interactive idle."""
+        log_info(
+            "hybrid_destination_preview_skipped_provisional_phase2_broad_rehydrate",
+            reason=str(reason or "")[:200],
+        )
+        self._destination_startup_ui_phase = "restore_minimal_complete"
+        try:
+            self._set_tree_status_message(
+                "destination",
+                "Saved plan preview — expand a folder to load live SharePoint children.",
+                loading=False,
+            )
+        except Exception:
+            pass
+        self._destination_provisional_startup_status_message = "Saved plan preview (expand to verify live)."
+
+        def _to_inactive() -> None:
+            if getattr(self, "_application_shutting_down", False):
+                return
+            if str(getattr(self, "_destination_startup_ui_phase", "") or "") != "restore_minimal_complete":
+                return
+            self._destination_startup_ui_phase = "inactive"
+            try:
+                self._destination_on_startup_replay_guard_idle_ready(
+                    reason="hybrid_destination_preview_no_phase2:" + str(reason or "")[:120]
+                )
+            except Exception:
+                pass
+
+        QTimer.singleShot(0, lambda: self._safe_invoke("hybrid_destination_preview_startup_to_inactive", _to_inactive))
+
     def _destination_maybe_begin_provisional_startup_hydration(self, *, reason: str) -> None:
         """Run phase-2 hydration once: expand paths, hydrate allocations, branch refresh (after cached_only paint)."""
         if str(getattr(self, "_destination_startup_ui_phase", "") or "") != "cached_only":
+            return
+        if hybrid_destination_preview_browse_first_enabled():
+            self._destination_hybrid_skip_provisional_phase2_broad_rehydrate(reason=str(reason or ""))
             return
         self._destination_startup_ui_phase = "hydrating"
         log_info("startup_hydration_started", reason=str(reason or "")[:160])

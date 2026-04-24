@@ -107,6 +107,9 @@ def test_root3_union_inserts_graph_only_and_merges_common() -> None:
     assert sp and (sp[0].data(Qt.UserRole) or {}).get("name") == "Pictures"
     m_h = m.find_indices_for_canonical_destination_path("Root3\\Management\\Email attachments")
     assert m_h
+    s_pl_h = m.find_indices_for_canonical_destination_path("Root3\\Sales")
+    assert s_pl_h
+    assert (s_pl_h[0].data(Qt.UserRole) or {}).get("graph_vs_planned") == "live_planned"
 
 
 def test_planned_orphan_preserved_if_not_in_graph() -> None:
