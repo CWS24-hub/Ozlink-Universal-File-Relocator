@@ -224,6 +224,9 @@ from ozlink_console.hybrid_destination_preview import (
     destination_memory_rehydrate_is_repair_truth_audit,
     destination_preview_rehydrate_audit_is_idempotent_merge_log,
     hybrid_destination_preview_browse_first_enabled,
+    hybrid_destination_preview_state_for_log,
+    preview_row_strength,
+    sanitize_destination_tree_snapshot_roots,
 )
 from ozlink_console.sharepoint_destination_overlay_attach import (
     WORKSPACE_ROW_STATE_CACHED_PROVISIONAL,
@@ -3117,6 +3120,10 @@ class MainWindow(QMainWindow):
         # Richer per-path nodes for faster shutdown branch preservation (optional; built lazily).
         self._destination_shutdown_preservation_branch_index: dict[str, dict] | None = None
         self._destination_post_shell_rich_rehydrate_scan_ran: bool = False
+        # Hybrid browse: broad post-shell rehydrate was suppressed (phase completion may still advance).
+        self._destination_hybrid_browse_rehydrate_suppressed: bool = False
+        # One-shot: hybrid restore/deferred expand logged as visual-only.
+        self._destination_hybrid_session_restore_expand_logged: bool = False
         # Post-shell memory rehydrate: Graph sessions must not depend on local-only startup hooks.
         self._destination_post_shell_memory_rehydrate_done_key: str = ""
         self._destination_post_shell_memory_rehydrate_scheduled: bool = False
@@ -11743,6 +11750,25 @@ class MainWindow(QMainWindow):
             elapsed_ms=round((time.perf_counter() - t_stop0) * 1000.0, 2),
         )
         self._application_shutting_down = True
+        if hybrid_destination_preview_browse_first_enabled():
+            try:
+                t_psh = getattr(self, "_destination_post_shell_rehydrate_chunk_timer", None)
+                if t_psh is not None:
+                    t_psh.stop()
+                self._destination_post_shell_memory_rehydrate_chunk_state = None
+                self._destination_post_shell_memory_rehydrate_running = False
+                self._destination_post_shell_memory_rehydrate_scheduled = False
+                n_mat = len(getattr(self, "_destination_restore_materialization_queue", []) or [])
+                if n_mat:
+                    self._destination_restore_materialization_queue = []
+                    self._destination_restore_materialization_seen = set()
+                log_info(
+                    "destination_shutdown_hybrid_cancelled_browse_work",
+                    cleared_post_shell_rehydrate_timer=bool(t_psh is not None),
+                    destination_restore_materialization_queue_len=n_mat,
+                )
+            except Exception as exc:
+                log_info("destination_shutdown_hybrid_cancelled_browse_work_failed", error_excerpt=str(exc)[:200])
         try:
             self._source_projection_restore_chunk_gen = int(getattr(self, "_source_projection_restore_chunk_gen", 0) or 0) + 1000
             self._source_projection_restore_chunk_active = False
@@ -27967,13 +27993,6 @@ class MainWindow(QMainWindow):
             return
         if not destination_authority_contract.graph_owns_visible_real_destination_structure(self):
             return
-        if hybrid_destination_preview_browse_first_enabled() and not self._destination_repair_truth_hydration_permitted():
-            log_info(
-                "destination_post_shell_memory_rehydrate_skipped",
-                reason="hybrid_browse_lane_broad_rehydrate_disabled",
-                request_reason=str(reason or "")[:200],
-            )
-            return
         dm = getattr(self, "destination_planning_model", None)
         if dm is None or not hasattr(dm, "rowCount"):
             return
@@ -27999,6 +28018,14 @@ class MainWindow(QMainWindow):
             return
         ident = self._destination_post_shell_library_identity()
         if not ident or ident == "|":
+            return
+        if hybrid_destination_preview_browse_first_enabled() and not self._destination_repair_truth_hydration_permitted():
+            self._destination_hybrid_mark_browse_post_shell_rehydrate_suppressed(request_reason=str(reason)[:200])
+            log_info(
+                "destination_post_shell_memory_rehydrate_skipped",
+                reason="hybrid_browse_lane_broad_rehydrate_disabled",
+                request_reason=str(reason or "")[:200],
+            )
             return
         if str(getattr(self, "_destination_post_shell_memory_rehydrate_done_key", "") or "") == ident and bool(
             getattr(self, "_destination_post_shell_rich_rehydrate_scan_ran", False)
@@ -28029,8 +28056,41 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(0, lambda: self._safe_invoke("destination_post_shell_memory_rehydrate", _go))
 
+    def _destination_hybrid_mark_browse_post_shell_rehydrate_suppressed(self, *, request_reason: str) -> None:
+        """When hybrid browse disallows broad post-shell rehydrate, mark startup phase inputs as 'done' without I/O."""
+        if not hybrid_destination_preview_browse_first_enabled():
+            return
+        if self._destination_repair_truth_hydration_permitted():
+            return
+        ident = self._destination_post_shell_library_identity()
+        if not ident or ident == "|":
+            return
+        self._destination_hybrid_browse_rehydrate_suppressed = True
+        self._destination_post_shell_memory_rehydrate_done_key = str(ident)[:200]
+        self._destination_post_shell_rich_rehydrate_scan_ran = True
+        self._destination_post_shell_memory_rehydrate_scheduled = False
+        self._destination_post_shell_memory_rehydrate_running = False
+        self._destination_post_shell_memory_rehydrate_chunk_state = None
+        try:
+            tmr = getattr(self, "_destination_post_shell_rehydrate_chunk_timer", None)
+            if tmr is not None:
+                tmr.stop()
+        except Exception:
+            pass
+        self._destination_maybe_finish_graph_startup_phase(
+            reason="hybrid_browse_post_shell_rehydrate_suppressed:" + str(request_reason or "")[:120]
+        )
+
     def _destination_run_post_shell_memory_rehydrate_once(self, *, reason: str, library_identity: str) -> None:
         """Entry used by one-shot and scan helpers; post-shell rehydrate is co-operative chunked on the GUI thread."""
+        if hybrid_destination_preview_browse_first_enabled() and not self._destination_repair_truth_hydration_permitted():
+            self._destination_hybrid_mark_browse_post_shell_rehydrate_suppressed(request_reason=str(reason)[:200])
+            log_info(
+                "destination_post_shell_memory_rehydrate_skipped",
+                reason="hybrid_browse_lane_broad_rehydrate_disabled",
+                request_reason=str(reason or "")[:200],
+            )
+            return
         self._destination_begin_post_shell_memory_rehydrate_chunked(
             reason=str(reason)[:200], library_identity=str(library_identity)[:200]
         )
@@ -28263,6 +28323,16 @@ class MainWindow(QMainWindow):
         self, *, reason: str, library_identity: str
     ) -> None:
         if bool(getattr(self, "_application_shutting_down", False)):
+            return
+        if hybrid_destination_preview_browse_first_enabled() and not self._destination_repair_truth_hydration_permitted():
+            self._destination_hybrid_mark_browse_post_shell_rehydrate_suppressed(
+                request_reason="begin_chunked:" + str(reason)[:120]
+            )
+            log_info(
+                "destination_post_shell_memory_rehydrate_skipped",
+                reason="hybrid_browse_lane_broad_rehydrate_disabled",
+                request_reason=str(reason or "")[:200],
+            )
             return
         if str(getattr(self, "_destination_post_shell_memory_rehydrate_done_key", "") or "") == str(
             library_identity
@@ -28919,6 +28989,18 @@ class MainWindow(QMainWindow):
                         lookup_source="workspace_snapshot_reread",
                         node_count_hint=int(len(roots)) if isinstance(roots, list) else 0,
                     )
+        if isinstance(roots, list) and roots:
+            r2, st = sanitize_destination_tree_snapshot_roots(roots)
+            if int(st.get("removed_count") or 0) > 0 or int(st.get("duplicate_path_count") or 0) > 0:
+                log_info(
+                    "destination_memory_preview_dedupe_applied",
+                    before_count=int(st.get("before_count") or 0),
+                    after_count=int(st.get("after_count") or 0),
+                    duplicate_path_count=int(st.get("duplicate_path_count") or 0),
+                    removed_count=int(st.get("removed_count") or 0),
+                    tree_tag=str(tag)[:80],
+                )
+            roots = r2
         self._destination_wso_roots_cache = roots
         self._destination_wso_roots_cache_tag = tag
         self._destination_wso_roots_cache_expiry_mono = t0 + 2.0
@@ -28932,6 +29014,10 @@ class MainWindow(QMainWindow):
             return "deferred_visibility_expand"
         if not bool(getattr(self, "_destination_startup_phase_active", False)):
             if bool(getattr(self, "_destination_expand_shell_ready", False)):
+                if hybrid_destination_preview_browse_first_enabled() and bool(
+                    getattr(self, "_destination_expand_deferred_drain_active", False)
+                ):
+                    return "session_restore_expand"
                 return "real_user_expand"
             return "deferred_visibility_expand"
         if hybrid_destination_preview_browse_first_enabled():
@@ -29451,6 +29537,46 @@ class MainWindow(QMainWindow):
         )
         return out
 
+    def _destination_dedupe_rehydrate_snapshot_children_by_canon(self, chs: list) -> list:
+        """
+        Sibling JSON snapshot nodes may duplicate the same canonical path; keep strongest preview row
+        (see :func:`preview_row_strength`) so rehydrate does not insert multiple model rows.
+        """
+        if not chs:
+            return []
+        keyed: dict[str, dict] = {}
+        order: list[str] = []
+        passthrough: list[dict] = []
+        for ch in chs:
+            if not isinstance(ch, dict):
+                continue
+            d = ch.get("data") if isinstance(ch.get("data"), dict) else None
+            if not isinstance(d, dict) or d.get("placeholder"):
+                passthrough.append(ch)
+                continue
+            raw = str(
+                d.get("item_path")
+                or d.get("destination_path")
+                or d.get("display_path")
+                or self._tree_item_path(d)
+                or ""
+            ).strip()
+            k = str(
+                self._canonical_planned_memory_path_for_graph_match(raw) or self.normalize_memory_path(raw) or ""
+            ).strip().casefold()
+            if not k:
+                passthrough.append(ch)
+                continue
+            if k not in keyed:
+                keyed[k] = ch
+                order.append(k)
+            else:
+                prev = keyed[k]
+                po = prev.get("data") if isinstance(prev.get("data"), dict) else {}
+                if preview_row_strength(d) > preview_row_strength(po if isinstance(po, dict) else {}):
+                    keyed[k] = ch
+        return list(passthrough) + [keyed[k] for k in order if k in keyed]
+
     def _destination_rehydrate_visible_branch_from_memory_snapshot(
         self,
         parent_ix: QModelIndex,
@@ -29563,6 +29689,7 @@ class MainWindow(QMainWindow):
         skipped_dup = 0
         existing_paths = 0
         chs = [c for c in (mem_node.get("children") or []) if isinstance(c, dict)]
+        chs = self._destination_dedupe_rehydrate_snapshot_children_by_canon(chs)
         n_ch = int(len(chs))
         c_start = max(0, int(child_index_start or 0))
         row_budget: int | None = None
@@ -29594,10 +29721,12 @@ class MainWindow(QMainWindow):
                 if existing and existing[0].isValid():
                     existing_paths += 1
                     epl = existing[0].data(Qt.UserRole) or {}
+                    _extra_ix = max(0, int(len(existing) - 1))
                     if destination_payload_is_live_graph_row(epl if isinstance(epl, dict) else {}):
                         preserved += 1
+                        skipped_dup += _extra_ix
                         continue
-                    skipped_dup += 1
+                    skipped_dup += 1 + _extra_ix
                     spec_merge = self._destination_tree_snapshot_dict_to_nested_spec(ch)
                     d_merge = spec_merge.get("data") if isinstance(spec_merge, dict) else None
                     if (
@@ -29658,6 +29787,7 @@ class MainWindow(QMainWindow):
             log_info(
                 "destination_preview_rehydrate_idempotent_merge",
                 audit_context=str(audit_ctx or "")[:120],
+                branch=canon[:500],
                 canonical_path_excerpt=canon[:400],
                 existing_count=int(existing_paths),
                 inserted_count=int(inserted),
@@ -32611,6 +32741,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pid = -1
         g_commit = ""
+        g_branch = ""
         g_dirty: Optional[bool] = None
         try:
             repo_root = Path(__file__).resolve().parent.parent
@@ -32623,6 +32754,15 @@ class MainWindow(QMainWindow):
             )
             if r.returncode == 0 and (r.stdout or "").strip():
                 g_commit = (r.stdout or "").strip()[:40]
+            rb = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if rb.returncode == 0 and (rb.stdout or "").strip():
+                g_branch = (rb.stdout or "").strip()[:80]
             r2 = subprocess.run(
                 ["git", "status", "--porcelain"],
                 cwd=str(repo_root),
@@ -32634,6 +32774,18 @@ class MainWindow(QMainWindow):
                 g_dirty = bool((r2.stdout or "").strip())
         except Exception:
             pass
+        try:
+            hst = hybrid_destination_preview_state_for_log()
+        except Exception:
+            hst = {"enabled": False, "env_value": "", "contract_doc_present": False}
+        log_info(
+            "destination_hybrid_preview_mode_state",
+            **hst,
+            branch_name=g_branch or "",
+            build_marker=str(os.environ.get("OZLINK_BUILD_MARKER", "") or "")[:80],
+            git_commit_short=g_commit or "",
+            main_window_file=mw_path,
+        )
         log_info(
             "ozlink_console_loaded",
             main_window_file=mw_path,
@@ -39384,8 +39536,21 @@ class MainWindow(QMainWindow):
             if ex0 not in ("explicit_repair", "explicit_repair_authorized_path"):
                 self._destination_expand_invocation = ""
         _ac = self._destination_infer_expand_auth_class()
-        self._destination_load_expand_auth_class = _ac
         _spc = str(self._destination_semantic_path(node_data) or self._tree_item_path(node_data) or "")[:500]
+        if hybrid_destination_preview_browse_first_enabled() and (
+            bool(getattr(self, "_destination_expand_deferred_drain_active", False))
+            or self._destination_expand_semantic_path_restore_or_deferred(_spc)
+        ):
+            _ac = "session_restore_expand"
+            if bool(getattr(self, "_destination_startup_phase_active", False)) and not bool(
+                getattr(self, "_destination_hybrid_session_restore_expand_logged", False)
+            ):
+                self._destination_hybrid_session_restore_expand_logged = True
+                log_info(
+                    "destination_startup_expand_replay_visual_only",
+                    canonical_path_excerpt=_spc[:500],
+                )
+        self._destination_load_expand_auth_class = _ac
         _sctx = str(self._collect_selected_tree_path("destination") or "")[:500]
         log_info(
             "destination_expand_authorization_classified",

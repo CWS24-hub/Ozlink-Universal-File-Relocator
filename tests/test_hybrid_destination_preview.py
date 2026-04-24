@@ -14,6 +14,8 @@ from ozlink_console.hybrid_destination_preview import (
     destination_memory_rehydrate_is_repair_truth_audit,
     destination_preview_rehydrate_audit_is_idempotent_merge_log,
     hybrid_destination_preview_browse_first_enabled,
+    preview_row_strength,
+    sanitize_destination_tree_snapshot_roots,
 )
 from ozlink_console.main_window import MainWindow
 from ozlink_console.sharepoint_destination_overlay_attach import (
@@ -29,6 +31,34 @@ def test_repair_truth_audit_tag_detection() -> None:
     assert destination_memory_rehydrate_is_repair_truth_audit("overlay_projection_invariant_repair")
     assert not destination_memory_rehydrate_is_repair_truth_audit("post_shell_rich_branch_scan")
     assert not destination_memory_rehydrate_is_repair_truth_audit("allocation_descendants_applied_zero_direct")
+
+
+def test_snapshot_sibling_dedupe_keeps_higher_strength_path() -> None:
+    a = {
+        "data": {
+            "item_path": r"R:\a.txt",
+            "destination_path": r"R:\a.txt",
+            "workspace_row_state": "cached_provisional",
+        },
+        "children": [],
+    }
+    b = {
+        "data": {
+            "item_path": r"R:\a.txt",
+            "id": "live1",
+            "row_kind": "live_file",
+            "graph_vs_planned": "live",
+        },
+        "children": [],
+    }
+    roots, st = sanitize_destination_tree_snapshot_roots(
+        [{"data": {"name": "root", "is_folder": True, "item_path": "R:\\"}, "children": [a, b]}]
+    )
+    ch = (roots[0].get("children") or []) if roots else []
+    assert len(ch) == 1
+    assert int(st.get("removed_count", 0)) >= 1
+    d0 = (ch[0] or {}).get("data") or {}
+    assert preview_row_strength(d0) == preview_row_strength(b["data"])
 
 
 def test_idempotent_merge_audit_tag_detection() -> None:

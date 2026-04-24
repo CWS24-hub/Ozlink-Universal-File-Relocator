@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .logger import log_info, log_trace, log_warn
+from .hybrid_destination_preview import sanitize_destination_tree_snapshot_roots
 from .version_info import APP_VERSION
 from .models import AllocationRow, ProposedFolder, SessionState, MemoryManifest
 
@@ -1309,6 +1310,19 @@ class MemoryManager:
                 new_graph_rows_before_merge=int(new_n),
                 save_reason=str(save_reason or "")[:240],
             )
+        dtnw = data.get("destination_tree_snapshot")
+        if isinstance(dtnw, list) and dtnw:
+            r2, st = sanitize_destination_tree_snapshot_roots(dtnw)
+            if int(st.get("removed_count") or 0) > 0 or int(st.get("duplicate_path_count") or 0) > 0:
+                log_info(
+                    "destination_memory_preview_dedupe_applied",
+                    before_count=int(st.get("before_count") or 0),
+                    after_count=int(st.get("after_count") or 0),
+                    duplicate_path_count=int(st.get("duplicate_path_count") or 0),
+                    removed_count=int(st.get("removed_count") or 0),
+                    context="write_workspace_snapshot",
+                )
+            data["destination_tree_snapshot"] = r2
 
         text = json.dumps(data, indent=2, ensure_ascii=False)
         json.loads(text)
@@ -1325,7 +1339,23 @@ class MemoryManager:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return None
-        return raw if isinstance(raw, dict) else None
+        if not isinstance(raw, dict):
+            return None
+        dtn = raw.get("destination_tree_snapshot")
+        if isinstance(dtn, list) and dtn:
+            r2, st = sanitize_destination_tree_snapshot_roots(dtn)
+            if int(st.get("removed_count") or 0) > 0 or int(st.get("duplicate_path_count") or 0) > 0:
+                log_info(
+                    "destination_memory_preview_dedupe_applied",
+                    before_count=int(st.get("before_count") or 0),
+                    after_count=int(st.get("after_count") or 0),
+                    duplicate_path_count=int(st.get("duplicate_path_count") or 0),
+                    removed_count=int(st.get("removed_count") or 0),
+                    context="read_workspace_snapshot_optional",
+                )
+            raw = dict(raw)
+            raw["destination_tree_snapshot"] = r2
+        return raw
 
     def save_manifest(self, manifest: MemoryManifest) -> None:
         self._backup_file(self.paths["manifest"], self.paths["manifest"].stem)
