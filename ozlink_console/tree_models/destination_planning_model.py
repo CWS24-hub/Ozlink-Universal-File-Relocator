@@ -909,6 +909,188 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
     ) -> bool:
         return int(self.count_planning_protected_descendant_rows(parent_folder_ix, max_nodes=max_nodes) or 0) > 0
 
+    @staticmethod
+    def _direct_child_row_is_planned_union_eligible(cix: QModelIndex) -> bool:
+        """True when this *direct* child of a merge parent must be preserved in Graph ⊃ planned/proposed tree."""
+        try:
+            pl: Any = cix.data(Qt.UserRole) or {}
+        except Exception:
+            pl = {}
+        if not isinstance(pl, dict) or pl.get("placeholder"):
+            return False
+        if DestinationPlanningTreeModel._payload_is_planning_protected_descendant_row(pl):
+            return True
+        try:
+            model = cix.model()
+        except Exception:
+            model = None
+        if (
+            model is not None
+            and hasattr(model, "folder_subtree_has_planning_protected_descendant")
+            and pl.get("is_folder", True)
+        ):
+            try:
+                if model.folder_subtree_has_planning_protected_descendant(cix):  # type: ignore[union-attr]
+                    return True
+            except Exception:
+                pass
+        return False
+
+    @staticmethod
+    def _overlay_payload_strength_for_dedup(pl: Dict[str, Any]) -> int:
+        gvp = str(pl.get("graph_vs_planned") or "").strip().casefold()
+        is_prop = bool(pl.get("proposed")) or str(pl.get("node_origin") or "").strip().casefold() == "proposed"
+        planned = destination_payload_is_planned_workspace_row(pl)
+        live = destination_payload_is_live_graph_row(pl)
+        live_planned = gvp == "live_planned"
+        if live_planned:
+            return 50
+        if live and planned:
+            return 45
+        if live and str(pl.get("id") or "").strip():
+            return 40
+        if is_prop:
+            return 35
+        if planned:
+            return 30
+        wss = str(pl.get("workspace_row_state") or "").strip().casefold()
+        if wss == "cached_provisional":
+            return 10
+        return 1
+
+    @staticmethod
+    def _nested_spec_subtree_has_protected_work(spec: "NestedSpec") -> bool:
+        pl, kids = spec[0], spec[1] if len(spec) > 1 else []
+        if not isinstance(pl, dict):
+            return any(
+                DestinationPlanningTreeModel._nested_spec_subtree_has_protected_work(c)
+                for c in (kids or [])
+            )
+        if DestinationPlanningTreeModel._payload_is_planning_protected_descendant_row(pl):
+            return True
+        for c in kids or []:
+            if DestinationPlanningTreeModel._nested_spec_subtree_has_protected_work(c):
+                return True
+        return False
+
+    @staticmethod
+    def _count_protected_rows_in_nested_spec(nested: "NestedSpec") -> int:
+        pl, kids = nested[0], nested[1] if len(nested) > 1 else []
+        n0 = 1 if DestinationPlanningTreeModel._payload_is_planning_protected_descendant_row(pl) else 0
+        t = n0
+        for c in kids or []:
+            t += DestinationPlanningTreeModel._count_protected_rows_in_nested_spec(c)
+        return t
+
+    def _find_first_direct_child_by_path_cf(self, parent_ix: QModelIndex, kcf: str) -> Optional[QModelIndex]:
+        if not kcf:
+            return None
+        if not parent_ix.isValid():
+            col0 = QModelIndex()
+        else:
+            col0 = parent_ix.siblingAtColumn(0) if parent_ix.column() != 0 else parent_ix
+        n = int(self.rowCount(col0))
+        for r in range(n):
+            ix = self.index(r, 0, col0)
+            if not ix.isValid():
+                continue
+            pl = ix.data(Qt.UserRole) or {}
+            if not isinstance(pl, dict) or pl.get("placeholder"):
+                continue
+            pkk = (self._path_key_for_payload(pl) or "").casefold()
+            if pkk and pkk == kcf:
+                return ix
+        return None
+
+    def _union_merge_preserved_nests(
+        self,
+        parent_ix: QModelIndex,
+        stashed: list[NestedSpec],
+        *,
+        only_planning: bool = True,
+    ) -> tuple[int, int, int, int]:
+        """
+        Re-attach stashed :class:`NestedSpec` direct children so Graph rows ∪ planning rows holds.
+        Returns (matched_merged, unmatched_reinserted, reinserted_protected_node_est, max_depth_merged)
+        """
+        m_m, m_u, pr_ins, d_max = 0, 0, 0, 0
+        for spec in list(stashed or []):
+            if not isinstance(spec, tuple) or len(spec) < 1:
+                continue
+            if only_planning and not self._nested_spec_subtree_has_protected_work(spec):
+                continue
+            pl0, kids0 = spec[0], spec[1] if len(spec) > 1 else []
+            if not isinstance(pl0, dict) or pl0.get("placeholder"):
+                continue
+            kcf = (self._path_key_for_payload(pl0) or "").casefold()
+            if not kcf:
+                continue
+            cix = self._find_first_direct_child_by_path_cf(parent_ix, kcf)
+            if cix is None or not cix.isValid():
+                self.append_nested_child(parent_ix, spec)
+                m_u += 1
+                pr_ins += int(self._count_protected_rows_in_nested_spec(spec))
+                d_max = max(d_max, 1)
+                continue
+            m_m += 1
+            if kids0:
+                km, ku, pr, d2 = self._union_merge_preserved_nests(
+                    cix, list(kids0), only_planning=only_planning
+                )
+                m_m += km
+                m_u += ku
+                pr_ins += pr
+                d_max = max(d_max, 1 + d2)
+        return m_m, m_u, int(pr_ins), int(d_max)
+
+    def _coalesce_direct_children_duplicate_path_keys(
+        self, parent_ix: QModelIndex, *, _log_tag: str = "graph_branch_union"
+    ) -> int:
+        """When snapshot bugs produced duplicate same-path direct siblings, keep highest-strength; merge subtrees, drop rest."""
+        if not parent_ix.isValid():
+            col0 = QModelIndex()
+        else:
+            col0 = parent_ix.siblingAtColumn(0) if parent_ix.column() != 0 else parent_ix
+        n = int(self.rowCount(col0))
+        if n < 2:
+            return 0
+        by_cf: dict[str, list[tuple[int, int, QModelIndex]]] = {}
+        for r in range(n):
+            ix = self.index(r, 0, col0)
+            if not ix.isValid():
+                continue
+            pl = ix.data(Qt.UserRole) or {}
+            if not isinstance(pl, dict) or pl.get("placeholder"):
+                continue
+            k = (self._path_key_for_payload(pl) or "").strip()
+            if not k:
+                continue
+            st = int(self._overlay_payload_strength_for_dedup(pl))
+            by_cf.setdefault(k.casefold(), []).append((r, st, ix))
+        removed = 0
+        for kcf, grp0 in by_cf.items():
+            if len(grp0) < 2:
+                continue
+            grp0.sort(key=lambda e: (-e[1], e[0]))  # strength, then row for stability
+            to_drop = sorted(grp0[1:], key=lambda e: e[0], reverse=True)  # drop high rows first
+            for _r, _st, ix_drop in to_drop:
+                nnode = self._node(ix_drop) if ix_drop is not None and ix_drop.isValid() else None
+                if nnode is None:
+                    continue
+                spec_full: NestedSpec = self._serialize_nested_node(nnode)
+                if self.remove_node_at(ix_drop) is None:
+                    continue
+                removed += 1
+                ch = spec_full[1] if len(spec_full) > 1 else []
+                if not ch:
+                    continue
+                k_dest = self._find_first_direct_child_by_path_cf(parent_ix, kcf)
+                if k_dest is None or not k_dest.isValid():
+                    continue
+                for sub in ch:
+                    self._union_merge_preserved_nests(k_dest, [sub], only_planning=True)
+        return removed
+
     def reconcile_top_level_live_graph_children_loaded_when_subtree_empty(self, *, reason: str = "unspecified") -> int:
         """Clear ``children_loaded`` on live top-level folders when the model has zero child rows.
 
@@ -1374,6 +1556,20 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
         n_matched_subtree_protected = 0
         matched_rows: Set[int] = set()
         to_insert: List[Dict[str, Any]] = []
+        pre_overlay_eligible = 0
+        for r_pre in range(int(n_before)):
+            c_pre = self.index(int(r_pre), 0, parent_col0)
+            if not c_pre.isValid():
+                continue
+            if self._direct_child_row_is_planned_union_eligible(c_pre):
+                pre_overlay_eligible += 1
+        try:
+            protected_desc_before = int(
+                self.count_planning_protected_descendant_rows(parent_col0) if parent_col0.isValid() else 0
+            )
+        except Exception:
+            protected_desc_before = 0
+        union_matched, union_unmatched, union_reinsert = 0, 0, 0
 
         for gpi0 in list(graph_child_payloads or []):
             if not isinstance(gpi0, dict):
@@ -1416,13 +1612,39 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
                 opl: Dict[str, Any] = dict(opl0) if isinstance(opl0, dict) else {}
                 row_state_before = str((opl0 if isinstance(opl0, dict) else {}).get("workspace_row_state") or "")[:64]
 
+                stashed_nests: list[NestedSpec] = []
+                nnode0 = self._node(cix_hit) if cix_hit.isValid() else None
+                if (
+                    nnode0 is not None
+                    and (
+                        subtree_planning
+                        or int(plan_desc_count) > 0
+                        or destination_payload_is_planned_workspace_row(opl)
+                        or destination_payload_is_memory_overlay_row_for_reuse(opl)
+                    )
+                ):
+                    for chn0 in list(nnode0._children or []):
+                        stashed_nests.append(self._serialize_nested_node(chn0))
+
                 def _mut(
                     p: Dict[str, Any],
                     _inc: Dict[str, Any] = gpi,
                     _old: Dict[str, Any] = opl,
                     _nd: int = n_desc,
+                    _st: bool = bool(subtree_planning),
+                    _pn: int = int(plan_desc_count or 0),
                 ) -> None:
                     p.update(_inc)
+                    if (
+                        _st
+                        or int(_pn) > 0
+                        or destination_payload_is_planned_workspace_row(_old)
+                        or destination_payload_is_memory_overlay_row_for_reuse(_old)
+                        or bool(_old.get("workspace_planned_row") or _old.get("planned_allocation"))
+                    ) and (bool(_old.get("is_folder", True)) or int(_nd) > 0):
+                        p["is_folder"] = True
+                    elif int(_nd) > 0 and (not destination_payload_is_live_graph_row(_old) or _st or int(_pn) > 0):
+                        p["is_folder"] = True
                     for _k in _PRES:
                         if _k in _old and _old.get(_k) not in (None, ""):
                             p[_k] = _old[_k]
@@ -1470,6 +1692,20 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
                         matched_rows.add(int(cix_hit.row()))
                     except Exception:
                         pass
+                plan_count_after = 0
+                if stashed_nests and cix_hit.isValid():
+                    um, uu, upr, _d = self._union_merge_preserved_nests(
+                        cix_hit, stashed_nests, only_planning=True
+                    )
+                    union_matched += int(um)
+                    union_unmatched += int(uu)
+                    union_reinsert += int(upr)
+                try:
+                    plan_count_after = int(
+                        self.count_planning_protected_descendant_rows(cix_hit) if cix_hit.isValid() else 0
+                    )
+                except Exception:
+                    plan_count_after = 0
                 opl_after = cix_hit.data(Qt.UserRole) or {}
                 row_state_after = str(
                     (opl_after if isinstance(opl_after, dict) else {}).get("workspace_row_state") or ""
@@ -1485,7 +1721,8 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
                         "destination_graph_branch_union_preserved_planned_descendants",
                         parent_path=str(pcan)[:500],
                         graph_child_path=str(ch_path)[:500],
-                        preserved_descendant_count=int(plan_desc_count),
+                        preserved_descendant_count=int(plan_count_after),
+                        n_planning_protected_subtree_ref=int(plan_desc_count),
                         row_state_before=str(row_state_before)[:64],
                         row_state_after=str(row_state_after)[:64],
                     )
@@ -1550,8 +1787,34 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
                     graph_item_id_suffix=str(p_ins.get("id") or "")[-16:],
                 )
 
+        try:
+            dedupe_removed = int(self._coalesce_direct_children_duplicate_path_keys(parent_col0))
+        except Exception:
+            dedupe_removed = 0
+        try:
+            protected_desc_after = int(
+                self.count_planning_protected_descendant_rows(parent_col0) if parent_col0.isValid() else 0
+            )
+        except Exception:
+            protected_desc_after = 0
+        final_n = int(self.rowCount(parent_col0)) if parent_col0.isValid() else 0
+        log_info(
+            "destination_graph_branch_union_enforced_planned_overlay_union",
+            parent_path=str(pcan)[:500],
+            graph_child_count=int(len(list(graph_child_payloads or []))),
+            existing_child_count=int(n_before),
+            preserved_overlay_child_count=int(pre_overlay_eligible),
+            matched_overlay_child_count=int(union_matched),
+            unmatched_overlay_child_count=int(union_unmatched),
+            protected_descendant_count=int(protected_desc_after),
+            protected_descendant_count_before_merge=int(protected_desc_before),
+            reinserted_protected_nodes_est=int(union_reinsert),
+            final_child_count=int(final_n),
+            duplicate_path_rows_coalesced=int(dedupe_removed),
+        )
+
         self._rebuild_path_index()
-        _overlay_preserved = int(n_preserved) + int(n_matched_subtree_protected)
+        _overlay_preserved = int(n_preserved) + int(n_matched_subtree_protected) + int(union_unmatched)
         log_info(
             "destination_graph_branch_union_completed",
             parent_path_excerpt=pcan[:500],
@@ -1560,12 +1823,16 @@ class DestinationPlanningTreeModel(QAbstractItemModel):
             overlay_preserved=int(_overlay_preserved),
             overlay_preserved_unmatched_graph_children=int(n_preserved),
             overlay_preserved_matched_protected_subtrees=int(n_matched_subtree_protected),
+            union_merge_matched_child_paths=int(union_matched),
+            union_merge_reinserted_full_rows=int(union_unmatched),
         )
         return {
             "inserted": n_ins,
             "upgraded": n_up,
             "preserved": n_preserved,
             "matched_subtree_protected": int(n_matched_subtree_protected),
+            "union_matched": int(union_matched),
+            "union_unmatched_reinserted": int(union_unmatched),
         }
 
     def replace_all_children(
