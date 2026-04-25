@@ -14,6 +14,20 @@ class AllocationRow:
     RequestedBy: str
     RequestedDate: str
     Status: str = "Pending"
+    SourceDriveId: str = ""
+    SourceItemId: str = ""
+    DestinationDriveId: str = ""
+    DestinationParentItemId: str = ""
+    # Legacy backup migration review metadata (round-trip through Memory JSON).
+    LegacyMigrationAnchorClassification: str = ""
+    LegacyMigrationPlannedScaffoldOnly: bool = False
+    LegacyMigrationRootNotLiveConfirmed: bool = False
+    LegacyMigrationUnresolvedGraphAnchor: bool = False
+    LegacyForeignRootBlocked: bool = False
+    LegacyMigrationPlannedParentResolved: bool = False
+    LegacyMigrationDestinationParentResolution: str = ""
+    DestinationParentPlannedPath: str = ""
+    LegacyMigrationPlannedParentMatchKind: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AllocationRow":
@@ -27,6 +41,19 @@ class AllocationRow:
             RequestedBy=str(data.get("RequestedBy", "")),
             RequestedDate=str(data.get("RequestedDate", "")),
             Status=str(data.get("Status", "Pending")),
+            SourceDriveId=str(data.get("SourceDriveId", "")),
+            SourceItemId=str(data.get("SourceItemId", "")),
+            DestinationDriveId=str(data.get("DestinationDriveId", "")),
+            DestinationParentItemId=str(data.get("DestinationParentItemId", "")),
+            LegacyMigrationAnchorClassification=str(data.get("LegacyMigrationAnchorClassification", "") or ""),
+            LegacyMigrationPlannedScaffoldOnly=bool(data.get("LegacyMigrationPlannedScaffoldOnly", False)),
+            LegacyMigrationRootNotLiveConfirmed=bool(data.get("LegacyMigrationRootNotLiveConfirmed", False)),
+            LegacyMigrationUnresolvedGraphAnchor=bool(data.get("LegacyMigrationUnresolvedGraphAnchor", False)),
+            LegacyForeignRootBlocked=bool(data.get("LegacyForeignRootBlocked", False)),
+            LegacyMigrationPlannedParentResolved=bool(data.get("LegacyMigrationPlannedParentResolved", False)),
+            LegacyMigrationDestinationParentResolution=str(data.get("LegacyMigrationDestinationParentResolution", "") or ""),
+            DestinationParentPlannedPath=str(data.get("DestinationParentPlannedPath", "") or ""),
+            LegacyMigrationPlannedParentMatchKind=str(data.get("LegacyMigrationPlannedParentMatchKind", "") or ""),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -41,12 +68,30 @@ class ProposedFolder:
     FolderName: str
     DestinationPath: str
     DestinationId: str = ""
+    DestinationDriveId: str = ""
+    DestinationParentItemId: str = ""
     ParentPath: str = ""
+    """Stable draft-scoped id for correlating planned workspace rows with this proposal (persisted)."""
+    StableKey: str = ""
     IsSelectable: bool = True
     IsProposed: bool = True
     Status: str = "Proposed"
     RequestedBy: str = ""
     RequestedDate: str = ""
+    LegacyMigrationAnchorClassification: str = ""
+    LegacyMigrationPlannedScaffoldOnly: bool = False
+    LegacyMigrationRootNotLiveConfirmed: bool = False
+    LegacyMigrationUnresolvedGraphAnchor: bool = False
+    LegacyForeignRootBlocked: bool = False
+    LegacyMigrationPlannedParentResolved: bool = False
+    LegacyMigrationDestinationParentResolution: str = ""
+    DestinationParentPlannedPath: str = ""
+    LegacyMigrationPlannedParentMatchKind: str = ""
+    # Runtime live-vs-memory duplicate resolution (planning only; no SharePoint mutations).
+    LiveMemoryDuplicateResolution: str = ""
+    LiveMemoryDuplicateLiveItemId: str = ""
+    LiveMemoryDuplicateLiveItemPath: str = ""
+    LiveMemoryDuplicateResolvedAtUtc: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ProposedFolder":
@@ -54,12 +99,28 @@ class ProposedFolder:
             DestinationId=str(data.get("DestinationId", "")),
             FolderName=str(data.get("FolderName", "")),
             DestinationPath=str(data.get("DestinationPath", "")),
+            DestinationDriveId=str(data.get("DestinationDriveId", "")),
+            DestinationParentItemId=str(data.get("DestinationParentItemId", "")),
             ParentPath=str(data.get("ParentPath", "")),
+            StableKey=str(data.get("StableKey", data.get("stable_key", ""))),
             IsSelectable=bool(data.get("IsSelectable", True)),
             IsProposed=bool(data.get("IsProposed", True)),
             Status=str(data.get("Status", "Proposed")),
             RequestedBy=str(data.get("RequestedBy", "")),
             RequestedDate=str(data.get("RequestedDate", "")),
+            LegacyMigrationAnchorClassification=str(data.get("LegacyMigrationAnchorClassification", "") or ""),
+            LegacyMigrationPlannedScaffoldOnly=bool(data.get("LegacyMigrationPlannedScaffoldOnly", False)),
+            LegacyMigrationRootNotLiveConfirmed=bool(data.get("LegacyMigrationRootNotLiveConfirmed", False)),
+            LegacyMigrationUnresolvedGraphAnchor=bool(data.get("LegacyMigrationUnresolvedGraphAnchor", False)),
+            LegacyForeignRootBlocked=bool(data.get("LegacyForeignRootBlocked", False)),
+            LegacyMigrationPlannedParentResolved=bool(data.get("LegacyMigrationPlannedParentResolved", False)),
+            LegacyMigrationDestinationParentResolution=str(data.get("LegacyMigrationDestinationParentResolution", "") or ""),
+            DestinationParentPlannedPath=str(data.get("DestinationParentPlannedPath", "") or ""),
+            LegacyMigrationPlannedParentMatchKind=str(data.get("LegacyMigrationPlannedParentMatchKind", "") or ""),
+            LiveMemoryDuplicateResolution=str(data.get("LiveMemoryDuplicateResolution", "") or ""),
+            LiveMemoryDuplicateLiveItemId=str(data.get("LiveMemoryDuplicateLiveItemId", "") or ""),
+            LiveMemoryDuplicateLiveItemPath=str(data.get("LiveMemoryDuplicateLiveItemPath", "") or ""),
+            LiveMemoryDuplicateResolvedAtUtc=str(data.get("LiveMemoryDuplicateResolvedAtUtc", "") or ""),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -77,9 +138,16 @@ class SessionState:
     SelectedSourceSite: str = ""
     SelectedSourceSiteKey: str = ""
     SelectedSourceLibrary: str = ""
+    # Graph drive id for the selected source library (SharePoint document library).
+    SelectedSourceLibraryId: str = ""
     SelectedDestinationSite: str = ""
     SelectedDestinationSiteKey: str = ""
     SelectedDestinationLibrary: str = ""
+    # Graph drive id for the selected destination library (durable restore key).
+    SelectedDestinationLibraryId: str = ""
+    # Planning header platform (sharepoint | local); restored before site/library rebind on import/restore.
+    SourceBrowseMode: str = "sharepoint"
+    DestinationBrowseMode: str = "sharepoint"
     SessionFingerprint: str = ""
     SourceExpandedPaths: list[str] = field(default_factory=list)
     DestinationExpandedPaths: list[str] = field(default_factory=list)
@@ -91,10 +159,42 @@ class SessionState:
     WorkspacePanelCollapsed: bool = False
     SourceTreeSnapshot: list[dict[str, Any]] = field(default_factory=list)
     DestinationTreeSnapshot: list[dict[str, Any]] = field(default_factory=list)
+    # Snapshot-level destination library identity for DestinationTreeSnapshot (Graph drive id = library id).
+    DestinationTreeSnapshotIdentityDriveId: str = ""
+    DestinationTreeSnapshotIdentityLibraryId: str = ""
+    DestinationTreeSnapshotIdentityLibraryName: str = ""
+    DestinationTreeSnapshotIdentitySiteId: str = ""
+    # True when DestinationTreeSnapshot* identity fields were backfilled by legacy startup inference (migration).
+    DestinationTreeSnapshotIdentityInferredFromLegacy: bool = False
+    # Visible library hub folder inside the selected document library (Graph drive item — not library identity).
+    # Path/name is mutable display state; ``DestinationAnchorItemId`` is the durable live-folder key when present.
+    DestinationAnchorItemId: str = ""
+    DestinationAnchorDriveId: str = ""
+    DestinationAnchorDisplayPath: str = ""
+    DestinationAnchorPathVerifiedAtUtc: str = ""
+    DestinationAnchorPathOnlyBinding: bool = False
+    DestinationAnchorLiveUnresolved: bool = False
+    # Canonical source paths (files) excluded from inherited folder allocations; persisted with draft session.
+    PlanLeafExclusions: list[str] = field(default_factory=list)
+    # Source paths for inherited_mapping rows the user dismissed in Needs Review (UI only; does not change the plan).
+    NeedsReviewDismissedInheritedSourcePaths: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SessionState":
-        kwargs = {f: data.get(f, getattr(cls, f, "")) for f in cls.__dataclass_fields__.keys()}  # type: ignore[attr-defined]
+        kwargs: dict[str, Any] = {}
+        for field_name, field_def in cls.__dataclass_fields__.items():  # type: ignore[attr-defined]
+            if field_name in data:
+                kwargs[field_name] = data[field_name]
+            elif field_def.default_factory is not MISSING:
+                kwargs[field_name] = field_def.default_factory()
+            elif field_def.default is not MISSING:
+                kwargs[field_name] = field_def.default
+            else:
+                kwargs[field_name] = None
+        if not isinstance(kwargs.get("PlanLeafExclusions"), list):
+            kwargs["PlanLeafExclusions"] = []
+        if not isinstance(kwargs.get("NeedsReviewDismissedInheritedSourcePaths"), list):
+            kwargs["NeedsReviewDismissedInheritedSourcePaths"] = []
         return cls(**kwargs)
 
     def to_dict(self) -> dict[str, Any]:

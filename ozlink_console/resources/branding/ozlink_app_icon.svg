@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <rect width="128" height="128" rx="26" fill="#152238"/>
+  <rect x="14" y="26" width="54" height="76" rx="14" fill="#1e293b" stroke="#34d399" stroke-width="3.5"/>
+  <circle cx="32" cy="48" r="5.5" fill="#34d399"/>
+  <circle cx="50" cy="48" r="5.5" fill="#34d399"/>
+  <circle cx="32" cy="68" r="5.5" fill="#34d399"/>
+  <circle cx="50" cy="68" r="5.5" fill="#34d399"/>
+  <circle cx="41" cy="86" r="5.5" fill="#34d399"/>
+  <path d="M32 53.5 H50 M32 73.5 H50 M41 73.5 V81" stroke="#34d399" stroke-width="3" stroke-linecap="round"/>
+  <rect x="78" y="34" width="36" height="60" rx="10" fill="#2563eb"/>
+  <text x="96" y="76" font-family="Arial" font-size="26" font-weight="700" fill="#ffffff" text-anchor="middle">IT</text>
+</svg>

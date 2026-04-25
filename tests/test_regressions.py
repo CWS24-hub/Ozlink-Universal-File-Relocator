@@ -5,17 +5,24 @@ import tempfile
 import unittest
 from collections import deque
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QMessageBox, QTreeWidget, QTreeWidgetItem
+from PySide6.QtCore import QModelIndex, QPersistentModelIndex, Qt, QTimer
+from PySide6.QtGui import QStandardItem, QStandardItemModel
+from PySide6.QtWidgets import QApplication, QMessageBox, QTreeView, QTreeWidget, QTreeWidgetItem
 
 import ozlink_console.logger as logger_module
-from ozlink_console.logger import JsonLineFormatter
-from ozlink_console.main_window import MainWindow
+from ozlink_console.logger import JsonLineFormatter, reset_logging_for_tests
+from ozlink_console.main_window import (
+    MainWindow,
+    _EXPAND_ALL_TREE_GLYPH_COLLAPSE,
+    _EXPAND_ALL_TREE_GLYPH_EXPAND,
+)
 from ozlink_console.memory import MemoryManager
+from ozlink_console.tree_models.destination_planning_model import DestinationPlanningTreeModel
+from ozlink_console.tree_models.sharepoint_source_model import SharePointSourceTreeModel
 from ozlink_console.graph import GraphClient
 from ozlink_console.models import ProposedFolder, SessionState
 
@@ -28,6 +35,37 @@ class _ViewportStub:
 class _TreeStub:
     def viewport(self):
         return _ViewportStub()
+
+    def topLevelItemCount(self):
+        return 0
+
+    def topLevelItem(self, _index):
+        return None
+
+
+class _PlannedMovesTableStub:
+    """Minimal QTableWidget stand-in for partial MainWindow tests that call refresh_planned_moves_table."""
+
+    def clearSpans(self):
+        return None
+
+    def clearContents(self):
+        return None
+
+    def setRowCount(self, _n):
+        return None
+
+    def columnCount(self):
+        return 5
+
+    def setItem(self, *_args, **_kwargs):
+        return None
+
+    def setSpan(self, *_args, **_kwargs):
+        return None
+
+    def clearSelection(self):
+        return None
 
 
 class _LabelStub:
@@ -89,6 +127,12 @@ class _ExpandTreeStub:
     def expandAll(self):
         self.expanded_all = True
 
+    def expand(self, *_args, **_kwargs):
+        return None
+
+    def isExpanded(self, *_args, **_kwargs):
+        return False
+
     def topLevelItemCount(self):
         return len(self._top_level_items)
 
@@ -117,12 +161,85 @@ class _ExpandTreeStub:
         return _ViewportStub()
 
 
+def _main_window_stub_for_source_model_expand_all(tree, model):
+    """Attach minimal state so MainWindow.__new__ can run model-view expand-all paths."""
+    window = MainWindow.__new__(MainWindow)
+    window._source_tree_model_view = True
+    window.source_tree_widget = tree
+    window.source_sharepoint_model = model
+    window.pending_root_drive_ids = {"source": "", "destination": ""}
+    window._expand_all_source_model_queue = deque()
+    window._expand_all_pending = {"source": False, "destination": False}
+    window._expand_all_queue = {"source": deque(), "destination": deque()}
+    window._expand_all_seen = {"source": set(), "destination": set()}
+    window._expand_all_processed_seen = {"source": set(), "destination": set()}
+    window._expand_all_processed = {"source": 0, "destination": 0}
+    window._expand_all_max_per_tick = {"source": 1, "destination": 2}
+    window._expand_all_deferred_refresh = {"source": False, "destination": False}
+    window._expand_all_requeue_attempts = {}
+    window._expand_all_status_last_update_ms = {"source": 0, "destination": 0}
+    window.pending_folder_loads = {"source": set(), "destination": set()}
+    window._pending_workspace_post_expand_selection = {"source": "", "destination": ""}
+    window._workspace_restore_expanded_all_intent = {"source": False, "destination": False}
+    window._workspace_ui_snapshot_dirty_panels = set()
+    window._source_column_refresh_pending = False
+    window._source_restore_materialization_queue = []
+    window._pending_snapshot_branch_refresh = {"source": set(), "destination": set()}
+    window._source_projection_refresh_paths = None
+    window._source_projection_refresh_context = None
+    window.planned_moves = []
+    window.destination_tree_widget = None
+    window._set_expand_all_button_label = lambda *a, **k: None
+    window._set_tree_status_message = lambda *a, **k: None
+    window._update_expand_all_status = lambda *a, **k: None
+    window._refresh_source_projection = lambda *a, **k: None
+    window._refresh_tree_column_width = lambda *a, **k: None
+    window._schedule_deferred_destination_materialization = lambda *a, **k: None
+    window._schedule_source_restore_materialization_queue = lambda *a, **k: None
+    window._schedule_snapshot_branch_refresh = lambda *a, **k: None
+    window._schedule_source_projection_refresh_for_paths = lambda *a, **k: None
+    window._schedule_source_projection_refresh = lambda *a, **k: None
+    window._try_flush_destination_future_model_after_source_restore = lambda *a, **k: None
+    window._sync_expand_all_button_from_tree = lambda *a, **k: None
+    window._refresh_runtime_tree_snapshot = lambda *a, **k: None
+    window._persist_workspace_ui_state_safely = lambda *a, **k: None
+    window._schedule_progress_summary_refresh = lambda *a, **k: None
+    return window
+
+
+def _sharepoint_source_test_tree(payloads, *, source_index_key_fn=None):
+    """QTreeView + SharePointSourceTreeModel (matches production SharePoint source panel)."""
+    _ = QApplication.instance() or QApplication([])
+    tree = QTreeView()
+    fn = source_index_key_fn
+    if fn is None:
+        fn = lambda pl: str(pl.get("item_path", "") or "").replace("/", "\\").strip()
+    model = SharePointSourceTreeModel(
+        parent=tree,
+        column_labels=["Name", "Size", "Type", "Modified"],
+        source_index_key_fn=fn,
+    )
+    model.reset_root_payloads(list(payloads))
+    tree.setModel(model)
+    return tree, model
+
+
 class _DeletedTreeItemStub:
     def childCount(self):
         raise RuntimeError("Internal C++ object (PySide6.QtWidgets.QTreeWidgetItem) already deleted.")
 
     def data(self, *_args, **_kwargs):
         raise RuntimeError("Internal C++ object (PySide6.QtWidgets.QTreeWidgetItem) already deleted.")
+
+
+class _FolderWorkerThreadStub:
+    """Minimal QThread stand-in for folder worker lifecycle tests."""
+
+    def isRunning(self):
+        return False
+
+    def deleteLater(self):
+        pass
 
 
 class _TimerStub:
@@ -175,12 +292,7 @@ class LoggerRegressionTests(unittest.TestCase):
 
 class MemoryImportRegressionTests(unittest.TestCase):
     def tearDown(self):
-        logger = logger_module._LOGGER
-        if logger is not None:
-            for handler in list(logger.handlers):
-                handler.close()
-                logger.removeHandler(handler)
-        logger_module._LOGGER = None
+        reset_logging_for_tests()
 
     def test_import_bundle_normalizes_legacy_destination_paths(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -223,6 +335,10 @@ class MemoryImportRegressionTests(unittest.TestCase):
             (bundle_root / "Draft-SessionState.json").write_text(json.dumps(session_payload, indent=2), encoding="utf-8")
             (bundle_root / "Draft-AllocationQueue.json").write_text(json.dumps(allocations_payload, indent=2), encoding="utf-8")
             (bundle_root / "Draft-ProposedFolders.json").write_text(json.dumps(proposed_payload, indent=2), encoding="utf-8")
+            (bundle_root / "LegacyMigrationReport.json").write_text(
+                json.dumps({"schema_version": 1, "migrated": True, "note": "unit import normalization"}),
+                encoding="utf-8",
+            )
 
             with patch.dict(os.environ, {"LOCALAPPDATA": str(localappdata)}):
                 manager = MemoryManager(tenant_domain="aquaticcs.com.au", operator_upn="gary@aquaticcs.com.au")
@@ -243,12 +359,7 @@ class MemoryImportRegressionTests(unittest.TestCase):
                 self.assertTrue(manager.paths["allocations_recovery"].exists())
                 self.assertTrue(manager.paths["proposed_recovery"].exists())
 
-                logger = logger_module._LOGGER
-                if logger is not None:
-                    for handler in list(logger.handlers):
-                        handler.close()
-                        logger.removeHandler(handler)
-                logger_module._LOGGER = None
+                reset_logging_for_tests()
 
 
 class GraphClientRegressionTests(unittest.TestCase):
@@ -303,6 +414,11 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window.planned_moves = []
         window._sharepoint_lazy_mode = True
         window._deferred_background_load_targets = {}
+        window._destination_full_tree_worker = None
+        window._destination_full_tree_requested_drive_id = ""
+        window._destination_expand_burst_ctx = None
+        window._memory_restore_in_progress = False
+        window._log_restore_phase = lambda *args, **kwargs: None
         destination_started = []
         source_counts_started = []
         source_preload_started = []
@@ -336,6 +452,9 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._draft_shell_state = SessionState(
             SelectedSourceLibrary="Files to be Migrated",
             SelectedDestinationLibrary="Documents",
+            SelectedDestinationLibraryId="drive-dest-1",
+            DestinationTreeSnapshotIdentityDriveId="drive-dest-1",
+            DestinationTreeSnapshotIdentityLibraryId="drive-dest-1",
             SourceExpandedPaths=["FTBMRoot\\Public"],
             DestinationExpandedPaths=["Root\\Finance"],
             SourceExpandedAll=True,
@@ -351,7 +470,12 @@ class DestinationReplayRegressionTests(unittest.TestCase):
             DestinationTreeSnapshot=[{
                 "text": "Folder: Destination Snapshot",
                 "expanded": True,
-                "data": {"item_path": "Root\\Finance", "is_folder": True},
+                "data": {
+                    "item_path": "Root\\Finance",
+                    "is_folder": True,
+                    "drive_id": "drive-dest-1",
+                    "tree_role": "destination",
+                },
                 "children": [],
             }],
         )
@@ -400,15 +524,21 @@ class DestinationReplayRegressionTests(unittest.TestCase):
 
     def test_schedule_workspace_ui_persist_refreshes_runtime_snapshots_and_starts_timer(self):
         window = MainWindow.__new__(MainWindow)
-        source_tree = QTreeWidget()
-        source_root = QTreeWidgetItem(["Folder: Public"])
-        source_root.setData(0, Qt.UserRole, {"item_path": "FTBMRoot\\Public", "is_folder": True})
-        source_tree.addTopLevelItem(source_root)
+        source_payload = {
+            "name": "Public",
+            "base_display_label": "Folder: Public",
+            "item_path": "FTBMRoot\\Public",
+            "is_folder": True,
+            "id": "pub",
+            "drive_id": "d1",
+        }
+        source_tree, source_model = _sharepoint_source_test_tree([source_payload])
+        window.source_tree_widget = source_tree
+        window.source_sharepoint_model = source_model
         destination_tree = QTreeWidget()
         destination_root = QTreeWidgetItem(["Folder: Root"])
         destination_root.setData(0, Qt.UserRole, {"item_path": "Root", "is_folder": True})
         destination_tree.addTopLevelItem(destination_root)
-        window.source_tree_widget = source_tree
         window.destination_tree_widget = destination_tree
         window.source_tree_status = _LabelStub()
         window.destination_tree_status = _LabelStub()
@@ -438,21 +568,19 @@ class DestinationReplayRegressionTests(unittest.TestCase):
     def test_process_snapshot_branch_refresh_starts_visible_expanded_branch_loads(self):
         window = MainWindow.__new__(MainWindow)
         window._draft_shell_state = SessionState()
-        source_tree = QTreeWidget()
-        root = QTreeWidgetItem(["Folder: Public"])
-        root.setData(
-            0,
-            Qt.UserRole,
-            {
-                "name": "Public",
-                "item_path": "FTBMRoot\\Public",
-                "is_folder": True,
-                "children_loaded": False,
-                "load_failed": False,
-            },
-        )
-        source_tree.addTopLevelItem(root)
+        src_pl = {
+            "name": "Public",
+            "base_display_label": "Folder: Public",
+            "item_path": "FTBMRoot\\Public",
+            "is_folder": True,
+            "children_loaded": False,
+            "load_failed": False,
+            "id": "pub-id",
+            "drive_id": "d1",
+        }
+        source_tree, source_model = _sharepoint_source_test_tree([src_pl])
         window.source_tree_widget = source_tree
+        window.source_sharepoint_model = source_model
         window.destination_tree_widget = QTreeWidget()
         window.source_tree_status = _LabelStub()
         window.destination_tree_status = _LabelStub()
@@ -461,11 +589,14 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._pending_snapshot_branch_refresh = {"source": {"FTBMRoot\\Public"}, "destination": set()}
         window._snapshot_branch_refresh_scheduled = {"source": False, "destination": False}
         window._expand_all_pending = {"source": False, "destination": False}
+        window._path_segments = MainWindow._path_segments.__get__(window, MainWindow)
+        window._canonical_source_projection_path = MainWindow._canonical_source_projection_path.__get__(window, MainWindow)
+        window.get_tree_item_node_data = MainWindow.get_tree_item_node_data.__get__(window, MainWindow)
         started = []
         scheduled = []
         status_updates = []
         window._ensure_tree_item_load_started = lambda panel_key, item: started.append(
-            (panel_key, item.data(0, Qt.UserRole).get("item_path"))
+            (panel_key, (item.data(Qt.UserRole) or {}).get("item_path"))
         ) or True
         window._schedule_snapshot_branch_refresh = lambda panel_key, delay_ms=0: scheduled.append((panel_key, delay_ms))
         window._set_tree_status_message = lambda panel_key, message, loading=False: status_updates.append(
@@ -482,22 +613,23 @@ class DestinationReplayRegressionTests(unittest.TestCase):
     def test_process_snapshot_branch_refresh_limits_started_loads_per_tick(self):
         window = MainWindow.__new__(MainWindow)
         window._draft_shell_state = SessionState()
-        source_tree = QTreeWidget()
+        payloads = []
         for path in ("FTBMRoot\\Public", "FTBMRoot\\Photos", "FTBMRoot\\Finance"):
-            item = QTreeWidgetItem([path])
-            item.setData(
-                0,
-                Qt.UserRole,
+            payloads.append(
                 {
                     "name": path.rsplit("\\", 1)[-1],
+                    "base_display_label": path.rsplit("\\", 1)[-1],
                     "item_path": path,
                     "is_folder": True,
                     "children_loaded": False,
                     "load_failed": False,
-                },
+                    "id": f"id-{path}",
+                    "drive_id": "d1",
+                }
             )
-            source_tree.addTopLevelItem(item)
+        source_tree, source_model = _sharepoint_source_test_tree(payloads)
         window.source_tree_widget = source_tree
+        window.source_sharepoint_model = source_model
         window.destination_tree_widget = QTreeWidget()
         window.source_tree_status = _LabelStub()
         window.destination_tree_status = _LabelStub()
@@ -509,9 +641,12 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         }
         window._snapshot_branch_refresh_scheduled = {"source": False, "destination": False}
         window._expand_all_pending = {"source": False, "destination": False}
+        window._path_segments = MainWindow._path_segments.__get__(window, MainWindow)
+        window._canonical_source_projection_path = MainWindow._canonical_source_projection_path.__get__(window, MainWindow)
+        window.get_tree_item_node_data = MainWindow.get_tree_item_node_data.__get__(window, MainWindow)
         started = []
         window._ensure_tree_item_load_started = lambda panel_key, item: started.append(
-            (panel_key, item.data(0, Qt.UserRole).get("item_path"))
+            (panel_key, (item.data(Qt.UserRole) or {}).get("item_path"))
         ) or True
         window._schedule_snapshot_branch_refresh = lambda panel_key, delay_ms=0: None
         window._set_tree_status_message = lambda panel_key, message, loading=False: None
@@ -604,33 +739,40 @@ class DestinationReplayRegressionTests(unittest.TestCase):
 
         self.assertFalse(window._panel_is_expanded_all("source"))
 
-    def test_find_visible_destination_item_by_path_skips_verbose_logs_by_default(self):
+    @patch("ozlink_console.main_window.is_dev_mode", return_value=False)
+    def test_find_visible_destination_item_by_path_skips_verbose_logs_by_default(self, _mock_dev):
         window = MainWindow.__new__(MainWindow)
-        tree = QTreeWidget()
-        root = QTreeWidgetItem(["Folder: Root"])
-        root.setData(
-            0,
-            Qt.UserRole,
-            {
-                "name": "Root",
-                "item_path": "Root\\Finance",
-                "display_path": "Root\\Finance",
-                "is_folder": True,
-            },
-        )
-        tree.addTopLevelItem(root)
-        window.destination_tree_widget = tree
+        model = QStandardItemModel()
+        root_item = QStandardItem("Folder: Root")
+        payload = {
+            "name": "Root",
+            "item_path": "Root\\Finance",
+            "display_path": "Root\\Finance",
+            "is_folder": True,
+        }
+        root_item.setData(payload, Qt.UserRole)
+        model.appendRow(root_item)
+        match_index = model.index(0, 0)
+
+        def _find_indices(_path):
+            return [match_index]
+
+        model.find_indices_for_canonical_destination_path = _find_indices
+        window.destination_tree_widget = QTreeView()
+        window.destination_planning_model = model
+        window._destination_browse_mode = "local"
         window._memory_restore_in_progress = False
         window._canonical_destination_projection_path = lambda path: path
         window.normalize_memory_path = lambda path: path
         window._tree_item_path = lambda data: data.get("item_path", "")
-        window._iter_tree_items = lambda item: [item]
-        window._select_canonical_destination_item = lambda matches: matches[0] if matches else None
+        window._destination_parent_match_details = MainWindow._destination_parent_match_details.__get__(window, MainWindow)
+        window._destination_resolution_rank = MainWindow._destination_resolution_rank.__get__(window, MainWindow)
+        window._path_segments = MainWindow._path_segments.__get__(window, MainWindow)
         window._log_restore_phase = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected verbose logging"))
 
         match = window._find_visible_destination_item_by_path("Root\\Finance")
 
-        self.assertIs(match, root)
+        self.assertEqual(match, match_index)
 
     def test_restore_tree_items_snapshot_clears_destination_root_prime_when_snapshot_is_rich(self):
         window = MainWindow.__new__(MainWindow)
@@ -661,6 +803,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
 
     def test_maybe_restore_runtime_snapshot_after_root_bind_uses_richer_saved_tree(self):
         window = MainWindow.__new__(MainWindow)
+        window._destination_browse_mode = "local"
         window._draft_shell_state = SessionState(
             DestinationExpandedAll=True,
             DestinationSelectedPath="Root\\Finance",
@@ -685,7 +828,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._restore_tree_items_snapshot = lambda panel_key, snapshots, status_message: restored.append(
             (panel_key, snapshots, status_message)
         ) or True
-        window._sync_expand_all_button_from_tree = lambda panel_key, fallback_expanded=False: synced.append((panel_key, fallback_expanded))
+        window._refresh_expand_all_button_for_panel = lambda panel_key: synced.append(panel_key)
         window._restore_selected_tree_path = lambda panel_key, path: selections.append((panel_key, path))
         window._count_expandable_tree_nodes = lambda panel_key: 1
         window._count_tree_snapshot_nodes = lambda snapshots: 5
@@ -694,7 +837,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
 
         self.assertTrue(reused)
         self.assertEqual(restored[0][0], "destination")
-        self.assertEqual(synced, [("destination", False)])
+        self.assertEqual(synced, ["destination"])
         self.assertEqual(selections, [("destination", "Root\\Finance")])
 
     def test_destination_shallow_root_payload_does_not_overwrite_richer_visible_tree(self):
@@ -753,22 +896,63 @@ class DestinationReplayRegressionTests(unittest.TestCase):
     def test_destination_shallow_folder_payload_does_not_overwrite_richer_visible_branch(self):
         app = QApplication.instance() or QApplication([])
         window = MainWindow.__new__(MainWindow)
-        item = QTreeWidgetItem(["Folder: Finance"])
-        item.setData(0, Qt.UserRole, {"item_path": "Root\\Finance", "is_folder": True, "children_loaded": True})
-        child = QTreeWidgetItem(["Folder: Payroll"])
-        child.setData(0, Qt.UserRole, {"item_path": "Root\\Finance\\Payroll", "is_folder": True, "children_loaded": True})
-        item.addChild(child)
+        model = DestinationPlanningTreeModel()
+        model.reset_root_payloads(
+            [
+                {
+                    "base_display_label": "Folder: Finance",
+                    "name": "Finance",
+                    "is_folder": True,
+                    "item_path": r"Root\Finance",
+                    "drive_id": "drive-1",
+                    "id": "item-1",
+                }
+            ]
+        )
+        fin_ix = model.index(0, 0, QModelIndex())
+        model.replace_all_children(
+            fin_ix,
+            [
+                {
+                    "base_display_label": "Folder: Payroll",
+                    "name": "Payroll",
+                    "is_folder": True,
+                    "item_path": r"Root\Finance\Payroll",
+                    "drive_id": "drive-1",
+                    "id": "pay-1",
+                }
+            ],
+        )
 
+        window.destination_planning_model = model
         window.pending_folder_loads = {"destination": set()}
-        window.folder_load_workers = {"destination:item-1": {"id": "folder-1", "item": item}}
+        window.folder_load_workers = {
+            "destination:item-1": {
+                "id": "folder-1",
+                "destination_folder_parent_persistent": QPersistentModelIndex(fin_ix),
+            }
+        }
         window._memory_restore_in_progress = False
         window._snapshot_branch_refresh_baseline_by_worker = {}
         window._destination_preserved_children_by_worker = {"destination:item-1": []}
         window._log_worker_lifecycle = lambda *args, **kwargs: None
         window._log_restore_phase = lambda *args, **kwargs: None
         window.normalize_memory_path = MainWindow.normalize_memory_path.__get__(window, MainWindow)
-        window._count_visible_subtree_nodes = MainWindow._count_visible_subtree_nodes.__get__(window, MainWindow)
+        window._count_visible_subtree_nodes_index = MainWindow._count_visible_subtree_nodes_index.__get__(
+            window, MainWindow
+        )
         window._count_folder_payload_nodes = MainWindow._count_folder_payload_nodes.__get__(window, MainWindow)
+        window._destination_payload_from_graph_item = lambda _c: {}
+        window._apply_tree_item_visual_state = lambda *a, **k: None
+        window._destination_lifecycle_trace_TEMP = lambda *a, **k: None
+        window._mark_destination_real_tree_snapshot_stale = lambda: None
+        window._destination_semantic_path = MainWindow._destination_semantic_path.__get__(window, MainWindow)
+        window._canonical_destination_projection_path = MainWindow._canonical_destination_projection_path.__get__(
+            window, MainWindow
+        )
+        window.destination_tree_widget = _TreeStub()
+        window._destination_expand_burst_should_coalesce = lambda _p: False
+        window._safe_invoke = lambda _name, _fn, *a, **k: None
 
         payload = {
             "panel_key": "destination",
@@ -779,20 +963,159 @@ class DestinationReplayRegressionTests(unittest.TestCase):
 
         window.on_folder_load_success(payload, "folder-1")
 
-        self.assertEqual(item.childCount(), 1)
-        self.assertEqual((item.child(0).data(0, Qt.UserRole) or {}).get("item_path"), "Root\\Finance\\Payroll")
+        self.assertEqual(model.rowCount(fin_ix), 1)
+        child_ix = model.index(0, 0, fin_ix)
+        self.assertTrue(child_ix.isValid())
+        self.assertEqual(
+            (child_ix.data(Qt.UserRole) or {}).get("item_path"),
+            r"Root\Finance\Payroll",
+        )
+
+    def test_destination_graph_authority_non_empty_folder_payload_replaces_richer_visible_branch(self):
+        """Graph-owned mode: non-empty Graph children must bind even if the UI subtree looked larger."""
+        import ozlink_console.main_window as main_window_module
+
+        with patch.object(
+            main_window_module.destination_authority_contract,
+            "graph_owns_visible_real_destination_structure",
+            lambda _h: True,
+        ):
+            app = QApplication.instance() or QApplication([])
+            window = MainWindow.__new__(MainWindow)
+            model = DestinationPlanningTreeModel()
+            model.reset_root_payloads(
+                [
+                    {
+                        "base_display_label": "Folder: Finance",
+                        "name": "Finance",
+                        "is_folder": True,
+                        "item_path": r"Root\Finance",
+                        "drive_id": "drive-1",
+                        "id": "item-1",
+                    }
+                ]
+            )
+            fin_ix = model.index(0, 0, QModelIndex())
+            model.replace_all_children(
+                fin_ix,
+                [
+                    {
+                        "base_display_label": "Folder: Payroll",
+                        "name": "Payroll",
+                        "is_folder": True,
+                        "item_path": r"Root\Finance\Payroll",
+                        "drive_id": "drive-1",
+                        "id": "pay-1",
+                    }
+                ],
+            )
+
+            window.destination_planning_model = model
+            window.pending_folder_loads = {"destination": set()}
+            window.folder_load_workers = {
+                "destination:item-1": {
+                    "id": "folder-1",
+                    "destination_folder_parent_persistent": QPersistentModelIndex(fin_ix),
+                }
+            }
+            window._memory_restore_in_progress = False
+            window._snapshot_branch_refresh_baseline_by_worker = {}
+            window._destination_preserved_children_by_worker = {"destination:item-1": []}
+            window._log_worker_lifecycle = lambda *args, **kwargs: None
+            window._log_restore_phase = lambda *args, **kwargs: None
+            window.normalize_memory_path = MainWindow.normalize_memory_path.__get__(window, MainWindow)
+            window._count_visible_subtree_nodes_index = MainWindow._count_visible_subtree_nodes_index.__get__(
+                window, MainWindow
+            )
+            window._count_folder_payload_nodes = MainWindow._count_folder_payload_nodes.__get__(window, MainWindow)
+
+            def _payload_from_graph(child):
+                cid = str(child.get("id") or "")
+                name = str(child.get("name") or "")
+                return {
+                    "id": cid,
+                    "name": name,
+                    "is_folder": True,
+                    "item_path": child.get("item_path"),
+                    "drive_id": "drive-1",
+                }
+
+            window._destination_payload_from_graph_item = _payload_from_graph
+            window._apply_tree_item_visual_state = lambda *a, **k: None
+            window._destination_lifecycle_trace_TEMP = lambda *a, **k: None
+            window._mark_destination_real_tree_snapshot_stale = lambda: None
+            window._destination_semantic_path = MainWindow._destination_semantic_path.__get__(window, MainWindow)
+            window._canonical_destination_projection_path = MainWindow._canonical_destination_projection_path.__get__(
+                window, MainWindow
+            )
+            window._destination_collect_planned_workspace_children_under_model = lambda _ix: []
+            window._destination_planned_workspace_snapshot_identity_only_tree = lambda snap: snap
+            window._destination_register_planned_workspace_snapshot_for_parent_path = lambda *a, **k: None
+            window._destination_invoke_planned_workspace_reconcile_after_graph_folder_load = lambda *a, **k: None
+            window.destination_tree_widget = _TreeStub()
+            window._destination_expand_burst_should_coalesce = lambda _p: False
+            window._safe_invoke = lambda _name, _fn, *a, **k: None
+            window.unresolved_proposed_by_parent_path = {}
+            window.unresolved_allocations_by_parent_path = {}
+
+            payload = {
+                "panel_key": "destination",
+                "drive_id": "drive-1",
+                "item_id": "item-1",
+                "items": [
+                    {
+                        "id": "c-a",
+                        "name": "Alpha",
+                        "is_folder": True,
+                        "item_path": r"Root\Finance\Alpha",
+                    },
+                    {
+                        "id": "c-b",
+                        "name": "Beta",
+                        "is_folder": True,
+                        "item_path": r"Root\Finance\Beta",
+                    },
+                ],
+            }
+
+            window.on_folder_load_success(payload, "folder-1")
+
+            rc = int(model.rowCount(fin_ix))
+            self.assertGreaterEqual(rc, 2)
+            paths = sorted(
+                (model.index(r, 0, fin_ix).data(Qt.UserRole) or {}).get("item_path")
+                for r in range(model.rowCount(fin_ix))
+            )
+            for want in (r"Root\Finance\Alpha", r"Root\Finance\Beta"):
+                self.assertIn(want, paths)
+            _ = app
 
     def test_folder_worker_success_skips_deleted_tree_item(self):
         window = MainWindow.__new__(MainWindow)
         worker_key = "destination:item-1"
         window.pending_folder_loads = {"destination": {"drive-1:item-1"}}
-        window.folder_load_workers = {worker_key: {"id": "folder-1", "item": _DeletedTreeItemStub()}}
+        window.folder_load_retired_workers = {}
+        window.folder_load_workers = {
+            worker_key: {
+                "id": "folder-1",
+                "item": _DeletedTreeItemStub(),
+                "pending_key": "drive-1:item-1",
+                "worker": _FolderWorkerThreadStub(),
+            }
+        }
         window._snapshot_branch_refresh_baseline_by_worker = {worker_key: {"Root\\Finance\\Payroll"}}
         window._destination_preserved_children_by_worker = {worker_key: ["kept"]}
         lifecycle = []
         window._log_worker_lifecycle = lambda *args, **kwargs: lifecycle.append((args, kwargs))
         window._tree_item_is_alive = MainWindow._tree_item_is_alive.__get__(window, MainWindow)
 
+        class _StaleDestModel:
+            def find_index_by_drive_item(self, _drive_id, _item_id):
+                return QModelIndex()
+
+        window.destination_planning_model = _StaleDestModel()
+        window._schedule_destination_bind_reconcile_after_workers = lambda: None
+
         payload = {
             "panel_key": "destination",
             "drive_id": "drive-1",
@@ -801,6 +1124,7 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         }
 
         window.on_folder_load_success(payload, "folder-1")
+        window.on_folder_worker_finished(worker_key, "folder-1")
 
         self.assertEqual(window.pending_folder_loads["destination"], set())
         self.assertNotIn(worker_key, window._snapshot_branch_refresh_baseline_by_worker)
@@ -948,15 +1272,17 @@ class DestinationReplayRegressionTests(unittest.TestCase):
 
         self.assertEqual(window._capture_child_path_set(parent), {"Root\\Real"})
 
-    def test_materialize_destination_future_model_defers_for_large_tree_during_expand_all(self):
+    def test_apply_destination_planning_overlays_defers_for_large_tree_during_expand_all(self):
         window = MainWindow.__new__(MainWindow)
         window.destination_tree_widget = _ExpandTreeStub()
         window._destination_root_prime_pending = False
         window._destination_full_tree_worker = None
+        window._destination_full_tree_requested_drive_id = ""
         window.pending_root_drive_ids = {"source": "", "destination": ""}
         window._current_selected_destination_drive_id = lambda: ""
         window._destination_full_tree_snapshot = []
         window._destination_full_tree_completed_drive_id = ""
+        window._destination_full_tree_ready = lambda: True
         window._expand_all_pending = {"source": False, "destination": True}
         window.pending_folder_loads = {"source": set(), "destination": set()}
         window._root_tree_bind_in_progress = False
@@ -965,13 +1291,14 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._schedule_deferred_destination_materialization = lambda reason, delay_ms=180: scheduled.append((reason, delay_ms))
         window._log_restore_phase = lambda *args, **kwargs: None
 
-        applied = window._materialize_destination_future_model("destination_expand_all_complete")
+        applied = window._apply_destination_planning_overlays("destination_expand_all_complete")
 
         self.assertEqual(applied, 0)
         self.assertEqual(scheduled, [("destination_expand_all_complete", 180)])
 
     def test_restore_workspace_tree_panel_state_reapplies_expanded_all(self):
         window = MainWindow.__new__(MainWindow)
+        window._pending_session_tree_snapshots = {}
         window.destination_tree_widget = QTreeWidget()
         window.destination_expand_all_button = _ButtonStub()
         window._expand_all_pending = {"source": False, "destination": False}
@@ -1034,68 +1361,116 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         self.assertEqual(window._expand_label, ("source", True))
         self.assertEqual(window._expand_status, ("source", "All branches expanded.", False))
 
-    def test_process_expand_all_queue_starts_async_source_loads(self):
-        window = MainWindow.__new__(MainWindow)
-        tree = _ExpandTreeStub()
-        root = QTreeWidgetItem(["Folder: Root"])
-        root.setData(
-            0,
-            Qt.UserRole,
-            {
-                "name": "Root",
-                "item_path": "FTBMRoot",
-                "is_folder": True,
-                "children_loaded": False,
-                "load_failed": False,
-            },
+    def test_begin_source_model_expand_all_seeds_queue(self):
+        model = SharePointSourceTreeModel()
+        model.reset_root_payloads(
+            [
+                {
+                    "name": "Lib",
+                    "is_folder": True,
+                    "id": "item-root",
+                    "library_id": "drive-1",
+                    "children_loaded": False,
+                    "base_display_label": "Folder: Lib",
+                    "tree_role": "source",
+                }
+            ]
         )
-        tree.addTopLevelItem(root)
+        tree = QTreeView()
+        tree.setModel(model)
+        window = _main_window_stub_for_source_model_expand_all(tree, model)
+        tick_calls = []
+        window._source_model_expand_all_tick = lambda: tick_calls.append(1)
 
-        window.source_tree_widget = tree
-        window.destination_tree_widget = _ExpandTreeStub()
-        window.source_tree_status = _LabelStub()
-        window.destination_tree_status = _LabelStub()
-        window.pending_folder_loads = {"source": set(), "destination": set()}
-        window._expand_all_pending = {"source": True, "destination": False}
-        window._expand_all_queue = {"source": deque([root]), "destination": deque()}
-        window._expand_all_processed = {"source": 0, "destination": 0}
-        window._expand_all_deferred_refresh = {"source": False, "destination": False}
-        window._expand_all_max_per_tick = {"source": 1, "destination": 2}
-        scheduled = []
-        started = []
-        window._count_expandable_tree_nodes = lambda panel_key: 10
-        window._ensure_tree_item_load_started = lambda panel_key, item: started.append(
-            (panel_key, item.data(0, Qt.UserRole).get("item_path"))
-        ) or True
-        window._update_expand_all_status = lambda panel_key, message, loading=False: scheduled.append((panel_key, message, loading))
+        window._begin_source_model_expand_all()
 
-        window._process_expand_all_queue("source")
-
-        self.assertEqual(started, [("source", "FTBMRoot")])
         self.assertTrue(window._expand_all_pending["source"])
-        self.assertEqual(scheduled[-1], ("source", "Expanding branches...", True))
+        self.assertEqual(tick_calls, [1])
+        self.assertEqual(len(window._expand_all_source_model_queue), 1)
+        self.assertTrue(window._expand_all_source_model_queue[0].isValid())
+        self.assertIn("drive-1:item-root", window._expand_all_seen["source"])
 
-    def test_fast_expand_path_skips_folders_with_lazy_placeholder_children(self):
-        window = MainWindow.__new__(MainWindow)
-        tree = _ExpandTreeStub()
-        root = QTreeWidgetItem(["Folder: Root"])
-        root.setData(
-            0,
-            Qt.UserRole,
-            {
-                "name": "Root",
-                "is_folder": True,
-                "children_loaded": True,
-                "load_failed": False,
-                "id": "root-id",
-            },
+    def test_source_model_expand_all_finishes_without_graph_for_loaded_subtree(self):
+        model = SharePointSourceTreeModel()
+        model.reset_root_payloads(
+            [
+                {
+                    "name": "Root",
+                    "is_folder": True,
+                    "id": "r1",
+                    "library_id": "d1",
+                    "children_loaded": True,
+                    "base_display_label": "Folder: Root",
+                    "tree_role": "source",
+                }
+            ]
         )
-        placeholder = QTreeWidgetItem(["Expand to load contents"])
-        placeholder.setData(0, Qt.UserRole, {"placeholder": True})
-        root.addChild(placeholder)
-        tree.addTopLevelItem(root)
+        root_ix = model.index(0, 0, QModelIndex())
+        model.replace_all_children(
+            root_ix,
+            [
+                {
+                    "name": "Sub",
+                    "is_folder": True,
+                    "id": "s1",
+                    "library_id": "d1",
+                    "children_loaded": True,
+                    "base_display_label": "Folder: Sub",
+                    "tree_role": "source",
+                }
+            ],
+        )
+        sub_ix = model.index(0, 0, root_ix)
+        model.replace_all_children(sub_ix, [])
+        model.update_payload_for_index(sub_ix, lambda p: p.update({"children_loaded": True}))
 
+        tree = QTreeView()
+        tree.setModel(model)
+        window = _main_window_stub_for_source_model_expand_all(tree, model)
+        graph_load_attempts = []
+        window._source_model_request_folder_children_load = (
+            lambda *a, **k: graph_load_attempts.append(1) or "noop"
+        )
+
+        with patch.object(QTimer, "singleShot", lambda _ms, _cb: None):
+            window._begin_source_model_expand_all()
+
+        self.assertEqual(len(window._expand_all_source_model_queue), 1)
+        self.assertTrue(window._expand_all_pending["source"])
+
+        window._source_model_expand_all_tick()
+
+        self.assertFalse(window._expand_all_pending["source"])
+        self.assertEqual(len(window._expand_all_source_model_queue), 0)
+        self.assertEqual(graph_load_attempts, [])
+        self.assertTrue(tree.isExpanded(root_ix))
+        self.assertTrue(tree.isExpanded(sub_ix))
+
+    def test_process_expand_all_queue_is_noop_for_model_driven_source_expand(self):
+        """Expand-all uses _source_model_expand_all_tick; timer queue is legacy."""
+        window = MainWindow.__new__(MainWindow)
+        window._expand_all_pending = {"source": True, "destination": False}
+        window._process_expand_all_queue("source")
+        self.assertTrue(window._expand_all_pending["source"])
+
+    def test_tree_has_unloaded_folder_nodes_source_model_reports_not_loaded(self):
+        window = MainWindow.__new__(MainWindow)
+        tree, model = _sharepoint_source_test_tree(
+            [
+                {
+                    "name": "Root",
+                    "base_display_label": "Folder: Root",
+                    "item_path": "FTBMRoot",
+                    "is_folder": True,
+                    "children_loaded": False,
+                    "load_failed": False,
+                    "id": "root-id",
+                    "drive_id": "drive-1",
+                }
+            ]
+        )
         window.source_tree_widget = tree
+        window.source_sharepoint_model = model
         window.destination_tree_widget = _ExpandTreeStub()
         window.pending_root_drive_ids = {"source": "drive-1", "destination": ""}
 
@@ -1147,74 +1522,134 @@ class DestinationReplayRegressionTests(unittest.TestCase):
             "planned_allocation_descendant": True,
             "item_path": "Root\\Projects Completed\\YMCA\\Hawthorn",
         }
-        item = QTreeWidgetItem(["Folder: Hawthorn"])
-        item.setData(0, Qt.UserRole, node_data)
-        item.addChild(QTreeWidgetItem(["File: child.txt"]))
+        model = QStandardItemModel()
+        row = QStandardItem("Folder: Hawthorn")
+        row.setData(dict(node_data), Qt.UserRole)
+        model.appendRow(row)
+        ix = model.index(0, 0)
 
-        log_calls = []
+        def _update_payload_for_index(index, mutator):
+            pl = dict(index.data(Qt.UserRole) or {})
+            mutator(pl)
+            model.setData(index, pl, Qt.UserRole)
+
+        model.update_payload_for_index = _update_payload_for_index
+        model.is_index_live = lambda idx: idx.isValid()
+
+        window.destination_planning_model = model
         window.destination_tree_widget = _TreeStub()
         window.proposed_folders = []
         window.planned_moves = []
-        window._log_restore_phase = lambda phase, **data: log_calls.append((phase, data))
+        window.node_is_planned_allocation = lambda _nd: False
+        window._refresh_destination_item_visibility_index = lambda *_a, **_k: None
+        window._apply_tree_item_visual_state = lambda *_a, **_k: None
         window._find_planned_move_for_destination_node = lambda _: (_ for _ in ()).throw(AssertionError("should not resolve move"))
 
-        window._load_destination_projected_descendants(item)
+        window._load_destination_projected_descendants_index(ix)
 
-        updated = item.data(0, Qt.UserRole)
+        updated = ix.data(Qt.UserRole) or {}
         self.assertTrue(updated["children_loaded"])
-        self.assertEqual(log_calls[0][0], "destination_projected_descendant_lazy_load_skipped")
 
     def test_rewrite_proposed_branch_runtime_paths_moves_branch_and_allocations(self):
         window = MainWindow.__new__(MainWindow)
         window.proposed_folders = [
             ProposedFolder(
                 FolderName="Follow Up",
-                DestinationPath="Root\\Sales\\Follow Up",
-                ParentPath="Root\\Sales",
+                DestinationPath="Sales\\Follow Up",
+                ParentPath="Sales",
             ),
             ProposedFolder(
                 FolderName="Nested",
-                DestinationPath="Root\\Sales\\Follow Up\\Nested",
-                ParentPath="Root\\Sales\\Follow Up",
+                DestinationPath="Sales\\Follow Up\\Nested",
+                ParentPath="Sales\\Follow Up",
             ),
         ]
         window.planned_moves = [
             {
-                "destination_path": "Root\\Sales\\Follow Up\\Salary Increases.xlsx",
+                "destination_path": "Sales\\Follow Up\\Salary Increases.xlsx",
                 "destination": {
-                    "display_path": "Root\\Sales\\Follow Up\\Salary Increases.xlsx",
-                    "item_path": "Root\\Sales\\Follow Up\\Salary Increases.xlsx",
-                    "destination_path": "Root\\Sales\\Follow Up\\Salary Increases.xlsx",
+                    "display_path": "Sales\\Follow Up\\Salary Increases.xlsx",
+                    "item_path": "Sales\\Follow Up\\Salary Increases.xlsx",
+                    "destination_path": "Sales\\Follow Up\\Salary Increases.xlsx",
                 },
             }
         ]
 
         window._rewrite_proposed_branch_runtime_paths(
-            "Root\\Sales\\Follow Up",
-            "Root\\Management\\Follow Up",
+            "Sales\\Follow Up",
+            "Management\\Follow Up",
         )
 
-        self.assertEqual(window.proposed_folders[0].DestinationPath, "Root\\Management\\Follow Up")
-        self.assertEqual(window.proposed_folders[0].ParentPath, "Root\\Management")
-        self.assertEqual(window.proposed_folders[1].DestinationPath, "Root\\Management\\Follow Up\\Nested")
-        self.assertEqual(window.proposed_folders[1].ParentPath, "Root\\Management\\Follow Up")
+        self.assertEqual(window.proposed_folders[0].DestinationPath, "Management\\Follow Up")
+        self.assertEqual(window.proposed_folders[0].ParentPath, "Management")
+        self.assertEqual(window.proposed_folders[1].DestinationPath, "Management\\Follow Up\\Nested")
+        self.assertEqual(window.proposed_folders[1].ParentPath, "Management\\Follow Up")
         self.assertEqual(
             window.planned_moves[0]["destination_path"],
-            "Root\\Management\\Follow Up\\Salary Increases.xlsx",
+            "Management\\Follow Up\\Salary Increases.xlsx",
         )
 
     def test_destination_branch_move_to_top_level_folder_is_not_treated_as_same_path(self):
+        _ = QApplication.instance() or QApplication([])
         window = MainWindow.__new__(MainWindow)
         window.proposed_folders = [
             ProposedFolder(
                 FolderName="Test",
-                DestinationPath="Root\\Test",
-                ParentPath="Root",
+                DestinationPath="Test",
+                ParentPath="",
             )
         ]
         window.planned_moves = []
+        window.current_session_context = {"connected": False}
+        window.planned_moves_table = _PlannedMovesTableStub()
+        window.planned_moves_status = _LabelStub()
+        window.source_tree_widget = _TreeStub()
         window.destination_tree_status = _LabelStub()
-        window.destination_tree_widget = _ExpandTreeStub()
+
+        std = QStandardItemModel()
+        src_payload = {
+            "name": "Test",
+            "real_name": "Test",
+            "display_path": "Test",
+            "item_path": "Test",
+            "destination_path": "Test",
+            "tree_role": "destination",
+            "is_folder": True,
+            "proposed": True,
+            "node_origin": "Proposed",
+        }
+        tgt_payload = {
+            "name": "Management",
+            "real_name": "Management",
+            "display_path": "Management",
+            "item_path": "Management",
+            "destination_path": "Management",
+            "tree_role": "destination",
+            "is_folder": True,
+            "node_origin": "Real",
+        }
+        si = QStandardItem("Test")
+        si.setData(src_payload, Qt.UserRole)
+        ti = QStandardItem("Management")
+        ti.setData(tgt_payload, Qt.UserRole)
+        std.appendRow(si)
+        std.appendRow(ti)
+        source_item = std.index(0, 0)
+        target_item = std.index(1, 0)
+
+        dmodel = MagicMock()
+        nested = ({"name": "Test", "display_path": "Management\\Test"}, [])
+        dmodel.remove_node_at.return_value = nested
+        new_ix = MagicMock(spec=QModelIndex)
+        new_ix.isValid.return_value = True
+        dmodel.append_nested_child.return_value = new_ix
+
+        tree = MagicMock()
+        tree.isExpanded.return_value = False
+        tree.selectionModel.return_value = MagicMock()
+
+        window.destination_planning_model = dmodel
+        window.destination_tree_widget = tree
         window._proposed_branch_contains_submitted_items = lambda path: False
         window._find_proposed_folder_record_by_path = lambda path: None
         window._show_submitted_item_locked_message = lambda *args, **kwargs: (_ for _ in ()).throw(
@@ -1222,47 +1657,19 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         )
         window._persist_planning_change_lightweight = lambda: setattr(window, "_persisted", True)
         window.on_tree_selection_changed = lambda panel_key: setattr(window, "_selection_panel", panel_key)
-
-        source_item = QTreeWidgetItem(["Folder: Test"])
-        source_item.setData(
-            0,
-            Qt.UserRole,
-            {
-                "name": "Test",
-                "real_name": "Test",
-                "display_path": "Root\\Test",
-                "item_path": "Root\\Test",
-                "destination_path": "Root\\Test",
-                "tree_role": "destination",
-                "is_folder": True,
-                "proposed": True,
-                "node_origin": "Proposed",
-            },
-        )
-        target_item = QTreeWidgetItem(["Folder: Management"])
-        target_item.setData(
-            0,
-            Qt.UserRole,
-            {
-                "name": "Management",
-                "real_name": "Management",
-                "display_path": "Root\\Management",
-                "item_path": "Root\\Management",
-                "destination_path": "Root\\Management",
-                "tree_role": "destination",
-                "is_folder": True,
-                "node_origin": "Real",
-            },
-        )
-        window.destination_tree_widget.addTopLevelItem(source_item)
-        window.destination_tree_widget.addTopLevelItem(target_item)
+        window.refresh_planned_moves_table = lambda: None
+        window._sync_planning_after_proposed_branch_destination_relocate = lambda *args, **kwargs: None
+        window._collect_source_projection_paths_under_destination_allocation_prefix = lambda _p: set()
+        window._destination_path_exists_under_parent = lambda *a, **k: False
+        window._rename_visible_destination_subtree_index = lambda *a, **k: None
+        window._refresh_destination_item_visibility_index = lambda *a, **k: None
 
         window.handle_destination_draft_move(source_item, target_item)
 
-        self.assertEqual(window.proposed_folders[0].DestinationPath, "Root\\Management\\Test")
-        self.assertEqual(window.proposed_folders[0].ParentPath, "Root\\Management")
-        self.assertEqual(target_item.childCount(), 1)
-        self.assertEqual(target_item.child(0).data(0, Qt.UserRole).get("display_path"), "Root\\Management\\Test")
+        self.assertEqual(window.proposed_folders[0].DestinationPath, "Management\\Test")
+        self.assertEqual(window.proposed_folders[0].ParentPath, "Management")
+        dmodel.remove_node_at.assert_called_once_with(source_item)
+        dmodel.append_nested_child.assert_called_once_with(target_item, nested)
         self.assertTrue(window._persisted)
 
     def test_move_planned_destination_node_updates_parent_path(self):
@@ -1289,27 +1696,32 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._resolve_planned_move_for_destination_node = lambda node: (0, move, None)
         window._is_move_submitted = lambda current_move: False
         window._find_visible_destination_item_by_path = lambda path: None
-        window._persist_planning_change = lambda reason: setattr(window, "_persist_reason", reason)
+        window._persist_planning_change = lambda reason, **kwargs: setattr(window, "_persist_reason", reason)
+        window.refresh_planned_moves_table = lambda: None
+        window._schedule_deferred_destination_materialization = lambda *args, **kwargs: None
 
         moved = window._move_planned_destination_node(
-            {"name": "Salary Increases.xlsx", "display_path": "Root\\Sales\\Follow Up\\Salary Increases.xlsx"},
-            {"name": "Management", "display_path": "Root\\Management", "item_path": "Root\\Management", "is_folder": True},
+            {"name": "Salary Increases.xlsx", "display_path": "Sales\\Follow Up\\Salary Increases.xlsx"},
+            {"name": "Management", "display_path": "Management", "item_path": "Management", "is_folder": True},
         )
 
         self.assertTrue(moved)
-        self.assertEqual(move["destination_path"], "Root\\Management")
-        self.assertEqual(move["destination"]["display_path"], "Root\\Management")
+        self.assertEqual(move["destination_path"], "Management")
+        self.assertEqual(move["destination"]["display_path"], "Management")
         self.assertEqual(window._persist_reason, "planned_item_moved")
 
     def test_persist_planning_change_lightweight_queues_deferred_refresh(self):
         window = MainWindow.__new__(MainWindow)
         window.destination_tree_widget = _TreeStub()
         window.source_tree_widget = _TreeStub()
-        window._save_draft_shell = lambda force=False: setattr(window, "_saved_force", force)
+        window.memory_manager = object()
+        window._save_draft_shell = lambda force=False, include_workspace_ui=False: setattr(
+            window, "_saved_force", force
+        )
         window._rebuild_submission_visual_cache = lambda: setattr(window, "_cache_rebuilt", True)
         window._collect_current_source_projection_paths = lambda: {"FTBMRoot", "FTBMRoot\\Contracts"}
         window._queue_deferred_planning_refresh = (
-            lambda reason, source_projection_paths=None, delay_ms=None: setattr(
+            lambda reason, source_projection_paths=None, delay_ms=None, notify_saved=True: setattr(
                 window,
                 "_queued_refresh",
                 (reason, set(source_projection_paths or set()), delay_ms),
@@ -1317,6 +1729,14 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         )
         window.update_progress_summaries = lambda: setattr(window, "_progress_updated", True)
         window._log_restore_exception = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected exception"))
+        window._safe_invoke = lambda _n, fn, *a, **k: fn(*a, **k)
+        window._mark_destination_tree_snapshot_dirty_after_injection = lambda **kw: None
+
+        def _immediate_planning_autosave(*, reason, surface=""):
+            window._planning_mutation_autosave_pending_reason = str(reason or "")[:220]
+            MainWindow._on_planning_mutation_autosave_timer(window)
+
+        window._schedule_planning_mutation_debounced_autosave = _immediate_planning_autosave
 
         window._persist_planning_change_lightweight()
 
@@ -1335,7 +1755,9 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._deferred_planning_refresh_reasons = ["move_folder"]
         window._deferred_source_projection_paths = {"FTBMRoot\\Contracts"}
         window._set_window_title_status = lambda status_text="": setattr(window, "_title_status", status_text)
-        window._materialize_destination_future_model = lambda reason: setattr(window, "_destination_materialize_reason", reason)
+        window._apply_destination_planning_overlays = lambda reason, **kwargs: setattr(
+            window, "_destination_materialize_reason", reason
+        )
         window._schedule_source_projection_refresh_for_paths = (
             lambda paths, reason, delay_ms=250, trigger_path="": setattr(
                 window,
@@ -1356,6 +1778,48 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         )
         self.assertEqual(window._title_status, "")
 
+    def test_deferred_planning_refresh_skips_destination_materialize_for_lightweight_reasons(self):
+        window = MainWindow.__new__(MainWindow)
+        window.destination_tree_widget = _TreeStub()
+        window.source_tree_widget = _TreeStub()
+        window._deferred_planning_refresh_pending = True
+        window._deferred_planning_refresh_reasons = ["planning_change_lightweight"]
+        window._deferred_source_projection_paths = set()
+        materialized = []
+        window._apply_destination_planning_overlays = lambda reason, **kwargs: materialized.append(reason)
+        window._schedule_source_projection_refresh_for_paths = lambda *a, **k: None
+        window.update_progress_summaries = lambda: None
+        window._set_window_title_status = lambda status_text="": None
+        window._log_restore_exception = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("unexpected exception")
+        )
+
+        window._run_deferred_planning_refresh()
+
+        self.assertFalse(materialized)
+
+    def test_deferred_planning_refresh_materializes_when_reason_not_incremental(self):
+        window = MainWindow.__new__(MainWindow)
+        window.destination_tree_widget = _TreeStub()
+        window.source_tree_widget = _TreeStub()
+        window._deferred_planning_refresh_pending = True
+        # Coalesced incremental-only reasons skip overlay; include a non-incremental driver to materialize.
+        window._deferred_planning_refresh_reasons = ["planning_change_lightweight", "move_folder"]
+        window._deferred_source_projection_paths = set()
+        materialized = []
+        window._apply_destination_planning_overlays = lambda reason, **kwargs: materialized.append(reason)
+        window._schedule_source_projection_refresh_for_paths = lambda *a, **k: None
+        window.update_progress_summaries = lambda: None
+        window._set_window_title_status = lambda status_text="": None
+        window._log_restore_exception = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("unexpected exception")
+        )
+
+        window._run_deferred_planning_refresh()
+
+        self.assertEqual(len(materialized), 1)
+        self.assertIn("move_folder", materialized[0])
+
     def test_finalize_cache_refresh_workspace_restore_reapplies_destination_overlay(self):
         window = MainWindow.__new__(MainWindow)
         window.destination_tree_widget = _TreeStub()
@@ -1370,7 +1834,9 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._cache_refresh_restore_active = True
         window._cache_refresh_skip_expanded_restore_panels = set()
         window._restore_workspace_tree_state = lambda ui_state: setattr(window, "_restored_ui_state", ui_state)
-        window._materialize_destination_future_model = lambda reason: setattr(window, "_cache_refresh_materialize_reason", reason)
+        window._apply_destination_planning_overlays = lambda reason, **kwargs: setattr(
+            window, "_cache_refresh_materialize_reason", reason
+        )
         window._start_destination_restore_materialization = lambda: setattr(window, "_destination_materialization_started", True)
         window._refresh_source_projection = lambda reason: setattr(window, "_source_projection_reason", reason)
         window._schedule_progress_summary_refresh = lambda delay_ms=180: setattr(window, "_progress_refresh_scheduled", delay_ms)
@@ -1387,20 +1853,22 @@ class DestinationReplayRegressionTests(unittest.TestCase):
 
     def test_destination_root_folder_load_error_falls_back_to_future_model(self):
         window = MainWindow.__new__(MainWindow)
-        root_item = QTreeWidgetItem(["Folder: Root"])
-        root_item.setData(
-            0,
-            Qt.UserRole,
-            {
-                "name": "Root",
-                "display_path": "Root",
-                "item_path": "Root",
-                "destination_path": "Root",
-                "tree_role": "destination",
-                "is_folder": True,
-            },
-        )
-        worker_state = {"id": 3, "item": root_item}
+        root_payload = {
+            "name": "Root",
+            "display_path": "Root",
+            "item_path": "Root",
+            "destination_path": "Root",
+            "tree_role": "destination",
+            "is_folder": True,
+        }
+        parent_ix = MagicMock(spec=QModelIndex)
+        parent_ix.isValid.return_value = True
+        parent_ix.data.return_value = dict(root_payload)
+
+        dmodel = MagicMock()
+        dmodel.find_index_by_drive_item.return_value = parent_ix
+
+        worker_state = {"id": 3}
         window.folder_load_workers = {"destination:item-1": worker_state}
         window.pending_folder_loads = {"destination": {"drive-1:item-1"}, "source": set()}
         window._destination_preserved_children_by_worker = {}
@@ -1413,9 +1881,14 @@ class DestinationReplayRegressionTests(unittest.TestCase):
             "_last_tree_status",
             (panel_key, message, loading),
         )
-        window._materialize_destination_future_model = lambda reason: setattr(window, "_fallback_materialize_reason", reason)
+        window._destination_steady_state_full_materialize_redundant = lambda: False
+        window._destination_lifecycle_trace_TEMP = lambda *a, **k: None
+        window._apply_destination_planning_overlays = lambda reason, **kwargs: setattr(
+            window, "_fallback_materialize_reason", reason
+        )
         window._start_destination_restore_materialization = lambda: setattr(window, "_fallback_restore_started", True)
         window.destination_tree_widget = _TreeStub()
+        window.destination_planning_model = dmodel
         window._schedule_progress_summary_refresh = lambda delay_ms=180: setattr(window, "_progress_refresh_delay", delay_ms)
         window._log_restore_exception = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected exception"))
         window._log_worker_lifecycle = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected lifecycle"))
@@ -1425,33 +1898,34 @@ class DestinationReplayRegressionTests(unittest.TestCase):
             3,
         )
 
-        updated = root_item.data(0, Qt.UserRole)
         self.assertFalse(window._destination_root_prime_pending)
         self.assertEqual(window._last_tree_status[0], "destination")
         self.assertEqual(window._fallback_materialize_reason, "destination_root_error_fallback")
         self.assertTrue(window._fallback_restore_started)
-        self.assertTrue(updated["load_failed"])
+        dmodel.update_payload_for_index.assert_called_once()
+        mut = dmodel.update_payload_for_index.call_args[0][1]
+        p = dict(root_payload)
+        mut(p)
+        self.assertTrue(p["load_failed"])
 
     def test_cache_refresh_root_error_restores_last_visible_tree_snapshot(self):
         window = MainWindow.__new__(MainWindow)
-        window.source_tree_widget = QTreeWidget()
+        src_pl = {
+            "name": "Existing Source",
+            "base_display_label": "Folder: Existing Source",
+            "display_path": "FTBMRoot",
+            "item_path": "FTBMRoot",
+            "tree_role": "source",
+            "is_folder": True,
+            "id": "e1",
+            "drive_id": "drive-source",
+        }
+        stree, smodel = _sharepoint_source_test_tree([src_pl])
+        window.source_tree_widget = stree
+        window.source_sharepoint_model = smodel
         window.destination_tree_widget = QTreeWidget()
         window.source_tree_status = _LabelStub()
         window.destination_tree_status = _LabelStub()
-
-        existing_item = QTreeWidgetItem(["Folder: Existing Source"])
-        existing_item.setData(
-            0,
-            Qt.UserRole,
-            {
-                "name": "Existing Source",
-                "display_path": "FTBMRoot",
-                "item_path": "FTBMRoot",
-                "tree_role": "source",
-                "is_folder": True,
-            },
-        )
-        window.source_tree_widget.addTopLevelItem(existing_item)
 
         worker_state = {"id": 9}
         window.root_load_workers = {"source": worker_state}
@@ -1470,8 +1944,9 @@ class DestinationReplayRegressionTests(unittest.TestCase):
 
         window.on_root_load_error({"panel_key": "source", "drive_id": "drive-source"}, 9)
 
-        self.assertEqual(window.source_tree_widget.topLevelItemCount(), 1)
-        self.assertEqual(window.source_tree_widget.topLevelItem(0).text(0), "Folder: Existing Source")
+        root_ix = smodel.index(0, 0, QModelIndex())
+        self.assertTrue(root_ix.isValid())
+        self.assertEqual(str(root_ix.data(Qt.DisplayRole) or ""), "Folder: Existing Source")
         self.assertIn("last loaded source content", window.source_tree_status.text)
         self.assertFalse(window._cache_refresh_restore_active)
         self.assertEqual(window._pending_cache_refresh_tree_snapshots, {})
@@ -1481,28 +1956,28 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window.proposed_folders = [
             ProposedFolder(
                 FolderName="Projects Completed",
-                DestinationPath="Root\\Projects\\Projects Completed",
-                ParentPath="Root\\Projects",
+                DestinationPath="Projects\\Projects Completed",
+                ParentPath="Projects",
                 Status="Draft",
             )
         ]
 
         node = window._upsert_destination_model_node(
             {},
-            "Root\\Projects\\Projects Completed",
+            "Projects\\Projects Completed",
             name="Projects Completed",
             node_state="real",
             data={
                 "name": "Projects Completed",
                 "real_name": "Projects Completed",
-                "display_path": "Root\\Projects\\Projects Completed",
-                "item_path": "Root\\Projects\\Projects Completed",
-                "destination_path": "Root\\Projects\\Projects Completed",
+                "display_path": "Projects\\Projects Completed",
+                "item_path": "Projects\\Projects Completed",
+                "destination_path": "Projects\\Projects Completed",
                 "tree_role": "destination",
                 "is_folder": True,
                 "children_loaded": True,
             },
-            parent_semantic_path="Root\\Projects",
+            parent_semantic_path="Projects",
         )
 
         self.assertEqual(node["node_state"], "proposed")
@@ -1574,13 +2049,23 @@ class DestinationReplayRegressionTests(unittest.TestCase):
         window._expand_all_pending = {"source": False, "destination": False}
         window._expand_all_queue = {"source": deque(), "destination": deque()}
         window._expand_all_seen = {"source": set(), "destination": set()}
+        window._expand_all_processed_seen = {"source": set(), "destination": set()}
+        window._expand_all_processed = {"source": 0, "destination": 0}
+        window._expand_all_destination_model_queue = deque()
         window._expand_all_deferred_refresh = {"source": False, "destination": False}
         window._expand_all_max_per_tick = {"source": 1, "destination": 2}
         window._expand_all_status_last_update_ms = {"source": 0, "destination": 0}
         window._expand_all_timers = {}
         window._destination_expand_all_after_full_tree = False
         window._destination_root_prime_pending = False
+        window._destination_expand_burst_ctx = None
+        window._destination_full_tree_worker = None
+        window._destination_full_tree_requested_drive_id = ""
         window.pending_root_drive_ids = {"destination": ""}
+        window.pending_folder_loads = {"source": set(), "destination": set()}
+        window._pending_workspace_post_expand_selection = {"source": "", "destination": ""}
+        window._workspace_restore_expanded_all_intent = {"source": False, "destination": False}
+        window._pending_snapshot_branch_refresh = {"source": set(), "destination": set()}
         window.planned_moves = []
         window._sharepoint_lazy_mode = False
         window._current_selected_destination_drive_id = lambda: "drive-123"
@@ -1591,28 +2076,40 @@ class DestinationReplayRegressionTests(unittest.TestCase):
             "_last_status",
             (panel_key, message, loading),
         )
+        window._log_restore_phase = lambda *args, **kwargs: None
+        window._memory_restore_in_progress = False
+        window._safe_invoke = lambda _name, fn, *args, **kwargs: fn(*args, **kwargs)
         window._can_fast_bulk_expand = lambda panel_key: False
         window._set_expand_all_button_label = lambda panel_key, expanded: window.destination_expand_all_button.setText(
-            "Collapse All" if expanded else "Expand All"
+            _EXPAND_ALL_TREE_GLYPH_COLLAPSE if expanded else _EXPAND_ALL_TREE_GLYPH_EXPAND
         )
         window._persist_workspace_ui_state_safely = lambda: None
         window._refresh_runtime_tree_snapshot = lambda *args, **kwargs: None
         window._workspace_ui_snapshot_dirty_panels = set()
         window.node_is_planned_allocation = lambda node_data: False
+        window._update_expand_all_status = lambda *args, **kwargs: None
+        dm = QStandardItemModel()
+        top = QStandardItem("Folder: Root")
+        top.setData({"is_folder": True, "children_loaded": True, "placeholder": False}, Qt.UserRole)
+        dm.appendRow(top)
+        window.destination_planning_model = dm
+        window._destination_model_tree_has_unloaded_folder_nodes = lambda: True
 
         window.handle_expand_all("destination")
 
-        self.assertTrue(window._expand_all_pending["destination"])
+        self.assertTrue(getattr(window, "_destination_expand_all_start_pending", False))
+        self.assertFalse(window._expand_all_pending["destination"])
         self.assertTrue(window._destination_expand_all_after_full_tree)
-        self.assertEqual(window.destination_expand_all_button.text(), "Collapse All")
+        self.assertEqual(window.destination_expand_all_button.text(), _EXPAND_ALL_TREE_GLYPH_COLLAPSE)
         self.assertTrue(window.destination_expand_all_button.enabled)
         self.assertEqual(window._started_drive_id, "drive-123")
 
         window.handle_expand_all("destination")
 
+        self.assertFalse(getattr(window, "_destination_expand_all_start_pending", False))
         self.assertFalse(window._expand_all_pending["destination"])
         self.assertFalse(window._destination_expand_all_after_full_tree)
-        self.assertEqual(window.destination_expand_all_button.text(), "Expand All")
+        self.assertEqual(window.destination_expand_all_button.text(), _EXPAND_ALL_TREE_GLYPH_EXPAND)
         self.assertTrue(window.destination_tree_widget.collapsed)
         self.assertEqual(window._last_status, ("destination", "Expand cancelled; branches collapsed.", False))
 

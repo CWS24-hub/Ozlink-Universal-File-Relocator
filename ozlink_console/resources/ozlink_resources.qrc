@@ -1,0 +1,15 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+  <qresource prefix="/branding">
+    <file alias="ozlink_app_icon.svg">branding/ozlink_app_icon.svg</file>
+    <file alias="ozlink_wordmark.svg">branding/ozlink_wordmark.svg</file>
+    <file alias="ozlink_app_icon_16.png">branding/ozlink_app_icon_16.png</file>
+    <file alias="ozlink_app_icon_24.png">branding/ozlink_app_icon_24.png</file>
+    <file alias="ozlink_app_icon_32.png">branding/ozlink_app_icon_32.png</file>
+    <file alias="ozlink_app_icon_48.png">branding/ozlink_app_icon_48.png</file>
+    <file alias="ozlink_app_icon_64.png">branding/ozlink_app_icon_64.png</file>
+    <file alias="ozlink_app_icon_128.png">branding/ozlink_app_icon_128.png</file>
+    <file alias="ozlink_app_icon_256.png">branding/ozlink_app_icon_256.png</file>
+    <file alias="ozlink_favicon.ico">branding/ozlink_favicon.ico</file>
+  </qresource>
+</RCC>

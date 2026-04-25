@@ -1,17 +1,86 @@
-"""Run transfer manifests on the local filesystem (Windows paths). Graph execution is not implemented."""
+"""Run transfer manifests: local filesystem paths and optional Microsoft Graph (SharePoint) copy/create."""
 
 from __future__ import annotations
 
 import json
 import shutil
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from ozlink_console.logger import log_error, log_info
+import requests
 
-SUPPORTED_MANIFEST_VERSIONS = frozenset({1})
+from ozlink_console.audit_log import append_audit_event
+from ozlink_console.dev_mode import is_dev_mode
+from ozlink_console.integrity import verify_copied_file, verify_copied_tree
+from ozlink_console.graph_folder_execution_safety import (
+    GRAPH_DIRTY_FOLDER_COPY_BLOCKED,
+    runner_should_block_graph_folder_copy_fallback,
+)
+from ozlink_console.logger import flush_logger, log_error, log_info
+
+SUPPORTED_MANIFEST_VERSIONS = frozenset({1, 2})
+
+
+def _nonempty_snapshot_scoped_request_ids(raw: Any) -> bool:
+    return any(str(x).strip() for x in (raw or []) if x is not None)
+
+
+def _manifest_has_runtime_synthetic_transfer_steps(manifest: dict[str, Any]) -> bool:
+    """True when transfer_steps include rows appended after static manifest build (e.g. recursive Graph expansion)."""
+    for st in manifest.get("transfer_steps") or []:
+        if not isinstance(st, dict):
+            continue
+        rid = str(st.get("request_id", "") or "").strip()
+        if rid.startswith("recsub-"):
+            return True
+    return False
+
+
+def _effective_graph_expanded_transfer_steps(
+    manifest: dict[str, Any],
+    opts: dict[str, Any],
+    graph_expanded_raw: list[Any],
+    *,
+    graph_client: Any | None,
+) -> list[Any]:
+    """Use embedded graph expansion only for a full static plan (same context expansion was built for)."""
+    if not graph_expanded_raw or graph_client is None:
+        return []
+
+    subset_active = _nonempty_snapshot_scoped_request_ids(opts.get("snapshot_scoped_request_ids"))
+    recursive_active = bool(opts.get("snapshot_recursive_subtree"))
+    browsed_active = bool(opts.get("snapshot_browsed_recursive"))
+    runtime_synthetic = _manifest_has_runtime_synthetic_transfer_steps(manifest)
+
+    if (
+        not subset_active
+        and not recursive_active
+        and not browsed_active
+        and not runtime_synthetic
+    ):
+        return list(graph_expanded_raw)
+
+    reasons: list[str] = []
+    if subset_active:
+        reasons.append("subset_scoped")
+    if recursive_active:
+        reasons.append("recursive_subtree")
+    if browsed_active:
+        reasons.append("browsed_recursive")
+    if runtime_synthetic:
+        reasons.append("runtime_synthetic_transfer_steps")
+    reason = ",".join(reasons)
+    if is_dev_mode():
+        log_info(
+            "graph_expansion_disabled_due_to_context",
+            subset_active=subset_active,
+            recursive_active=bool(recursive_active or browsed_active),
+            reason=reason,
+        )
+    return []
 
 
 def is_absolute_local_path(path: str) -> bool:
@@ -35,6 +104,111 @@ def _path_depth_for_sort(path: str) -> int:
     return len(parts)
 
 
+def _direct_file_sources_under_folder_root(
+    manifest: dict[str, Any],
+    folder_step_index: int,
+    folder_src: Path,
+) -> set[str]:
+    """
+    Absolute paths of non-folder transfer steps whose source is under folder_src.
+
+    Those files must be skipped by copytree so their own copy steps apply (direct override).
+    """
+    folder_resolved = folder_src.resolve()
+    out: set[str] = set()
+    for st in manifest.get("transfer_steps") or []:
+        if int(st.get("index", -1)) == folder_step_index:
+            continue
+        if str(st.get("operation", "")).lower() != "copy":
+            continue
+        if bool(st.get("is_source_folder", False)):
+            continue
+        sp = str(st.get("source_path") or "").strip()
+        if not sp:
+            continue
+        try:
+            Path(sp).resolve().relative_to(folder_resolved)
+        except ValueError:
+            continue
+        out.add(str(Path(sp).resolve()))
+    return out
+
+
+def _copytree_ignore_for_plan_rules(
+    manifest: dict[str, Any],
+    folder_step_index: int,
+    folder_src: Path,
+    plan_leaf_exclusions: list[str],
+) -> Callable[[str, list[str]], list[str]]:
+    """shutil.copytree ignore=… factory: skip excluded leaves and direct per-file steps under this folder."""
+    from ozlink_console.planning_resolution import local_absolute_path_matches_canonical_projection
+
+    direct_abs = _direct_file_sources_under_folder_root(manifest, folder_step_index, folder_src)
+    exclusions = [str(x) for x in plan_leaf_exclusions if str(x).strip()]
+
+    def ignore(dir_str: str, names: list[str]) -> list[str]:
+        ignored: list[str] = []
+        for name in names:
+            full = Path(dir_str) / name
+            if not full.is_file():
+                continue
+            rp = str(full.resolve())
+            if rp in direct_abs:
+                ignored.append(name)
+                continue
+            for ex in exclusions:
+                if local_absolute_path_matches_canonical_projection(rp, ex):
+                    ignored.append(name)
+                    break
+        return ignored
+
+    return ignore
+
+
+def _graph_async_monitor_auth_poll_failure(exc: BaseException) -> bool:
+    """True when the async copy monitor poll failed with HTTP 401 (copy may still have completed)."""
+    return isinstance(exc, requests.HTTPError) and exc.response is not None and exc.response.status_code == 401
+
+
+def _verify_graph_copy_destination_item_present(
+    graph_client: Any,
+    step: dict[str, Any],
+    dest_name: str,
+) -> tuple[bool, str]:
+    """
+    Best-effort check that the destination driveItem exists at the planned path after a monitor error.
+    Used only to avoid false failures when Graph accepted the copy (202) but monitor GET returned 401.
+    """
+    get_by_path = getattr(graph_client, "get_drive_item_by_path", None)
+    if not callable(get_by_path):
+        return False, "no_get_drive_item_by_path"
+    drive_id = str(step.get("destination_drive_id", "") or "").strip()
+    dest_path = str(step.get("destination_path", "") or "").strip().replace("\\", "/")
+    name = str(dest_name or "").strip()
+    if not drive_id or not dest_path:
+        return False, "missing_destination_drive_or_path"
+
+    hit = get_by_path(drive_id, dest_path)
+    if isinstance(hit, dict) and str(hit.get("id") or "").strip():
+        resolved_name = str(hit.get("name") or "").strip()
+        if name and resolved_name and resolved_name.lower() != name.lower():
+            return False, f"name_mismatch_resolved={resolved_name!r}_expected={name!r}"
+        return True, "destination_path"
+
+    if name:
+        parent = dest_path.rstrip("/")
+        if parent:
+            combined = f"{parent}/{name}".replace("//", "/")
+            hit2 = get_by_path(drive_id, combined)
+            if isinstance(hit2, dict) and str(hit2.get("id") or "").strip():
+                resolved_name = str(hit2.get("name") or "").strip()
+                if name and resolved_name and resolved_name.lower() != name.lower():
+                    return False, f"name_mismatch_resolved={resolved_name!r}_expected={name!r}"
+                return True, "parent_plus_destination_name"
+
+    return False, "destination_item_not_found"
+
+
 def load_manifest_json(path: str | Path) -> dict[str, Any]:
     raw = Path(path).read_text(encoding="utf-8")
     return json.loads(raw)
@@ -53,10 +227,35 @@ def validate_manifest(manifest: dict[str, Any]) -> list[str]:
 
 
 def _step_graph_ready(step: dict[str, Any]) -> bool:
+    """True when manifest has Graph ids for a driveItem copy (destination_item_id = parent folder)."""
     return bool(
         str(step.get("source_drive_id", "") or "").strip()
         and str(step.get("source_item_id", "") or "").strip()
         and str(step.get("destination_drive_id", "") or "").strip()
+        and str(step.get("destination_item_id", "") or "").strip()
+    )
+
+
+def _pilot_planned_move_key_for_step(step: dict[str, Any]) -> int:
+    """Planned-move index for pilot filters. Expanded steps use ``planned_move_index`` when present."""
+    if "planned_move_index" in step:
+        try:
+            pm = int(step.get("planned_move_index", -1))
+        except (TypeError, ValueError):
+            pm = -1
+        if pm >= 0:
+            return pm
+    try:
+        return int(step.get("index", -1))
+    except (TypeError, ValueError):
+        return -1
+
+
+def _proposed_graph_ready(step: dict[str, Any]) -> bool:
+    return bool(
+        str(step.get("folder_name", "") or "").strip()
+        and str(step.get("destination_drive_id", "") or "").strip()
+        and str(step.get("destination_parent_item_id", "") or "").strip()
     )
 
 
@@ -68,6 +267,7 @@ def manifest_execution_summary(manifest: dict[str, Any]) -> dict[str, Any]:
     graph_transfer = 0
     skipped_transfer = 0
     local_mkdir = 0
+    graph_mkdir = 0
     skipped_mkdir = 0
     for step in transfer:
         op = str(step.get("operation", "copy")).lower()
@@ -87,7 +287,9 @@ def manifest_execution_summary(manifest: dict[str, Any]) -> dict[str, Any]:
             skipped_mkdir += 1
             continue
         dst = str(step.get("destination_path", "") or "")
-        if is_absolute_local_path(dst):
+        if _proposed_graph_ready(step):
+            graph_mkdir += 1
+        elif is_absolute_local_path(dst):
             local_mkdir += 1
         else:
             skipped_mkdir += 1
@@ -98,6 +300,7 @@ def manifest_execution_summary(manifest: dict[str, Any]) -> dict[str, Any]:
         "graph_transfer_pending": graph_transfer,
         "transfer_skipped_non_local": skipped_transfer,
         "local_mkdir": local_mkdir,
+        "graph_folder_create": graph_mkdir,
         "proposed_skipped_non_local": skipped_mkdir,
     }
 
@@ -109,6 +312,9 @@ class StepRunRecord:
     status: str
     detail: str = ""
     attempts: int = 0
+    source_sha256: str = ""
+    dest_sha256: str = ""
+    integrity_verified: bool | None = None
 
 
 @dataclass
@@ -116,13 +322,20 @@ class RunManifestResult:
     dry_run: bool
     records: list[StepRunRecord] = field(default_factory=list)
     log_path: str | None = None
+    job_id: str = ""
+    job_report_path: str | None = None
 
     def summary_line(self) -> str:
         ok = sum(1 for r in self.records if r.status == "ok")
         skipped = sum(1 for r in self.records if r.status == "skipped")
         failed = sum(1 for r in self.records if r.status == "failed")
         dry = sum(1 for r in self.records if r.status == "dry_run")
-        return f"ok={ok} skipped={skipped} failed={failed} dry_run={dry}"
+        v = sum(1 for r in self.records if r.integrity_verified is True)
+        vi = sum(1 for r in self.records if r.integrity_verified is False)
+        base = f"ok={ok} skipped={skipped} failed={failed} dry_run={dry}"
+        if v or vi:
+            base += f" integrity_ok={v} integrity_failed={vi}"
+        return base
 
 
 def _retry_call(
@@ -152,21 +365,129 @@ def run_manifest_local_filesystem(
     base_delay_sec: float = 0.35,
     on_step: Callable[[StepRunRecord], None] | None = None,
     log_file: str | Path | None = None,
+    audit_file: str | Path | None = None,
+    job_report_file: str | Path | None = None,
+    job_id: str | None = None,
+    verify_integrity: bool | None = None,
+    graph_client: Any | None = None,
 ) -> RunManifestResult:
     """
-    Execute proposed_folder_steps (mkdir) and transfer_steps (copy file or tree) when paths are
-    absolute local paths. Skips Graph-only steps. Folders use shutil.copytree(..., dirs_exist_ok=True).
+    Execute proposed_folder_steps and transfer_steps.
+
+    * **Local paths** (``C:\\``, UNC, POSIX ``/``): mkdir and shutil copies; optional integrity checks.
+    * **Graph steps** (when ``graph_client`` is set): copy driveItems between libraries/sites using
+      manifest drive/item ids; create proposed folders via Graph when the manifest includes
+      ``destination_drive_id`` and ``destination_parent_item_id``.
+
+    Without ``graph_client``, Graph-eligible steps are skipped with a clear log line.
+
+    **Pilot / partial live test** (``execution_options``): set ``pilot_max_graph_operations`` to a
+    positive integer **only for non-dry-run** jobs to cap how many Graph **mutations** run (each
+    proposed-folder create and each Graph copy counts as one). Remaining Graph steps are recorded as
+    ``skipped`` with a clear reason. Dry runs ignore this limit so previews stay complete.
+
+    Governance: optional ``audit_file`` JSONL and ``job_report_file`` JSON (``ozlink.job_report/v1``).
     """
+    from ozlink_console.governance_report import build_job_report, write_job_report_json
+
     errors = validate_manifest(manifest)
     if errors:
         raise ValueError("; ".join(errors))
 
+    opts: dict[str, Any] = dict(manifest.get("execution_options") or {})
+    do_verify = bool(opts.get("verify_integrity", True))
+    if verify_integrity is not None:
+        do_verify = bool(verify_integrity)
+    file_graph_timeout = float(opts.get("graph_copy_file_timeout_sec", 600))
+    folder_graph_timeout = float(opts.get("graph_copy_folder_timeout_sec", 7200))
+    graph_conflict = str(opts.get("graph_copy_conflict_behavior", "rename") or "rename")
+    pilot_max_graph_ops = int(opts.get("pilot_max_graph_operations") or 0)
+    pilot_proposed_folder_name = str(opts.get("pilot_proposed_folder_name") or "").strip()
+    pilot_proposed_folder_destination_paths = set(
+        str(x).strip()
+        for x in (opts.get("pilot_proposed_folder_destination_paths") or [])
+        if str(x).strip()
+    )
+    pilot_transfer_destination_keys = set(
+        str(x).strip()
+        for x in (opts.get("pilot_transfer_destination_keys") or [])
+        if str(x).strip()
+    )
+    pilot_transfer_step_uids = set(
+        str(x).strip()
+        for x in (opts.get("pilot_transfer_step_uids") or [])
+        if str(x).strip()
+    )
+    pilot_transfer_step_indices = set(
+        int(x)
+        for x in (opts.get("pilot_transfer_step_indices") or [])
+        if str(x).strip()
+    )
+    pilot_transfer_destination_paths = set(
+        str(x).strip()
+        for x in (opts.get("pilot_transfer_destination_paths") or [])
+        if str(x).strip()
+    )
+    plan_leaf_exclusions = list(opts.get("plan_leaf_exclusions") or [])
+    graph_expanded_raw = list(opts.get("graph_expanded_transfer_steps") or [])
+    graph_expanded_steps = _effective_graph_expanded_transfer_steps(
+        manifest, opts, graph_expanded_raw, graph_client=graph_client
+    )
+    graph_unsafe_embedded_key_present = "graph_unsafe_folder_step_indices" in opts
+    graph_unsafe_folder_indices: set[int] = set()
+    if graph_unsafe_embedded_key_present:
+        for _x in opts.get("graph_unsafe_folder_step_indices") or []:
+            try:
+                v = int(_x)
+            except (TypeError, ValueError):
+                continue
+            if v >= 0:
+                graph_unsafe_folder_indices.add(v)
+    if dry_run:
+        pilot_max_graph_ops = 0
+    graph_ops_used = 0
+
+    def _pilot_allows_graph_mutation() -> bool:
+        if pilot_max_graph_ops <= 0:
+            return True
+        return graph_ops_used < pilot_max_graph_ops
+
+    if audit_file is None and opts.get("audit_jsonl_path"):
+        audit_file = opts["audit_jsonl_path"]
+    if job_report_file is None and opts.get("job_report_path"):
+        job_report_file = opts["job_report_path"]
+    lp_log = Path(log_file) if log_file else None
+    if lp_log is not None:
+        if audit_file is None:
+            audit_file = str(lp_log.with_suffix(".audit.jsonl"))
+        if job_report_file is None:
+            job_report_file = str(lp_log.parent / f"{lp_log.stem}_report.json")
+    jid = str(job_id or opts.get("job_id") or "").strip() or uuid.uuid4().hex
+
     records: list[StepRunRecord] = []
     log_lines: list[str] = []
 
+    append_audit_event(
+        audit_file,
+        job_id=jid,
+        event_type="job_started",
+        payload={
+            "dry_run": dry_run,
+            "verify_integrity": do_verify,
+            "pilot_max_graph_operations": pilot_max_graph_ops or None,
+        },
+    )
+
     def emit(rec: StepRunRecord) -> None:
         records.append(rec)
-        line = f"{rec.phase}\tidx={rec.step_index}\t{rec.status}\t{rec.detail}"
+        extra = ""
+        if rec.source_sha256:
+            extra += f"\tsha_src={rec.source_sha256[:16]}…"
+        if rec.dest_sha256:
+            extra += f"\tsha_dst={rec.dest_sha256[:16]}…"
+        if rec.integrity_verified is not None:
+            extra += f"\tintegrity={'ok' if rec.integrity_verified else 'fail'}"
+        line = f"{rec.phase}\tidx={rec.step_index}\t{rec.status}\t{rec.detail}{extra}"
         log_lines.append(line)
         log_info(
             "transfer_job_step",
@@ -178,6 +499,17 @@ def run_manifest_local_filesystem(
         )
         if on_step:
             on_step(rec)
+        append_audit_event(
+            audit_file,
+            job_id=jid,
+            event_type="step",
+            payload={
+                "phase": rec.phase,
+                "step_index": rec.step_index,
+                "status": rec.status,
+                "integrity_verified": rec.integrity_verified,
+            },
+        )
 
     proposed = sorted(
         list(manifest.get("proposed_folder_steps") or []),
@@ -190,8 +522,97 @@ def run_manifest_local_filesystem(
             emit(StepRunRecord("proposed_folder", idx, "skipped", f"unsupported operation {op!r}"))
             continue
         dst = str(step.get("destination_path", "") or "")
+        fname = str(step.get("folder_name", "") or "").strip()
+        d_drive = str(step.get("destination_drive_id", "") or "").strip()
+        d_parent = str(step.get("destination_parent_item_id", "") or "").strip()
+
+        if pilot_proposed_folder_destination_paths and dst.strip() not in pilot_proposed_folder_destination_paths:
+            emit(
+                StepRunRecord(
+                    "proposed_folder",
+                    idx,
+                    "skipped",
+                    f"pilot_proposed_folder_destination_paths filter: destination_path {dst!r} not selected",
+                )
+            )
+            continue
+
+        if pilot_proposed_folder_name and fname != pilot_proposed_folder_name:
+            emit(
+                StepRunRecord(
+                    "proposed_folder",
+                    idx,
+                    "skipped",
+                    f"pilot_proposed_folder_name filter: {fname!r} != {pilot_proposed_folder_name!r}",
+                )
+            )
+            continue
+
+        if _proposed_graph_ready(step):
+            if graph_client is None:
+                emit(
+                    StepRunRecord(
+                        "proposed_folder",
+                        idx,
+                        "skipped",
+                        "Graph folder create requires Microsoft 365 sign-in (graph client not provided)",
+                    )
+                )
+                continue
+            if dry_run:
+                emit(
+                    StepRunRecord(
+                        "proposed_folder",
+                        idx,
+                        "dry_run",
+                        f"graph create folder {fname!r} under parent in drive {d_drive[-12:] if len(d_drive) > 12 else d_drive}",
+                    )
+                )
+                continue
+
+            if not _pilot_allows_graph_mutation():
+                emit(
+                    StepRunRecord(
+                        "proposed_folder",
+                        idx,
+                        "skipped",
+                        f"pilot_max_graph_operations reached ({pilot_max_graph_ops}); remaining Graph steps not run",
+                    )
+                )
+                continue
+
+            try:
+                # Count the mutation attempt even if it fails (409 conflicts etc.).
+                graph_ops_used += 1
+                graph_client.create_child_folder(
+                    d_drive,
+                    d_parent,
+                    fname,
+                    conflict_behavior=str(opts.get("graph_mkdir_conflict_behavior", "fail") or "fail"),
+                )
+                emit(StepRunRecord("proposed_folder", idx, "ok", f"graph mkdir {fname!r}"))
+            except Exception as exc:
+                emit(
+                    StepRunRecord(
+                        "proposed_folder",
+                        idx,
+                        "failed",
+                        f"graph mkdir {fname!r}: {exc}",
+                    )
+                )
+                log_error("transfer_job_graph_mkdir_failed", folder=fname, error=str(exc))
+            continue
+
         if not is_absolute_local_path(dst):
-            emit(StepRunRecord("proposed_folder", idx, "skipped", "destination is not a local absolute path"))
+            emit(
+                StepRunRecord(
+                    "proposed_folder",
+                    idx,
+                    "skipped",
+                    "not a local folder path and step lacks destination_drive_id + destination_parent_item_id "
+                    "(re-save manifest after adding proposed folders under SharePoint in planning).",
+                )
+            )
             continue
         if dry_run:
             emit(StepRunRecord("proposed_folder", idx, "dry_run", f"mkdir {dst}"))
@@ -215,7 +636,14 @@ def run_manifest_local_filesystem(
         else:
             emit(StepRunRecord("proposed_folder", idx, "ok", f"mkdir {dst}", attempts=attempts))
 
-    for step in manifest.get("transfer_steps") or []:
+    def _graph_expansion_then_transfer_steps():
+        if graph_expanded_steps and graph_client is not None:
+            for s in graph_expanded_steps:
+                yield s, True
+        for s in manifest.get("transfer_steps") or []:
+            yield s, False
+
+    for step, from_graph_expansion in _graph_expansion_then_transfer_steps():
         idx = int(step.get("index", -1))
         op = str(step.get("operation", "copy")).lower()
         if op != "copy":
@@ -225,16 +653,209 @@ def run_manifest_local_filesystem(
         src = str(step.get("source_path", "") or "")
         dst = str(step.get("destination_path", "") or "")
         is_folder = bool(step.get("is_source_folder", False))
+        dest_name = str(step.get("destination_name", "") or step.get("source_name", "") or "").strip()
+        step_uid = str(step.get("step_uid", "") or "").strip()
+        pilot_move_key = _pilot_planned_move_key_for_step(step)
 
-        if _step_graph_ready(step) and not (is_absolute_local_path(src) and is_absolute_local_path(dst)):
+        if (
+            not from_graph_expansion
+            and graph_expanded_steps
+            and graph_client is not None
+            and _step_graph_ready(step)
+            and not (is_absolute_local_path(src) and is_absolute_local_path(dst))
+        ):
+            continue
+
+        if pilot_transfer_step_indices and pilot_move_key not in pilot_transfer_step_indices:
             emit(
                 StepRunRecord(
                     "transfer",
                     idx,
                     "skipped",
-                    "Microsoft Graph copy is not implemented in this build (drive/item ids present)",
+                    f"pilot_transfer_step_indices filter: planned move {pilot_move_key} not selected",
                 )
             )
+            continue
+
+        if pilot_transfer_step_uids and step_uid not in pilot_transfer_step_uids:
+            emit(
+                StepRunRecord(
+                    "transfer",
+                    idx,
+                    "skipped",
+                    f"pilot_transfer_step_uids filter: step_uid {step_uid!r} not selected",
+                )
+            )
+            continue
+
+        if pilot_transfer_destination_keys:
+            key = f"{dst.strip()}|||{dest_name}"
+            if key not in pilot_transfer_destination_keys:
+                emit(
+                    StepRunRecord(
+                        "transfer",
+                        idx,
+                        "skipped",
+                        f"pilot_transfer_destination_keys filter: key {key!r} not selected",
+                    )
+                )
+                continue
+
+        if pilot_transfer_destination_paths:
+            # destination_path uniquely identifies the parent + leaf in our manifests.
+            if dst.strip() not in pilot_transfer_destination_paths:
+                emit(
+                    StepRunRecord(
+                        "transfer",
+                        idx,
+                        "skipped",
+                        f"pilot_transfer_destination_paths filter: destination_path {dst!r} not selected",
+                    )
+                )
+                continue
+
+        if _step_graph_ready(step) and not (is_absolute_local_path(src) and is_absolute_local_path(dst)):
+            if graph_client is None:
+                emit(
+                    StepRunRecord(
+                        "transfer",
+                        idx,
+                        "skipped",
+                        "Microsoft Graph copy requires Microsoft 365 sign-in (graph client not provided)",
+                    )
+                )
+                continue
+
+            if is_folder and not from_graph_expansion:
+                if graph_unsafe_embedded_key_present:
+                    graph_folder_blocked = idx in graph_unsafe_folder_indices
+                else:
+                    graph_folder_blocked = runner_should_block_graph_folder_copy_fallback(
+                        manifest, idx, step, plan_leaf_exclusions
+                    )
+                if graph_folder_blocked:
+                    log_info(
+                        "transfer_job_graph_folder_copy_blocked_dirty",
+                        step_index=idx,
+                        embedded_indices=graph_unsafe_embedded_key_present,
+                    )
+                    emit(
+                        StepRunRecord(
+                            "transfer",
+                            idx,
+                            "skipped",
+                            GRAPH_DIRTY_FOLDER_COPY_BLOCKED,
+                        )
+                    )
+                    continue
+
+            if dry_run:
+                emit(
+                    StepRunRecord(
+                        "transfer",
+                        idx,
+                        "dry_run",
+                        f"graph copy driveItem -> parent in dest drive (name={dest_name!r}, folder={is_folder})",
+                    )
+                )
+                continue
+
+            if not _pilot_allows_graph_mutation():
+                emit(
+                    StepRunRecord(
+                        "transfer",
+                        idx,
+                        "skipped",
+                        f"pilot_max_graph_operations reached ({pilot_max_graph_ops}); remaining Graph steps not run",
+                    )
+                )
+                continue
+
+            try:
+                # Count the mutation attempt even if it fails (409 conflicts etc.).
+                graph_ops_used += 1
+                src_drive_id = str(step.get("source_drive_id", "") or "").strip()
+                src_item_id = str(step.get("source_item_id", "") or "").strip()
+                dst_drive_id = str(step.get("destination_drive_id", "") or "").strip()
+                dst_parent_item_id = str(step.get("destination_item_id", "") or "").strip()
+                monitor = graph_client.start_drive_item_copy(
+                    source_drive_id=src_drive_id,
+                    source_item_id=src_item_id,
+                    dest_drive_id=dst_drive_id,
+                    dest_parent_item_id=dst_parent_item_id,
+                    name=dest_name or None,
+                    conflict_behavior=graph_conflict,
+                )
+                timeout_sec = folder_graph_timeout if is_folder else file_graph_timeout
+                log_info(
+                    "transfer_job_graph_copy_async_handoff",
+                    step_index=idx,
+                    is_folder=bool(is_folder),
+                    timeout_sec=float(timeout_sec),
+                    monitor_url_excerpt=str(monitor or "")[:220],
+                    destination_name_excerpt=str(dest_name or "")[:200] or None,
+                )
+                flush_logger()
+                graph_client.wait_graph_async_operation(monitor, timeout_sec=timeout_sec)
+                emit(
+                    StepRunRecord(
+                        "transfer",
+                        idx,
+                        "ok",
+                        f"graph copy completed (name={dest_name!r})",
+                    )
+                )
+            except Exception as exc:
+                recovered = False
+                recovery_how = ""
+                if _graph_async_monitor_auth_poll_failure(exc):
+                    ok_probe, recovery_how = _verify_graph_copy_destination_item_present(
+                        graph_client, step, dest_name
+                    )
+                    if ok_probe:
+                        recovered = True
+                        log_info(
+                            "transfer_job_graph_copy_recovered_after_monitor_401",
+                            step_index=idx,
+                            destination_name_excerpt=str(dest_name or "")[:200] or None,
+                            recovery_probe=recovery_how,
+                            destination_path_excerpt=str(dst or "")[:220] or None,
+                        )
+                        flush_logger()
+                if recovered:
+                    emit(
+                        StepRunRecord(
+                            "transfer",
+                            idx,
+                            "ok",
+                            f"graph copy completed (name={dest_name!r}); "
+                            f"async monitor polling returned 401 but destination item was verified via path "
+                            f"({recovery_how})",
+                        )
+                    )
+                    continue
+                payload_hint = (
+                    f"graph copy: {exc} "
+                    f"(source_drive_id={src_drive_id!r}, source_item_id={src_item_id!r}, "
+                    f"destination_drive_id={dst_drive_id!r}, destination_parent_item_id={dst_parent_item_id!r}, "
+                    f"name={dest_name!r}, conflict_behavior={graph_conflict!r}, "
+                    f"destination_path={dst!r}, is_folder={is_folder})"
+                )
+                emit(StepRunRecord("transfer", idx, "failed", payload_hint))
+                log_error(
+                    "transfer_job_graph_copy_failed",
+                    step_index=idx,
+                    error=str(exc),
+                    source_drive_id=src_drive_id,
+                    source_item_id=src_item_id,
+                    destination_drive_id=dst_drive_id,
+                    destination_parent_item_id=dst_parent_item_id,
+                    destination_name=dest_name,
+                    destination_path=dst,
+                    conflict_behavior=graph_conflict,
+                    is_folder=bool(is_folder),
+                    recovered_after_monitor_401=False,
+                )
             continue
 
         if not is_absolute_local_path(src) or not is_absolute_local_path(dst):
@@ -243,7 +864,9 @@ def run_manifest_local_filesystem(
                     "transfer",
                     idx,
                     "skipped",
-                    "source or destination is not a local absolute path (SharePoint library paths need Graph executor)",
+                    "SharePoint-style paths but step lacks full Graph ids "
+                    "(need source_drive_id, source_item_id, destination_drive_id, destination_item_id=parent folder); "
+                    "or use local C:\\/UNC paths. Re-save manifest from planning with live trees.",
                 )
             )
             continue
@@ -264,7 +887,8 @@ def run_manifest_local_filesystem(
 
             def _tree() -> None:
                 dst_p.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copytree(src_p, dst_p, dirs_exist_ok=True)
+                ign = _copytree_ignore_for_plan_rules(manifest, idx, src_p, plan_leaf_exclusions)
+                shutil.copytree(src_p, dst_p, dirs_exist_ok=True, ignore=ign)
 
             attempts, exc = _retry_call(_tree, max_retries=max_retries, base_delay_sec=base_delay_sec)
             if exc is not None:
@@ -279,15 +903,20 @@ def run_manifest_local_filesystem(
                 )
                 log_error("transfer_job_copytree_failed", source=str(src_p), dest=str(dst_p), error=str(exc))
             else:
-                emit(
-                    StepRunRecord(
-                        "transfer",
-                        idx,
-                        "ok",
-                        f"copytree {src_p} -> {dst_p}",
-                        attempts=attempts,
-                    )
+                rec = StepRunRecord(
+                    "transfer",
+                    idx,
+                    "ok",
+                    f"copytree {src_p} -> {dst_p}",
+                    attempts=attempts,
                 )
+                if do_verify:
+                    ok_v, msg = verify_copied_tree(src_p, dst_p)
+                    rec.integrity_verified = ok_v
+                    if not ok_v:
+                        rec.status = "failed"
+                        rec.detail = f"{rec.detail}; integrity_failed {msg}"
+                emit(rec)
         elif src_p.is_file():
 
             def _file() -> None:
@@ -307,15 +936,22 @@ def run_manifest_local_filesystem(
                 )
                 log_error("transfer_job_copy2_failed", source=str(src_p), dest=str(dst_p), error=str(exc))
             else:
-                emit(
-                    StepRunRecord(
-                        "transfer",
-                        idx,
-                        "ok",
-                        f"copy2 {src_p} -> {dst_p}",
-                        attempts=attempts,
-                    )
+                rec = StepRunRecord(
+                    "transfer",
+                    idx,
+                    "ok",
+                    f"copy2 {src_p} -> {dst_p}",
+                    attempts=attempts,
                 )
+                if do_verify:
+                    ok_v, msg, hs, hd = verify_copied_file(src_p, dst_p)
+                    rec.source_sha256 = hs
+                    rec.dest_sha256 = hd
+                    rec.integrity_verified = ok_v
+                    if not ok_v:
+                        rec.status = "failed"
+                        rec.detail = f"{rec.detail}; integrity_failed {msg}"
+                emit(rec)
         else:
             emit(StepRunRecord("transfer", idx, "skipped", f"source is not a file or directory: {src_p}"))
 
@@ -326,4 +962,24 @@ def run_manifest_local_filesystem(
         lp.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
         log_path = str(lp)
 
-    return RunManifestResult(dry_run=dry_run, records=records, log_path=log_path)
+    report = build_job_report(job_id=jid, manifest=manifest, records=records, dry_run=dry_run)
+    job_report_path: str | None = None
+    if job_report_file:
+        rp = Path(job_report_file)
+        write_job_report_json(rp, report)
+        job_report_path = str(rp)
+
+    append_audit_event(
+        audit_file,
+        job_id=jid,
+        event_type="job_finished",
+        payload={"summary": report.get("summary", {})},
+    )
+
+    return RunManifestResult(
+        dry_run=dry_run,
+        records=records,
+        log_path=log_path,
+        job_id=jid,
+        job_report_path=job_report_path,
+    )

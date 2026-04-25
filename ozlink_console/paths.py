@@ -46,6 +46,28 @@ def memory_root() -> Path:
 def legacy_memory_root() -> Path:
     return legacy_compatibility_root() / "Memory"
 
+
+def ensure_app_storage_directories() -> None:
+    """Create all standard Ozlink console folders under LocalAppData if they do not exist.
+
+    Call once at process startup (before logging). Re-entrant and safe if folders already exist.
+    Covers global roots used by logs, unscoped memory, exports, requests, cache, and legacy migration paths.
+    """
+    python_primary_storage_root().mkdir(parents=True, exist_ok=True)
+    legacy_compatibility_root().mkdir(parents=True, exist_ok=True)
+    legacy_memory_root().mkdir(parents=True, exist_ok=True)
+    # Each helper creates its directory tree
+    _ = logs_root()
+    _ = memory_root()
+    _ = backups_root()
+    _ = quarantine_root()
+    _ = exports_root()
+    _ = requests_root()
+    _ = test_requests_root()
+    _ = cache_root()
+    _ = graph_cache_root()
+
+
 def backups_root() -> Path:
     path = memory_root() / "Backups"
     path.mkdir(parents=True, exist_ok=True)
@@ -80,3 +102,37 @@ def graph_cache_root() -> Path:
     path = cache_root() / "Graph"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def msal_token_cache_path() -> Path:
+    """MSAL delegated-token cache file path (used only when ``--dev`` / ``OZLINK_DEV`` is set)."""
+    return cache_root() / "msal_token_cache.json"
+
+
+def normalize_manifest_path(path: str | None) -> str:
+    """Normalize a stored path string the same way as ``MainWindow.normalize_memory_path``."""
+    text = str(path or "").strip().replace("/", "\\")
+    text = re.sub(r"\s*\\\s*", "\\\\", text)
+    text = re.sub(r"\\{2,}", "\\\\", text)
+    segments = [segment.strip() for segment in text.split("\\") if segment.strip()]
+    return "\\".join(segments)
+
+
+def manifest_folder_copy_logical_path(destination_path: str, leaf_name: str) -> str:
+    """
+    Build the logical destination path for a folder-copy manifest row.
+
+    Graph folder rows often repeat the leaf: ``destination_path`` may already be
+    ``Root\\Personal`` while ``leaf_name`` is ``Personal``. Blind concatenation
+    yields ``Root\\Personal\\Personal``, which breaks pilot identity matching.
+    """
+    dst_norm = normalize_manifest_path(destination_path).rstrip("\\")
+    if not dst_norm:
+        return ""
+    nm = str(leaf_name or "").strip()
+    if nm:
+        parts = [p for p in dst_norm.split("\\") if p]
+        if parts and parts[-1].lower() == nm.lower():
+            return dst_norm
+        return f"{dst_norm}\\{nm}"
+    return dst_norm
